@@ -1,6 +1,6 @@
 <img align="right" width="28%" src="media/ntoseye.png">
 
-# ntoseye ![license](https://img.shields.io/badge/license-MIT-blue)
+# ntoseye ![license](https://img.shields.io/badge/license-MIT-blue) [![crates.io](https://img.shields.io/crates/v/ntoseye.svg)](https://crates.io/crates/ntoseye)
 
 Windows kernel debugger for Linux hosts running Windows under KVM/QEMU. Essentially, WinDbg for Linux.
 
