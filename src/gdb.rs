@@ -188,9 +188,18 @@ impl RegisterMap {
         Ok(u64::from_le_bytes(buf))
     }
 
-    // pub fn iter(&self) -> impl Iterator<Item = &RegisterInfo> {
-    //     self.ordered.iter()
-    // }
+    pub fn to_hashmap(&self, data: &[u8]) -> HashMap<String, u64> {
+        self.ordered.iter().filter_map(|reg| {
+            if reg.offset + reg.size > data.len() {
+                return None;
+            }
+            let slice = &data[reg.offset..reg.offset + reg.size];
+            let mut buf = [0u8; 8];
+            let copy_len = slice.len().min(8);
+            buf[..copy_len].copy_from_slice(&slice[..copy_len]);
+            Some((reg.name.clone(), u64::from_le_bytes(buf)))
+        }).collect()
+    }
 
     // pub fn is_empty(&self) -> bool {
     //     self.ordered.is_empty()

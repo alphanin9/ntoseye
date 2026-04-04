@@ -51,6 +51,8 @@ Note that you may need to run `ntoseye` with `sudo` aswell (last resort, try com
 
 To view command line arguments, run `ntoseye --help`. The debugger is self documented, so pressing tab will display completions and descriptions for commands, symbols, and types.
 
+For examples, refer [here](#usage-examples).
+
 ## VM configuration
 
 `bcdedit /debug on` is not required within the guest.
@@ -89,3 +91,10 @@ Functionality regarding initialization of guest information was written with the
 - [vmread](https://github.com/h33p/vmread)
 - [pcileech](https://github.com/ufrisk/pcileech)
 - [MemProcFS](https://github.com/ufrisk/MemProcFS)
+
+## Usage examples
+
+### Privilege escalation
+
+1. Run `ps <filter>` to get the `EPROCESS` address of the process you wish to escalate
+2. Run `eq (_EPROCESS)(AddressOfEPROCESS)->Token *(_EPROCESS)*PsInitialSystemProcess->Token` where `AddressOfEPROCESS` is the address from step 1

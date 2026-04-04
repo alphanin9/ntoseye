@@ -74,6 +74,9 @@ pub enum Error {
     #[error("Field '{0}' not found")]
     FieldNotFound(String),
 
+    #[error("Invalid expression: {0}")]
+    InvalidExpression(String),
+
     #[error("Expected loaded symbols")]
     ExpectedSymbols,
 

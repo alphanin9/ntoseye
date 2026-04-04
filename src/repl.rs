@@ -28,11 +28,12 @@ use owo_colors::OwoColorize;
 use std::borrow::Cow;
 
 use crate::backend::MemoryOps;
-use crate::debugger::{DebuggerArgument, DebuggerContext};
+use crate::debugger::DebuggerContext;
+use crate::expr::Expr;
 use crate::error::{Error, Result};
 use crate::gdb::{BreakpointHitResult, BreakpointManager, GdbClient, RegisterMap};
-use crate::symbols::{ParsedType, SymbolIndex};
-use crate::types::{Value, VirtAddr};
+use crate::symbols::{ParsedType, SymbolIndex, SymbolStore};
+use crate::types::{Dtb, Value, VirtAddr};
 
 static INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -84,8 +85,7 @@ enum CompletionStrategy {
 fn make_suggestions(
     names: Vec<String>,
     description: &str,
-    arg_start: usize,
-    prefix_offset: usize,
+    span_start: usize,
     pos: usize,
 ) -> Vec<Suggestion> {
     names
@@ -96,7 +96,7 @@ fn make_suggestions(
             style: None,
             extra: None,
             match_indices: None,
-            span: Span::new(arg_start + prefix_offset, pos),
+            span: Span::new(span_start, pos),
             append_whitespace: true,
         })
         .collect()
@@ -120,15 +120,19 @@ struct AddressRange {
 }
 
 impl AddressRange {
-    fn parse(parts: &[&str], debugger: &DebuggerContext, default_length: u64) -> Result<Self> {
+    fn parse(parts: &[&str], debugger: &DebuggerContext, default_count: u64, item_size: u64) -> Result<Self> {
         let start_arg = parts.get(1).ok_or(Error::InvalidRange)?;
-        let start = DebuggerArgument::new(start_arg).try_resolve(debugger)?;
+        let start = Expr::eval(start_arg, debugger)?;
 
         let end = if let Some(end_arg) = parts.get(2) {
-            let end = DebuggerArgument::new(end_arg).try_resolve(debugger)?;
-            if end.0 < start.0 { end + start.0 } else { end }
+            let end = Expr::eval(end_arg, debugger)?;
+            if end.0 < start.0 {
+                start + end.0 * item_size
+            } else {
+                end
+            }
         } else {
-            start + default_length
+            start + default_count * item_size
         };
 
         if end.0 < start.0 {
@@ -146,11 +150,9 @@ impl AddressRange {
 // TODO
 //
 // Memory Display:
-//   dd, dq       - Display as DWORDs/QWORDs
 //   da, du       - Display ASCII/Unicode strings
 //   dps          - Display pointers with symbol resolution
 // Memory Write:
-//   eb, ed, eq   - Edit byte/dword/qword
 //   ea, eu       - Write ASCII/Unicode string
 //   f            - Fill memory with pattern
 // Execution Control:
@@ -161,13 +163,11 @@ impl AddressRange {
 // Breakpoints:
 //   Conditional breakpoints
 // Registers:
-//   r            - Display/modify registers
 //   context      - Auto-display regs/stack/disasm on break
 // Stack Analysis:
 //   k            - Stack backtrace
 //   kv, kp       - Backtrace with locals/params
 // Search:
-//   s            - Search memory for bytes/string/pattern
 //   x            - Search symbols by wildcard
 //   ln           - List nearest symbols to address
 // Expression Evaluation
@@ -177,91 +177,89 @@ impl AddressRange {
 #[derive(Debug, Clone, Copy, PartialEq, EnumIter, Display, EnumString, EnumMessage)]
 #[strum(serialize_all = "kebab-case")]
 enum ReplCommand {
+    // memory read
     #[strum(
-        message = "Display memory as bytes. Command accepts either just a symbol/address, or accepts an optional argument noting either the length or end address. The optional parameter is treated as an address if it's greater than the start address. By default, the optional parameter is 128.\n(usage: db <VirtualAddress or Symbol> [Length or EndAddress])"
+        message = "Display memory as bytes.\n(usage: db <address> [length or end])"
     )]
     Db,
-
     #[strum(
-        message = "Display type definition. Users may optionally supply a memory location, either as a symbol or address, and optionally provide a specific field to be printed.\n(usage: dt <Name> [VirtualAddress or Symbol] [Field])"
+        message = "Display memory as doublewords (4 bytes).\n(usage: dd <address> [length or end])"
+    )]
+    Dd,
+    #[strum(
+        message = "Display memory as quadwords (8 bytes).\n(usage: dq <address> [length or end])"
+    )]
+    Dq,
+    #[strum(
+        message = "Disassemble memory at a symbol or address.\n(usage: disasm <address> [length or end])"
+    )]
+    Disasm,
+    #[strum(
+        message = "Display type definition.\n(usage: dt <type> [address] [field])"
     )]
     Dt,
 
-    #[strum(
-        message = "Disassemble memory at a symbol or address.\n(usage: disasm <VirtualAddress or Symbol>)"
-    )]
-    Disasm,
+    // memory write
+    #[strum(message = "Write a byte to memory.\n(usage: eb <address> <expr>)")]
+    Eb,
+    #[strum(message = "Write a doubleword (4 bytes) to memory.\n(usage: ed <address> <expr>)")]
+    Ed,
+    #[strum(message = "Write a quadword (8 bytes) to memory.\n(usage: eq <address> <expr>)")]
+    Eq,
 
-    #[strum(
-        message = "Resume VM execution. If breakpoints are set, waits for breakpoint hit or Ctrl+C.\n(usage: continue)"
-    )]
-    Continue,
+    // memory search
+    #[strum(message = "Search memory for a byte pattern.\n(usage: s <address> <hex bytes> [length])")]
+    S,
 
-    #[strum(
-        message = "Display the page table entry (PTE) and page directory entry (PDE) for the specified address.\n(usage: pte <VirtualAddress or Symbol>)"
-    )]
+    // expression
+    #[strum(message = "Evaluate an expression.\n(usage: ev <expression>)")]
+    Ev,
+
+    // page table
+    #[strum(message = "Display page table entries for an address.\n(usage: pte <address>)")]
     Pte,
 
-    #[strum(message = "List all threads and their RIP values.\n(usage: lt)")]
-    Lt,
-
-    #[strum(
-        message = "List all running processes. Shows process name, PID, and CR3 (DirectoryTableBase).\n(usage: ps)"
-    )]
-    Ps,
-
-    #[strum(
-        message = "List all loaded modules in the current process. For kernel context, shows kernel modules.\n(usage: lm)"
-    )]
-    Lm,
-
-    #[strum(
-        message = "Attach to a process by PID. This sets the current process context for memory operations.\n(usage: attach <PID>)"
-    )]
-    Attach,
-
-    #[strum(
-        message = "Detach from the current process and return to kernel context.\n(usage: detach)"
-    )]
-    Detach,
-
-    #[strum(message = "Display CPU registers (GPR, control, debug, segment).\n(usage: registers)")]
-    Registers,
-
-    #[strum(
-        message = "Single step (step into). Waits for the next instruction to execute.\n(usage: si)"
-    )]
+    // execution
+    #[strum(message = "Resume VM execution.\n(usage: continue)")]
+    Continue,
+    #[strum(message = "Break/pause VM execution.\n(usage: break)")]
+    Break,
+    #[strum(message = "Single step (step into).\n(usage: si)")]
     Si,
 
-    #[strum(message = "Switch to a different thread/vCPU.\n(usage: thread <thread_id>)")]
-    Thread,
-
-    #[strum(
-        message = "Set a breakpoint at address or symbol. If attached to a process, the breakpoint is process-specific.\n(usage: bp <VirtualAddress or Symbol>)"
-    )]
+    // breakpoints
+    #[strum(message = "Set a breakpoint.\n(usage: bp <address>)")]
     Bp,
-
     #[strum(message = "List all breakpoints.\n(usage: bl)")]
     Bl,
-
-    #[strum(message = "Clear a breakpoint by ID.\n(usage: bc <ID>)")]
+    #[strum(message = "Clear a breakpoint by ID.\n(usage: bc <id>)")]
     Bc,
-
-    #[strum(message = "Disable a breakpoint by ID.\n(usage: bd <ID>)")]
+    #[strum(message = "Disable a breakpoint by ID.\n(usage: bd <id>)")]
     Bd,
-
-    #[strum(message = "Enable a previously disabled breakpoint by ID.\n(usage: be <ID>)")]
+    #[strum(message = "Enable a breakpoint by ID.\n(usage: be <id>)")]
     Be,
 
-    #[strum(
-        message = "Display stack backtrace. Scans the stack for return addresses pointing into known modules.\n(usage: k [count])"
-    )]
+    // inspection
+    #[strum(message = "Display CPU registers.\n(usage: registers)")]
+    Registers,
+    #[strum(message = "Display stack backtrace.\n(usage: k [count])")]
     K,
-
-    #[strum(
-        message = "Display current VM status. Shows break information if stopped, or indicates if running.\n(usage: status)"
-    )]
+    #[strum(message = "Display current VM status.\n(usage: status)")]
     Status,
+
+    // threads / processes / modules
+    #[strum(message = "List all threads and their RIP values.\n(usage: lt)")]
+    Lt,
+    #[strum(message = "Switch to a different thread/vCPU.\n(usage: thread <id>)")]
+    Thread,
+    #[strum(message = "List running processes.\n(usage: ps [filter])")]
+    Ps,
+    #[strum(message = "List loaded modules.\n(usage: lm [filter])")]
+    Lm,
+    #[strum(message = "Attach to a process by PID.\n(usage: attach <pid>)")]
+    Attach,
+    #[strum(message = "Detach from current process.\n(usage: detach)")]
+    Detach,
 
     #[strum(message = "Exit the application.")]
     Quit,
@@ -270,27 +268,14 @@ enum ReplCommand {
 impl ReplCommand {
     pub fn completion_type(&self) -> CompletionStrategy {
         match self {
-            Self::Quit => CompletionStrategy::None,
-            Self::Pte => CompletionStrategy::Symbol,
-            Self::Db => CompletionStrategy::Symbol,
-            Self::Disasm => CompletionStrategy::Symbol,
-            Self::Lt => CompletionStrategy::None,
-            Self::Continue => CompletionStrategy::None,
+            Self::Db | Self::Dd | Self::Dq | Self::Disasm
+            | Self::Eb | Self::Ed | Self::Eq
+            | Self::S | Self::Ev | Self::Pte | Self::Bp => CompletionStrategy::Symbol,
             Self::Dt => CompletionStrategy::Type,
-            Self::Ps => CompletionStrategy::None,
-            Self::Lm => CompletionStrategy::None,
             Self::Attach => CompletionStrategy::Process,
-            Self::Detach => CompletionStrategy::None,
-            Self::Registers => CompletionStrategy::None,
-            Self::Si => CompletionStrategy::None,
             Self::Thread => CompletionStrategy::Thread,
-            Self::Bp => CompletionStrategy::Symbol,
-            Self::Bl => CompletionStrategy::None,
-            Self::Bc => CompletionStrategy::Breakpoint,
-            Self::Bd => CompletionStrategy::Breakpoint,
-            Self::Be => CompletionStrategy::Breakpoint,
-            Self::K => CompletionStrategy::None,
-            Self::Status => CompletionStrategy::None,
+            Self::Bc | Self::Bd | Self::Be => CompletionStrategy::Breakpoint,
+            _ => CompletionStrategy::None,
         }
     }
 }
@@ -307,6 +292,8 @@ type BreakpointCache = Vec<(u32, bool, VirtAddr, Option<String>)>;
 struct MyCompleter {
     symbols: Arc<RwLock<SymbolIndex>>,
     types: Arc<RwLock<SymbolIndex>>,
+    symbol_store: Arc<SymbolStore>,
+    dtb: Arc<RwLock<Dtb>>,
     processes: Arc<RwLock<ProcessCache>>,
     threads: Arc<RwLock<ThreadCache>>,
     breakpoints: Arc<RwLock<BreakpointCache>>,
@@ -345,16 +332,57 @@ impl Completer for MyCompleter {
             let arg_start = text_before_cursor.rfind(' ').map(|i| i + 1).unwrap_or(0);
             let raw_prefix = &text_before_cursor[arg_start..];
 
-            let prefix = raw_prefix.strip_prefix('*').unwrap_or(raw_prefix);
-            let prefix_offset = if raw_prefix.starts_with('*') { 1 } else { 0 };
+            // find the start of the identifier being typed by scanning backward
+            // for expression boundary characters (operators, parens, dereference)
+            let ident_start = raw_prefix
+                .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let prefix = &raw_prefix[ident_start..];
+            let span_start = arg_start + ident_start;
 
             match cmd.completion_type() {
                 CompletionStrategy::None => return vec![],
 
                 CompletionStrategy::Symbol => {
+                    if ident_start > 0 {
+                        let preceding = &raw_prefix[..ident_start];
+
+                        // after +/-/[ numeric operand expected, no completion
+                        if preceding.ends_with('+') || preceding.ends_with('-') || preceding.ends_with('[') {
+                            return vec![];
+                        }
+
+                        // after -> complete field names from the resolved type
+                        if preceding.ends_with("->") {
+                            let expr_text = &preceding[..preceding.len() - 2];
+                            if let Ok(expr) = Expr::parse(expr_text) {
+                                let dtb = *self.dtb.read().unwrap();
+                                let fields = expr.complete_fields(&self.symbol_store, dtb, prefix);
+                                if !fields.is_empty() {
+                                    return make_suggestions(fields, "Field", span_start, pos);
+                                }
+                            }
+                            return vec![];
+                        }
+
+                        // inside parentheses: likely a cast, try type completion first
+                        if preceding.ends_with('(') {
+                            let types = self.types.read().unwrap();
+                            let mut results = types.search(prefix, 512);
+                            // also try with underscore prefix (_EPROCESS, etc.)
+                            if !prefix.starts_with('_') {
+                                results.extend(types.search(&format!("_{}", prefix), 512));
+                            }
+                            if !results.is_empty() {
+                                return make_suggestions(results, "Type", span_start, pos);
+                            }
+                        }
+                    }
+
                     let symbols = self.symbols.read().unwrap();
                     let results = symbols.search(prefix, 1024);
-                    return make_suggestions(results, "Symbol", arg_start, prefix_offset, pos);
+                    return make_suggestions(results, "Symbol", span_start, pos);
                 }
 
                 CompletionStrategy::Type => {
@@ -372,7 +400,7 @@ impl Completer for MyCompleter {
                     };
 
                     let description = if arg_count > 2 { "Symbol" } else { "Structure" };
-                    return make_suggestions(results, description, arg_start, prefix_offset, pos);
+                    return make_suggestions(results, description, span_start, pos);
                 }
 
                 CompletionStrategy::Process => {
@@ -390,7 +418,7 @@ impl Completer for MyCompleter {
                             style: None,
                             extra: None,
                             match_indices: None,
-                            span: Span::new(arg_start + prefix_offset, pos),
+                            span: Span::new(span_start, pos),
                             append_whitespace: true,
                         })
                         .collect();
@@ -407,7 +435,7 @@ impl Completer for MyCompleter {
                             style: None,
                             extra: None,
                             match_indices: None,
-                            span: Span::new(arg_start + prefix_offset, pos),
+                            span: Span::new(span_start, pos),
                             append_whitespace: true,
                         })
                         .collect();
@@ -426,7 +454,7 @@ impl Completer for MyCompleter {
                                 style: None,
                                 extra: None,
                                 match_indices: None,
-                                span: Span::new(arg_start + prefix_offset, pos),
+                                span: Span::new(span_start, pos),
                                 append_whitespace: true,
                             }
                         })
@@ -459,19 +487,324 @@ macro_rules! update_breakpoint_cache {
     };
 }
 
-fn print_break_info(
+fn print_registers(register_map: &RegisterMap, regs: &[u8]) {
+    let read_reg = |name: &str| -> String {
+        register_map
+            .read_u64(name, regs)
+            .map(|v| format!("{:#018x}", VirtAddr(v)))
+            .unwrap_or_else(|_| "N/A".to_string())
+    };
+
+    println!(
+        "{}", "─── registers ─────────────────────────────────────────────────────".bright_black()
+    );
+    println!(
+        "rax={}  rbx={}  rcx={}",
+        read_reg("rax"),
+        read_reg("rbx"),
+        read_reg("rcx")
+    );
+    println!(
+        "rdx={}  rsi={}  rdi={}",
+        read_reg("rdx"),
+        read_reg("rsi"),
+        read_reg("rdi")
+    );
+    println!(
+        "rsp={}  rbp={}  rip={}",
+        read_reg("rsp"),
+        read_reg("rbp"),
+        read_reg("rip")
+    );
+    println!(
+        "r8 ={}  r9 ={}  r10={}",
+        read_reg("r8"),
+        read_reg("r9"),
+        read_reg("r10")
+    );
+    println!(
+        "r11={}  r12={}  r13={}",
+        read_reg("r11"),
+        read_reg("r12"),
+        read_reg("r13")
+    );
+    println!(
+        "r14={}  r15={}  rflags={}",
+        read_reg("r14"),
+        read_reg("r15"),
+        read_reg("eflags")
+    );
+}
+
+fn print_disasm_context(debugger: &DebuggerContext, rip: u64) {
+    println!(
+        "{}", "─── disasm ────────────────────────────────────────────────────────".bright_black()
+    );
+
+    let pre_bytes: u64 = 64;
+    let post_bytes: u64 = 64;
+    let start_addr = rip.saturating_sub(pre_bytes);
+    let total_len = (pre_bytes + post_bytes) as usize;
+
+    let mut bytes = vec![0u8; total_len];
+    if debugger
+        .get_current_process()
+        .memory(&debugger.kvm)
+        .read_bytes(VirtAddr(start_addr), &mut bytes)
+        .is_err()
+    {
+        println!("{}", "  (could not read memory at RIP)".bright_black());
+        return;
+    }
+
+    let mut decoder = Decoder::with_ip(64, &bytes, start_addr, DecoderOptions::NONE);
+    let mut formatter = NasmFormatter::new();
+    let options = formatter.options_mut();
+    options.set_space_after_operand_separator(true);
+    options.set_hex_prefix("0x");
+    options.set_hex_suffix("");
+    options.set_first_operand_char_index(5);
+    options.set_memory_size_options(MemorySizeOptions::Always);
+    options.set_show_branch_size(false);
+    options.set_rip_relative_addresses(true);
+
+    let mut instructions: Vec<(u64, usize, String)> = Vec::new();
+    let mut instruction = Instruction::default();
+    let mut output = String::new();
+
+    while decoder.can_decode() {
+        decoder.decode_out(&mut instruction);
+        if instruction.code() == Code::INVALID {
+            continue;
+        }
+        output.clear();
+        formatter.format(&instruction, &mut output);
+
+        let ip = instruction.ip();
+        let len = instruction.len();
+
+        let start_index = (ip - start_addr) as usize;
+        let instr_bytes = &bytes[start_index..start_index + len];
+        let hex: String = instr_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+
+        let mut line = format!("{hex:<24} {output}");
+
+        if instruction.is_ip_rel_memory_operand() {
+            let target = instruction.ip_rel_memory_address();
+            let sym = debugger
+                .get_current_process()
+                .closest_symbol(&debugger.symbols, VirtAddr(target))
+                .map(|(s, o)| format!("{}+{:#x}", s, o))
+                .unwrap_or_else(|_| format!("{:#X}", target));
+            line.push_str(&format!(" ; {}", sym));
+        } else if instruction.is_call_near()
+            || instruction.is_jmp_near()
+            || instruction.is_jcc_near()
+        {
+            let target = instruction.near_branch_target();
+            let sym = debugger
+                .get_current_process()
+                .closest_symbol(&debugger.symbols, VirtAddr(target))
+                .map(|(s, o)| format!("{}+{:#x}", s, o))
+                .unwrap_or_else(|_| format!("{:#X}", target));
+            line.push_str(&format!(" ; {}", sym));
+        }
+
+        instructions.push((ip, len, line));
+    }
+
+    // find which instruction corresponds to RIP
+    let rip_idx = instructions.iter().position(|(ip, _, _)| *ip == rip);
+
+    if let Some(idx) = rip_idx {
+        let context_before = 5;
+        let context_after = 5;
+        let start = idx.saturating_sub(context_before);
+        let end = (idx + context_after + 1).min(instructions.len());
+
+        for i in start..end {
+            let (ip, _, ref line) = instructions[i];
+            if ip == rip {
+                println!(
+                    " {} {}  {}",
+                    ">".green(),
+                    format!("{:016x}", VirtAddr(ip)).green(),
+                    line.green()
+                );
+            } else {
+                println!(
+                    "   {:016x}  {}",
+                    VirtAddr(ip),
+                    line.bright_black()
+                );
+            }
+        }
+    } else {
+        let mut forward_buf = vec![0u8; post_bytes as usize];
+        if debugger
+            .get_current_process()
+            .memory(&debugger.kvm)
+            .read_bytes(VirtAddr(rip), &mut forward_buf)
+            .is_ok()
+        {
+            let mut dec =
+                Decoder::with_ip(64, &forward_buf, rip, DecoderOptions::NONE);
+            let mut inst = Instruction::default();
+            let mut out = String::new();
+            let mut count = 0;
+            while dec.can_decode() && count < 11 {
+                dec.decode_out(&mut inst);
+                if inst.code() == Code::INVALID {
+                    continue;
+                }
+                out.clear();
+                formatter.format(&inst, &mut out);
+                let ip = inst.ip();
+                let start_index = (ip - rip) as usize;
+                let instr_bytes = &forward_buf[start_index..start_index + inst.len()];
+                let hex: String = instr_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+                if ip == rip {
+                    println!(
+                        " {} {}  {:<24} {}",
+                        "=>".green(),
+                        format!("{:016x}", VirtAddr(ip)).green(),
+                        hex.green(),
+                        out.green()
+                    );
+                } else {
+                    println!(
+                        "   {:016x}  {:<24} {}",
+                        VirtAddr(ip),
+                        hex.bright_black(),
+                        out.bright_black()
+                    );
+                }
+                count += 1;
+            }
+        } else {
+            println!("{}", "  (could not read memory at RIP)".bright_black());
+        }
+    }
+}
+
+fn print_stacktrace(
+    debugger: &DebuggerContext,
+    register_map: &RegisterMap,
+    regs: &[u8],
+    limit: usize,
+) {
+    println!(
+        "{}", "─── stack trace ───────────────────────────────────────────────────".bright_black()
+    );
+
+    let rip = register_map.read_u64("rip", regs).unwrap_or(0);
+    let rsp = register_map.read_u64("rsp", regs).unwrap_or(0);
+    let cr3 = register_map.read_u64("cr3", regs).unwrap_or(0);
+
+    let cr3_masked = cr3 & 0x000F_FFFF_FFFF_F000;
+    let kernel_dtb_masked = debugger.guest.ntoskrnl.dtb() & 0x000F_FFFF_FFFF_F000;
+    let is_kernel = cr3_masked == kernel_dtb_masked;
+
+    let modules = if is_kernel {
+        debugger
+            .guest
+            .get_kernel_modules(&debugger.kvm, &debugger.symbols)
+            .unwrap_or_default()
+    } else if let Some(ref proc_info) = debugger.current_process_info {
+        debugger
+            .guest
+            .get_process_modules(&debugger.kvm, &debugger.symbols, proc_info)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let is_code_addr = |addr: u64| -> bool {
+        modules.iter().any(|m| {
+            let start = m.base_address.0;
+            let end = start + m.size as u64;
+            addr >= start && addr < end
+        })
+    };
+
+    let resolve_symbol = |addr: u64| -> String {
+        if is_kernel {
+            debugger
+                .guest
+                .ntoskrnl
+                .closest_symbol(&debugger.symbols, VirtAddr(addr))
+                .map(|(s, o)| if o == 0 { s } else { format!("{}+{:#x}", s, o) })
+                .unwrap_or_else(|_| format!("{:#x}", addr))
+        } else {
+            debugger
+                .symbols
+                .find_closest_symbol_for_address(debugger.current_dtb(), VirtAddr(addr))
+                .map(|(module, sym, offset)| {
+                    if offset == 0 {
+                        format!("{}!{}", module, sym)
+                    } else {
+                        format!("{}!{}+{:#x}", module, sym, offset)
+                    }
+                })
+                .unwrap_or_else(|| format!("{:#x}", addr))
+        }
+    };
+
+    let mem = debugger.get_current_process().memory(&debugger.kvm);
+    let mut frames: Vec<(usize, u64, u64, String)> = Vec::new();
+    const STACK_SCAN_SIZE: usize = 0x1000;
+
+    frames.push((0, rsp, rip, resolve_symbol(rip)));
+
+    let mut stack_data = vec![0u8; STACK_SCAN_SIZE];
+    if mem.read_bytes(VirtAddr(rsp), &mut stack_data).is_ok() {
+        for offset in (0..STACK_SCAN_SIZE - 8).step_by(8) {
+            if frames.len() >= limit {
+                break;
+            }
+
+            let potential_addr =
+                u64::from_le_bytes(stack_data[offset..offset + 8].try_into().unwrap());
+
+            if potential_addr == rip {
+                continue;
+            }
+
+            if is_code_addr(potential_addr) {
+                let stack_addr = rsp + offset as u64;
+                let symbol = resolve_symbol(potential_addr);
+                frames.push((frames.len(), stack_addr, potential_addr, symbol));
+            }
+        }
+    }
+
+    for (num, sp, addr, sym) in &frames {
+        println!(
+            " {:>2}  {:#018x}  {:#018x}  {}",
+            num,
+            VirtAddr(*sp),
+            VirtAddr(*addr),
+            sym
+        );
+    }
+}
+
+fn print_break_context(
     client: &mut GdbClient,
     register_map: &RegisterMap,
-    debugger: &DebuggerContext,
+    debugger: &mut DebuggerContext,
     thread_id: &str,
 ) {
     let regs = match client.read_registers() {
         Ok(r) => r,
         Err(_) => {
+            debugger.registers = None;
             println!("{} thread {}\n", "break:".magenta(), thread_id);
             return;
         }
     };
+
+    debugger.registers = Some(register_map.to_hashmap(&regs));
 
     let rip = register_map.read_u64("rip", &regs).unwrap_or(0);
     let cr3 = register_map.read_u64("cr3", &regs).unwrap_or(0);
@@ -515,7 +848,7 @@ fn print_break_info(
     };
 
     println!(
-        "{} {} {} {} {} {}\n",
+        "{} {} {} {} {} {}",
         "break:".magenta(),
         format!("thread {}", thread_id).bright_black(),
         "in".bright_black(),
@@ -523,28 +856,113 @@ fn print_break_info(
         "at".bright_black(),
         symbol.green()
     );
+
+    print_registers(register_map, &regs);
+    print_disasm_context(debugger, rip);
+    print_stacktrace(debugger, register_map, &regs, 8);
+    println!();
 }
 
-fn hexdump(start_address: VirtAddr, data: &[u8]) {
-    for (i, chunk) in data.chunks(16).enumerate() {
-        print!("{:08x}  ", start_address + ((i * 16) as u64));
+enum ItemFormat {
+    Bytes,
+    Dwords,
+    Qwords,
+}
 
-        for byte in chunk {
-            print!("{:02x} ", byte);
+struct MemoryDisplayMode {
+    bytes_per_row: usize,
+    item_size: usize,
+    item_format: ItemFormat,
+    show_ascii: bool,
+}
+
+impl MemoryDisplayMode {
+    fn bytes() -> Self {
+        Self {
+            bytes_per_row: 16,
+            item_size: 1,
+            item_format: ItemFormat::Bytes,
+            show_ascii: true,
+        }
+    }
+
+    fn dwords() -> Self {
+        Self {
+            bytes_per_row: 16,
+            item_size: 4,
+            item_format: ItemFormat::Dwords,
+            show_ascii: false,
+        }
+    }
+
+    fn qwords() -> Self {
+        Self {
+            bytes_per_row: 16,
+            item_size: 8,
+            item_format: ItemFormat::Qwords,
+            show_ascii: false,
+        }
+    }
+}
+
+fn display_memory(start_address: VirtAddr, data: &[u8], mode: &MemoryDisplayMode) {
+    for (i, chunk) in data.chunks(mode.bytes_per_row).enumerate() {
+        print!("{:08x}  ", start_address + ((i * mode.bytes_per_row) as u64));
+
+        let items_per_row = mode.bytes_per_row / mode.item_size;
+        let mut printed = 0;
+
+        for item in chunk.chunks(mode.item_size) {
+            match mode.item_format {
+                ItemFormat::Bytes => {
+                    print!("{:02x} ", item[0]);
+                }
+                ItemFormat::Dwords => {
+                    if item.len() == 4 {
+                        let val = u32::from_le_bytes([item[0], item[1], item[2], item[3]]);
+                        print!("{:08x} ", val);
+                    } else {
+                        for byte in item {
+                            print!("{:02x}", byte);
+                        }
+                        print!("   ");
+                    }
+                }
+                ItemFormat::Qwords => {
+                    if item.len() == 8 {
+                        let val = u64::from_le_bytes([
+                            item[0], item[1], item[2], item[3],
+                            item[4], item[5], item[6], item[7],
+                        ]);
+                        print!("{:016x} ", val);
+                    } else {
+                        for byte in item {
+                            print!("{:02x}", byte);
+                        }
+                        print!("   ");
+                    }
+                }
+            }
+            printed += 1;
         }
 
-        for _ in chunk.len()..16 {
-            print!("   ");
+        // pad remaining items if needed
+        for _ in printed..items_per_row {
+            match mode.item_format {
+                ItemFormat::Bytes => print!("   "),
+                ItemFormat::Dwords => print!("         "),
+                ItemFormat::Qwords => print!("                 "),
+            }
         }
 
-        print!(" ");
-
-        // not the most efficient, FIXME?
-        for byte in chunk {
-            if byte.is_ascii_graphic() || *byte == b' ' {
-                print!("{}", *byte as char);
-            } else {
-                print!("{}", ".".bright_black());
+        if mode.show_ascii {
+            print!(" ");
+            for byte in chunk {
+                if byte.is_ascii_graphic() || *byte == b' ' {
+                    print!("{}", *byte as char);
+                } else {
+                    print!("{}", ".".bright_black());
+                }
             }
         }
 
@@ -606,7 +1024,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
 
     let mut breakpoints = BreakpointManager::new();
 
-    print_break_info(&mut client, &register_map, debugger, &current_thread);
+    print_break_context(&mut client, &register_map, debugger, &current_thread);
 
     let min_completion_width: u16 = 0;
     let max_completion_width: u16 = 50;
@@ -663,6 +1081,8 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
 
     let shared_symbols = Arc::new(RwLock::new(debugger.current_symbol_index()));
     let shared_types = Arc::new(RwLock::new(debugger.current_types_index()));
+    let shared_symbol_store = Arc::clone(&debugger.symbols);
+    let shared_dtb = Arc::new(RwLock::new(debugger.current_dtb()));
 
     let initial_processes = debugger
         .guest
@@ -679,6 +1099,8 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
     let completor = Box::new(MyCompleter {
         symbols: Arc::clone(&shared_symbols),
         types: Arc::clone(&shared_types),
+        symbol_store: Arc::clone(&shared_symbol_store),
+        dtb: Arc::clone(&shared_dtb),
         processes: Arc::clone(&shared_processes),
         threads: Arc::clone(&shared_threads),
         breakpoints: Arc::clone(&shared_breakpoints),
@@ -707,9 +1129,14 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                             break;
                         }
                         Ok(ReplCommand::Pte) => {
-                            let arg = require_arg!(parts, 1, ReplCommand::Pte);
-                            let arg = DebuggerArgument::new(arg);
-                            match debugger.pte_traverse(arg) {
+                            let address = match Expr::eval(parts.get(1).copied().unwrap_or(""), debugger) {
+                                Ok(a) => a,
+                                Err(e) => {
+                                    error!("{}", e);
+                                    continue;
+                                }
+                            };
+                            match debugger.pte_traverse(address) {
                                 Ok(result) => {
                                     let mut levels = vec![result.pxe, result.ppe];
 
@@ -742,13 +1169,10 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                             }
                         }
                         Ok(ReplCommand::Db) => {
-                            let range = match AddressRange::parse(&parts, debugger, 128) {
+                            let range = match AddressRange::parse(&parts, debugger, 128, 1) {
                                 Ok(r) => r,
-                                Err(_) => {
-                                    println!(
-                                        "{}\n",
-                                        ReplCommand::Db.get_message().unwrap_or("invalid usage")
-                                    );
+                                Err(e) => {
+                                    error!("{}", e);
                                     continue;
                                 }
                             };
@@ -763,27 +1187,65 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                 continue;
                             }
 
-                            hexdump(range.start, &data);
+                            display_memory(range.start, &data, &MemoryDisplayMode::bytes());
                         }
-                        Ok(ReplCommand::Disasm) => {
-                            let range = match AddressRange::parse(&parts, debugger, 32) {
+                        Ok(ReplCommand::Dd) => {
+                            let range = match AddressRange::parse(&parts, debugger, 16, 4) {
                                 Ok(r) => r,
-                                Err(_) => {
-                                    println!(
-                                        "{}\n",
-                                        ReplCommand::Disasm
-                                            .get_message()
-                                            .unwrap_or("invalid usage")
-                                    );
+                                Err(e) => {
+                                    error!("{}", e);
                                     continue;
                                 }
                             };
 
+                            let mut data: Vec<u8> = vec![0u8; range.len()];
+                            if let Err(e) = debugger
+                                .get_current_process()
+                                .memory(&debugger.kvm)
+                                .read_bytes(range.start, &mut data)
+                            {
+                                println!("{e}\n");
+                                continue;
+                            }
+
+                            display_memory(range.start, &data, &MemoryDisplayMode::dwords());
+                        }
+                        Ok(ReplCommand::Dq) => {
+                            let range = match AddressRange::parse(&parts, debugger, 8, 8) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    error!("{}", e);
+                                    continue;
+                                }
+                            };
+
+                            let mut data: Vec<u8> = vec![0u8; range.len()];
+                            if let Err(e) = debugger
+                                .get_current_process()
+                                .memory(&debugger.kvm)
+                                .read_bytes(range.start, &mut data)
+                            {
+                                println!("{e}\n");
+                                continue;
+                            }
+
+                            display_memory(range.start, &data, &MemoryDisplayMode::qwords());
+                        }
+                        Ok(ReplCommand::Disasm) => {
+                            let range = match AddressRange::parse(&parts, debugger, 32, 1) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    error!("{}", e);
+                                    continue;
+                                }
+                            };
+
+                            let start_addr = range.start;
                             let mut bytes: Vec<u8> = vec![0u8; range.len()];
                             if let Err(e) = debugger
                                 .get_current_process()
                                 .memory(&debugger.kvm)
-                                .read_bytes(range.start, &mut bytes)
+                                .read_bytes(start_addr, &mut bytes)
                             {
                                 println!("{e}\n");
                                 continue;
@@ -792,7 +1254,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                             let mut decoder = Decoder::with_ip(
                                 64, /* TODO dont hardcode for WOW64 process? */
                                 &bytes,
-                                range.start.0,
+                                start_addr.0,
                                 DecoderOptions::NONE,
                             );
 
@@ -820,7 +1282,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                 formatter.format(&instruction, &mut output);
 
                                 print!("{:016x} ", VirtAddr(instruction.ip()));
-                                let start_index = (instruction.ip() - range.start.0) as usize;
+                                let start_index = (instruction.ip() - start_addr.0) as usize;
                                 let instr_bytes =
                                     &bytes[start_index..start_index + instruction.len()];
                                 for b in instr_bytes.iter() {
@@ -859,6 +1321,198 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                 println!();
                             }
                             println!();
+                        }
+                        Ok(ReplCommand::Eb) => {
+                            if parts.len() < 3 {
+                                println!(
+                                    "{}\n",
+                                    ReplCommand::Eb.get_message().unwrap_or("invalid usage")
+                                );
+                                continue;
+                            }
+
+                            let address = match Expr::eval(parts[1], debugger) {
+                                Ok(a) => a,
+                                Err(e) => {
+                                    error!("{}", e);
+                                    continue;
+                                }
+                            };
+
+                            let expr_str = parts[2..].join(" ");
+                            let value: u8 = match Expr::eval(&expr_str, debugger) {
+                                Ok(v) => v.0 as u8,
+                                Err(e) => {
+                                    error!("{}", e);
+                                    continue;
+                                }
+                            };
+
+                            let mem = debugger.get_current_process().memory(&debugger.kvm);
+                            if let Err(e) = mem.write_bytes(address, &[value]) {
+                                error!("failed to write byte: {}", e);
+                            } else {
+                                println!("{} {:02x} -> {:#x}\n", "wrote".green(), value, address);
+                            }
+                        }
+                        Ok(ReplCommand::Ed) => {
+                            if parts.len() < 3 {
+                                println!(
+                                    "{}\n",
+                                    ReplCommand::Ed.get_message().unwrap_or("invalid usage")
+                                );
+                                continue;
+                            }
+
+                            let address = match Expr::eval(parts[1], debugger) {
+                                Ok(a) => a,
+                                Err(e) => {
+                                    error!("{}", e);
+                                    continue;
+                                }
+                            };
+
+                            let expr_str = parts[2..].join(" ");
+                            let value: u32 = match Expr::eval(&expr_str, debugger) {
+                                Ok(v) => v.0 as u32,
+                                Err(e) => {
+                                    error!("{}", e);
+                                    continue;
+                                }
+                            };
+
+                            let mem = debugger.get_current_process().memory(&debugger.kvm);
+                            if let Err(e) = mem.write_bytes(address, &value.to_le_bytes()) {
+                                error!("failed to write dword: {}", e);
+                            } else {
+                                println!("{} {:#x} -> {:#x}\n", "wrote".green(), value, address);
+                            }
+                        }
+                        Ok(ReplCommand::Eq) => {
+                            if parts.len() < 3 {
+                                println!(
+                                    "{}\n",
+                                    ReplCommand::Eq.get_message().unwrap_or("invalid usage")
+                                );
+                                continue;
+                            }
+
+                            let address = match Expr::eval(parts[1], debugger) {
+                                Ok(a) => a,
+                                Err(e) => {
+                                    error!("{}", e);
+                                    continue;
+                                }
+                            };
+
+                            let expr_str = parts[2..].join(" ");
+                            let value: u64 = match Expr::eval(&expr_str, debugger) {
+                                Ok(v) => v.0,
+                                Err(e) => {
+                                    error!("{}", e);
+                                    continue;
+                                }
+                            };
+
+                            let mem = debugger.get_current_process().memory(&debugger.kvm);
+                            if let Err(e) = mem.write_bytes(address, &value.to_le_bytes()) {
+                                error!("failed to write qword: {}", e);
+                            } else {
+                                println!("{} {:#x} -> {:#x}\n", "wrote".green(), value, address);
+                            }
+                        }
+                        Ok(ReplCommand::S) => {
+                            if parts.len() < 3 {
+                                println!(
+                                    "{}\n",
+                                    ReplCommand::S.get_message().unwrap_or("invalid usage")
+                                );
+                                continue;
+                            }
+
+                            let pattern_str = parts[2];
+
+                            let start_addr = match Expr::eval(parts[1], debugger) {
+                                Ok(a) => a,
+                                Err(e) => {
+                                    error!("{}", e);
+                                    continue;
+                                }
+                            };
+
+                            let pattern: Vec<u8> = pattern_str
+                                .split(|c| c == ':' || c == ' ')
+                                .filter(|s| !s.is_empty())
+                                .filter_map(|s| u8::from_str_radix(s, 16).ok())
+                                .collect();
+
+                            if pattern.is_empty() {
+                                error!("invalid pattern: {}", pattern_str);
+                                continue;
+                            }
+
+                            let length: usize = parts.get(3)
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0x100);
+
+                            let mut data = vec![0u8; length];
+                            let mem = debugger.get_current_process().memory(&debugger.kvm);
+
+                            if let Err(e) = mem.read_bytes(start_addr, &mut data) {
+                                error!("failed to read memory: {}", e);
+                                continue;
+                            }
+
+                            let mut found = 0;
+                            for i in 0..=data.len().saturating_sub(pattern.len()) {
+                                if &data[i..i + pattern.len()] == pattern.as_slice() {
+                                    let addr = start_addr + i as u64;
+                                    let sym = debugger
+                                        .guest
+                                        .ntoskrnl
+                                        .closest_symbol(&debugger.symbols, addr)
+                                        .map(|(s, o)| {
+                                            if o == 0 {
+                                                format!("{}+{:#x}", s, o)
+                                            } else {
+                                                format!("{}", s)
+                                            }
+                                        })
+                                        .unwrap_or_default();
+
+                                    println!("{:#16x}  {} {}", addr, sym.bright_black(), format!("[{}]", pattern_str).green());
+                                    found += 1;
+
+                                    if found >= 50 {
+                                        println!("... (showing first 50 matches)");
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if found == 0 {
+                                println!("{} (searched {:#x} bytes at {:#x})", "no matches found".bright_black(), length, start_addr);
+                            } else {
+                                println!("\n{} {}", found, if found == 1 { "match" } else { "matches" });
+                            }
+                            println!();
+                        }
+                        Ok(ReplCommand::Ev) => {
+                            if parts.is_empty() {
+                                println!("{}\n", ReplCommand::Ev.get_message().unwrap_or("invalid usage"));
+                                continue;
+                            }
+
+                            let expr_str = if parts.len() > 2 {
+                                parts[1..].join(" ")
+                            } else {
+                                parts[1].to_string()
+                            };
+
+                            match Expr::eval(&expr_str, debugger) {
+                                Ok(addr) => println!("{:#16x}", addr),
+                                Err(e) => error!("{}", e),
+                            }
                         }
                         Ok(ReplCommand::Lt) => {
                             if client.is_running {
@@ -978,6 +1632,8 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                 continue;
                             }
 
+                            debugger.registers = None;
+
                             if breakpoints.has_enabled_breakpoints() {
                                 println!(
                                     "{}",
@@ -1007,7 +1663,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                             current_thread = tid;
                                         }
                                         println!();
-                                        print_break_info(
+                                        print_break_context(
                                             &mut client,
                                             &register_map,
                                             debugger,
@@ -1052,7 +1708,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                                             .unwrap_or_default()
                                                             .green()
                                                     );
-                                                    print_break_info(
+                                                    print_break_context(
                                                         &mut client,
                                                         &register_map,
                                                         debugger,
@@ -1129,7 +1785,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                                     }
 
                                                     println!();
-                                                    print_break_info(
+                                                    print_break_context(
                                                         &mut client,
                                                         &register_map,
                                                         debugger,
@@ -1151,11 +1807,38 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                 }
                             }
                         }
+                        Ok(ReplCommand::Break) => {
+                            if !client.is_running {
+                                error!("VM is already paused");
+                                continue;
+                            }
+
+                            if let Err(e) = client.interrupt() {
+                                error!("failed to interrupt: {:?}", e);
+                                continue;
+                            }
+
+                            if let Ok(tid) = client.get_stopped_thread_id() {
+                                current_thread = tid;
+                            }
+                            println!();
+                            print_break_context(
+                                &mut client,
+                                &register_map,
+                                debugger,
+                                &current_thread,
+                            );
+                        }
                         Ok(ReplCommand::Dt) => {
                             let arg = require_arg!(parts, 1, ReplCommand::Dt);
 
-                            let address = DebuggerArgument::new(parts.get(2).unwrap_or(&"0"))
-                                .try_resolve(debugger)?;
+                            let address = match Expr::eval(parts.get(2).copied().unwrap_or("0"), debugger) {
+                                Ok(a) => a,
+                                Err(e) => {
+                                    error!("{}", e);
+                                    continue;
+                                }
+                            };
 
                             let field_name = parts.get(3);
 
@@ -1264,6 +1947,8 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                             }
                         }
                         Ok(ReplCommand::Ps) => {
+                            let filter = parts.get(1).map(|s| s.to_lowercase());
+
                             match debugger
                                 .guest
                                 .enumerate_processes(&debugger.kvm, &debugger.symbols)
@@ -1276,22 +1961,35 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                     builder.push_record(vec![
                                         "Name".to_string(),
                                         "PID".to_string(),
+                                        "EPROCESS".to_string(),
                                         "DTB".to_string(),
                                     ]);
 
+                                    let mut count = 0;
                                     for proc in processes {
+                                        if let Some(ref f) = filter {
+                                            if !proc.name.to_lowercase().contains(f) {
+                                                continue;
+                                            }
+                                        }
+                                        count += 1;
                                         builder.push_record(vec![
                                             format!("{}  ", proc.name),
                                             format!("{}  ", Value(proc.pid)),
+                                            format!("{:#018x}  ", proc.eprocess_va),
                                             format!("{:#018x}", VirtAddr(proc.dtb)), // TODO technically is phys addr..
                                         ]);
                                     }
 
-                                    let mut table = builder.build();
-                                    table
-                                        .with(tabled::settings::Style::empty())
-                                        .with(Padding::zero());
-                                    println!("{}\n", table);
+                                    if count == 0 {
+                                        println!("{}\n", "no matching processes".bright_black());
+                                    } else {
+                                        let mut table = builder.build();
+                                        table
+                                            .with(tabled::settings::Style::empty())
+                                            .with(Padding::zero());
+                                        println!("{}\n", table);
+                                    }
                                 }
                                 Err(e) => {
                                     error!("failed to enumerate processes: {}", e);
@@ -1299,6 +1997,8 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                             }
                         }
                         Ok(ReplCommand::Lm) => {
+                            let filter = parts.get(1).map(|s| s.to_lowercase());
+
                             let result = if let Some(process_info) = &debugger.current_process_info
                             {
                                 debugger.guest.get_process_modules(
@@ -1322,7 +2022,16 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                         "Image".to_string(),
                                     ]);
 
+                                    let mut count = 0;
                                     for module in modules {
+                                        if let Some(ref f) = filter {
+                                            if !module.short_name.to_lowercase().contains(f)
+                                                && !module.name.to_lowercase().contains(f)
+                                            {
+                                                continue;
+                                            }
+                                        }
+                                        count += 1;
                                         let end_address =
                                             module.base_address.0 + module.size as u64;
                                         builder.push_record(vec![
@@ -1333,11 +2042,15 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                         ]);
                                     }
 
-                                    let mut table = builder.build();
-                                    table
-                                        .with(tabled::settings::Style::empty())
-                                        .with(Padding::zero());
-                                    println!("{}\n", table);
+                                    if count == 0 {
+                                        println!("{}\n", "no matching modules".bright_black());
+                                    } else {
+                                        let mut table = builder.build();
+                                        table
+                                            .with(tabled::settings::Style::empty())
+                                            .with(Padding::zero());
+                                        println!("{}\n", table);
+                                    }
                                 }
                                 Err(e) => {
                                     error!("failed to list modules: {}", e);
@@ -1353,6 +2066,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                             debugger.current_symbol_index();
                                         *shared_types.write().unwrap() =
                                             debugger.current_types_index();
+                                        *shared_dtb.write().unwrap() = debugger.current_dtb();
                                         println!("attached to {} (PID {})\n", name, pid);
                                     }
                                     Err(e) => {
@@ -1371,6 +2085,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                 debugger.detach();
                                 *shared_symbols.write().unwrap() = debugger.current_symbol_index();
                                 *shared_types.write().unwrap() = debugger.current_types_index();
+                                *shared_dtb.write().unwrap() = debugger.current_dtb();
                                 println!("detached, now in kernel context\n");
                             }
                         }
@@ -1393,6 +2108,9 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                 }
                             };
 
+                            debugger.registers = Some(register_map.to_hashmap(&regs));
+                            print_registers(&register_map, &regs);
+
                             let read_reg = |name: &str| -> String {
                                 register_map
                                     .read_u64(name, &regs)
@@ -1400,44 +2118,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                     .unwrap_or_else(|_| "N/A".to_string())
                             };
 
-                            println!(
-                                "rax={}  rbx={}  rcx={}",
-                                read_reg("rax"),
-                                read_reg("rbx"),
-                                read_reg("rcx")
-                            );
-                            println!(
-                                "rdx={}  rsi={}  rdi={}",
-                                read_reg("rdx"),
-                                read_reg("rsi"),
-                                read_reg("rdi")
-                            );
-                            println!(
-                                "rsp={}  rbp={}  rip={}",
-                                read_reg("rsp"),
-                                read_reg("rbp"),
-                                read_reg("rip")
-                            );
-                            println!(
-                                "r8 ={}  r9 ={}  r10={}",
-                                read_reg("r8"),
-                                read_reg("r9"),
-                                read_reg("r10")
-                            );
-                            println!(
-                                "r11={}  r12={}  r13={}",
-                                read_reg("r11"),
-                                read_reg("r12"),
-                                read_reg("r13")
-                            );
-                            println!(
-                                "r14={}  r15={}  rflags={}",
-                                read_reg("r14"),
-                                read_reg("r15"),
-                                read_reg("eflags")
-                            );
                             println!();
-
                             println!(
                                 "cr0={}  cr2={}  cr3={}",
                                 read_reg("cr0"),
@@ -1446,10 +2127,6 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                             );
                             println!("cr4={}  cr8={}", read_reg("cr4"), read_reg("cr8"));
                             println!();
-
-                            // println!("dr0={}  dr1={}  dr2={}", read_reg("dr0"), read_reg("dr1"), read_reg("dr2"));
-                            // println!("dr3={}  dr6={}  dr7={}", read_reg("dr3"), read_reg("dr6"), read_reg("dr7"));
-                            // println!();
 
                             println!(
                                 "cs={}  ds={}  es={}",
@@ -1534,7 +2211,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                             }
 
                             println!();
-                            print_break_info(&mut client, &register_map, debugger, &current_thread);
+                            print_break_context(&mut client, &register_map, debugger, &current_thread);
                         }
                         Ok(ReplCommand::Thread) => {
                             if client.is_running {
@@ -1575,8 +2252,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                             }
 
                             let addr_str = require_arg!(parts, 1, ReplCommand::Bp);
-                            let arg = DebuggerArgument::new(addr_str);
-                            let address = match arg.try_resolve(debugger) {
+                            let address = match Expr::eval(addr_str, debugger) {
                                 Ok(a) => a,
                                 Err(e) => {
                                     error!("{}", e);
@@ -1741,8 +2417,8 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                 continue;
                             }
 
-                            let frame_limit: Option<usize> =
-                                parts.get(1).and_then(|s| s.parse().ok());
+                            let frame_limit: usize =
+                                parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(64);
 
                             if let Err(e) = client.set_current_thread(&current_thread) {
                                 error!("failed to set thread context: {:?}", e);
@@ -1757,141 +2433,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                 }
                             };
 
-                            let rip = register_map.read_u64("rip", &regs).unwrap_or(0);
-                            let rsp = register_map.read_u64("rsp", &regs).unwrap_or(0);
-                            let cr3 = register_map.read_u64("cr3", &regs).unwrap_or(0);
-
-                            let cr3_masked = cr3 & 0x000F_FFFF_FFFF_F000;
-                            let kernel_dtb_masked =
-                                debugger.guest.ntoskrnl.dtb() & 0x000F_FFFF_FFFF_F000;
-                            let is_kernel = cr3_masked == kernel_dtb_masked;
-
-                            // get module ranges for validating return addresses
-                            let modules = if is_kernel {
-                                debugger
-                                    .guest
-                                    .get_kernel_modules(&debugger.kvm, &debugger.symbols)
-                                    .unwrap_or_default()
-                            } else if let Some(ref proc_info) = debugger.current_process_info {
-                                debugger
-                                    .guest
-                                    .get_process_modules(
-                                        &debugger.kvm,
-                                        &debugger.symbols,
-                                        proc_info,
-                                    )
-                                    .unwrap_or_default()
-                            } else {
-                                Vec::new()
-                            };
-
-                            let is_code_addr = |addr: u64| -> bool {
-                                modules.iter().any(|m| {
-                                    let start = m.base_address.0;
-                                    let end = start + m.size as u64;
-                                    addr >= start && addr < end
-                                })
-                            };
-
-                            let mem = debugger.get_current_process().memory(&debugger.kvm);
-
-                            let resolve_symbol = |addr: u64| -> String {
-                                if is_kernel {
-                                    debugger
-                                        .guest
-                                        .ntoskrnl
-                                        .closest_symbol(&debugger.symbols, VirtAddr(addr))
-                                        .map(
-                                            |(s, o)| {
-                                                if o == 0 { s } else { format!("{}+{:#x}", s, o) }
-                                            },
-                                        )
-                                        .unwrap_or_else(|_| format!("{:#x}", addr))
-                                } else {
-                                    debugger
-                                        .symbols
-                                        .find_closest_symbol_for_address(
-                                            debugger.current_dtb(),
-                                            VirtAddr(addr),
-                                        )
-                                        .map(|(module, sym, offset)| {
-                                            if offset == 0 {
-                                                format!("{}!{}", module, sym)
-                                            } else {
-                                                format!("{}!{}+{:#x}", module, sym, offset)
-                                            }
-                                        })
-                                        .unwrap_or_else(|| format!("{:#x}", addr))
-                                }
-                            };
-
-                            let mut frames: Vec<(usize, u64, u64, String)> = Vec::new();
-                            const MAX_FRAMES: usize = 64;
-                            const STACK_SCAN_SIZE: usize = 0x1000;
-
-                            // frame 0 is current RIP
-                            frames.push((0, rsp, rip, resolve_symbol(rip)));
-
-                            let mut stack_data = vec![0u8; STACK_SCAN_SIZE];
-                            if mem.read_bytes(VirtAddr(rsp), &mut stack_data).is_ok() {
-                                // scan for potential return addresses
-                                for offset in (0..STACK_SCAN_SIZE - 8).step_by(8) {
-                                    if frames.len() >= MAX_FRAMES {
-                                        break;
-                                    }
-
-                                    let potential_addr = u64::from_le_bytes(
-                                        stack_data[offset..offset + 8].try_into().unwrap(),
-                                    );
-
-                                    if potential_addr == rip {
-                                        continue;
-                                    }
-
-                                    if is_code_addr(potential_addr) {
-                                        let stack_addr = rsp + offset as u64;
-                                        let symbol = resolve_symbol(potential_addr);
-                                        frames.push((
-                                            frames.len(),
-                                            stack_addr,
-                                            potential_addr,
-                                            symbol,
-                                        ));
-                                    }
-                                }
-                            }
-
-                            let total_frames = frames.len();
-                            let display_count =
-                                frame_limit.unwrap_or(total_frames).min(total_frames);
-                            let remaining = total_frames.saturating_sub(display_count);
-
-                            let mut builder = Builder::default();
-                            builder.push_record(vec![
-                                "#".to_string(),
-                                "Child SP".to_string(),
-                                "Return addr".to_string(),
-                                "Symbol".to_string(),
-                            ]);
-
-                            for (num, sp, addr, sym) in frames.into_iter().take(display_count) {
-                                builder.push_record(vec![
-                                    format!("{:02}  ", num),
-                                    format!("{:#018x}  ", VirtAddr(sp)),
-                                    format!("{:#018x}  ", VirtAddr(addr)),
-                                    sym,
-                                ]);
-                            }
-
-                            let mut table = builder.build();
-                            table
-                                .with(tabled::settings::Style::empty())
-                                .with(Padding::zero());
-                            println!("{}", table);
-
-                            if remaining > 0 {
-                                println!("{}", format!("+{} more", remaining).bright_black());
-                            }
+                            print_stacktrace(debugger, &register_map, &regs, frame_limit);
                             println!();
                         }
                         Ok(ReplCommand::Status) => {
@@ -1902,7 +2444,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                     error!("failed to set thread context: {:?}", e);
                                     continue;
                                 }
-                                print_break_info(
+                                print_break_context(
                                     &mut client,
                                     &register_map,
                                     debugger,
@@ -1938,7 +2480,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                         current_thread = thread_id;
                     }
                     println!();
-                    print_break_info(&mut client, &register_map, debugger, &current_thread);
+                    print_break_context(&mut client, &register_map, debugger, &current_thread);
                 } else {
                     error!("VM is already paused");
                 }

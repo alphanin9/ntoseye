@@ -9,6 +9,7 @@ use crate::{
 mod backend;
 mod debugger;
 mod error;
+mod expr;
 mod gdb;
 mod guest;
 mod host;

@@ -128,7 +128,7 @@ impl WinObject {
         }
     }
 
-    pub fn load_symbols(mut self, kvm: &KvmHandle, symbols: &mut SymbolStore) -> Result<Self> {
+    pub fn load_symbols(mut self, kvm: &KvmHandle, symbols: &SymbolStore) -> Result<Self> {
         self.guid = symbols.load_from_binary(kvm, &mut self)?;
         Ok(self)
     }
@@ -363,7 +363,7 @@ fn find_ntoskrnl(kvm: &KvmHandle) -> Result<Option<WinObject>> {
 
 impl Guest {
     // TODO (everywhere) use MemoryOps, not KvmHandle...
-    pub fn new(kvm: &KvmHandle, symbols: &mut SymbolStore) -> Result<Self> {
+    pub fn new(kvm: &KvmHandle, symbols: &SymbolStore) -> Result<Self> {
         let ntoskrnl = find_ntoskrnl(kvm)?
             .ok_or(Error::NtoskrnlNotFound)?
             .load_symbols(kvm, symbols)?;
@@ -749,7 +749,7 @@ impl Guest {
     pub fn load_all_kernel_module_symbols(
         &self,
         kvm: &KvmHandle,
-        symbols: &mut SymbolStore,
+        symbols: &SymbolStore,
     ) -> Result<usize> {
         use crate::symbols::{DownloadJob, SymbolStore, download_pdbs_parallel};
 
@@ -819,7 +819,7 @@ impl Guest {
     pub fn load_all_process_module_symbols(
         &self,
         kvm: &KvmHandle,
-        symbols: &mut SymbolStore,
+        symbols: &SymbolStore,
         info: &ProcessInfo,
     ) -> Result<usize> {
         use crate::symbols::{DownloadJob, SymbolStore, download_pdbs_parallel};

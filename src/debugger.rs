@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::{
     backend::MemoryOps,
@@ -11,10 +13,11 @@ use crate::{
 
 pub struct DebuggerContext {
     pub kvm: KvmHandle,
-    pub symbols: SymbolStore,
+    pub symbols: Arc<SymbolStore>,
     pub guest: Guest,
     pub current_process: Option<WinObject>,
     pub current_process_info: Option<ProcessInfo>,
+    pub registers: Option<HashMap<String, u64>>,
 }
 
 pub struct DebuggerStartupMessage {
@@ -37,95 +40,16 @@ pub struct DebuggerPteTraversal {
     pub pte: Option<DebuggerPte>,
 }
 
-pub struct DebuggerArgument {
-    value: DebuggerArgumentValue,
-    deref: bool,
-}
-
-pub enum DebuggerArgumentValue {
-    Address(u64),
-    Symbol(String),
-}
-
-impl DebuggerArgument {
-    pub fn new(input: &str) -> Self {
-        let (deref, input) = match input.strip_prefix('*') {
-            Some(rest) => (true, rest),
-            None => (false, input),
-        };
-
-        let value = if Self::is_decimal(input) {
-            match input.parse::<u64>() {
-                Ok(addr) => DebuggerArgumentValue::Address(addr),
-                Err(_) => DebuggerArgumentValue::Symbol(input.to_string()),
-            }
-        } else if Self::is_hex(input) {
-            let hex_str = input
-                .strip_prefix("0x")
-                .or_else(|| input.strip_prefix("0X"))
-                .unwrap_or(input);
-
-            match u64::from_str_radix(hex_str, 16) {
-                Ok(addr) => DebuggerArgumentValue::Address(addr),
-                Err(_) => DebuggerArgumentValue::Symbol(input.to_string()),
-            }
-        } else {
-            DebuggerArgumentValue::Symbol(input.to_string())
-        };
-
-        Self { value, deref }
-    }
-
-    fn is_hex(s: &str) -> bool {
-        let s = s
-            .strip_prefix("0x")
-            .or_else(|| s.strip_prefix("0X"))
-            .unwrap_or(s);
-
-        !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit())
-    }
-
-    fn is_decimal(s: &str) -> bool {
-        !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
-    }
-
-    pub fn try_resolve(&self, context: &DebuggerContext) -> Result<VirtAddr> {
-        match &self.value {
-            DebuggerArgumentValue::Address(addr) => {
-                if !self.deref {
-                    Ok(VirtAddr(*addr))
-                } else {
-                    let mem = context.get_current_process().memory(&context.kvm);
-                    let val: VirtAddr = mem.read(VirtAddr(*addr))?;
-                    Ok(val)
-                }
-            }
-            DebuggerArgumentValue::Symbol(sym) => {
-                let addr = context
-                    .symbols
-                    .find_symbol_across_modules(context.current_dtb(), sym)
-                    .ok_or(Error::SymbolNotFound(sym.clone()))?;
-
-                if !self.deref {
-                    Ok(addr)
-                } else {
-                    let mem = context.get_current_process().memory(&context.kvm);
-                    let val: VirtAddr = mem.read(addr)?;
-                    Ok(val)
-                }
-            }
-        }
-    }
-}
-
 impl DebuggerContext {
     pub fn new() -> Result<Self> {
         let kvm = KvmHandle::new()?;
-        let mut symbols = SymbolStore::new();
-        let guest = Guest::new(&kvm, &mut symbols)?;
+        let symbols = SymbolStore::new();
+        let guest = Guest::new(&kvm, &symbols)?;
 
         // load symbols for all kernel modules (ntoskrnl is already loaded, this adds others)
-        let _ = guest.load_all_kernel_module_symbols(&kvm, &mut symbols);
+        let _ = guest.load_all_kernel_module_symbols(&kvm, &symbols);
+
+        let symbols = Arc::new(symbols);
 
         Ok(Self {
             kvm,
@@ -133,6 +57,7 @@ impl DebuggerContext {
             guest,
             current_process: None,
             current_process_info: None,
+            registers: None,
         })
     }
 
@@ -155,7 +80,7 @@ impl DebuggerContext {
 
         let _ =
             self.guest
-                .load_all_process_module_symbols(&self.kvm, &mut self.symbols, &process_info);
+                .load_all_process_module_symbols(&self.kvm, &self.symbols, &process_info);
 
         let winobj =
             self.guest
@@ -206,8 +131,7 @@ impl DebuggerContext {
         })
     }
 
-    pub fn pte_traverse(&self, address: DebuggerArgument) -> Result<DebuggerPteTraversal> {
-        let address = address.try_resolve(self)?;
+    pub fn pte_traverse(&self, address: VirtAddr) -> Result<DebuggerPteTraversal> {
         let process = &self.guest.ntoskrnl;
         let memory = process.memory(&self.kvm);
 
