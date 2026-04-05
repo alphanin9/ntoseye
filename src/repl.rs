@@ -97,7 +97,7 @@ fn make_suggestions(
             extra: None,
             match_indices: None,
             span: Span::new(span_start, pos),
-            append_whitespace: true,
+            append_whitespace: false,
         })
         .collect()
 }
@@ -319,7 +319,7 @@ impl Completer for MyCompleter {
                             extra: None,
                             match_indices: None,
                             span: Span::new(0, pos),
-                            append_whitespace: true,
+                            append_whitespace: false,
                         })
                     } else {
                         None
@@ -419,7 +419,7 @@ impl Completer for MyCompleter {
                             extra: None,
                             match_indices: None,
                             span: Span::new(span_start, pos),
-                            append_whitespace: true,
+                            append_whitespace: false,
                         })
                         .collect();
                 }
@@ -436,7 +436,7 @@ impl Completer for MyCompleter {
                             extra: None,
                             match_indices: None,
                             span: Span::new(span_start, pos),
-                            append_whitespace: true,
+                            append_whitespace: false,
                         })
                         .collect();
                 }
@@ -455,7 +455,7 @@ impl Completer for MyCompleter {
                                 extra: None,
                                 match_indices: None,
                                 span: Span::new(span_start, pos),
-                                append_whitespace: true,
+                                append_whitespace: false,
                             }
                         })
                         .collect();
