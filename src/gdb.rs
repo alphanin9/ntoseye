@@ -71,7 +71,12 @@ impl BreakpointManager {
         let bp = self.breakpoints.remove(&id).ok_or(Error::BPNotFound(id))?;
 
         if bp.enabled {
-            client.remove_breakpoint(bp.address.0, 1)?;
+            // ignore errors, the stub may have already lost the breakpoint
+            let _ = client.remove_breakpoint(bp.address.0, 1);
+        }
+
+        if self.breakpoints.is_empty() {
+            self.next_id = 0;
         }
 
         Ok(())
@@ -97,7 +102,8 @@ impl BreakpointManager {
             return Ok(());
         }
 
-        client.remove_breakpoint(bp.address.0, 1)?;
+        // ignore errors, the stub may have already lost the breakpoint
+        let _ = client.remove_breakpoint(bp.address.0, 1);
 
         bp.enabled = false;
         Ok(())

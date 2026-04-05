@@ -319,7 +319,7 @@ impl Completer for MyCompleter {
                             extra: None,
                             match_indices: None,
                             span: Span::new(0, pos),
-                            append_whitespace: false,
+                            append_whitespace: true,
                         })
                     } else {
                         None
@@ -1715,8 +1715,9 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                                         &current_thread,
                                                     );
 
-                                                    // reset the breakpoint to ensure it's still active
-                                                    let _ = client.set_breakpoint(bp.address.0, 1);
+                                                    // refresh all breakpoints, the stub may have
+                                                    // lost non-hit breakpoints when the VM stopped
+                                                    let _ = breakpoints.refresh_enabled(&mut client);
 
                                                     break;
                                                 }
