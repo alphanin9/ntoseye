@@ -4,7 +4,7 @@ use crate::error::Result;
 
 pub trait MemoryOps<A> {
     fn read_bytes(&self, addr: A, buf: &mut [u8]) -> Result<()>;
-    
+
     #[allow(dead_code)]
     fn write_bytes(&self, addr: A, buf: &[u8]) -> Result<()>;
 

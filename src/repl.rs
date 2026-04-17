@@ -28,14 +28,21 @@ use owo_colors::OwoColorize;
 use std::borrow::Cow;
 
 use crate::backend::MemoryOps;
-use crate::debugger::DebuggerContext;
-use crate::expr::Expr;
+use crate::debugger::{AttachReport, DebuggerContext};
 use crate::error::{Error, Result};
+use crate::expr::Expr;
 use crate::gdb::{BreakpointHitResult, BreakpointManager, GdbClient, RegisterMap};
+use crate::guest::ModuleSymbolLoadReport;
+use crate::memory::AddressSpace;
 use crate::symbols::{ParsedType, SymbolIndex, SymbolStore};
 use crate::types::{Dtb, Value, VirtAddr};
+use crate::unwind::{
+    FrameSource, build_stacktrace, format_symbol, preferred_code_dtb, resolve_thread_trace_context,
+};
 
 static INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
+const BREAK_STACKTRACE_DISPLAY_LIMIT: usize = 8;
+const BREAK_STACKTRACE_PROBE_LIMIT: usize = 64;
 
 #[derive(Clone)]
 pub struct CustomPrompt;
@@ -120,7 +127,12 @@ struct AddressRange {
 }
 
 impl AddressRange {
-    fn parse(parts: &[&str], debugger: &DebuggerContext, default_count: u64, item_size: u64) -> Result<Self> {
+    fn parse(
+        parts: &[&str],
+        debugger: &DebuggerContext,
+        default_count: u64,
+        item_size: u64,
+    ) -> Result<Self> {
         let start_arg = parts.get(1).ok_or(Error::InvalidRange)?;
         let start = Expr::eval(start_arg, debugger)?;
 
@@ -178,9 +190,7 @@ impl AddressRange {
 #[strum(serialize_all = "kebab-case")]
 enum ReplCommand {
     // memory read
-    #[strum(
-        message = "Display memory as bytes.\n(usage: db <address> [length or end])"
-    )]
+    #[strum(message = "Display memory as bytes.\n(usage: db <address> [length or end])")]
     Db,
     #[strum(
         message = "Display memory as doublewords (4 bytes).\n(usage: dd <address> [length or end])"
@@ -194,9 +204,7 @@ enum ReplCommand {
         message = "Disassemble memory at a symbol or address.\n(usage: disasm <address> [length or end])"
     )]
     Disasm,
-    #[strum(
-        message = "Display type definition.\n(usage: dt <type> [address] [field])"
-    )]
+    #[strum(message = "Display type definition.\n(usage: dt <type> [address] [field])")]
     Dt,
 
     // memory write
@@ -208,7 +216,9 @@ enum ReplCommand {
     Eq,
 
     // memory search
-    #[strum(message = "Search memory for a byte pattern.\n(usage: s <address> <hex bytes> [length])")]
+    #[strum(
+        message = "Search memory for a byte pattern.\n(usage: s <address> <hex bytes> [length])"
+    )]
     S,
 
     // expression
@@ -268,9 +278,17 @@ enum ReplCommand {
 impl ReplCommand {
     pub fn completion_type(&self) -> CompletionStrategy {
         match self {
-            Self::Db | Self::Dd | Self::Dq | Self::Disasm
-            | Self::Eb | Self::Ed | Self::Eq
-            | Self::S | Self::Ev | Self::Pte | Self::Bp => CompletionStrategy::Symbol,
+            Self::Db
+            | Self::Dd
+            | Self::Dq
+            | Self::Disasm
+            | Self::Eb
+            | Self::Ed
+            | Self::Eq
+            | Self::S
+            | Self::Ev
+            | Self::Pte
+            | Self::Bp => CompletionStrategy::Symbol,
             Self::Dt => CompletionStrategy::Type,
             Self::Attach => CompletionStrategy::Process,
             Self::Thread => CompletionStrategy::Thread,
@@ -349,13 +367,15 @@ impl Completer for MyCompleter {
                         let preceding = &raw_prefix[..ident_start];
 
                         // after +/-/[ numeric operand expected, no completion
-                        if preceding.ends_with('+') || preceding.ends_with('-') || preceding.ends_with('[') {
+                        if preceding.ends_with('+')
+                            || preceding.ends_with('-')
+                            || preceding.ends_with('[')
+                        {
                             return vec![];
                         }
 
                         // after -> complete field names from the resolved type
-                        if preceding.ends_with("->") {
-                            let expr_text = &preceding[..preceding.len() - 2];
+                        if let Some(expr_text) = preceding.strip_suffix("->") {
                             if let Ok(expr) = Expr::parse(expr_text) {
                                 let dtb = *self.dtb.read().unwrap();
                                 let fields = expr.complete_fields(&self.symbol_store, dtb, prefix);
@@ -477,6 +497,31 @@ macro_rules! error {
     };
 }
 
+fn print_module_symbol_report(report: &ModuleSymbolLoadReport) {
+    let mut summary = format!("symbols: loaded {}/{}", report.loaded, report.total);
+    if report.failed_count() > 0 {
+        summary.push_str(&format!(", {} failed", report.failed_count()));
+    }
+    if report.no_pdb > 0 {
+        summary.push_str(&format!(", {} no-pdb", report.no_pdb));
+    }
+    if report.skipped > 0 {
+        summary.push_str(&format!(", {} skipped", report.skipped));
+    }
+    println!("{summary}");
+}
+
+fn refresh_process_cache(
+    debugger: &DebuggerContext,
+    shared_processes: &Arc<RwLock<ProcessCache>>,
+) -> Result<()> {
+    let processes = debugger
+        .guest
+        .enumerate_processes(&debugger.kvm, &debugger.symbols)?;
+    *shared_processes.write().unwrap() = processes.into_iter().map(|p| (p.name, p.pid)).collect();
+    Ok(())
+}
+
 macro_rules! update_breakpoint_cache {
     ($breakpoints:expr, $cache:expr) => {
         *$cache.write().unwrap() = $breakpoints
@@ -496,7 +541,8 @@ fn print_registers(register_map: &RegisterMap, regs: &[u8]) {
     };
 
     println!(
-        "{}", "─── registers ─────────────────────────────────────────────────────".bright_black()
+        "{}",
+        "─── registers ─────────────────────────────────────────────────────".bright_black()
     );
     println!(
         "rax={}  rbx={}  rcx={}",
@@ -536,22 +582,32 @@ fn print_registers(register_map: &RegisterMap, regs: &[u8]) {
     );
 }
 
-fn print_disasm_context(debugger: &DebuggerContext, rip: u64) {
+fn print_disasm_context(
+    debugger: &DebuggerContext,
+    trace: &crate::unwind::ThreadTraceContext,
+    rip: u64,
+) {
     println!(
-        "{}", "─── disasm ────────────────────────────────────────────────────────".bright_black()
+        "{}",
+        "─── disasm ────────────────────────────────────────────────────────".bright_black()
     );
 
     let pre_bytes: u64 = 64;
     let post_bytes: u64 = 64;
     let start_addr = rip.saturating_sub(pre_bytes);
     let total_len = (pre_bytes + post_bytes) as usize;
+    let active_memory = AddressSpace::new(&debugger.kvm, trace.active_dtb);
+    let code_dtb = preferred_code_dtb(trace, rip);
+    let code_memory = AddressSpace::new(&debugger.kvm, code_dtb);
 
     let mut bytes = vec![0u8; total_len];
-    if debugger
-        .get_current_process()
-        .memory(&debugger.kvm)
+    if active_memory
         .read_bytes(VirtAddr(start_addr), &mut bytes)
         .is_err()
+        && (code_dtb == trace.active_dtb
+            || code_memory
+                .read_bytes(VirtAddr(start_addr), &mut bytes)
+                .is_err())
     {
         println!("{}", "  (could not read memory at RIP)".bright_black());
         return;
@@ -591,22 +647,14 @@ fn print_disasm_context(debugger: &DebuggerContext, rip: u64) {
 
         if instruction.is_ip_rel_memory_operand() {
             let target = instruction.ip_rel_memory_address();
-            let sym = debugger
-                .get_current_process()
-                .closest_symbol(&debugger.symbols, VirtAddr(target))
-                .map(|(s, o)| format!("{}+{:#x}", s, o))
-                .unwrap_or_else(|_| format!("{:#X}", target));
+            let sym = format_symbol(debugger, trace, target);
             line.push_str(&format!(" ; {}", sym));
         } else if instruction.is_call_near()
             || instruction.is_jmp_near()
             || instruction.is_jcc_near()
         {
             let target = instruction.near_branch_target();
-            let sym = debugger
-                .get_current_process()
-                .closest_symbol(&debugger.symbols, VirtAddr(target))
-                .map(|(s, o)| format!("{}+{:#x}", s, o))
-                .unwrap_or_else(|_| format!("{:#X}", target));
+            let sym = format_symbol(debugger, trace, target);
             line.push_str(&format!(" ; {}", sym));
         }
 
@@ -622,33 +670,29 @@ fn print_disasm_context(debugger: &DebuggerContext, rip: u64) {
         let start = idx.saturating_sub(context_before);
         let end = (idx + context_after + 1).min(instructions.len());
 
-        for i in start..end {
-            let (ip, _, ref line) = instructions[i];
-            if ip == rip {
+        for (ip, _, line) in instructions.iter().take(end).skip(start) {
+            if *ip == rip {
                 println!(
                     " {} {}  {}",
                     ">".green(),
-                    format!("{:016x}", VirtAddr(ip)).green(),
+                    format!("{:016x}", VirtAddr(*ip)).green(),
                     line.green()
                 );
             } else {
-                println!(
-                    "   {:016x}  {}",
-                    VirtAddr(ip),
-                    line.bright_black()
-                );
+                println!("   {:016x}  {}", VirtAddr(*ip), line.bright_black());
             }
         }
     } else {
         let mut forward_buf = vec![0u8; post_bytes as usize];
-        if debugger
-            .get_current_process()
-            .memory(&debugger.kvm)
+        if active_memory
             .read_bytes(VirtAddr(rip), &mut forward_buf)
             .is_ok()
+            || (code_dtb != trace.active_dtb
+                && code_memory
+                    .read_bytes(VirtAddr(rip), &mut forward_buf)
+                    .is_ok())
         {
-            let mut dec =
-                Decoder::with_ip(64, &forward_buf, rip, DecoderOptions::NONE);
+            let mut dec = Decoder::with_ip(64, &forward_buf, rip, DecoderOptions::NONE);
             let mut inst = Instruction::default();
             let mut out = String::new();
             let mut count = 0;
@@ -691,100 +735,38 @@ fn print_stacktrace(
     debugger: &DebuggerContext,
     register_map: &RegisterMap,
     regs: &[u8],
-    limit: usize,
+    build_limit: usize,
+    display_limit: usize,
 ) {
     println!(
-        "{}", "─── stack trace ───────────────────────────────────────────────────".bright_black()
+        "{}",
+        "─── stack trace ───────────────────────────────────────────────────".bright_black()
     );
 
-    let rip = register_map.read_u64("rip", regs).unwrap_or(0);
-    let rsp = register_map.read_u64("rsp", regs).unwrap_or(0);
-    let cr3 = register_map.read_u64("cr3", regs).unwrap_or(0);
+    let stacktrace = build_stacktrace(debugger, register_map, regs, build_limit);
+    let shown = stacktrace.frames.len().min(display_limit);
 
-    let cr3_masked = cr3 & 0x000F_FFFF_FFFF_F000;
-    let kernel_dtb_masked = debugger.guest.ntoskrnl.dtb() & 0x000F_FFFF_FFFF_F000;
-    let is_kernel = cr3_masked == kernel_dtb_masked;
-
-    let modules = if is_kernel {
-        debugger
-            .guest
-            .get_kernel_modules(&debugger.kvm, &debugger.symbols)
-            .unwrap_or_default()
-    } else if let Some(ref proc_info) = debugger.current_process_info {
-        debugger
-            .guest
-            .get_process_modules(&debugger.kvm, &debugger.symbols, proc_info)
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-
-    let is_code_addr = |addr: u64| -> bool {
-        modules.iter().any(|m| {
-            let start = m.base_address.0;
-            let end = start + m.size as u64;
-            addr >= start && addr < end
-        })
-    };
-
-    let resolve_symbol = |addr: u64| -> String {
-        if is_kernel {
-            debugger
-                .guest
-                .ntoskrnl
-                .closest_symbol(&debugger.symbols, VirtAddr(addr))
-                .map(|(s, o)| if o == 0 { s } else { format!("{}+{:#x}", s, o) })
-                .unwrap_or_else(|_| format!("{:#x}", addr))
+    for (num, frame) in stacktrace.frames.iter().take(shown).enumerate() {
+        let suffix = if frame.source == FrameSource::Scan {
+            format!(" {}", "[scan]".bright_black())
         } else {
-            debugger
-                .symbols
-                .find_closest_symbol_for_address(debugger.current_dtb(), VirtAddr(addr))
-                .map(|(module, sym, offset)| {
-                    if offset == 0 {
-                        format!("{}!{}", module, sym)
-                    } else {
-                        format!("{}!{}+{:#x}", module, sym, offset)
-                    }
-                })
-                .unwrap_or_else(|| format!("{:#x}", addr))
-        }
-    };
-
-    let mem = debugger.get_current_process().memory(&debugger.kvm);
-    let mut frames: Vec<(usize, u64, u64, String)> = Vec::new();
-    const STACK_SCAN_SIZE: usize = 0x1000;
-
-    frames.push((0, rsp, rip, resolve_symbol(rip)));
-
-    let mut stack_data = vec![0u8; STACK_SCAN_SIZE];
-    if mem.read_bytes(VirtAddr(rsp), &mut stack_data).is_ok() {
-        for offset in (0..STACK_SCAN_SIZE - 8).step_by(8) {
-            if frames.len() >= limit {
-                break;
-            }
-
-            let potential_addr =
-                u64::from_le_bytes(stack_data[offset..offset + 8].try_into().unwrap());
-
-            if potential_addr == rip {
-                continue;
-            }
-
-            if is_code_addr(potential_addr) {
-                let stack_addr = rsp + offset as u64;
-                let symbol = resolve_symbol(potential_addr);
-                frames.push((frames.len(), stack_addr, potential_addr, symbol));
-            }
-        }
+            String::new()
+        };
+        println!(
+            " {:>2}  {:#018x}  {:#018x}  {}{}",
+            num,
+            VirtAddr(frame.sp),
+            VirtAddr(frame.ip),
+            frame.symbol,
+            suffix
+        );
     }
 
-    for (num, sp, addr, sym) in &frames {
+    let hidden = stacktrace.frames.len().saturating_sub(display_limit) + stacktrace.truncated;
+    if hidden > 0 {
         println!(
-            " {:>2}  {:#018x}  {:#018x}  {}",
-            num,
-            VirtAddr(*sp),
-            VirtAddr(*addr),
-            sym
+            " {}",
+            format!("... {} more frames truncated", hidden).bright_black()
         );
     }
 }
@@ -795,6 +777,8 @@ fn print_break_context(
     debugger: &mut DebuggerContext,
     thread_id: &str,
 ) {
+    let _ = client.set_current_thread(thread_id);
+
     let regs = match client.read_registers() {
         Ok(r) => r,
         Err(_) => {
@@ -806,60 +790,30 @@ fn print_break_context(
 
     debugger.registers = Some(register_map.to_hashmap(&regs));
 
-    let rip = register_map.read_u64("rip", &regs).unwrap_or(0);
     let cr3 = register_map.read_u64("cr3", &regs).unwrap_or(0);
-    let cr3_masked = cr3 & 0x000F_FFFF_FFFF_F000;
-    let kernel_dtb_masked = debugger.guest.ntoskrnl.dtb() & 0x000F_FFFF_FFFF_F000;
-
-    let (context, symbol) = if cr3_masked == kernel_dtb_masked {
-        let sym = debugger
-            .guest
-            .ntoskrnl
-            .closest_symbol(&debugger.symbols, VirtAddr(rip))
-            .map(|(s, o)| if o == 0 { s } else { format!("{}+{:#x}", s, o) })
-            .unwrap_or_else(|_| format!("{:#x}", rip));
-        ("kernel".to_string(), sym)
-    } else {
-        let processes = debugger
-            .guest
-            .enumerate_processes(&debugger.kvm, &debugger.symbols)
-            .unwrap_or_default();
-
-        match processes
-            .iter()
-            .find(|p| (p.dtb & 0x000F_FFFF_FFFF_F000) == cr3_masked)
-        {
-            Some(proc) => {
-                let sym = debugger
-                    .symbols
-                    .find_closest_symbol_for_address(proc.dtb, VirtAddr(rip))
-                    .map(|(module, sym, offset)| {
-                        if offset == 0 {
-                            format!("{}!{}", module, sym)
-                        } else {
-                            format!("{}!{}+{:#x}", module, sym, offset)
-                        }
-                    })
-                    .unwrap_or_else(|| format!("{:#x}", rip));
-                (format!("{} ({})", proc.name.clone(), proc.pid), sym)
-            }
-            None => ("unknown".to_string(), format!("{:#x}", rip)),
-        }
-    };
+    let rip = register_map.read_u64("rip", &regs).unwrap_or(0);
+    let trace = resolve_thread_trace_context(debugger, cr3);
+    let symbol = format_symbol(debugger, &trace, rip);
 
     println!(
         "{} {} {} {} {} {}",
         "break:".magenta(),
         format!("thread {}", thread_id).bright_black(),
         "in".bright_black(),
-        context.cyan(),
+        trace.description.cyan(),
         "at".bright_black(),
         symbol.green()
     );
 
     print_registers(register_map, &regs);
-    print_disasm_context(debugger, rip);
-    print_stacktrace(debugger, register_map, &regs, 8);
+    print_disasm_context(debugger, &trace, rip);
+    print_stacktrace(
+        debugger,
+        register_map,
+        &regs,
+        BREAK_STACKTRACE_PROBE_LIMIT,
+        BREAK_STACKTRACE_DISPLAY_LIMIT,
+    );
     println!();
 }
 
@@ -907,7 +861,10 @@ impl MemoryDisplayMode {
 
 fn display_memory(start_address: VirtAddr, data: &[u8], mode: &MemoryDisplayMode) {
     for (i, chunk) in data.chunks(mode.bytes_per_row).enumerate() {
-        print!("{:08x}  ", start_address + ((i * mode.bytes_per_row) as u64));
+        print!(
+            "{:08x}  ",
+            start_address + ((i * mode.bytes_per_row) as u64)
+        );
 
         let items_per_row = mode.bytes_per_row / mode.item_size;
         let mut printed = 0;
@@ -931,8 +888,7 @@ fn display_memory(start_address: VirtAddr, data: &[u8], mode: &MemoryDisplayMode
                 ItemFormat::Qwords => {
                     if item.len() == 8 {
                         let val = u64::from_le_bytes([
-                            item[0], item[1], item[2], item[3],
-                            item[4], item[5], item[6], item[7],
+                            item[0], item[1], item[2], item[3], item[4], item[5], item[6], item[7],
                         ]);
                         print!("{:016x} ", val);
                     } else {
@@ -1129,13 +1085,14 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                             break;
                         }
                         Ok(ReplCommand::Pte) => {
-                            let address = match Expr::eval(parts.get(1).copied().unwrap_or(""), debugger) {
-                                Ok(a) => a,
-                                Err(e) => {
-                                    error!("{}", e);
-                                    continue;
-                                }
-                            };
+                            let address =
+                                match Expr::eval(parts.get(1).copied().unwrap_or(""), debugger) {
+                                    Ok(a) => a,
+                                    Err(e) => {
+                                        error!("{}", e);
+                                        continue;
+                                    }
+                                };
                             match debugger.pte_traverse(address) {
                                 Ok(result) => {
                                     let mut levels = vec![result.pxe, result.ppe];
@@ -1441,7 +1398,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                             };
 
                             let pattern: Vec<u8> = pattern_str
-                                .split(|c| c == ':' || c == ' ')
+                                .split([':', ' '])
                                 .filter(|s| !s.is_empty())
                                 .filter_map(|s| u8::from_str_radix(s, 16).ok())
                                 .collect();
@@ -1451,9 +1408,8 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                 continue;
                             }
 
-                            let length: usize = parts.get(3)
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(0x100);
+                            let length: usize =
+                                parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0x100);
 
                             let mut data = vec![0u8; length];
                             let mem = debugger.get_current_process().memory(&debugger.kvm);
@@ -1475,12 +1431,17 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                             if o == 0 {
                                                 format!("{}+{:#x}", s, o)
                                             } else {
-                                                format!("{}", s)
+                                                s.to_string()
                                             }
                                         })
                                         .unwrap_or_default();
 
-                                    println!("{:#16x}  {} {}", addr, sym.bright_black(), format!("[{}]", pattern_str).green());
+                                    println!(
+                                        "{:#16x}  {} {}",
+                                        addr,
+                                        sym.bright_black(),
+                                        format!("[{}]", pattern_str).green()
+                                    );
                                     found += 1;
 
                                     if found >= 50 {
@@ -1491,15 +1452,27 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                             }
 
                             if found == 0 {
-                                println!("{} (searched {:#x} bytes at {:#x})", "no matches found".bright_black(), length, start_addr);
+                                println!(
+                                    "{} (searched {:#x} bytes at {:#x})",
+                                    "no matches found".bright_black(),
+                                    length,
+                                    start_addr
+                                );
                             } else {
-                                println!("\n{} {}", found, if found == 1 { "match" } else { "matches" });
+                                println!(
+                                    "\n{} {}",
+                                    found,
+                                    if found == 1 { "match" } else { "matches" }
+                                );
                             }
                             println!();
                         }
                         Ok(ReplCommand::Ev) => {
                             if parts.is_empty() {
-                                println!("{}\n", ReplCommand::Ev.get_message().unwrap_or("invalid usage"));
+                                println!(
+                                    "{}\n",
+                                    ReplCommand::Ev.get_message().unwrap_or("invalid usage")
+                                );
                                 continue;
                             }
 
@@ -1662,6 +1635,11 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                         if let Ok(tid) = client.get_stopped_thread_id() {
                                             current_thread = tid;
                                         }
+                                        if let Err(e) =
+                                            refresh_process_cache(debugger, &shared_processes)
+                                        {
+                                            error!("failed to refresh process cache: {}", e);
+                                        }
                                         println!();
                                         print_break_context(
                                             &mut client,
@@ -1677,6 +1655,16 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                             // restore blocking mode for subsequent operations
                                             let _ = client.set_read_timeout(None);
 
+                                            if let Ok(tid) = client.get_stopped_thread_id() {
+                                                current_thread = tid;
+                                                let _ = client.set_current_thread(&current_thread);
+                                            }
+                                            if let Err(e) =
+                                                refresh_process_cache(debugger, &shared_processes)
+                                            {
+                                                error!("failed to refresh process cache: {}", e);
+                                            }
+
                                             // VM stopped, check if it's our breakpoint
                                             let regs = match client.read_registers() {
                                                 Ok(r) => r,
@@ -1688,10 +1676,8 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
 
                                             let rip =
                                                 register_map.read_u64("rip", &regs).unwrap_or(0);
-                                            let cr3 =
-                                                register_map.read_u64("cr3", &regs).unwrap_or(0);
 
-                                            match breakpoints.check_breakpoint_hit(rip, cr3) {
+                                            match breakpoints.check_breakpoint_hit(rip) {
                                                 BreakpointHitResult::Hit(bp) => {
                                                     if let Ok(tid) = client.get_stopped_thread_id()
                                                     {
@@ -1717,67 +1703,10 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
 
                                                     // refresh all breakpoints, the stub may have
                                                     // lost non-hit breakpoints when the VM stopped
-                                                    let _ = breakpoints.refresh_enabled(&mut client);
+                                                    let _ =
+                                                        breakpoints.refresh_enabled(&mut client);
 
                                                     break;
-                                                }
-                                                BreakpointHitResult::WrongProcess(bp) => {
-                                                    // temporarily disable the breakpoint to step over it
-                                                    if let Err(e) =
-                                                        breakpoints.disable(&mut client, bp.id)
-                                                    {
-                                                        error!(
-                                                            "failed to disable breakpoint for step: {}",
-                                                            e
-                                                        );
-                                                        break;
-                                                    }
-
-                                                    if let Err(e) = client.step() {
-                                                        let _ =
-                                                            breakpoints.enable(&mut client, bp.id);
-                                                        error!("failed to step: {:?}", e);
-                                                        break;
-                                                    }
-                                                    if let Err(e) = client.wait_for_stop() {
-                                                        let _ =
-                                                            breakpoints.enable(&mut client, bp.id);
-                                                        error!(
-                                                            "failed to wait after step: {:?}",
-                                                            e
-                                                        );
-                                                        break;
-                                                    }
-
-                                                    // reenable the breakpoint after stepping
-                                                    if let Err(e) =
-                                                        breakpoints.enable(&mut client, bp.id)
-                                                    {
-                                                        error!(
-                                                            "failed to re-enable breakpoint: {}",
-                                                            e
-                                                        );
-                                                        break;
-                                                    }
-
-                                                    if let Err(e) =
-                                                        breakpoints.refresh_enabled(&mut client)
-                                                    {
-                                                        error!(
-                                                            "failed to refresh breakpoints after step: {}",
-                                                            e
-                                                        );
-                                                        break;
-                                                    }
-
-                                                    if let Err(e) = client.continue_execution() {
-                                                        error!("failed to continue: {:?}", e);
-                                                        break;
-                                                    }
-
-                                                    let _ = client.set_read_timeout(Some(
-                                                        Duration::from_millis(100),
-                                                    ));
                                                 }
                                                 BreakpointHitResult::NotBreakpoint => {
                                                     if let Ok(tid) = client.get_stopped_thread_id()
@@ -1822,6 +1751,9 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                             if let Ok(tid) = client.get_stopped_thread_id() {
                                 current_thread = tid;
                             }
+                            if let Err(e) = refresh_process_cache(debugger, &shared_processes) {
+                                error!("failed to refresh process cache: {}", e);
+                            }
                             println!();
                             print_break_context(
                                 &mut client,
@@ -1833,13 +1765,14 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                         Ok(ReplCommand::Dt) => {
                             let arg = require_arg!(parts, 1, ReplCommand::Dt);
 
-                            let address = match Expr::eval(parts.get(2).copied().unwrap_or("0"), debugger) {
-                                Ok(a) => a,
-                                Err(e) => {
-                                    error!("{}", e);
-                                    continue;
-                                }
-                            };
+                            let address =
+                                match Expr::eval(parts.get(2).copied().unwrap_or("0"), debugger) {
+                                    Ok(a) => a,
+                                    Err(e) => {
+                                        error!("{}", e);
+                                        continue;
+                                    }
+                                };
 
                             let field_name = parts.get(3);
 
@@ -1968,10 +1901,10 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
 
                                     let mut count = 0;
                                     for proc in processes {
-                                        if let Some(ref f) = filter {
-                                            if !proc.name.to_lowercase().contains(f) {
-                                                continue;
-                                            }
+                                        if let Some(ref f) = filter
+                                            && !proc.name.to_lowercase().contains(f)
+                                        {
+                                            continue;
                                         }
                                         count += 1;
                                         builder.push_record(vec![
@@ -2000,18 +1933,24 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                         Ok(ReplCommand::Lm) => {
                             let filter = parts.get(1).map(|s| s.to_lowercase());
 
-                            let result = if let Some(process_info) = &debugger.current_process_info
-                            {
-                                debugger.guest.get_process_modules(
-                                    &debugger.kvm,
-                                    &debugger.symbols,
-                                    process_info,
-                                )
-                            } else {
-                                debugger
-                                    .guest
-                                    .get_kernel_modules(&debugger.kvm, &debugger.symbols)
-                            };
+                            let (result, dtb) =
+                                if let Some(process_info) = &debugger.current_process_info {
+                                    (
+                                        debugger.guest.get_process_modules(
+                                            &debugger.kvm,
+                                            &debugger.symbols,
+                                            process_info,
+                                        ),
+                                        process_info.dtb,
+                                    )
+                                } else {
+                                    (
+                                        debugger
+                                            .guest
+                                            .get_kernel_modules(&debugger.kvm, &debugger.symbols),
+                                        debugger.guest.ntoskrnl.dtb(),
+                                    )
+                                };
 
                             match result {
                                 Ok(modules) => {
@@ -2020,25 +1959,40 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                         "Start".to_string(),
                                         "End".to_string(),
                                         "Module".to_string(),
+                                        "Symbols".to_string(),
+                                        "Source".to_string(),
                                         "Image".to_string(),
                                     ]);
 
                                     let mut count = 0;
                                     for module in modules {
-                                        if let Some(ref f) = filter {
-                                            if !module.short_name.to_lowercase().contains(f)
-                                                && !module.name.to_lowercase().contains(f)
-                                            {
-                                                continue;
-                                            }
+                                        if let Some(ref f) = filter
+                                            && !module.short_name.to_lowercase().contains(f)
+                                            && !module.name.to_lowercase().contains(f)
+                                        {
+                                            continue;
                                         }
                                         count += 1;
-                                        let end_address =
-                                            module.base_address.0 + module.size as u64;
                                         builder.push_record(vec![
                                             format!("{:#018x}  ", module.base_address),
-                                            format!("{:#018x}  ", VirtAddr(end_address)),
+                                            format!("{:#018x}  ", module.end_address()),
                                             format!("{}  ", module.short_name),
+                                            format!(
+                                                "{}  ",
+                                                debugger
+                                                    .symbols
+                                                    .module_symbol_status(dtb, module.base_address)
+                                                    .map(|status| status.label().to_string())
+                                                    .unwrap_or_else(|| "unknown".to_string())
+                                            ),
+                                            format!(
+                                                "{}  ",
+                                                debugger
+                                                    .symbols
+                                                    .module_symbol_source(dtb, module.base_address)
+                                                    .map(|source| source.label().to_string())
+                                                    .unwrap_or_else(|| "-".to_string())
+                                            ),
                                             module.name,
                                         ]);
                                     }
@@ -2062,13 +2016,23 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                             let pid_str = require_arg!(parts, 1, ReplCommand::Attach);
                             match pid_str.parse::<u64>() {
                                 Ok(pid) => match debugger.attach(pid) {
-                                    Ok(name) => {
+                                    Ok(AttachReport {
+                                        name,
+                                        symbol_report,
+                                    }) => {
                                         *shared_symbols.write().unwrap() =
                                             debugger.current_symbol_index();
                                         *shared_types.write().unwrap() =
                                             debugger.current_types_index();
                                         *shared_dtb.write().unwrap() = debugger.current_dtb();
-                                        println!("attached to {} (PID {})\n", name, pid);
+                                        if let Err(e) =
+                                            refresh_process_cache(debugger, &shared_processes)
+                                        {
+                                            error!("failed to refresh process cache: {}", e);
+                                        }
+                                        println!("attached to {} (PID {})", name, pid);
+                                        print_module_symbol_report(&symbol_report);
+                                        println!();
                                     }
                                     Err(e) => {
                                         error!("failed to attach: {}", e);
@@ -2087,6 +2051,9 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                 *shared_symbols.write().unwrap() = debugger.current_symbol_index();
                                 *shared_types.write().unwrap() = debugger.current_types_index();
                                 *shared_dtb.write().unwrap() = debugger.current_dtb();
+                                if let Err(e) = refresh_process_cache(debugger, &shared_processes) {
+                                    error!("failed to refresh process cache: {}", e);
+                                }
                                 println!("detached, now in kernel context\n");
                             }
                         }
@@ -2164,11 +2131,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                             };
                             let rip = register_map.read_u64("rip", &regs).unwrap_or(0);
 
-                            let bp_at_rip = breakpoints
-                                .list()
-                                .iter()
-                                .find(|bp| bp.enabled && bp.address.0 == rip)
-                                .map(|bp| bp.id);
+                            let bp_at_rip = breakpoints.breakpoint_at_execution_point(rip);
 
                             // temporarily disable breakpoint at current rip if present
                             if let Some(bp_id) = bp_at_rip
@@ -2212,7 +2175,12 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                             }
 
                             println!();
-                            print_break_context(&mut client, &register_map, debugger, &current_thread);
+                            print_break_context(
+                                &mut client,
+                                &register_map,
+                                debugger,
+                                &current_thread,
+                            );
                         }
                         Ok(ReplCommand::Thread) => {
                             if client.is_running {
@@ -2252,6 +2220,13 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                 continue;
                             }
 
+                            if debugger.current_process_info.is_some() {
+                                error!(
+                                    "breakpoints while attached to a user process are disabled for now; detach to set kernel/global breakpoints"
+                                );
+                                continue;
+                            }
+
                             let addr_str = require_arg!(parts, 1, ReplCommand::Bp);
                             let address = match Expr::eval(addr_str, debugger) {
                                 Ok(a) => a,
@@ -2272,17 +2247,9 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                     }
                                 });
 
-                            let target_cr3 = debugger.current_process_info.as_ref().map(|p| p.dtb);
-
-                            match breakpoints.add(&mut client, address, target_cr3, symbol.clone())
-                            {
+                            match breakpoints.add(&mut client, debugger, address, symbol.clone()) {
                                 Ok(id) => {
                                     update_breakpoint_cache!(breakpoints, shared_breakpoints);
-                                    let scope = if let Some(target_cr3) = target_cr3 {
-                                        format!(" (process-specific, CR3={:#x})", target_cr3)
-                                    } else {
-                                        " (global)".to_string()
-                                    };
                                     println!(
                                         "breakpoint {} set at {}{}{}\n",
                                         format!("#{}", id).cyan(),
@@ -2291,7 +2258,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                             .map(|s| format!(" ({})", s))
                                             .unwrap_or_default()
                                             .green(),
-                                        scope.bright_black()
+                                        " (global)".bright_black()
                                     );
                                 }
                                 Err(e) => {
@@ -2315,10 +2282,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
 
                                 for bp in bps {
                                     let status = if bp.enabled { "enabled" } else { "disabled" };
-                                    let scope = bp
-                                        .target_cr3
-                                        .map(|cr3| format!("CR3={:#x}", cr3))
-                                        .unwrap_or_else(|| "global".to_string());
+                                    let scope = "global".to_string();
 
                                     builder.push_record(vec![
                                         format!("{}   ", bp.id),
@@ -2411,7 +2375,8 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                 }
                             }
                         }
-                        // TODO look into using UNWIND info?
+                        // TODO extend `k` with chained-unwind and machframe support; user symbols
+                        // may still need lazy per-process loading on first stop.
                         Ok(ReplCommand::K) => {
                             if client.is_running {
                                 error!("VM is running");
@@ -2434,7 +2399,13 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                 }
                             };
 
-                            print_stacktrace(debugger, &register_map, &regs, frame_limit);
+                            print_stacktrace(
+                                debugger,
+                                &register_map,
+                                &regs,
+                                frame_limit,
+                                frame_limit,
+                            );
                             println!();
                         }
                         Ok(ReplCommand::Status) => {
@@ -2479,6 +2450,9 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
 
                     if let Ok(thread_id) = client.get_stopped_thread_id() {
                         current_thread = thread_id;
+                    }
+                    if let Err(e) = refresh_process_cache(debugger, &shared_processes) {
+                        error!("failed to refresh process cache: {}", e);
                     }
                     println!();
                     print_break_context(&mut client, &register_map, debugger, &current_thread);

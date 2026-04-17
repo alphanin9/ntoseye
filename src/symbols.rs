@@ -1,7 +1,7 @@
 use crate::{
     backend::MemoryOps,
     error::{Error, Result},
-    guest::WinObject,
+    guest::{ModuleInfo, WinObject},
     host::KvmHandle,
     memory,
     types::{Dtb, PhysAddr, VirtAddr},
@@ -12,7 +12,10 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use memmap2::Mmap;
 use pdb2::{FallibleIterator, PrimitiveKind, TypeData, TypeFinder, TypeIndex};
 use pelite::{
-    image::GUID,
+    image::{
+        GUID, IMAGE_DEBUG_CV_INFO_PDB70, IMAGE_DEBUG_DIRECTORY, IMAGE_DEBUG_TYPE_CODEVIEW,
+        IMAGE_DIRECTORY_ENTRY_DEBUG,
+    },
     pe64::{Pe, debug::CodeView},
 };
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -20,7 +23,9 @@ use spin::Mutex;
 use std::{
     collections::HashMap,
     fs::File,
-    path::PathBuf,
+    mem::size_of,
+    path::{Path, PathBuf},
+    ptr,
     sync::{Arc, OnceLock},
 };
 use std::{fmt, io::Cursor};
@@ -40,7 +45,9 @@ pub struct SymbolStore {
     index: DashMap<u128, SymbolIndex>,
     index_types: DashMap<u128, SymbolIndex>,
 
-    modules: DashMap<u64, LoadedModule>,
+    modules: DashMap<(Dtb, u64), LoadedModule>,
+    module_status: DashMap<(Dtb, u64), ModuleSymbolStatus>,
+    module_source: DashMap<(Dtb, u64), ModuleSymbolSource>,
 }
 
 fn guid_to_u128(guid: GUID) -> u128 {
@@ -52,7 +59,7 @@ fn guid_to_u128(guid: GUID) -> u128 {
     u128::from_be_bytes(bytes)
 }
 
-fn get_storage_directory() -> Option<PathBuf> {
+fn get_cache_root() -> Option<PathBuf> {
     let config_dir = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| {
@@ -68,18 +75,112 @@ fn get_storage_directory() -> Option<PathBuf> {
                 })
         })?;
 
-    let symbols_path = config_dir.join("ntoseye/symbols");
-    std::fs::create_dir_all(&symbols_path).ok()?;
+    let cache_root = config_dir.join("ntoseye");
+    std::fs::create_dir_all(&cache_root).ok()?;
+    Some(cache_root)
+}
 
+fn get_symbols_directory() -> Option<PathBuf> {
+    let symbols_path = get_cache_root()?.join("symbols");
+    std::fs::create_dir_all(&symbols_path).ok()?;
     Some(symbols_path)
 }
 
+fn get_images_directory() -> Option<PathBuf> {
+    let images_path = get_cache_root()?.join("images");
+    std::fs::create_dir_all(&images_path).ok()?;
+    Some(images_path)
+}
+
 /// Information needed to download a PDB file
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct DownloadJob {
     pub url: String,
     pub path: PathBuf,
     pub filename: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum ModuleSymbolStatus {
+    Loaded,
+    MissingDebugInfo,
+    Skipped,
+    Failed(#[allow(dead_code)] String),
+}
+
+impl ModuleSymbolStatus {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Loaded => "loaded",
+            Self::MissingDebugInfo => "no-pdb",
+            Self::Skipped => "skipped",
+            Self::Failed(_) => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ModuleSymbolSource {
+    Memory,
+    Image,
+}
+
+impl ModuleSymbolSource {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Image => "image",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ModuleSymbolDiscovery {
+    Ready {
+        job: DownloadJob,
+        guid: u128,
+        source: ModuleSymbolSource,
+    },
+    NeedsImage {
+        image_job: DownloadJob,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct ModuleSymbolLoad {
+    pub job: DownloadJob,
+    pub guid: u128,
+    pub source: ModuleSymbolSource,
+    pub module: ModuleInfo,
+    pub dtb: Dtb,
+}
+
+impl ModuleSymbolLoad {
+    pub fn new(
+        job: DownloadJob,
+        guid: u128,
+        source: ModuleSymbolSource,
+        module: ModuleInfo,
+        dtb: Dtb,
+    ) -> Self {
+        Self {
+            job,
+            guid,
+            source,
+            module,
+            dtb,
+        }
+    }
+
+    fn loaded_module(&self) -> LoadedModule {
+        LoadedModule {
+            name: self.module.name.clone(),
+            guid: self.guid,
+            base_address: self.module.base_address,
+            size: self.module.size,
+            dtb: self.dtb,
+        }
+    }
 }
 
 impl DownloadJob {
@@ -88,22 +189,40 @@ impl DownloadJob {
     }
 }
 
-fn download_pdb_with_progress(job: &DownloadJob, mp: &MultiProgress) -> Result<()> {
+fn format_progress_name(name: &str) -> String {
+    const WIDTH: usize = 32;
+    format!("{name:<WIDTH$}")
+}
+
+const DOWNLOAD_PROGRESS_TEMPLATE: &str = "{msg} [{bar:40}] {bytes}/{total_bytes} ({eta})";
+const TASK_PROGRESS_TEMPLATE: &str = "{msg} [{bar:40}] {pos}/{len}";
+
+fn download_progress_style() -> Result<ProgressStyle> {
+    Ok(ProgressStyle::with_template(DOWNLOAD_PROGRESS_TEMPLATE)?.progress_chars("#-"))
+}
+
+fn task_progress_style() -> ProgressStyle {
+    ProgressStyle::with_template(TASK_PROGRESS_TEMPLATE)
+        .unwrap()
+        .progress_chars("#-")
+}
+
+fn download_job(job: &DownloadJob, pb: ProgressBar) -> Result<()> {
     if !job.needs_download() {
         return Ok(());
     }
 
     let response = reqwest::blocking::get(&job.url)?;
+    let response = response.error_for_status()?;
     let total_size = response.content_length().unwrap_or(0);
 
-    let pb = mp.add(ProgressBar::new(total_size));
-    pb.set_style(
-        ProgressStyle::with_template("{msg} [{bar:40}] {bytes}/{total_bytes} ({eta})")?
-            .progress_chars("#-"),
-    );
+    pb.set_style(download_progress_style()?);
+    pb.set_length(total_size);
+    pb.set_message(format_progress_name(&job.filename));
 
-    pb.set_message(job.filename.clone());
-
+    if let Some(parent) = job.path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let mut file = File::create(&job.path)?;
     let mut downloaded = pb.wrap_read(response);
 
@@ -113,7 +232,7 @@ fn download_pdb_with_progress(job: &DownloadJob, mp: &MultiProgress) -> Result<(
     Ok(())
 }
 
-pub fn download_pdbs_parallel(jobs: Vec<DownloadJob>) -> Vec<Result<PathBuf>> {
+pub fn download_jobs_parallel(jobs: Vec<DownloadJob>) -> Vec<Result<PathBuf>> {
     let mp = Arc::new(MultiProgress::new());
 
     jobs.into_par_iter()
@@ -123,35 +242,9 @@ pub fn download_pdbs_parallel(jobs: Vec<DownloadJob>) -> Vec<Result<PathBuf>> {
             }
 
             let mp = Arc::clone(&mp);
-            download_pdb_with_progress(&job, &mp).map(|_| job.path)
+            download_job(&job, mp.add(ProgressBar::new(0))).map(|_| job.path)
         })
         .collect::<Vec<_>>()
-}
-
-fn download_pdb_single(job: &DownloadJob) -> Result<()> {
-    if !job.needs_download() {
-        return Ok(());
-    }
-
-    let response = reqwest::blocking::get(&job.url)?;
-    let total_size = response.content_length().unwrap_or(0);
-
-    let pb = ProgressBar::new(total_size);
-    pb.set_style(
-        ProgressStyle::with_template("{msg} [{bar:40}] {bytes}/{total_bytes} ({eta})")
-            .unwrap()
-            .progress_chars("#-"),
-    );
-
-    pb.set_message(job.filename.clone());
-
-    let mut file = File::create(&job.path)?;
-    let mut downloaded = pb.wrap_read(response);
-
-    std::io::copy(&mut downloaded, &mut file)?;
-    pb.finish_and_clear();
-
-    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -252,7 +345,21 @@ pub struct LoadedModule {
     pub dtb: Dtb,
 }
 
+impl LoadedModule {
+    fn end_address(&self) -> VirtAddr {
+        VirtAddr(self.base_address.0.saturating_add(self.size as u64))
+    }
+
+    fn contains_address(&self, address: VirtAddr) -> bool {
+        address.0 >= self.base_address.0 && address.0 < self.end_address().0
+    }
+}
+
 impl SymbolStore {
+    fn module_key(dtb: Dtb, base_address: VirtAddr) -> (Dtb, u64) {
+        (dtb, base_address.0)
+    }
+
     pub fn new() -> Self {
         Self {
             pdbs: DashMap::new(),
@@ -260,7 +367,218 @@ impl SymbolStore {
             index: DashMap::new(),
             index_types: DashMap::new(),
             modules: DashMap::new(),
+            module_status: DashMap::new(),
+            module_source: DashMap::new(),
         }
+    }
+
+    pub fn set_module_symbol_status(
+        &self,
+        dtb: Dtb,
+        base_address: VirtAddr,
+        status: ModuleSymbolStatus,
+    ) {
+        let key = Self::module_key(dtb, base_address);
+        if !matches!(status, ModuleSymbolStatus::Loaded) {
+            self.module_source.remove(&key);
+        }
+        self.module_status.insert(key, status);
+    }
+
+    pub fn module_symbol_status(
+        &self,
+        dtb: Dtb,
+        base_address: VirtAddr,
+    ) -> Option<ModuleSymbolStatus> {
+        self.module_status
+            .get(&Self::module_key(dtb, base_address))
+            .map(|status| status.clone())
+    }
+
+    pub fn set_module_symbol_source(
+        &self,
+        dtb: Dtb,
+        base_address: VirtAddr,
+        source: ModuleSymbolSource,
+    ) {
+        self.module_source
+            .insert(Self::module_key(dtb, base_address), source);
+    }
+
+    pub fn module_symbol_source(
+        &self,
+        dtb: Dtb,
+        base_address: VirtAddr,
+    ) -> Option<ModuleSymbolSource> {
+        self.module_source
+            .get(&Self::module_key(dtb, base_address))
+            .map(|source| source.clone())
+    }
+
+    fn read_debug_directory_location<B: MemoryOps<PhysAddr>>(
+        memory: &memory::AddressSpace<'_, B>,
+        base_address: VirtAddr,
+    ) -> Result<Option<(u32, u32)>> {
+        let mut header_buf = [0u8; 0x1000];
+        memory.read_bytes(base_address, &mut header_buf)?;
+        let view = pelite::pe64::PeView::from_bytes(&header_buf)?;
+        Ok(view
+            .data_directory()
+            .get(IMAGE_DIRECTORY_ENTRY_DEBUG)
+            .map(|entry| (entry.VirtualAddress, entry.Size)))
+    }
+
+    fn read_debug_directory_entries<B: MemoryOps<PhysAddr>>(
+        memory: &memory::AddressSpace<'_, B>,
+        base_address: VirtAddr,
+        debug_rva: u32,
+        debug_size: u32,
+    ) -> Result<Vec<IMAGE_DEBUG_DIRECTORY>> {
+        if debug_size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let entry_size = size_of::<IMAGE_DEBUG_DIRECTORY>();
+        if !(debug_size as usize).is_multiple_of(entry_size) {
+            return Err(Error::DebugInfo(format!(
+                "debug directory size {:#x} is not a multiple of {}",
+                debug_size, entry_size
+            )));
+        }
+
+        let mut bytes = vec![0u8; debug_size as usize];
+        memory.read_bytes(base_address + debug_rva as u64, &mut bytes)?;
+
+        let mut entries = Vec::new();
+        for chunk in bytes.chunks_exact(entry_size) {
+            let entry =
+                unsafe { ptr::read_unaligned(chunk.as_ptr() as *const IMAGE_DEBUG_DIRECTORY) };
+            entries.push(entry);
+        }
+
+        Ok(entries)
+    }
+
+    fn read_codeview_from_memory<B: MemoryOps<PhysAddr>>(
+        memory: &memory::AddressSpace<'_, B>,
+        base_address: VirtAddr,
+        entry: &IMAGE_DEBUG_DIRECTORY,
+    ) -> Result<(String, Option<(DownloadJob, u128)>)> {
+        if entry.AddressOfRawData == 0 || entry.SizeOfData < 4 {
+            return Err(Error::DebugInfo(
+                "codeview entry is missing raw data".to_string(),
+            ));
+        }
+
+        let mut bytes = vec![0u8; entry.SizeOfData as usize];
+        memory.read_bytes(base_address + entry.AddressOfRawData as u64, &mut bytes)?;
+        let signature = bytes
+            .get(..4)
+            .ok_or_else(|| Error::DebugInfo("codeview entry truncated".to_string()))?;
+
+        match signature {
+            b"RSDS" => {
+                if bytes.len() < size_of::<IMAGE_DEBUG_CV_INFO_PDB70>() {
+                    return Err(Error::DebugInfo("RSDS entry truncated".to_string()));
+                }
+
+                let image = unsafe {
+                    ptr::read_unaligned(bytes.as_ptr() as *const IMAGE_DEBUG_CV_INFO_PDB70)
+                };
+                let path =
+                    Self::read_c_string_lossy(&bytes[size_of::<IMAGE_DEBUG_CV_INFO_PDB70>()..]);
+                let summary = format!("CodeView RSDS age={} path={}", image.Age, path);
+                let job = Self::build_download_job(&path, image.Signature, image.Age)?;
+                Ok((summary, Some(job)))
+            }
+            b"NB10" => {
+                if bytes.len() < 16 {
+                    return Err(Error::DebugInfo("NB10 entry truncated".to_string()));
+                }
+                let age = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+                let path = Self::read_c_string_lossy(&bytes[16..]);
+                Ok((format!("CodeView NB10 age={} path={}", age, path), None))
+            }
+            _ => Err(Error::DebugInfo("unknown magic number".to_string())),
+        }
+    }
+
+    fn read_c_string_lossy(bytes: &[u8]) -> String {
+        let nul = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(bytes.len());
+        String::from_utf8_lossy(&bytes[..nul]).into_owned()
+    }
+
+    fn build_download_job(
+        pdb_file_name: &str,
+        guid: GUID,
+        age: u32,
+    ) -> Result<(DownloadJob, u128)> {
+        let server_name = Self::symbol_server_file_name(pdb_file_name);
+        let guid_str = format!(
+            "{:08X}{:04X}{:04X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+            guid.Data1,
+            guid.Data2,
+            guid.Data3,
+            guid.Data4[0],
+            guid.Data4[1],
+            guid.Data4[2],
+            guid.Data4[3],
+            guid.Data4[4],
+            guid.Data4[5],
+            guid.Data4[6],
+            guid.Data4[7],
+        );
+
+        let url = format!(
+            "https://msdl.microsoft.com/download/symbols/{}/{}{:X}/{}",
+            server_name, guid_str, age, server_name
+        );
+
+        let stem = server_name
+            .rsplit_once('.')
+            .map(|(stem, _)| stem)
+            .unwrap_or(server_name);
+
+        let filename = format!("{}.{}{:X}.pdb", stem, guid_str, age);
+        let storage_dir = get_symbols_directory().ok_or(Error::StorageNotFound)?;
+        let path = storage_dir.join(&filename);
+
+        let guid = guid_to_u128(guid);
+        let job = DownloadJob {
+            url,
+            path,
+            filename: format!("{}.pdb", stem),
+        };
+
+        Ok((job, guid))
+    }
+
+    fn build_image_download_job(
+        image_file_name: &str,
+        time_date_stamp: u32,
+        size_of_image: u32,
+    ) -> Result<DownloadJob> {
+        let server_name = Self::symbol_server_file_name(image_file_name);
+        let image_id = format!("{time_date_stamp:08X}{size_of_image:X}");
+        let url = format!(
+            "https://msdl.microsoft.com/download/symbols/{}/{}/{}",
+            server_name, image_id, server_name
+        );
+        let storage_dir = get_images_directory().ok_or(Error::StorageNotFound)?;
+        let path = storage_dir.join(format!("{}.{}", image_id, server_name));
+
+        Ok(DownloadJob {
+            url,
+            path,
+            filename: server_name.to_string(),
+        })
+    }
+
+    fn symbol_server_file_name(path: &str) -> &str {
+        path.rsplit(['\\', '/']).next().unwrap_or(path)
     }
 
     // TODO (everywhere) use MemoryOps, not KvmHandle...
@@ -274,69 +592,11 @@ impl SymbolStore {
         let view = object.view(kvm).ok_or(Error::ViewFailed)?;
         let debug = view.debug()?;
 
-        for entry in debug.iter().filter_map(|e| e.entry().ok()) {
-            if let Some(CodeView::Cv70 {
-                image,
-                pdb_file_name,
-            }) = entry.as_code_view()
-            {
-                let guid_str = format!(
-                    "{:08X}{:04X}{:04X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-                    image.Signature.Data1,
-                    image.Signature.Data2,
-                    image.Signature.Data3,
-                    image.Signature.Data4[0],
-                    image.Signature.Data4[1],
-                    image.Signature.Data4[2],
-                    image.Signature.Data4[3],
-                    image.Signature.Data4[4],
-                    image.Signature.Data4[5],
-                    image.Signature.Data4[6],
-                    image.Signature.Data4[7],
-                );
+        if let Some((job, guid)) = Self::download_job_from_debug(&debug)? {
+            download_job(&job, ProgressBar::new(0))?;
+            self.ensure_pdb_loaded(guid, &job.path)?;
 
-                let url = format!(
-                    "https://msdl.microsoft.com/download/symbols/{}/{}{:X}/{}",
-                    pdb_file_name, guid_str, image.Age, pdb_file_name
-                );
-
-                let stem = pdb_file_name
-                    .to_str()
-                    .ok()
-                    .and_then(|s| s.split('.').next())
-                    .unwrap_or("");
-
-                let filename = format!("{}.{}{:X}.pdb", stem, guid_str, image.Age);
-                let storage_dir = get_storage_directory().ok_or(Error::StorageNotFound)?;
-                let path = storage_dir.join(&filename);
-
-                let job = DownloadJob {
-                    url,
-                    path: path.clone(),
-                    filename: format!("{}.pdb", stem),
-                };
-                download_pdb_single(&job)?;
-
-                let guid = guid_to_u128(image.Signature);
-                let file = File::open(&path)?;
-
-                let mmap = unsafe { Mmap::map(&file)? };
-                let mmap = Arc::new(mmap);
-                let mmap_slice: &[u8] = &mmap;
-
-                // we know `mmap` will live in `self.mmaps` as long as `self.pdbs` exists
-                let static_slice: &'static [u8] = unsafe { std::mem::transmute(mmap_slice) };
-                let cursor = Cursor::new(static_slice);
-
-                let pdb = pdb2::PDB::open(cursor)?;
-
-                self.mmaps.insert(guid, mmap);
-                self.pdbs.insert(guid, pdb.into());
-
-                self.build_index(guid);
-
-                return Ok(Some(guid_to_u128(image.Signature)));
-            }
+            return Ok(Some(guid));
         }
 
         Ok(None)
@@ -349,113 +609,183 @@ impl SymbolStore {
     pub fn extract_download_job<B: MemoryOps<PhysAddr>>(
         backend: &B,
         dtb: Dtb,
+        module_name: &str,
+        base_address: VirtAddr,
+    ) -> Result<ModuleSymbolDiscovery> {
+        let addr_space = memory::AddressSpace::new(backend, dtb);
+        match Self::extract_download_job_from_memory(&addr_space, base_address) {
+            Ok(Some((job, guid))) => Ok(ModuleSymbolDiscovery::Ready {
+                job,
+                guid,
+                source: ModuleSymbolSource::Memory,
+            }),
+            Ok(None) => Self::plan_image_fallback(&addr_space, module_name, base_address),
+            Err(Error::BadVirtualAddress(_))
+            | Err(Error::PartialRead(_))
+            | Err(Error::DebugInfo(_)) => {
+                Self::plan_image_fallback(&addr_space, module_name, base_address)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    pub fn load_downloaded_pdb(&self, load: &ModuleSymbolLoad) -> Result<()> {
+        let module_key = Self::module_key(load.dtb, load.module.base_address);
+        if let Some(existing) = self.modules.get(&module_key) {
+            debug_assert_eq!(existing.guid, load.guid);
+            self.set_module_symbol_status(
+                load.dtb,
+                load.module.base_address,
+                ModuleSymbolStatus::Loaded,
+            );
+            self.set_module_symbol_source(load.dtb, load.module.base_address, load.source.clone());
+            return Ok(());
+        }
+
+        self.ensure_pdb_loaded(load.guid, &load.job.path)?;
+        self.modules.insert(module_key, load.loaded_module());
+        self.set_module_symbol_status(
+            load.dtb,
+            load.module.base_address,
+            ModuleSymbolStatus::Loaded,
+        );
+        self.set_module_symbol_source(load.dtb, load.module.base_address, load.source.clone());
+
+        Ok(())
+    }
+
+    fn download_job_from_debug<'a, P>(
+        debug: &pelite::pe64::debug::Debug<'a, P>,
+    ) -> Result<Option<(DownloadJob, u128)>>
+    where
+        P: pelite::pe64::Pe<'a>,
+    {
+        let mut first_error = None;
+
+        for dir in debug.iter() {
+            match dir.entry() {
+                Ok(entry) => {
+                    if let Some(CodeView::Cv70 {
+                        image,
+                        pdb_file_name,
+                    }) = entry.as_code_view()
+                    {
+                        let pdb_path = pdb_file_name.to_string();
+                        let (job, guid) =
+                            Self::build_download_job(&pdb_path, image.Signature, image.Age)?;
+                        return Ok(Some((job, guid)));
+                    }
+                }
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+            }
+        }
+
+        if let Some(err) = first_error {
+            return Err(err.into());
+        }
+
+        Ok(None)
+    }
+
+    fn extract_download_job_from_memory<B: MemoryOps<PhysAddr>>(
+        memory: &memory::AddressSpace<'_, B>,
         base_address: VirtAddr,
     ) -> Result<Option<(DownloadJob, u128)>> {
-        let addr_space = memory::AddressSpace::new(backend, dtb);
-        let pe_image = crate::guest::read_pe_image(base_address, &addr_space)?;
+        let Some((debug_rva, debug_size)) =
+            Self::read_debug_directory_location(memory, base_address)?
+        else {
+            return Ok(None);
+        };
 
-        let view = pelite::pe64::PeView::from_bytes(&pe_image)?;
+        for entry in
+            Self::read_debug_directory_entries(memory, base_address, debug_rva, debug_size)?
+        {
+            if entry.Type != IMAGE_DEBUG_TYPE_CODEVIEW {
+                continue;
+            }
 
-        let debug = view.debug()?;
-
-        for entry in debug.iter().filter_map(|e| e.entry().ok()) {
-            if let Some(CodeView::Cv70 {
-                image,
-                pdb_file_name,
-            }) = entry.as_code_view()
-            {
-                let guid_str = format!(
-                    "{:08X}{:04X}{:04X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-                    image.Signature.Data1,
-                    image.Signature.Data2,
-                    image.Signature.Data3,
-                    image.Signature.Data4[0],
-                    image.Signature.Data4[1],
-                    image.Signature.Data4[2],
-                    image.Signature.Data4[3],
-                    image.Signature.Data4[4],
-                    image.Signature.Data4[5],
-                    image.Signature.Data4[6],
-                    image.Signature.Data4[7],
-                );
-
-                let url = format!(
-                    "https://msdl.microsoft.com/download/symbols/{}/{}{:X}/{}",
-                    pdb_file_name, guid_str, image.Age, pdb_file_name
-                );
-
-                let stem = pdb_file_name
-                    .to_str()
-                    .ok()
-                    .and_then(|s| s.split('.').next())
-                    .unwrap_or("");
-
-                let filename = format!("{}.{}{:X}.pdb", stem, guid_str, image.Age);
-                let storage_dir = get_storage_directory().ok_or(Error::StorageNotFound)?;
-                let path = storage_dir.join(&filename);
-
-                let guid = guid_to_u128(image.Signature);
-                let job = DownloadJob {
-                    url,
-                    path,
-                    filename: format!("{}.pdb", stem),
-                };
-
-                return Ok(Some((job, guid)));
+            let (_, job) = Self::read_codeview_from_memory(memory, base_address, &entry)?;
+            if let Some(job) = job {
+                return Ok(Some(job));
             }
         }
 
         Ok(None)
     }
 
-    pub fn load_downloaded_pdb(
-        &self,
-        job: &DownloadJob,
-        guid: u128,
-        name: &str,
+    fn plan_image_fallback<B: MemoryOps<PhysAddr>>(
+        memory: &memory::AddressSpace<'_, B>,
+        module_name: &str,
         base_address: VirtAddr,
-        size: u32,
-        dtb: Dtb,
-    ) -> Result<u128> {
-        if let Some(existing) = self.modules.get(&base_address.0) {
-            return Ok(existing.guid);
+    ) -> Result<ModuleSymbolDiscovery> {
+        let (time_date_stamp, size_of_image) = Self::read_image_lookup_info(memory, base_address)?;
+        let image_job =
+            Self::build_image_download_job(module_name, time_date_stamp, size_of_image)?;
+        Ok(ModuleSymbolDiscovery::NeedsImage { image_job })
+    }
+
+    pub fn extract_download_job_from_image_file(
+        image_path: &std::path::Path,
+    ) -> Result<Option<(DownloadJob, u128)>> {
+        let file = File::open(image_path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        let pe = pelite::pe64::PeFile::from_bytes(&mmap[..])?;
+        let debug = pe.debug()?;
+        Self::download_job_from_debug(&debug)
+    }
+
+    fn read_image_lookup_info<B: MemoryOps<PhysAddr>>(
+        memory: &memory::AddressSpace<'_, B>,
+        base_address: VirtAddr,
+    ) -> Result<(u32, u32)> {
+        let mut header_buf = [0u8; 0x1000];
+        memory.read_bytes(base_address, &mut header_buf)?;
+        let view = pelite::pe64::PeView::from_bytes(&header_buf)?;
+        Ok((
+            view.file_header().TimeDateStamp,
+            view.optional_header().SizeOfImage,
+        ))
+    }
+
+    fn ensure_pdb_loaded(&self, guid: u128, path: &Path) -> Result<()> {
+        if self.pdbs.contains_key(&guid) {
+            return Ok(());
         }
 
-        if !self.pdbs.contains_key(&guid) {
-            if !job.path.exists() {
-                return Err(Error::PdbNotFound(job.path.clone()));
-            }
-
-            let file = File::open(&job.path)?;
-            let mmap = unsafe { Mmap::map(&file)? };
-            let mmap = Arc::new(mmap);
-            let mmap_slice: &[u8] = &mmap;
-
-            let static_slice: &'static [u8] = unsafe { std::mem::transmute(mmap_slice) };
-            let cursor = Cursor::new(static_slice);
-
-            let pdb = pdb2::PDB::open(cursor)?;
-
-            self.mmaps.insert(guid, mmap);
-            self.pdbs.insert(guid, pdb.into());
-
-            self.build_index(guid);
+        if !path.exists() {
+            return Err(Error::PdbNotFound(path.to_path_buf()));
         }
 
-        let module = LoadedModule {
-            name: name.to_string(),
-            guid,
-            base_address,
-            size,
-            dtb,
-        };
+        let file = File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        let mmap = Arc::new(mmap);
+        let mmap_slice: &[u8] = &mmap;
 
-        self.modules.insert(module.base_address.0, module);
+        let static_slice: &'static [u8] = unsafe { std::mem::transmute(mmap_slice) };
+        let cursor = Cursor::new(static_slice);
+        let pdb = pdb2::PDB::open(cursor)?;
 
-        Ok(guid)
+        self.mmaps.insert(guid, mmap);
+        self.pdbs.insert(guid, pdb.into());
+        self.build_index(guid);
+
+        Ok(())
     }
 
     pub fn merged_symbol_index(&self, dtb: Option<Dtb>) -> SymbolIndex {
+        let total_modules = self
+            .modules
+            .iter()
+            .filter(|module| dtb.is_none_or(|filter_dtb| module.dtb == filter_dtb))
+            .count();
+        let progress = ProgressBar::new((total_modules + 1) as u64);
+        progress.set_style(task_progress_style());
+        progress.set_message("Building symbol completions");
+
         let mut all_strings: Vec<String> = Vec::new();
 
         for module in self.modules.iter() {
@@ -473,6 +803,8 @@ impl SymbolStore {
                     }
                 }
             }
+
+            progress.inc(1);
         }
 
         all_strings.sort();
@@ -485,11 +817,22 @@ impl SymbolStore {
 
         let bytes = build.into_inner().unwrap_or_default();
         let set = Set::new(bytes).unwrap_or_default();
+        progress.inc(1);
+        progress.finish_and_clear();
 
         SymbolIndex { set }
     }
 
     pub fn merged_types_index(&self, dtb: Option<Dtb>) -> SymbolIndex {
+        let total_modules = self
+            .modules
+            .iter()
+            .filter(|module| dtb.is_none_or(|filter_dtb| module.dtb == filter_dtb))
+            .count();
+        let progress = ProgressBar::new((total_modules + 1) as u64);
+        progress.set_style(task_progress_style());
+        progress.set_message("Building type completions");
+
         let mut all_strings: Vec<String> = Vec::new();
 
         for module in self.modules.iter() {
@@ -507,6 +850,8 @@ impl SymbolStore {
                     }
                 }
             }
+
+            progress.inc(1);
         }
 
         all_strings.sort();
@@ -519,6 +864,8 @@ impl SymbolStore {
 
         let bytes = build.into_inner().unwrap_or_default();
         let set = Set::new(bytes).unwrap_or_default();
+        progress.inc(1);
+        progress.finish_and_clear();
 
         SymbolIndex { set }
     }
@@ -559,9 +906,7 @@ impl SymbolStore {
                 continue;
             }
 
-            let module_end = module.base_address.0.saturating_add(module.size as u64);
-            if address.0 >= module.base_address.0
-                && address.0 < module_end
+            if module.contains_address(address)
                 && let Some((sym_name, offset)) =
                     self.get_address_of_closest_symbol(module.guid, module.base_address, address)
             {

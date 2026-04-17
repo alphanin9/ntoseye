@@ -4,7 +4,6 @@ use std::fs;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::io::{IoSlice, IoSliceMut};
-use std::path::PathBuf;
 
 use crate::backend::MemoryOps;
 use crate::error::{Error, Result};
@@ -64,7 +63,7 @@ fn get_kvm_pid() -> Result<i32> {
             };
 
             if let Ok(target) = fs::read_link(fd_entry.path())
-                && target == PathBuf::from("/dev/kvm")
+                && target == std::path::Path::new("/dev/kvm")
                 && let Some(pid_str) = entry.file_name().to_str()
                 && let Ok(pid) = pid_str.parse::<i32>()
             {
@@ -82,7 +81,7 @@ fn get_kvm_primary_memory(pid: i32) -> Result<MemoryRegion> {
 
     let region = reader
         .lines()
-        .filter_map(|line| line.ok())
+        .map_while(|line| line.ok())
         .filter_map(|line| {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.is_empty() {

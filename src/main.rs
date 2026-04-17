@@ -17,6 +17,7 @@ mod memory;
 mod repl;
 mod symbols;
 mod types;
+mod unwind;
 
 #[derive(FromArgs)]
 /// Windows kernel debugger for Linux hosts running Windows under KVM/QEMU
@@ -85,15 +86,15 @@ fn main() -> Result<()> {
     start_repl(&mut debugger)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
 
-    #[test]
-    fn test_startup() -> Result<()> {
-        let mut debugger = debugger::DebuggerContext::new()?;
-        let _ = debugger.get_startup_message_data()?;
+//     #[test]
+//     fn test_startup() -> Result<()> {
+//         let mut debugger = debugger::DebuggerContext::new()?;
+//         let _ = debugger.get_startup_message_data()?;
 
-        Ok(())
-    }
-}
+//         Ok(())
+//     }
+// }

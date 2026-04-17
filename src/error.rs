@@ -46,6 +46,9 @@ pub enum Error {
     #[error("Not supported")]
     NotSupported,
 
+    #[error("{0}")]
+    DebugInfo(String),
+
     // Handle other errors
     #[error("PDB file not found for {0:?}")]
     PdbNotFound(PathBuf),

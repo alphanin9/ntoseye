@@ -1,11 +1,12 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use crate::{
     backend::MemoryOps,
     error::{Error, Result},
     host::KvmHandle,
     memory::{self, AddressSpace, PAGE_SIZE},
-    symbols::{SymbolStore, TypeInfo},
+    symbols::{
+        ModuleSymbolDiscovery, ModuleSymbolLoad, ModuleSymbolSource, ModuleSymbolStatus,
+        SymbolStore, TypeInfo,
+    },
     types::*,
 };
 use indicatif::{ProgressBar, ProgressStyle};
@@ -55,6 +56,53 @@ impl ModuleInfo {
             _ => lowered,
         }
     }
+
+    pub fn end_address(&self) -> VirtAddr {
+        VirtAddr(self.base_address.0.saturating_add(self.size as u64))
+    }
+
+    pub fn contains_address(&self, address: VirtAddr) -> bool {
+        address.0 >= self.base_address.0 && address.0 < self.end_address().0
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ModuleSymbolLoadReport {
+    pub total: usize,
+    pub loaded: usize,
+    pub no_pdb: usize,
+    pub skipped: usize,
+    pub failed: usize,
+}
+
+impl ModuleSymbolLoadReport {
+    fn new(total: usize) -> Self {
+        Self {
+            total,
+            ..Self::default()
+        }
+    }
+
+    fn record_status(&mut self, status: &ModuleSymbolStatus) {
+        match status {
+            ModuleSymbolStatus::Loaded => {
+                self.loaded += 1;
+            }
+            ModuleSymbolStatus::MissingDebugInfo => {
+                self.no_pdb += 1;
+            }
+            ModuleSymbolStatus::Skipped => {
+                self.skipped += 1;
+            }
+            ModuleSymbolStatus::Failed(_) => {
+                self.failed += 1;
+            }
+        }
+    }
+
+    pub fn failed_count(&self) -> usize {
+        self.failed
+    }
 }
 
 pub fn read_pe_image<'a, B: MemoryOps<PhysAddr>>(
@@ -78,15 +126,15 @@ pub fn read_pe_image<'a, B: MemoryOps<PhysAddr>>(
     for section in sections {
         let v_addr = section.VirtualAddress as usize;
         let v_size = section.VirtualSize as usize;
+        let raw_size = section.SizeOfRawData as usize;
+        let copy_size = std::cmp::max(v_size, raw_size);
 
-        if v_addr + v_size > total_size {
+        if v_addr + copy_size > total_size {
             continue;
         }
 
-        let read_addr = VirtAddr(base_address.0 + v_addr as u64);
-        let target_slice = &mut image_buffer[v_addr..v_addr + v_size];
-
-        let _ = memory.read_bytes(read_addr, target_slice);
+        let target_slice = &mut image_buffer[v_addr..v_addr + copy_size];
+        let _ = memory.read_bytes(VirtAddr(base_address.0 + v_addr as u64), target_slice);
     }
 
     Ok(image_buffer)
@@ -362,6 +410,30 @@ fn find_ntoskrnl(kvm: &KvmHandle) -> Result<Option<WinObject>> {
 }
 
 impl Guest {
+    fn queue_module_symbol_load(
+        symbols: &SymbolStore,
+        downloads: &mut Vec<ModuleSymbolLoad>,
+        ready: &mut Vec<ModuleSymbolLoad>,
+        load: ModuleSymbolLoad,
+    ) {
+        if symbols.has_guid(load.guid) {
+            ready.push(load);
+        } else {
+            downloads.push(load);
+        }
+    }
+
+    fn apply_module_symbol_status(
+        symbols: &SymbolStore,
+        report: &mut ModuleSymbolLoadReport,
+        dtb: Dtb,
+        module: &ModuleInfo,
+        status: ModuleSymbolStatus,
+    ) {
+        symbols.set_module_symbol_status(dtb, module.base_address, status.clone());
+        report.record_status(&status);
+    }
+
     // TODO (everywhere) use MemoryOps, not KvmHandle...
     pub fn new(kvm: &KvmHandle, symbols: &SymbolStore) -> Result<Self> {
         let ntoskrnl = find_ntoskrnl(kvm)?
@@ -746,74 +818,175 @@ impl Guest {
         prefix == 0xFFFF8 || prefix == 0xFFFF9 || prefix == 0xFFFFA
     }
 
-    pub fn load_all_kernel_module_symbols(
+    fn load_module_symbols(
         &self,
         kvm: &KvmHandle,
         symbols: &SymbolStore,
-    ) -> Result<usize> {
-        use crate::symbols::{DownloadJob, SymbolStore, download_pdbs_parallel};
+        modules: Vec<ModuleInfo>,
+        dtb: Dtb,
+        skip_session_space: bool,
+    ) -> Result<ModuleSymbolLoadReport> {
+        use crate::symbols::{DownloadJob, SymbolStore, download_jobs_parallel};
 
-        let modules = self.get_kernel_modules(kvm, symbols)?;
-        let dtb = self.ntoskrnl.dtb;
+        let mut report = ModuleSymbolLoadReport::new(modules.len());
+        let mut jobs_with_info: Vec<ModuleSymbolLoad> = Vec::new();
+        let mut image_jobs: Vec<(DownloadJob, ModuleInfo)> = Vec::new();
+        let mut ready_to_load: Vec<ModuleSymbolLoad> = Vec::new();
 
-        let mut jobs_with_info: Vec<(DownloadJob, u128, ModuleInfo)> = Vec::new();
-        let mut already_loaded: Vec<(DownloadJob, u128, ModuleInfo)> = Vec::new();
-        let loaded = AtomicUsize::new(0);
-
-        for module in &modules {
-            if Self::is_session_space(module.base_address) {
+        for module in modules {
+            if skip_session_space && Self::is_session_space(module.base_address) {
+                Self::apply_module_symbol_status(
+                    symbols,
+                    &mut report,
+                    dtb,
+                    &module,
+                    ModuleSymbolStatus::Skipped,
+                );
                 continue;
             }
 
-            if let Ok(Some((job, guid))) =
-                SymbolStore::extract_download_job(kvm, dtb, module.base_address)
-            {
-                if symbols.has_guid(guid) {
-                    already_loaded.push((job, guid, module.clone()));
-                    continue;
+            match SymbolStore::extract_download_job(kvm, dtb, &module.name, module.base_address) {
+                Ok(ModuleSymbolDiscovery::Ready { job, guid, source }) => {
+                    Self::queue_module_symbol_load(
+                        symbols,
+                        &mut jobs_with_info,
+                        &mut ready_to_load,
+                        ModuleSymbolLoad::new(job, guid, source, module, dtb),
+                    );
                 }
-                jobs_with_info.push((job, guid, module.clone()));
+                Ok(ModuleSymbolDiscovery::NeedsImage { image_job }) => {
+                    image_jobs.push((image_job, module));
+                }
+                Err(e) => {
+                    Self::apply_module_symbol_status(
+                        symbols,
+                        &mut report,
+                        dtb,
+                        &module,
+                        ModuleSymbolStatus::Failed(e.to_string()),
+                    );
+                }
             }
         }
 
-        let jobs: Vec<DownloadJob> = jobs_with_info.iter().map(|(j, _, _)| j.clone()).collect();
-        let _ = download_pdbs_parallel(jobs);
+        let image_results =
+            download_jobs_parallel(image_jobs.iter().map(|(job, _)| job.clone()).collect());
 
-        let total = already_loaded.len() + jobs_with_info.len();
-        if total > 0 {
-            let pb = ProgressBar::new(total as u64);
+        for ((image_job, module), result) in image_jobs.into_iter().zip(image_results) {
+            match result {
+                Ok(_) => match SymbolStore::extract_download_job_from_image_file(&image_job.path) {
+                    Ok(Some((job, guid))) => {
+                        Self::queue_module_symbol_load(
+                            symbols,
+                            &mut jobs_with_info,
+                            &mut ready_to_load,
+                            ModuleSymbolLoad::new(
+                                job,
+                                guid,
+                                ModuleSymbolSource::Image,
+                                module,
+                                dtb,
+                            ),
+                        );
+                    }
+                    Ok(None) => {
+                        Self::apply_module_symbol_status(
+                            symbols,
+                            &mut report,
+                            dtb,
+                            &module,
+                            ModuleSymbolStatus::MissingDebugInfo,
+                        );
+                    }
+                    Err(e) => {
+                        Self::apply_module_symbol_status(
+                            symbols,
+                            &mut report,
+                            dtb,
+                            &module,
+                            ModuleSymbolStatus::Failed(e.to_string()),
+                        );
+                    }
+                },
+                Err(e) => {
+                    Self::apply_module_symbol_status(
+                        symbols,
+                        &mut report,
+                        dtb,
+                        &module,
+                        ModuleSymbolStatus::Failed(e.to_string()),
+                    );
+                }
+            }
+        }
+
+        let download_results =
+            download_jobs_parallel(jobs_with_info.iter().map(|load| load.job.clone()).collect());
+
+        for (load, result) in jobs_with_info.into_iter().zip(download_results) {
+            match result {
+                Ok(_) => ready_to_load.push(load),
+                Err(e) => {
+                    Self::apply_module_symbol_status(
+                        symbols,
+                        &mut report,
+                        dtb,
+                        &load.module,
+                        ModuleSymbolStatus::Failed(e.to_string()),
+                    );
+                }
+            }
+        }
+
+        if !ready_to_load.is_empty() {
+            let pb = ProgressBar::new(ready_to_load.len() as u64);
             pb.set_style(
                 ProgressStyle::with_template("Indexing [{bar:40}] {pos}/{len}")
                     .unwrap()
                     .progress_chars("#-"),
             );
 
-            let all_jobs = already_loaded
-                .into_iter()
-                .chain(jobs_with_info.into_iter())
+            let results = ready_to_load
+                .into_par_iter()
+                .map(|load| {
+                    let module = load.module.clone();
+                    let result = symbols.load_downloaded_pdb(&load);
+                    pb.inc(1);
+                    (module, result)
+                })
                 .collect::<Vec<_>>();
 
-            all_jobs.into_par_iter().for_each(|(job, guid, module)| {
-                if symbols
-                    .load_downloaded_pdb(
-                        &job,
-                        guid,
-                        &module.name,
-                        module.base_address,
-                        module.size,
-                        dtb,
-                    )
-                    .is_ok()
-                {
-                    loaded.fetch_add(1, Ordering::Relaxed);
-                }
-                pb.inc(1);
-            });
-
             pb.finish_and_clear();
+
+            for (module, result) in results {
+                match result {
+                    Ok(_) => {
+                        report.record_status(&ModuleSymbolStatus::Loaded);
+                    }
+                    Err(e) => {
+                        Self::apply_module_symbol_status(
+                            symbols,
+                            &mut report,
+                            dtb,
+                            &module,
+                            ModuleSymbolStatus::Failed(e.to_string()),
+                        );
+                    }
+                }
+            }
         }
 
-        Ok(loaded.load(Ordering::Relaxed))
+        Ok(report)
+    }
+
+    pub fn load_all_kernel_module_symbols(
+        &self,
+        kvm: &KvmHandle,
+        symbols: &SymbolStore,
+    ) -> Result<ModuleSymbolLoadReport> {
+        let modules = self.get_kernel_modules(kvm, symbols)?;
+        let dtb = self.ntoskrnl.dtb;
+        self.load_module_symbols(kvm, symbols, modules, dtb, true)
     }
 
     pub fn load_all_process_module_symbols(
@@ -821,66 +994,9 @@ impl Guest {
         kvm: &KvmHandle,
         symbols: &SymbolStore,
         info: &ProcessInfo,
-    ) -> Result<usize> {
-        use crate::symbols::{DownloadJob, SymbolStore, download_pdbs_parallel};
-
+    ) -> Result<ModuleSymbolLoadReport> {
         let modules = self.get_process_modules(kvm, symbols, info)?;
         let dtb = info.dtb;
-
-        let mut jobs_with_info: Vec<(DownloadJob, u128, ModuleInfo)> = Vec::new();
-        let mut already_loaded: Vec<(DownloadJob, u128, ModuleInfo)> = Vec::new();
-        let loaded = AtomicUsize::new(0);
-
-        for module in &modules {
-            if let Ok(Some((job, guid))) =
-                SymbolStore::extract_download_job(kvm, dtb, module.base_address)
-            {
-                if symbols.has_guid(guid) {
-                    already_loaded.push((job, guid, module.clone()));
-                    continue;
-                }
-                jobs_with_info.push((job, guid, module.clone()));
-            }
-        }
-
-        let jobs: Vec<DownloadJob> = jobs_with_info.iter().map(|(j, _, _)| j.clone()).collect();
-        let _ = download_pdbs_parallel(jobs);
-
-        let total = already_loaded.len() + jobs_with_info.len();
-        if total > 0 {
-            let pb = ProgressBar::new(total as u64);
-            pb.set_style(
-                ProgressStyle::with_template("Indexing [{bar:40}] {pos}/{len}")
-                    .unwrap()
-                    .progress_chars("#-"),
-            );
-
-            let all_jobs = already_loaded
-                .into_iter()
-                .chain(jobs_with_info.into_iter())
-                .collect::<Vec<_>>();
-
-            all_jobs.into_par_iter().for_each(|(job, guid, module)| {
-                if symbols
-                    .load_downloaded_pdb(
-                        &job,
-                        guid,
-                        &module.name,
-                        module.base_address,
-                        module.size,
-                        dtb,
-                    )
-                    .is_ok()
-                {
-                    loaded.fetch_add(1, Ordering::Relaxed);
-                }
-
-                pb.inc(1);
-            });
-
-            pb.finish_and_clear();
-        }
-
-        Ok(loaded.load(Ordering::Relaxed))
+        self.load_module_symbols(kvm, symbols, modules, dtb, false)
     }
 }

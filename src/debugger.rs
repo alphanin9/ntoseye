@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::{
     backend::MemoryOps,
     error::{Error, Result},
-    guest::{Guest, ProcessInfo, WinObject},
+    guest::{Guest, ModuleSymbolLoadReport, ProcessInfo, WinObject},
     host::KvmHandle,
     symbols::SymbolStore,
     types::{PageTableEntry, Value, VirtAddr},
@@ -24,6 +24,11 @@ pub struct DebuggerStartupMessage {
     pub build_number: Value<u16>,
     pub base_address: VirtAddr,
     pub loaded_module_list: VirtAddr,
+}
+
+pub struct AttachReport {
+    pub name: String,
+    pub symbol_report: ModuleSymbolLoadReport,
 }
 
 pub struct DebuggerPte {
@@ -68,7 +73,7 @@ impl DebuggerContext {
         }
     }
 
-    pub fn attach(&mut self, pid: u64) -> Result<String> {
+    pub fn attach(&mut self, pid: u64) -> Result<AttachReport> {
         let processes = self.guest.enumerate_processes(&self.kvm, &self.symbols)?;
         let process_info = processes
             .iter()
@@ -78,7 +83,7 @@ impl DebuggerContext {
 
         let name = process_info.name.clone();
 
-        let _ =
+        let symbol_report =
             self.guest
                 .load_all_process_module_symbols(&self.kvm, &self.symbols, &process_info);
 
@@ -88,7 +93,10 @@ impl DebuggerContext {
 
         self.current_process = Some(winobj);
         self.current_process_info = Some(process_info);
-        Ok(name)
+        Ok(AttachReport {
+            name,
+            symbol_report: symbol_report?,
+        })
     }
 
     pub fn detach(&mut self) {
