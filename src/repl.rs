@@ -159,6 +159,63 @@ impl AddressRange {
     }
 }
 
+fn parse_byte_pattern(pattern: &str) -> Option<Vec<u8>> {
+    if pattern.is_empty() {
+        return None;
+    }
+
+    if pattern.starts_with("\\x") || pattern.starts_with("\\X") {
+        let mut bytes = Vec::new();
+        let mut rest = pattern;
+
+        while let Some(stripped) = rest
+            .strip_prefix("\\x")
+            .or_else(|| rest.strip_prefix("\\X"))
+        {
+            if stripped.len() < 2 {
+                return None;
+            }
+
+            let byte = u8::from_str_radix(&stripped[..2], 16).ok()?;
+            bytes.push(byte);
+            rest = &stripped[2..];
+        }
+
+        if rest.is_empty() && !bytes.is_empty() {
+            return Some(bytes);
+        }
+
+        return None;
+    }
+
+    if pattern.len() % 2 != 0 || !pattern.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    hex::decode(pattern).ok()
+}
+
+fn resolve_length_or_end(start: VirtAddr, end_or_length: VirtAddr) -> Option<usize> {
+    let length = if end_or_length.0 < start.0 {
+        end_or_length.0
+    } else {
+        end_or_length.0 - start.0
+    };
+
+    usize::try_from(length).ok()
+}
+
+fn repeat_pattern(pattern: &[u8], length: usize) -> Vec<u8> {
+    let mut filled = Vec::with_capacity(length);
+
+    while filled.len() < length {
+        let remaining = length - filled.len();
+        filled.extend_from_slice(&pattern[..remaining.min(pattern.len())]);
+    }
+
+    filled
+}
+
 // TODO
 //
 // Memory Display:
@@ -166,7 +223,6 @@ impl AddressRange {
 //   dps          - Display pointers with symbol resolution
 // Memory Write:
 //   ea, eu       - Write ASCII/Unicode string
-//   f            - Fill memory with pattern
 // Execution Control:
 //   t / si       - Single step (step into)
 //   p / ni       - Step over
@@ -214,10 +270,14 @@ enum ReplCommand {
     Ed,
     #[strum(message = "Write a quadword (8 bytes) to memory.\n(usage: eq <address> <expr>)")]
     Eq,
+    #[strum(
+        message = "Fill memory with a repeated byte pattern.\n(usage: f <address> <hex bytes> [length or end])\nhex bytes: 90, 4883792000740a, or \\x90\\x90"
+    )]
+    F,
 
     // memory search
     #[strum(
-        message = "Search memory for a byte pattern.\n(usage: s <address> <hex bytes> [length])"
+        message = "Search memory for a byte pattern.\n(usage: s <address> <hex bytes> [length])\nhex bytes: 4883792000740a or \\x48\\x83\\x79\\x20\\x00\\x74\\x0a"
     )]
     S,
 
@@ -285,6 +345,7 @@ impl ReplCommand {
             | Self::Eb
             | Self::Ed
             | Self::Eq
+            | Self::F
             | Self::S
             | Self::Ev
             | Self::Pte
@@ -1378,6 +1439,64 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                 println!("{} {:#x} -> {:#x}\n", "wrote".green(), value, address);
                             }
                         }
+                        Ok(ReplCommand::F) => {
+                            if parts.len() < 3 {
+                                println!(
+                                    "{}\n",
+                                    ReplCommand::F.get_message().unwrap_or("invalid usage")
+                                );
+                                continue;
+                            }
+
+                            let address = match Expr::eval(parts[1], debugger) {
+                                Ok(a) => a,
+                                Err(e) => {
+                                    error!("{}", e);
+                                    continue;
+                                }
+                            };
+
+                            let pattern_str = parts[2];
+                            let pattern = match parse_byte_pattern(pattern_str) {
+                                Some(pattern) => pattern,
+                                None => {
+                                    error!("invalid pattern: {}", pattern_str);
+                                    continue;
+                                }
+                            };
+
+                            let length = match parts.get(3) {
+                                Some(length_arg) => match Expr::eval(length_arg, debugger) {
+                                    Ok(value) => match resolve_length_or_end(address, value) {
+                                        Some(length) => length,
+                                        None => {
+                                            error!("invalid length or end: {}", length_arg);
+                                            continue;
+                                        }
+                                    },
+                                    Err(e) => {
+                                        error!("{}", e);
+                                        continue;
+                                    }
+                                },
+                                None => pattern.len(),
+                            };
+
+                            let data = repeat_pattern(&pattern, length);
+                            let mem = debugger.get_current_process().memory(&debugger.kvm);
+
+                            if let Err(e) = mem.write_bytes(address, &data) {
+                                error!("failed to fill memory: {}", e);
+                            } else {
+                                println!(
+                                    "{} {:#x} bytes at {:#x} with {}\n",
+                                    "filled".green(),
+                                    length,
+                                    address,
+                                    format!("[{}]", pattern_str).green()
+                                );
+                            }
+                        }
                         Ok(ReplCommand::S) => {
                             if parts.len() < 3 {
                                 println!(
@@ -1397,19 +1516,30 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                 }
                             };
 
-                            let pattern: Vec<u8> = pattern_str
-                                .split([':', ' '])
-                                .filter(|s| !s.is_empty())
-                                .filter_map(|s| u8::from_str_radix(s, 16).ok())
-                                .collect();
+                            let pattern = match parse_byte_pattern(pattern_str) {
+                                Some(pattern) => pattern,
+                                None => {
+                                    error!("invalid pattern: {}", pattern_str);
+                                    continue;
+                                }
+                            };
 
-                            if pattern.is_empty() {
-                                error!("invalid pattern: {}", pattern_str);
-                                continue;
-                            }
-
-                            let length: usize =
-                                parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0x100);
+                            let length = match parts.get(3) {
+                                Some(length_arg) => match Expr::eval(length_arg, debugger) {
+                                    Ok(value) => match usize::try_from(value.0) {
+                                        Ok(length) => length,
+                                        Err(_) => {
+                                            error!("invalid length: {}", length_arg);
+                                            continue;
+                                        }
+                                    },
+                                    Err(e) => {
+                                        error!("{}", e);
+                                        continue;
+                                    }
+                                },
+                                None => 0x100,
+                            };
 
                             let mut data = vec![0u8; length];
                             let mem = debugger.get_current_process().memory(&debugger.kvm);
@@ -1420,33 +1550,30 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                             }
 
                             let mut found = 0;
-                            for i in 0..=data.len().saturating_sub(pattern.len()) {
-                                if &data[i..i + pattern.len()] == pattern.as_slice() {
-                                    let addr = start_addr + i as u64;
-                                    let sym = debugger
-                                        .guest
-                                        .ntoskrnl
-                                        .closest_symbol(&debugger.symbols, addr)
-                                        .map(|(s, o)| {
-                                            if o == 0 {
-                                                format!("{}+{:#x}", s, o)
-                                            } else {
-                                                s.to_string()
-                                            }
-                                        })
-                                        .unwrap_or_default();
+                            if pattern.len() <= data.len() {
+                                for i in 0..=data.len() - pattern.len() {
+                                    if &data[i..i + pattern.len()] == pattern.as_slice() {
+                                        let addr = start_addr + i as u64;
+                                        let sym = debugger
+                                            .guest
+                                            .ntoskrnl
+                                            .closest_symbol(&debugger.symbols, addr)
+                                            .map(|(s, o)| {
+                                                if o == 0 {
+                                                    format!("{}+{:#x}", s, o)
+                                                } else {
+                                                    s.to_string()
+                                                }
+                                            })
+                                            .unwrap_or_default();
 
-                                    println!(
-                                        "{:#16x}  {} {}",
-                                        addr,
-                                        sym.bright_black(),
-                                        format!("[{}]", pattern_str).green()
-                                    );
-                                    found += 1;
-
-                                    if found >= 50 {
-                                        println!("... (showing first 50 matches)");
-                                        break;
+                                        println!(
+                                            "{:#16x}  {} {}",
+                                            addr,
+                                            sym.bright_black(),
+                                            format!("[{}]", pattern_str).green()
+                                        );
+                                        found += 1;
                                     }
                                 }
                             }
@@ -2468,4 +2595,60 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VirtAddr, parse_byte_pattern, repeat_pattern, resolve_length_or_end};
+
+    #[test]
+    fn parse_byte_pattern_accepts_contiguous_hex() {
+        assert_eq!(
+            parse_byte_pattern("4883792000740a"),
+            Some(vec![0x48, 0x83, 0x79, 0x20, 0x00, 0x74, 0x0a])
+        );
+    }
+
+    #[test]
+    fn parse_byte_pattern_accepts_hex_escape_bytes() {
+        assert_eq!(
+            parse_byte_pattern(r"\x48\x83\x79\x20\x00\x74\x0a"),
+            Some(vec![0x48, 0x83, 0x79, 0x20, 0x00, 0x74, 0x0a])
+        );
+    }
+
+    #[test]
+    fn parse_byte_pattern_rejects_odd_length_hex() {
+        assert_eq!(parse_byte_pattern("488379200074a"), None);
+    }
+
+    #[test]
+    fn resolve_length_or_end_treats_small_value_as_length() {
+        assert_eq!(
+            resolve_length_or_end(VirtAddr(0xfffff8075b471000), VirtAddr(0x20)),
+            Some(0x20)
+        );
+    }
+
+    #[test]
+    fn resolve_length_or_end_treats_large_value_as_end() {
+        assert_eq!(
+            resolve_length_or_end(VirtAddr(0x1000), VirtAddr(0x1020)),
+            Some(0x20)
+        );
+    }
+
+    #[test]
+    fn repeat_pattern_repeats_and_truncates() {
+        assert_eq!(repeat_pattern(&[0x90], 4), vec![0x90, 0x90, 0x90, 0x90]);
+        assert_eq!(
+            repeat_pattern(&[0x48, 0x83, 0x79], 8),
+            vec![0x48, 0x83, 0x79, 0x48, 0x83, 0x79, 0x48, 0x83]
+        );
+    }
+
+    #[test]
+    fn repeat_pattern_allows_zero_length() {
+        assert_eq!(repeat_pattern(&[0x90], 0), Vec::<u8>::new());
+    }
 }
