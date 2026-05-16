@@ -280,6 +280,23 @@ impl RegisterMap {
         Ok(u64::from_le_bytes(buf))
     }
 
+    pub fn write_u64<S>(&self, name: S, data: &mut [u8], value: u64) -> Result<()>
+    where
+        S: Into<String> + AsRef<str>,
+    {
+        let info = self
+            .by_name
+            .get(name.as_ref())
+            .ok_or(Error::RegisterNotFound(name.into()))?;
+        if info.offset + info.size > data.len() {
+            return Err(Error::BufferNotEnough);
+        }
+        let bytes = value.to_le_bytes();
+        let copy_len = info.size.min(bytes.len());
+        data[info.offset..info.offset + copy_len].copy_from_slice(&bytes[..copy_len]);
+        Ok(())
+    }
+
     pub fn to_hashmap(&self, data: &[u8]) -> HashMap<String, u64> {
         self.ordered
             .iter()
@@ -884,7 +901,7 @@ impl GdbClient {
         ))
     }
 
-    fn parse_stop_reply_thread_id(response: &str) -> Option<String> {
+    pub fn parse_stop_reply_thread_id(response: &str) -> Option<String> {
         if !response.starts_with('T') {
             return None;
         }

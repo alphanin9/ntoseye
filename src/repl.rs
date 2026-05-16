@@ -643,6 +643,99 @@ fn print_registers(register_map: &RegisterMap, regs: &[u8]) {
     );
 }
 
+/// Single-step the current thread and clear `TF` from its RFLAGS afterwards.
+/// KVM sets `TF` when enabling `KVM_GUESTDBG_SINGLESTEP` but doesn't clear it
+/// when SINGLESTEP is removed; without this clear, the stepped thread keeps
+/// trapping after every instruction on resume.
+fn step_one_and_clear_tf(client: &mut GdbClient, register_map: &RegisterMap) -> Result<()> {
+    client.step()?;
+    client.wait_for_stop()?;
+
+    if let Ok(mut regs) = client.read_registers()
+        && let Ok(eflags) = register_map.read_u64("eflags", &regs)
+    {
+        let cleared = eflags & !(1u64 << 8);
+        if cleared != eflags
+            && register_map
+                .write_u64("eflags", &mut regs, cleared)
+                .is_ok()
+        {
+            let _ = client.write_registers(&regs);
+        }
+    }
+
+    Ok(())
+}
+
+/// If the current thread's RIP sits on one of our enabled breakpoints,
+/// disable it, step the underlying instruction, then re-enable. Returns
+/// whether a step was performed. Caller must have set the gdb stub's
+/// control thread first.
+fn step_over_current_breakpoint(
+    client: &mut GdbClient,
+    register_map: &RegisterMap,
+    breakpoints: &mut BreakpointManager,
+) -> Result<bool> {
+    let regs = client.read_registers()?;
+    let rip = register_map.read_u64("rip", &regs)?;
+
+    let Some(bp_id) = breakpoints.breakpoint_at_execution_point(rip) else {
+        return Ok(false);
+    };
+
+    breakpoints.disable(client, bp_id)?;
+    let step_outcome = step_one_and_clear_tf(client, register_map);
+    let enable_outcome = breakpoints.enable(client, bp_id);
+
+    step_outcome?;
+    enable_outcome?;
+    Ok(true)
+}
+
+/// For every gdb thread whose RIP sits one byte past one of our breakpoints,
+/// rewind it back to the breakpoint address. The stub doesn't always adjust
+/// RIP back to the int3 when multiple vCPUs hit the same BP simultaneously;
+/// resuming an un-adjusted vCPU would decode the remainder of the original
+/// instruction's bytes as a different instruction and corrupt guest state.
+/// Restores Hg/Hc to `restore_thread` before returning.
+fn rewind_threads_off_breakpoints(
+    client: &mut GdbClient,
+    register_map: &RegisterMap,
+    breakpoints: &BreakpointManager,
+    restore_thread: &str,
+) {
+    let threads = match client.get_thread_list() {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+
+    for tid in &threads {
+        if client.set_current_thread(tid).is_err() {
+            continue;
+        }
+        let Ok(regs) = client.read_registers() else {
+            continue;
+        };
+        let rip = register_map.read_u64("rip", &regs).unwrap_or(0);
+        let Some(prev) = rip.checked_sub(1) else {
+            continue;
+        };
+        if !matches!(
+            breakpoints.check_breakpoint_hit(prev),
+            BreakpointHitResult::Hit(_)
+        ) {
+            continue;
+        }
+        let mut adjusted = regs.clone();
+        if register_map.write_u64("rip", &mut adjusted, prev).is_err() {
+            continue;
+        }
+        let _ = client.write_registers(&adjusted);
+    }
+
+    let _ = client.set_current_thread(restore_thread);
+}
+
 fn print_disasm_context(
     debugger: &DebuggerContext,
     trace: &crate::unwind::ThreadTraceContext,
@@ -1722,6 +1815,24 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                 continue;
                             }
 
+                            // If we're sitting on one of our breakpoints, step past it
+                            // before resuming; otherwise the int3 at RIP fires the BP
+                            // again on the very next cycle.
+                            if breakpoints.has_enabled_breakpoints() {
+                                if let Err(e) = client.set_current_thread(&current_thread) {
+                                    error!("failed to set thread context: {:?}", e);
+                                    continue;
+                                }
+                                if let Err(e) = step_over_current_breakpoint(
+                                    &mut client,
+                                    &register_map,
+                                    &mut breakpoints,
+                                ) {
+                                    error!("failed to step over current breakpoint: {:?}", e);
+                                    continue;
+                                }
+                            }
+
                             if let Err(e) = breakpoints.refresh_enabled(&mut client) {
                                 error!("failed to refresh breakpoints: {}", e);
                                 continue;
@@ -1778,11 +1889,20 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                     }
 
                                     match client.try_wait_for_stop() {
-                                        Ok(Some(_)) => {
+                                        Ok(Some(response)) => {
                                             // restore blocking mode for subsequent operations
                                             let _ = client.set_read_timeout(None);
 
-                                            if let Ok(tid) = client.get_stopped_thread_id() {
+                                            // Pull the thread id straight from the stop reply.
+                                            // `?` reuses c_cpu, which we churn via Hg/Hc during
+                                            // the multi-thread rewind, so it can return the
+                                            // wrong thread.
+                                            let stopped_tid =
+                                                GdbClient::parse_stop_reply_thread_id(&response)
+                                                    .or_else(|| {
+                                                        client.get_stopped_thread_id().ok()
+                                                    });
+                                            if let Some(tid) = stopped_tid {
                                                 current_thread = tid;
                                                 let _ = client.set_current_thread(&current_thread);
                                             }
@@ -1792,7 +1912,15 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                                 error!("failed to refresh process cache: {}", e);
                                             }
 
-                                            // VM stopped, check if it's our breakpoint
+                                            // Done before reading the current thread's regs so
+                                            // the BP-hit check below sees the post-rewind RIP.
+                                            rewind_threads_off_breakpoints(
+                                                &mut client,
+                                                &register_map,
+                                                &breakpoints,
+                                                &current_thread,
+                                            );
+
                                             let regs = match client.read_registers() {
                                                 Ok(r) => r,
                                                 Err(e) => {
@@ -1806,10 +1934,6 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
 
                                             match breakpoints.check_breakpoint_hit(rip) {
                                                 BreakpointHitResult::Hit(bp) => {
-                                                    if let Ok(tid) = client.get_stopped_thread_id()
-                                                    {
-                                                        current_thread = tid;
-                                                    }
                                                     println!();
                                                     println!(
                                                         "{} {} {}",
@@ -1836,11 +1960,6 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                                     break;
                                                 }
                                                 BreakpointHitResult::NotBreakpoint => {
-                                                    if let Ok(tid) = client.get_stopped_thread_id()
-                                                    {
-                                                        current_thread = tid;
-                                                    }
-
                                                     println!();
                                                     print_break_context(
                                                         &mut client,
@@ -2248,49 +2367,23 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                 continue;
                             }
 
-                            // check if we're at a breakpoint address and temporarily remove it
-                            let regs = match client.read_registers() {
-                                Ok(r) => r,
+                            let stepped = match step_over_current_breakpoint(
+                                &mut client,
+                                &register_map,
+                                &mut breakpoints,
+                            ) {
+                                Ok(stepped) => stepped,
                                 Err(e) => {
-                                    error!("failed to read registers: {:?}", e);
+                                    error!("failed to step over breakpoint: {:?}", e);
                                     continue;
                                 }
                             };
-                            let rip = register_map.read_u64("rip", &regs).unwrap_or(0);
 
-                            let bp_at_rip = breakpoints.breakpoint_at_execution_point(rip);
-
-                            // temporarily disable breakpoint at current rip if present
-                            if let Some(bp_id) = bp_at_rip
-                                && let Err(e) = breakpoints.disable(&mut client, bp_id)
+                            if !stepped
+                                && let Err(e) = step_one_and_clear_tf(&mut client, &register_map)
                             {
-                                error!("failed to disable breakpoint for step: {}", e);
-                                continue;
-                            }
-
-                            if let Err(e) = client.step() {
-                                // reenable breakpoint on error
-                                if let Some(bp_id) = bp_at_rip {
-                                    let _ = breakpoints.enable(&mut client, bp_id);
-                                }
                                 error!("failed to step: {:?}", e);
                                 continue;
-                            }
-
-                            if let Err(e) = client.wait_for_stop() {
-                                // reenable breakpoint on error
-                                if let Some(bp_id) = bp_at_rip {
-                                    let _ = breakpoints.enable(&mut client, bp_id);
-                                }
-                                error!("failed to wait after step: {:?}", e);
-                                continue;
-                            }
-
-                            // reenable the breakpoint after stepping
-                            if let Some(bp_id) = bp_at_rip
-                                && let Err(e) = breakpoints.enable(&mut client, bp_id)
-                            {
-                                error!("failed to re-enable breakpoint after step: {}", e);
                             }
 
                             if let Err(e) = breakpoints.refresh_enabled(&mut client) {
