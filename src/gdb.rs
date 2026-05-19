@@ -6,11 +6,13 @@ use std::time::Duration;
 
 use pelite::pe64::{Pe, PeView, image::IMAGE_SCN_MEM_EXECUTE};
 
+use crate::backend::MemoryOps;
+use crate::dbg_backend::{DebugBackend, StopEvent};
 use crate::debugger::DebuggerContext;
 use crate::error::{Error, Result};
-use crate::guest::{ModuleInfo, read_pe_image};
+use crate::guest::{ModuleInfo, ProcessInfo, read_pe_image};
 use crate::memory::AddressSpace;
-use crate::types::VirtAddr;
+use crate::types::{Dtb, VirtAddr};
 
 #[derive(Debug, Default, Clone)]
 struct StubFeatures {
@@ -52,7 +54,7 @@ pub struct RegisterInfo {
     pub regnum: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RegisterMap {
     by_name: HashMap<String, RegisterInfo>,
     ordered: Vec<RegisterInfo>,
@@ -64,6 +66,53 @@ pub struct Breakpoint {
     pub address: VirtAddr,
     pub enabled: bool,
     pub symbol: Option<String>,
+    pub scope: BreakpointScope,
+    backend: BreakpointBackend,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BreakpointScope {
+    Kernel,
+    Process { pid: u64, dtb: Dtb, name: String },
+}
+
+impl BreakpointScope {
+    fn matches_cr3(&self, cr3: u64) -> bool {
+        // Mask out the PCID (bits 0..11) and reserved/canonical bits
+        // (52..63), leaving only the page-directory base physical frame.
+        const CR3_PAGE_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+        match self {
+            Self::Kernel => true,
+            Self::Process { dtb, .. } => (cr3 & CR3_PAGE_MASK) == (*dtb & CR3_PAGE_MASK),
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Self::Kernel => "global".to_string(),
+            Self::Process { pid, name, .. } => format!("{name} ({pid})"),
+        }
+    }
+}
+
+/// Who owns the int3 byte for a breakpoint.
+///
+/// * `Kernel`: written via the target's kernel debugger API
+///   (`DbgKdWriteBreakPointApi` / gdb `Z0`). The kernel tracks the original
+///   byte and handles step-over.
+///
+/// * `GuestMemoryPatch`: we write 0xCC ourselves through `/dev/kvm` against a
+///   specific process's page table. No Kdp primitive supports per-process BPs
+///   (KD's BP APIs all route through `MmDbgCopyMemory`, which uses the current
+///   CR3), so this is the only way to scope a user-mode BP to one process.
+///   Writing at the physical-frame level bypasses copy-on-write, so the int3
+///   is visible to every process mapping that frame. `check_breakpoint_hit`'s
+///   CR3 filter discards wrong-process hits, but the kernel still pays for
+///   the trap.
+#[derive(Debug, Clone)]
+enum BreakpointBackend {
+    Kernel,
+    GuestMemoryPatch { original_byte: u8 },
 }
 
 pub struct BreakpointManager {
@@ -81,39 +130,47 @@ impl BreakpointManager {
 
     pub fn add(
         &mut self,
-        client: &mut GdbClient,
+        client: &mut dyn DebugBackend,
         debugger: &DebuggerContext,
         address: VirtAddr,
         symbol: Option<String>,
     ) -> Result<u32> {
-        if debugger.current_process_info.is_some() {
-            return Err(Error::Rsp(
-                "breakpoints while attached to a user process are currently disabled".into(),
-            ));
+        let scope = Self::scope_for_current_context(debugger);
+        if matches!(scope, BreakpointScope::Process { .. })
+            && !client.supports_process_breakpoints()
+        {
+            return Err(Error::NotSupported);
         }
 
         let id = self.next_id;
         self.next_id += 1;
 
         Self::validate_breakpoint_target(debugger, address)?;
-        client.set_breakpoint(address.0)?;
+        let backend = Self::install_breakpoint(client, debugger, address, &scope)?;
 
         let bp = Breakpoint {
             id,
             address,
             enabled: true,
             symbol,
+            scope,
+            backend,
         };
 
         self.breakpoints.insert(id, bp);
         Ok(id)
     }
 
-    pub fn remove(&mut self, client: &mut GdbClient, id: u32) -> Result<()> {
+    pub fn remove(
+        &mut self,
+        client: &mut dyn DebugBackend,
+        debugger: &DebuggerContext,
+        id: u32,
+    ) -> Result<()> {
         let bp = self.breakpoints.remove(&id).ok_or(Error::BPNotFound(id))?;
 
         if bp.enabled {
-            let _ = client.remove_breakpoint(bp.address.0);
+            let _ = Self::uninstall_breakpoint(client, debugger, &bp);
         }
 
         if self.breakpoints.is_empty() {
@@ -123,30 +180,73 @@ impl BreakpointManager {
         Ok(())
     }
 
-    pub fn enable(&mut self, client: &mut GdbClient, id: u32) -> Result<()> {
+    pub fn discard(&mut self, id: u32) -> Result<Breakpoint> {
+        let bp = self.breakpoints.remove(&id).ok_or(Error::BPNotFound(id))?;
+        if self.breakpoints.is_empty() {
+            self.next_id = 0;
+        }
+        Ok(bp)
+    }
+
+    pub fn enable(
+        &mut self,
+        client: &mut dyn DebugBackend,
+        debugger: &DebuggerContext,
+        id: u32,
+    ) -> Result<()> {
         let bp = self.breakpoints.get_mut(&id).ok_or(Error::BPNotFound(id))?;
 
         if bp.enabled {
             return Ok(());
         }
 
-        client.set_breakpoint(bp.address.0)?;
-
+        Self::install_existing_breakpoint(client, debugger, bp)?;
         bp.enabled = true;
         Ok(())
     }
 
-    pub fn disable(&mut self, client: &mut GdbClient, id: u32) -> Result<()> {
+    pub fn disable(
+        &mut self,
+        client: &mut dyn DebugBackend,
+        debugger: &DebuggerContext,
+        id: u32,
+    ) -> Result<()> {
         let bp = self.breakpoints.get_mut(&id).ok_or(Error::BPNotFound(id))?;
 
         if !bp.enabled {
             return Ok(());
         }
 
-        let _ = client.remove_breakpoint(bp.address.0);
-
+        Self::uninstall_breakpoint(client, debugger, bp)?;
         bp.enabled = false;
         Ok(())
+    }
+
+    pub fn disable_guest_memory_patch_in_address_space(
+        &mut self,
+        client: &mut dyn DebugBackend,
+        debugger: &DebuggerContext,
+        id: u32,
+        dtb: Dtb,
+    ) -> Result<()> {
+        let bp = self.breakpoints.get_mut(&id).ok_or(Error::BPNotFound(id))?;
+
+        if !bp.enabled {
+            return Ok(());
+        }
+
+        match bp.backend {
+            BreakpointBackend::GuestMemoryPatch { original_byte } => {
+                let memory = AddressSpace::new(&debugger.kvm, dtb);
+                memory.write_bytes(bp.address, &[original_byte])?;
+                client.note_breakpoint_uninstalled(bp.address.0);
+                bp.enabled = false;
+                Ok(())
+            }
+            BreakpointBackend::Kernel => Err(Error::Rsp(
+                "cannot address-space-disable a kernel breakpoint".into(),
+            )),
+        }
     }
 
     pub fn list(&self) -> Vec<&Breakpoint> {
@@ -161,21 +261,25 @@ impl BreakpointManager {
 
     // NOTE refreshing ensures local breakpoint state matches target state in case they were cleared,
     // this should fix single stepping breaking every breakpoint proceeding the step..
-    pub fn refresh_enabled(&self, client: &mut GdbClient) -> Result<()> {
+    pub fn refresh_enabled(
+        &self,
+        client: &mut dyn DebugBackend,
+        debugger: &DebuggerContext,
+    ) -> Result<()> {
         let mut enabled: Vec<_> = self.breakpoints.values().filter(|bp| bp.enabled).collect();
         enabled.sort_by_key(|bp| bp.id);
 
         for bp in enabled {
-            let _ = client.remove_breakpoint(bp.address.0);
-            client.set_breakpoint(bp.address.0)?;
+            let _ = Self::uninstall_breakpoint(client, debugger, bp);
+            Self::install_existing_breakpoint(client, debugger, bp)?;
         }
 
         Ok(())
     }
 
-    pub fn check_breakpoint_hit(&self, rip: u64) -> BreakpointHitResult {
+    pub fn check_breakpoint_hit(&self, rip: u64, cr3: u64) -> BreakpointHitResult {
         for bp in self.breakpoints.values() {
-            if bp.address.0 == rip && bp.enabled {
+            if bp.address.0 == rip && bp.enabled && bp.scope.matches_cr3(cr3) {
                 return BreakpointHitResult::Hit(bp.clone());
             }
         }
@@ -183,11 +287,91 @@ impl BreakpointManager {
         BreakpointHitResult::NotBreakpoint
     }
 
-    pub fn breakpoint_at_execution_point(&self, rip: u64) -> Option<u32> {
+    /// Find a BP at `rip` regardless of its scope; "is this int3 owned by us?"
+    pub fn breakpoint_id_at_address(&self, rip: u64) -> Option<u32> {
         self.breakpoints
             .values()
             .find(|bp| bp.enabled && bp.address.0 == rip)
             .map(|bp| bp.id)
+    }
+
+    fn scope_for_current_context(debugger: &DebuggerContext) -> BreakpointScope {
+        match &debugger.current_process_info {
+            Some(ProcessInfo { pid, name, dtb, .. }) => BreakpointScope::Process {
+                pid: *pid,
+                dtb: *dtb,
+                name: name.clone(),
+            },
+            None => BreakpointScope::Kernel,
+        }
+    }
+
+    fn install_breakpoint(
+        client: &mut dyn DebugBackend,
+        debugger: &DebuggerContext,
+        address: VirtAddr,
+        scope: &BreakpointScope,
+    ) -> Result<BreakpointBackend> {
+        match scope {
+            BreakpointScope::Kernel => {
+                client.set_breakpoint(address.0)?;
+                Ok(BreakpointBackend::Kernel)
+            }
+            BreakpointScope::Process { dtb, .. } => {
+                let memory = AddressSpace::new(&debugger.kvm, *dtb);
+                let mut original = [0u8; 1];
+                memory.read_bytes(address, &mut original)?;
+                memory.write_bytes(address, &[0xcc])?;
+                // The kernel doesn't know about this BP (we patched it
+                // directly via /dev/kvm), so the backend needs to be told
+                // separately for managed-BP bookkeeping at stop time.
+                client.note_breakpoint_installed(address.0);
+                Ok(BreakpointBackend::GuestMemoryPatch {
+                    original_byte: original[0],
+                })
+            }
+        }
+    }
+
+    fn install_existing_breakpoint(
+        client: &mut dyn DebugBackend,
+        debugger: &DebuggerContext,
+        bp: &Breakpoint,
+    ) -> Result<()> {
+        match (&bp.scope, &bp.backend) {
+            (BreakpointScope::Kernel, BreakpointBackend::Kernel) => {
+                client.set_breakpoint(bp.address.0)
+            }
+            (BreakpointScope::Process { dtb, .. }, BreakpointBackend::GuestMemoryPatch { .. }) => {
+                let memory = AddressSpace::new(&debugger.kvm, *dtb);
+                memory.write_bytes(bp.address, &[0xcc])?;
+                client.note_breakpoint_installed(bp.address.0);
+                Ok(())
+            }
+            _ => Err(Error::Rsp("breakpoint backend/scope mismatch".into())),
+        }
+    }
+
+    fn uninstall_breakpoint(
+        client: &mut dyn DebugBackend,
+        debugger: &DebuggerContext,
+        bp: &Breakpoint,
+    ) -> Result<()> {
+        match (&bp.scope, &bp.backend) {
+            (BreakpointScope::Kernel, BreakpointBackend::Kernel) => {
+                client.remove_breakpoint(bp.address.0)
+            }
+            (
+                BreakpointScope::Process { dtb, .. },
+                BreakpointBackend::GuestMemoryPatch { original_byte },
+            ) => {
+                let memory = AddressSpace::new(&debugger.kvm, *dtb);
+                memory.write_bytes(bp.address, &[*original_byte])?;
+                client.note_breakpoint_uninstalled(bp.address.0);
+                Ok(())
+            }
+            _ => Err(Error::Rsp("breakpoint backend/scope mismatch".into())),
+        }
     }
 
     fn validate_breakpoint_target(debugger: &DebuggerContext, address: VirtAddr) -> Result<()> {
@@ -253,13 +437,19 @@ pub enum BreakpointHitResult {
 }
 
 impl RegisterMap {
-    // pub fn get(&self, name: &str) -> Option<&RegisterInfo> {
-    //     self.by_name.get(name)
-    // }
-
-    // pub fn get_range(&self, name: &str) -> Option<std::ops::Range<usize>> {
-    //     self.by_name.get(name).map(|r| r.offset..r.offset + r.size)
-    // }
+    /// Construct a `RegisterMap` from an explicit list of registers. Each
+    /// register's `offset`/`size` is interpreted as an index into whatever
+    /// byte buffer the backend hands back from `read_registers`. Used by
+    /// backends (like KD) that build their register layout from a fixed
+    /// struct rather than parsing a target description.
+    pub fn from_registers(registers: Vec<RegisterInfo>) -> Self {
+        let mut map = RegisterMap::default();
+        for reg in registers {
+            map.by_name.insert(reg.name.clone(), reg.clone());
+            map.ordered.push(reg);
+        }
+        map
+    }
 
     pub fn read_u64<S>(&self, name: S, data: &[u8]) -> Result<u64>
     where
@@ -419,7 +609,8 @@ pub struct GdbClient {
     features: StubFeatures,
     rx_state: PacketReadState,
     no_ack_mode: bool,
-    pub is_running: bool,
+    register_map: RegisterMap,
+    is_running: bool,
 }
 
 impl GdbClient {
@@ -431,6 +622,7 @@ impl GdbClient {
             features: StubFeatures::default(),
             rx_state: PacketReadState::default(),
             no_ack_mode: false,
+            register_map: RegisterMap::default(),
             is_running: false, // NOTE if the user toys with VM via GUI, this value goes bad
         };
 
@@ -445,6 +637,8 @@ impl GdbClient {
         }
 
         let _ = client.send_packet("?")?;
+
+        client.register_map = client.fetch_register_map()?;
 
         Ok(client)
     }
@@ -659,7 +853,7 @@ impl GdbClient {
         Ok(decoded)
     }
 
-    pub fn set_breakpoint(&mut self, addr: u64) -> Result<()> {
+    fn set_breakpoint(&mut self, addr: u64) -> Result<()> {
         let response = self.send_packet(&format!("Z0,{:x},1", addr))?;
         if response == "OK" {
             Ok(())
@@ -673,7 +867,7 @@ impl GdbClient {
         }
     }
 
-    pub fn remove_breakpoint(&mut self, addr: u64) -> Result<()> {
+    fn remove_breakpoint(&mut self, addr: u64) -> Result<()> {
         let response = self.send_packet(&format!("z0,{:x},1", addr))?;
         if response == "OK" {
             Ok(())
@@ -687,7 +881,7 @@ impl GdbClient {
         }
     }
 
-    pub fn read_registers(&mut self) -> Result<Vec<u8>> {
+    fn read_registers(&mut self) -> Result<Vec<u8>> {
         let response = self.send_packet("g")?;
 
         if response.starts_with('E') {
@@ -702,7 +896,7 @@ impl GdbClient {
     }
 
     #[allow(dead_code)]
-    pub fn write_registers(&mut self, data: &[u8]) -> Result<()> {
+    fn write_registers(&mut self, data: &[u8]) -> Result<()> {
         let hex_data: String = data.iter().map(|b| format!("{:02x}", b)).collect();
 
         let response = self.send_packet(&format!("G{}", hex_data))?;
@@ -722,7 +916,7 @@ impl GdbClient {
         self.send_raw_command(&packet)
     }
 
-    pub fn continue_execution(&mut self) -> Result<()> {
+    fn continue_execution(&mut self) -> Result<()> {
         // set continue thread to -1 (all threads)
         let _ = self.send_packet("Hc-1")?;
         self.send_command_no_reply("c")?;
@@ -737,7 +931,7 @@ impl GdbClient {
         Ok(())
     }
 
-    pub fn step(&mut self) -> Result<()> {
+    fn step(&mut self) -> Result<()> {
         self.send_command_no_reply("s")?;
         self.is_running = true;
         Ok(())
@@ -756,7 +950,7 @@ impl GdbClient {
         self.wait_for_stop()
     }
 
-    pub fn wait_for_stop(&mut self) -> Result<String> {
+    fn wait_for_stop(&mut self) -> Result<String> {
         if !self.is_running {
             return self.query_halt_reason();
         }
@@ -766,12 +960,7 @@ impl GdbClient {
         Ok(response)
     }
 
-    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<()> {
-        self.stream.set_read_timeout(timeout)?;
-        Ok(())
-    }
-
-    pub fn try_wait_for_stop(&mut self) -> Result<Option<String>> {
+    fn try_wait_for_stop(&mut self) -> Result<Option<String>> {
         if !self.is_running {
             return Ok(Some(self.query_halt_reason()?));
         }
@@ -817,7 +1006,7 @@ impl GdbClient {
         }
     }
 
-    pub fn interrupt(&mut self) -> Result<()> {
+    fn interrupt(&mut self) -> Result<()> {
         if !self.is_running {
             return Ok(());
         }
@@ -832,7 +1021,7 @@ impl GdbClient {
         Ok(())
     }
 
-    pub fn get_thread_list(&mut self) -> Result<Vec<String>> {
+    fn get_thread_list(&mut self) -> Result<Vec<String>> {
         let mut threads = Vec::new();
         let mut response = self.send_packet("qfThreadInfo")?;
 
@@ -865,7 +1054,7 @@ impl GdbClient {
         Ok(threads)
     }
 
-    pub fn set_current_thread(&mut self, thread_id: &str) -> Result<()> {
+    fn set_current_thread(&mut self, thread_id: &str) -> Result<()> {
         let resp_g = self.send_packet(&format!("Hg{}", thread_id))?;
         if resp_g != "OK" {
             return Err(Error::Rsp(format!(
@@ -885,7 +1074,7 @@ impl GdbClient {
         Ok(())
     }
 
-    pub fn get_stopped_thread_id(&mut self) -> Result<String> {
+    fn get_stopped_thread_id(&mut self) -> Result<String> {
         let response = self.send_packet("?")?;
         if let Some(thread_id) = Self::parse_stop_reply_thread_id(&response) {
             return Ok(thread_id);
@@ -901,7 +1090,7 @@ impl GdbClient {
         ))
     }
 
-    pub fn parse_stop_reply_thread_id(response: &str) -> Option<String> {
+    fn parse_stop_reply_thread_id(response: &str) -> Option<String> {
         if !response.starts_with('T') {
             return None;
         }
@@ -912,7 +1101,7 @@ impl GdbClient {
         Some(remainder[..end].to_string())
     }
 
-    pub fn get_register_map(&mut self) -> Result<RegisterMap> {
+    fn fetch_register_map(&mut self) -> Result<RegisterMap> {
         if !self.features.qxfer_features_read {
             return Err(Error::NotSupported);
         }
@@ -1006,10 +1195,78 @@ impl GdbClient {
     }
 }
 
+impl DebugBackend for GdbClient {
+    fn register_map(&self) -> &RegisterMap {
+        &self.register_map
+    }
+
+    fn read_registers(&mut self) -> Result<Vec<u8>> {
+        GdbClient::read_registers(self)
+    }
+
+    fn write_registers(&mut self, data: &[u8]) -> Result<()> {
+        GdbClient::write_registers(self, data)
+    }
+
+    fn set_breakpoint(&mut self, addr: u64) -> Result<()> {
+        GdbClient::set_breakpoint(self, addr)
+    }
+
+    fn remove_breakpoint(&mut self, addr: u64) -> Result<()> {
+        GdbClient::remove_breakpoint(self, addr)
+    }
+
+    fn continue_execution(&mut self) -> Result<()> {
+        GdbClient::continue_execution(self)
+    }
+
+    fn step(&mut self) -> Result<()> {
+        GdbClient::step(self)
+    }
+
+    fn interrupt(&mut self) -> Result<()> {
+        GdbClient::interrupt(self)
+    }
+
+    fn wait_for_stop(&mut self) -> Result<StopEvent> {
+        let response = GdbClient::wait_for_stop(self)?;
+        Ok(StopEvent {
+            thread_id: Self::parse_stop_reply_thread_id(&response),
+        })
+    }
+
+    fn try_wait_for_stop(&mut self, timeout: Duration) -> Result<Option<StopEvent>> {
+        self.stream.set_read_timeout(Some(timeout))?;
+        let result = GdbClient::try_wait_for_stop(self);
+        // restore blocking mode regardless of outcome
+        let _ = self.stream.set_read_timeout(None);
+        Ok(result?.map(|response| StopEvent {
+            thread_id: Self::parse_stop_reply_thread_id(&response),
+        }))
+    }
+
+    fn get_thread_list(&mut self) -> Result<Vec<String>> {
+        GdbClient::get_thread_list(self)
+    }
+
+    fn set_current_thread(&mut self, thread_id: &str) -> Result<()> {
+        GdbClient::set_current_thread(self, thread_id)
+    }
+
+    fn get_stopped_thread_id(&mut self) -> Result<String> {
+        GdbClient::get_stopped_thread_id(self)
+    }
+
+    fn is_running(&self) -> bool {
+        self.is_running
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Breakpoint, BreakpointHitResult, BreakpointManager, GdbClient, RegisterMap, StubFeatures,
+        Breakpoint, BreakpointBackend, BreakpointHitResult, BreakpointManager, BreakpointScope,
+        GdbClient, RegisterMap, StubFeatures,
     };
     use crate::types::VirtAddr;
 
@@ -1079,12 +1336,53 @@ mod tests {
                 address: VirtAddr(0x1000),
                 enabled: true,
                 symbol: None,
+                scope: BreakpointScope::Kernel,
+                backend: BreakpointBackend::Kernel,
             },
         );
 
-        match manager.check_breakpoint_hit(0x1000) {
+        match manager.check_breakpoint_hit(0x1000, 0) {
             BreakpointHitResult::Hit(bp) => assert_eq!(bp.id, 0),
             other => panic!("unexpected result: {:?}", other),
         }
+    }
+
+    #[test]
+    fn process_breakpoint_hit_requires_matching_cr3() {
+        let mut manager = BreakpointManager::new();
+        manager.breakpoints.insert(
+            0,
+            Breakpoint {
+                id: 0,
+                address: VirtAddr(0x7ff7_1234_1000),
+                enabled: true,
+                symbol: None,
+                scope: BreakpointScope::Process {
+                    pid: 42,
+                    dtb: 0x1234_5000,
+                    name: "user.exe".to_string(),
+                },
+                backend: BreakpointBackend::GuestMemoryPatch {
+                    original_byte: 0x90,
+                },
+            },
+        );
+
+        assert!(matches!(
+            manager.check_breakpoint_hit(0x7ff7_1234_1000, 0x1234_5000),
+            BreakpointHitResult::Hit(_)
+        ));
+        assert!(matches!(
+            manager.check_breakpoint_hit(0x7ff7_1234_1000, 0x1234_5fff),
+            BreakpointHitResult::Hit(_)
+        ));
+        assert!(matches!(
+            manager.check_breakpoint_hit(0x7ff7_1234_1000, 0x9999_9000),
+            BreakpointHitResult::NotBreakpoint
+        ));
+        assert!(matches!(
+            manager.check_breakpoint_hit(0x7ff7_1234_1000, 0x1234_4000),
+            BreakpointHitResult::NotBreakpoint
+        ));
     }
 }

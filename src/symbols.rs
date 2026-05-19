@@ -899,8 +899,6 @@ impl SymbolStore {
         dtb: Dtb,
         address: VirtAddr,
     ) -> Option<(String, String, u32)> {
-        use crate::guest::ModuleInfo;
-
         for module in self.modules.iter() {
             if module.dtb != dtb {
                 continue;

@@ -1,7 +1,7 @@
 use crate::backend::MemoryOps;
 use crate::debugger::DebuggerContext;
 use crate::error::{Error, Result};
-use crate::symbols::SymbolStore;
+use crate::symbols::{ParsedType, SymbolStore};
 use crate::types::{Dtb, VirtAddr};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -405,8 +405,7 @@ impl Expr {
         }
     }
 
-    fn get_struct_type_name(type_data: &crate::symbols::ParsedType) -> Option<String> {
-        use crate::symbols::ParsedType;
+    fn get_struct_type_name(type_data: &ParsedType) -> Option<String> {
         match type_data {
             ParsedType::Struct(name) | ParsedType::Union(name) => Some(name.clone()),
             ParsedType::Pointer(inner) => Self::get_struct_type_name(inner),

@@ -37,6 +37,9 @@ pub enum Error {
     #[error("GDB protocol failure: {0}")]
     Rsp(String),
 
+    #[error("KD protocol failure: {0}")]
+    Kd(String),
+
     #[error("Register '{0}' not found")]
     RegisterNotFound(String),
 

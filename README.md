@@ -10,7 +10,8 @@ Windows kernel debugger for Linux hosts running Windows under KVM/QEMU. Essentia
 - WinDbg style commands
 - Kernel debugging
 - PDB fetching & parsing for offsets
-- Breakpointing
+- Breakpointing (kernel, usermode)
+- Two debug backends: QEMU's `gdbstub` (default) and Windows KD over a serial pipe (KDCOM, see [Choosing a backend](#choosing-a-backend))
 
 ### Supported Windows
 
@@ -53,11 +54,20 @@ To view command line arguments, run `ntoseye --help`. The debugger is self docum
 
 For examples, refer [here](#usage-examples).
 
+## Choosing a backend
+
+`ntoseye` can talk to the guest two ways. Pick with `--backend gdb` (default) or `--backend kd`.
+
+| | `gdb` (default) | `kd` |
+|---|---|---|
+| Transport | QEMU's `gdbstub` | Windows KD over a serial pipe (KDCOM) |
+| Requires in-guest configuration | No (guest is unaware it's being debugged) | Yes (`bcdedit /debug on`; anti-debug code, PatchGuard, and some Windows behaviour change once enabled) |
+| Supports usermode breakpoints | No | Yes |
+| Native breakpoints | gdb `Z0` packets | `DbgKdWriteBreakPointApi` |
+
+See [VM configuration](#vm-configuration) for the host-side setup of each backend.
+
 ## VM configuration
-
-`bcdedit /debug on` is not required within the guest.
-
-Many features depend on `gdbstub` being enabled, so its recommended that it is enabled.
 
 It is recommended to disable memory paging and memory compression within the guest operating system to avoid memory-related issues. This only needs to be done once per Windows installation. Run the following commands in PowerShell (Run as Administrator):
 ```
@@ -67,9 +77,13 @@ Disable-MMAgent -MemoryCompression
 Restart-Computer
 ```
 
+### GDBSTUB
+
+Default backend. Expose QEMU's gdbstub on `127.0.0.1:1234` by passing `-s -S`.
+
 #### QEMU
 
-Append `-s -S` to qemu command.
+Append `-s -S` to the qemu command.
 
 #### virt-manager
 
@@ -84,6 +98,52 @@ Add the following to the XML configuration:
 </domain>
 ```
 
+### KDCOM
+
+Run with `--backend kd`. In the guest, enable kernel debugging (run as Administrator, then reboot):
+```
+bcdedit /debug on
+bcdedit /dbgsettings serial debugport:1 baudrate:115200
+```
+Use `debugport:2` instead of `:1` if the KD chardev ends up as COM2 (see the virt-manager subsection below).
+
+#### QEMU
+
+Add a Unix-socket chardev and route a serial port to it:
+```
+-chardev socket,id=kd,path=/tmp/ntoseye-kd.sock,server=on,wait=off -serial chardev:kd
+```
+Then connect: `ntoseye --backend kd`.
+
+#### virt-manager
+
+> [!WARNING]
+> virt-manager auto-adds a `<serial>` console device on every VM, which
+> claims COM1. Either replace that device with one pointing at the KD socket
+> (KD becomes COM1, use `debugport:1`), or leave it and add the KD chardev
+> via `qemu:commandline` (KD becomes COM2, use `debugport:2`).
+
+**Option A (recommended):** replace the auto-added serial. KD is COM1, `debugport:1` is correct.
+```xml
+<serial type="unix">
+  <source mode="bind" path="/tmp/ntoseye-kd.sock"/>
+  <target type="isa-serial" port="0"/>
+</serial>
+```
+
+**Option B:** keep the auto-added serial and append the KD chardev via `qemu:commandline`. KD is COM2, use `debugport:2`.
+```xml
+<domain xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0" type="kvm">
+  ...
+  <qemu:commandline>
+    <qemu:arg value="-chardev"/>
+    <qemu:arg value="socket,id=kd,path=/tmp/ntoseye-kd.sock,server=on,wait=off"/>
+    <qemu:arg value="-serial"/>
+    <qemu:arg value="chardev:kd"/>
+  </qemu:commandline>
+</domain>
+```
+
 ## Credits
 
 Functionality regarding initialization of guest information was written with the help of the following sources:
@@ -91,6 +151,7 @@ Functionality regarding initialization of guest information was written with the
 - [vmread](https://github.com/h33p/vmread)
 - [pcileech](https://github.com/ufrisk/pcileech)
 - [MemProcFS](https://github.com/ufrisk/MemProcFS)
+- [ReactOS](https://github.com/reactos/reactos)
 
 ## Usage examples
 

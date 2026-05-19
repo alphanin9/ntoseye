@@ -1,23 +1,44 @@
-use argh::FromArgs;
+use argh::{FromArgValue, FromArgs};
 use single_instance::SingleInstance;
 
 use crate::{
+    dbg_backend::DebugBackend,
     error::{Error, Result},
+    gdb::GdbClient,
+    kd::KdBackend,
     repl::start_repl,
 };
 
 mod backend;
+mod dbg_backend;
 mod debugger;
 mod error;
 mod expr;
 mod gdb;
 mod guest;
 mod host;
+mod kd;
 mod memory;
 mod repl;
 mod symbols;
 mod types;
 mod unwind;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackendKind {
+    Gdb,
+    Kd,
+}
+
+impl FromArgValue for BackendKind {
+    fn from_arg_value(value: &str) -> std::result::Result<Self, String> {
+        match value {
+            "gdb" => Ok(BackendKind::Gdb),
+            "kd" => Ok(BackendKind::Kd),
+            other => Err(format!("unknown backend '{other}': expected 'gdb' or 'kd'")),
+        }
+    }
+}
 
 #[derive(FromArgs)]
 /// Windows kernel debugger for Linux hosts running Windows under KVM/QEMU
@@ -33,6 +54,18 @@ struct Args {
     /// help instructions with enabling gdbstub in qemu
     #[argh(switch, long = "gdbstub-instructions")]
     gdbstub_instructions: bool,
+
+    /// help instructions with enabling kd-over-serial in qemu/windows
+    #[argh(switch, long = "kd-instructions")]
+    kd_instructions: bool,
+
+    /// debugger backend: 'gdb' (QEMU gdbstub, default) or 'kd' (Windows KD over serial pipe)
+    #[argh(option, short = 'b', long = "backend", default = "BackendKind::Gdb")]
+    backend: BackendKind,
+
+    /// backend connection target. Defaults: '127.0.0.1:1234' for gdb, '/tmp/ntoseye-kd.sock' for kd.
+    #[argh(option, long = "connect")]
+    connect: Option<String>,
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -60,6 +93,60 @@ there, you must edit & add the following:
   </qemu:commandline>
 </domain>";
 
+static KD_INSTRUCTIONS: &str = "The KD backend speaks the same wire protocol WinDbg uses, over a
+serial pipe between QEMU and ntoseye. It requires Windows to be
+booted in debug mode (which removes the 'stealth' property of the
+gdb backend: anti-debug code, PatchGuard, and even some Windows
+behaviors change when /debug is on).
+
+GUEST: enable kernel debugging over a serial port (run as
+Administrator, then reboot):
+
+bcdedit /debug on
+bcdedit /dbgsettings serial debugport:1 baudrate:115200
+
+If your hypervisor wires the KD serial as COM2 (see the libvirt
+note below), use 'debugport:2' instead.
+
+QEMU (commandline): route COM1 to a host-side Unix socket. The
+path here matches ntoseye's default; adjust both sides if you pick
+a different one:
+
+-chardev socket,id=kd,path=/tmp/ntoseye-kd.sock,server=on,wait=off -serial chardev:kd
+
+QEMU via virt-manager / libvirt: virt-manager auto-adds a <serial>
+console device on every VM, and it claims COM1. Either replace or
+remove that device so the KD chardev becomes COM1 (recommended), or
+leave it in place and the KD chardev will be COM2 (use 'debugport:2'
+in bcdedit instead of 'debugport:1').
+
+OPTION A (recommended): replace the auto-added <serial> with one
+that points at our Unix socket. KD is COM1, 'debugport:1' is correct.
+
+<serial type=\"unix\">
+  <source mode=\"bind\" path=\"/tmp/ntoseye-kd.sock\"/>
+  <target type=\"isa-serial\" port=\"0\"/>
+</serial>
+
+OPTION B: leave the auto-added serial alone and append the KD
+chardev via qemu:commandline. KD ends up as COM2, so use
+'debugport:2' in bcdedit.
+
+<domain xmlns:qemu=\"http://libvirt.org/schemas/domain/qemu/1.0\" type=\"kvm\">
+  ...
+  <qemu:commandline>
+    <qemu:arg value=\"-chardev\"/>
+    <qemu:arg value=\"socket,id=kd,path=/tmp/ntoseye-kd.sock,server=on,wait=off\"/>
+    <qemu:arg value=\"-serial\"/>
+    <qemu:arg value=\"chardev:kd\"/>
+  </qemu:commandline>
+</domain>
+
+Once the guest is booting (or already booted and waiting for the
+debugger), run:
+
+ntoseye --backend kd --connect /tmp/ntoseye-kd.sock";
+
 fn main() -> Result<()> {
     let args: Args = argh::from_env();
     if args.version {
@@ -69,6 +156,11 @@ fn main() -> Result<()> {
 
     if args.gdbstub_instructions {
         println!("{}", GDBSTUB_INSTRUCTIONS);
+        return Ok(());
+    }
+
+    if args.kd_instructions {
+        println!("{}", KD_INSTRUCTIONS);
         return Ok(());
     }
 
@@ -83,7 +175,18 @@ fn main() -> Result<()> {
 
     let mut debugger = debugger::DebuggerContext::new()?;
 
-    start_repl(&mut debugger)
+    let mut backend: Box<dyn DebugBackend> = match args.backend {
+        BackendKind::Gdb => {
+            let addr = args.connect.as_deref().unwrap_or("127.0.0.1:1234");
+            Box::new(GdbClient::connect(addr)?)
+        }
+        BackendKind::Kd => {
+            let path = args.connect.as_deref().unwrap_or("/tmp/ntoseye-kd.sock");
+            Box::new(KdBackend::connect(path)?)
+        }
+    };
+
+    start_repl(&mut debugger, backend.as_mut())
 }
 
 // #[cfg(test)]

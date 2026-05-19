@@ -7,8 +7,8 @@ use crate::{
     error::{Error, Result},
     guest::{Guest, ModuleSymbolLoadReport, ProcessInfo, WinObject},
     host::KvmHandle,
-    symbols::SymbolStore,
-    types::{PageTableEntry, Value, VirtAddr},
+    symbols::{SymbolIndex, SymbolStore},
+    types::{Dtb, PageTableEntry, Value, VirtAddr},
 };
 
 pub struct DebuggerContext {
@@ -104,18 +104,18 @@ impl DebuggerContext {
         self.current_process_info = None;
     }
 
-    pub fn current_dtb(&self) -> crate::types::Dtb {
+    pub fn current_dtb(&self) -> Dtb {
         match &self.current_process {
             Some(p) => p.dtb(),
             None => self.guest.ntoskrnl.dtb(),
         }
     }
 
-    pub fn current_symbol_index(&self) -> crate::symbols::SymbolIndex {
+    pub fn current_symbol_index(&self) -> SymbolIndex {
         self.symbols.merged_symbol_index(Some(self.current_dtb()))
     }
 
-    pub fn current_types_index(&self) -> crate::symbols::SymbolIndex {
+    pub fn current_types_index(&self) -> SymbolIndex {
         self.symbols.merged_types_index(Some(self.current_dtb()))
     }
 

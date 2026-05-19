@@ -4,8 +4,8 @@ use crate::{
     host::KvmHandle,
     memory::{self, AddressSpace, PAGE_SIZE},
     symbols::{
-        ModuleSymbolDiscovery, ModuleSymbolLoad, ModuleSymbolSource, ModuleSymbolStatus,
-        SymbolStore, TypeInfo,
+        DownloadJob, ModuleSymbolDiscovery, ModuleSymbolLoad, ModuleSymbolSource,
+        ModuleSymbolStatus, SymbolStore, TypeInfo, download_jobs_parallel,
     },
     types::*,
 };
@@ -826,8 +826,6 @@ impl Guest {
         dtb: Dtb,
         skip_session_space: bool,
     ) -> Result<ModuleSymbolLoadReport> {
-        use crate::symbols::{DownloadJob, SymbolStore, download_jobs_parallel};
-
         let mut report = ModuleSymbolLoadReport::new(modules.len());
         let mut jobs_with_info: Vec<ModuleSymbolLoad> = Vec::new();
         let mut image_jobs: Vec<(DownloadJob, ModuleInfo)> = Vec::new();
