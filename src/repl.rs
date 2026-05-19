@@ -2733,9 +2733,18 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
         }
     }
 
-    if !client.is_running() {
-        let _ = client.continue_execution();
+    if client.is_running() {
+        let _ = client.interrupt();
     }
+
+    let bp_ids: Vec<u32> = breakpoints.list().iter().map(|bp| bp.id).collect();
+    for id in bp_ids {
+        if let Err(e) = breakpoints.remove(&mut *client, debugger, id) {
+            error!("failed to uninstall breakpoint #{} on exit: {}", id, e);
+        }
+    }
+
+    let _ = client.continue_execution();
 
     Ok(())
 }
