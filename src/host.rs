@@ -117,14 +117,38 @@ fn gpa2hva(x: PhysAddr) -> u64 {
     x - 0x80000000
 }
 
+fn read_ptrace_scope() -> String {
+    fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn probe_ptrace_access(pid: Pid, addr: u64) -> Result<()> {
+    let mut probe = [0u8; 1];
+    let remote_iov = RemoteIoVec {
+        base: addr as usize,
+        len: 1,
+    };
+    match process_vm_readv(pid, &mut [IoSliceMut::new(&mut probe)], &[remote_iov]) {
+        Err(nix::Error::EPERM) => Err(Error::PtraceDenied {
+            pid: pid.as_raw(),
+            scope: read_ptrace_scope(),
+        }),
+        _ => Ok(()),
+    }
+}
+
 impl KvmHandle {
     pub fn new() -> Result<Self> {
         let pid = get_kvm_pid()?;
         let memory = get_kvm_primary_memory(pid)?;
+        let nix_pid = Pid::from_raw(pid);
+
+        probe_ptrace_access(nix_pid, memory.start)?;
 
         Ok(Self {
             memory,
-            pid: Pid::from_raw(pid),
+            pid: nix_pid,
         })
     }
 }

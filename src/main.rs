@@ -194,7 +194,14 @@ debugger), run:
 
 ntoseye --backend kd --connect /tmp/ntoseye-kd.sock";
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     let args: Args = argh::from_env();
     if args.version {
         println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
