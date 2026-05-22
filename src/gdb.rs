@@ -916,6 +916,38 @@ impl GdbClient {
         self.send_raw_command(&packet)
     }
 
+    fn monitor_command(&mut self, command: &str) -> Result<String> {
+        let encoded_command = hex::encode(command.as_bytes());
+        let packet = Self::encode_packet(&format!("qRcmd,{}", encoded_command));
+        self.send_raw_command(&packet)?;
+
+        let mut output = String::new();
+        loop {
+            let response = self.read_response_packet()?;
+            if response == "OK" {
+                return Ok(output);
+            }
+            if response.is_empty() {
+                return Err(Error::NotSupported);
+            }
+            if let Some(hex_output) = response.strip_prefix('O') {
+                let bytes = hex::decode(hex_output)?;
+                output.push_str(&String::from_utf8_lossy(&bytes));
+                continue;
+            }
+            if response.starts_with('E') {
+                return Err(Error::Rsp(format!(
+                    "monitor command failed for '{}': {}",
+                    command, response
+                )));
+            }
+            return Err(Error::Rsp(format!(
+                "unexpected qRcmd response for '{}': {}",
+                command, response
+            )));
+        }
+    }
+
     fn continue_execution(&mut self) -> Result<()> {
         // set continue thread to -1 (all threads)
         let _ = self.send_packet("Hc-1")?;
@@ -1004,6 +1036,37 @@ impl GdbClient {
                 }
             }
         }
+    }
+
+    fn stop_reply_summary(response: &str) -> Option<String> {
+        let first = response.as_bytes().first().copied()?;
+        match first {
+            b'W' => Some(format!(
+                "gdbstub target exited with status 0x{}",
+                response.get(1..).unwrap_or("")
+            )),
+            b'X' => Some(format!(
+                "gdbstub target terminated with signal 0x{}",
+                response.get(1..).unwrap_or("")
+            )),
+            b'N' => Some("gdbstub reports no resumed threads".to_string()),
+            b'S' => Some(format!(
+                "gdbstub stop signal 0x{}",
+                response.get(1..).unwrap_or("")
+            )),
+            b'T' => {
+                let signal = response.get(1..3).unwrap_or("");
+                Some(format!("gdbstub stop signal 0x{signal}"))
+            }
+            _ => None,
+        }
+    }
+
+    fn stop_reply_is_terminal(response: &str) -> bool {
+        matches!(
+            response.as_bytes().first().copied(),
+            Some(b'W' | b'X' | b'N')
+        )
     }
 
     fn interrupt(&mut self) -> Result<()> {
@@ -1232,6 +1295,8 @@ impl DebugBackend for GdbClient {
         let response = GdbClient::wait_for_stop(self)?;
         Ok(StopEvent {
             thread_id: Self::parse_stop_reply_thread_id(&response),
+            summary: Self::stop_reply_summary(&response),
+            target_exited: Self::stop_reply_is_terminal(&response),
         })
     }
 
@@ -1242,6 +1307,8 @@ impl DebugBackend for GdbClient {
         let _ = self.stream.set_read_timeout(None);
         Ok(result?.map(|response| StopEvent {
             thread_id: Self::parse_stop_reply_thread_id(&response),
+            summary: Self::stop_reply_summary(&response),
+            target_exited: Self::stop_reply_is_terminal(&response),
         }))
     }
 
@@ -1255,6 +1322,10 @@ impl DebugBackend for GdbClient {
 
     fn get_stopped_thread_id(&mut self) -> Result<String> {
         GdbClient::get_stopped_thread_id(self)
+    }
+
+    fn monitor_command(&mut self, command: &str) -> Result<String> {
+        GdbClient::monitor_command(self, command)
     }
 
     fn is_running(&self) -> bool {

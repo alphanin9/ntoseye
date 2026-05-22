@@ -78,6 +78,15 @@ following arguments to QEMU:
 
 -s -S
 
+For crash/reset logging while developing low-level code, add QEMU
+logging and prevent immediate reboot:
+
+-d int,cpu_reset,guest_errors -D /tmp/qemu-ntoseye.log -no-reboot
+
+Inside ntoseye, the same log masks can be enabled after connection with:
+
+qlog int,cpu_reset,guest_errors /tmp/qemu-ntoseye.log
+
 If you are running QEMU via commandline, simply append them
 to your existing command.
 
