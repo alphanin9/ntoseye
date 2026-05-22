@@ -27,12 +27,12 @@ macro_rules! kd_trace_bytes {
     };
 }
 
-pub(crate) fn trace_enabled() -> bool {
+pub fn trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("NTOSEYE_KD_TRACE").is_some())
 }
 
-pub(crate) fn trace_bytes_enabled() -> bool {
+pub fn trace_bytes_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("NTOSEYE_KD_TRACE_BYTES").is_some())
 }
@@ -113,7 +113,7 @@ fn parse_state_change(payload: &[u8]) -> Result<StateChange> {
 struct DebugPrint<'a> {
     text: &'a [u8],
 }
-pub(crate) fn print_debug_io(payload: &[u8]) {
+pub fn print_debug_io(payload: &[u8]) {
     if let Some(print) = parse_debug_io_print(payload) {
         let _ = std::io::stderr().write_all(print.text);
     }
@@ -648,7 +648,7 @@ impl DebugBackend for KdBackend {
             && Some(stop.program_counter) == self.known_spurious_rip
             && !self.managed_bp_addresses.contains(&stop.program_counter);
         kd_trace!(
-            "kd: try_wait: stop rip={:#x} exc={:#x} known_spurious={:?} in_managed={} → spurious={}",
+            "kd: try_wait: stop rip={:#x} exc={:#x} known_spurious={:?} in_managed={} -> spurious={}",
             stop.program_counter,
             stop.exception_code,
             self.known_spurious_rip,

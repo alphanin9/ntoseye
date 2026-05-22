@@ -479,6 +479,11 @@ impl Guest {
             .ntoskrnl
             .symbol(symbols, "PsInitialSystemProcess")?
             .read(kvm)?;
+        let ps_active_process_head = self
+            .ntoskrnl
+            .symbol(symbols, "PsActiveProcessHead")
+            .ok()
+            .map(|s| s.address());
 
         let mut processes = Vec::new();
         let mut visited = std::collections::HashSet::new();
@@ -533,7 +538,7 @@ impl Guest {
             });
 
             let flink = memory.read::<VirtAddr>(current_eprocess + active_process_links_offset)?;
-            if flink.0 == 0 {
+            if flink.0 == 0 || Some(flink) == ps_active_process_head {
                 break;
             }
 
