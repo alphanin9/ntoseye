@@ -59,7 +59,7 @@ fn guid_to_u128(guid: GUID) -> u128 {
     u128::from_be_bytes(bytes)
 }
 
-fn get_cache_root() -> Option<PathBuf> {
+pub fn get_cache_root() -> Option<PathBuf> {
     let config_dir = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| {
@@ -952,6 +952,13 @@ impl SymbolStore {
         None
     }
 
+    pub fn find_module_for_address(&self, dtb: Dtb, address: VirtAddr) -> Option<LoadedModule> {
+        self.modules
+            .iter()
+            .find(|module| module.dtb == dtb && module.contains_address(address))
+            .map(|module| module.clone())
+    }
+
     fn build_index(&self, guid: u128) -> Option<()> {
         let pdb = self.pdbs.get_mut(&guid)?;
         let mut pdb_lock = pdb.lock();
@@ -1096,41 +1103,47 @@ impl SymbolStore {
     ) -> pdb2::Result<u64> {
         let item = finder.find(index)?;
         match item.parse()? {
-            pdb2::TypeData::Primitive(data) => match data.kind {
-                pdb2::PrimitiveKind::Void => Ok(0),
+            pdb2::TypeData::Primitive(data) => {
+                if data.indirection.is_some() {
+                    return Ok(ptr_size);
+                }
 
-                pdb2::PrimitiveKind::Char
-                | pdb2::PrimitiveKind::RChar
-                | pdb2::PrimitiveKind::UChar
-                | pdb2::PrimitiveKind::I8
-                | pdb2::PrimitiveKind::U8
-                | pdb2::PrimitiveKind::Bool8 => Ok(1),
+                match data.kind {
+                    pdb2::PrimitiveKind::Void => Ok(0),
 
-                pdb2::PrimitiveKind::WChar
-                | pdb2::PrimitiveKind::RChar16
-                | pdb2::PrimitiveKind::Short
-                | pdb2::PrimitiveKind::UShort
-                | pdb2::PrimitiveKind::I16
-                | pdb2::PrimitiveKind::U16 => Ok(2),
+                    pdb2::PrimitiveKind::Char
+                    | pdb2::PrimitiveKind::RChar
+                    | pdb2::PrimitiveKind::UChar
+                    | pdb2::PrimitiveKind::I8
+                    | pdb2::PrimitiveKind::U8
+                    | pdb2::PrimitiveKind::Bool8 => Ok(1),
 
-                pdb2::PrimitiveKind::Long
-                | pdb2::PrimitiveKind::ULong
-                | pdb2::PrimitiveKind::I32
-                | pdb2::PrimitiveKind::U32
-                | pdb2::PrimitiveKind::Bool32
-                | pdb2::PrimitiveKind::F32
-                | pdb2::PrimitiveKind::RChar32 => Ok(4),
+                    pdb2::PrimitiveKind::WChar
+                    | pdb2::PrimitiveKind::RChar16
+                    | pdb2::PrimitiveKind::Short
+                    | pdb2::PrimitiveKind::UShort
+                    | pdb2::PrimitiveKind::I16
+                    | pdb2::PrimitiveKind::U16 => Ok(2),
 
-                pdb2::PrimitiveKind::Quad
-                | pdb2::PrimitiveKind::UQuad
-                | pdb2::PrimitiveKind::I64
-                | pdb2::PrimitiveKind::U64
-                | pdb2::PrimitiveKind::F64 => Ok(8),
+                    pdb2::PrimitiveKind::Long
+                    | pdb2::PrimitiveKind::ULong
+                    | pdb2::PrimitiveKind::I32
+                    | pdb2::PrimitiveKind::U32
+                    | pdb2::PrimitiveKind::Bool32
+                    | pdb2::PrimitiveKind::F32
+                    | pdb2::PrimitiveKind::RChar32 => Ok(4),
 
-                pdb2::PrimitiveKind::Octa | pdb2::PrimitiveKind::UOcta => Ok(16),
+                    pdb2::PrimitiveKind::Quad
+                    | pdb2::PrimitiveKind::UQuad
+                    | pdb2::PrimitiveKind::I64
+                    | pdb2::PrimitiveKind::U64
+                    | pdb2::PrimitiveKind::F64 => Ok(8),
 
-                _ => Ok(0),
-            },
+                    pdb2::PrimitiveKind::Octa | pdb2::PrimitiveKind::UOcta => Ok(16),
+
+                    _ => Ok(0),
+                }
+            }
             pdb2::TypeData::Class(data) => Ok(data.size), // NOTE this might (probably will) return 0
             pdb2::TypeData::Union(data) => Ok(data.size), // FIXME possibly? ^^
             pdb2::TypeData::Pointer(_) => Ok(ptr_size),
@@ -1182,9 +1195,12 @@ impl SymbolStore {
                     PrimitiveKind::Bool8 | PrimitiveKind::Bool32 => "bool",
                     _ => "__unknown_t",
                 };
-                Ok(ParsedType::Primitive(
-                    name.to_string() + data.indirection.map_or("", |_| "*"),
-                ))
+                let primitive = ParsedType::Primitive(name.to_string());
+                if data.indirection.is_some() {
+                    Ok(ParsedType::Pointer(Box::new(primitive)))
+                } else {
+                    Ok(primitive)
+                }
             }
 
             TypeData::Class(data) => Ok(ParsedType::Struct(data.name.to_string().into_owned())),

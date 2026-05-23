@@ -86,7 +86,7 @@ impl Expr {
         if input.starts_with('(') {
             let (inner, rest) = Self::split_parens(input)?;
 
-            // try as cast: (TYPE)expr — must have a valid type name and something after
+            // try as cast: (TYPE)expr, must have a valid type name and something after
             if !rest.is_empty() && Self::is_type_name(inner) {
                 let expr_type = Self::parse_type(inner)?;
                 let (base_expr, suffix) = Self::parse_base_with_suffix(rest)?;
@@ -357,7 +357,7 @@ impl Expr {
     }
 
     /// determine the element size in bytes for array indexing
-    /// uses type info from casts (e.g. `(dword*)addr[3]` → 4 bytes per element)
+    /// uses type info from casts (e.g. `(dword*)addr[3]` -> 4 bytes per element)
     /// falls back to 1 if no type info is available
     fn resolve_element_size(expr: &Expr, context: &DebuggerContext) -> u64 {
         match expr {

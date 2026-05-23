@@ -91,7 +91,7 @@ impl<T> KdFraming<T> {
 
     /// Test-only transport accessor
     #[cfg(test)]
-    pub(crate) fn transport_ref(&self) -> &T {
+    pub fn transport_ref(&self) -> &T {
         &self.transport
     }
 }

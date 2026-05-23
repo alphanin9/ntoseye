@@ -49,6 +49,7 @@ pub struct StackFrame {
     pub ip: u64,
     pub symbol: String,
     pub source: FrameSource,
+    pub trap_frame: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -62,6 +63,25 @@ struct RegisterContext {
     rip: u64,
     rsp: u64,
     regs: [Option<u64>; 16],
+    last_trap_frame: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TrapFrameLayout {
+    rip_offset: u64,
+    error_code_offset: Option<u64>,
+}
+
+impl TrapFrameLayout {
+    fn base_from_machine_frame(&self, machine_frame: u64, has_error_code: bool) -> Option<u64> {
+        let offset = if has_error_code {
+            self.error_code_offset
+                .unwrap_or(self.rip_offset.saturating_sub(8))
+        } else {
+            self.rip_offset
+        };
+        machine_frame.checked_sub(offset)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +119,7 @@ struct StackTracer<'a> {
     kvm: &'a KvmHandle,
     memory: AddressSpace<'a, KvmHandle>,
     modules: HashMap<(Dtb, u64), CachedModule>,
+    trap_frame_layout: Option<TrapFrameLayout>,
 }
 
 pub fn resolve_thread_trace_context(debugger: &DebuggerContext, cr3: u64) -> ThreadTraceContext {
@@ -214,6 +235,7 @@ pub fn build_stacktrace(
             ip: rip,
             symbol: format_symbol(debugger, &trace, rip),
             source: FrameSource::Current,
+            trap_frame: None,
         },
     );
 
@@ -229,6 +251,13 @@ pub fn build_stacktrace(
             break;
         }
 
+        if let Some(trap_frame) = context.take_last_trap_frame()
+            && let Some(frame) = stacktrace.frames.last_mut()
+            && frame.ip == previous_rip
+        {
+            frame.trap_frame = Some(trap_frame);
+        }
+
         if context.rip == 0 || context.rip == previous_rip || context.rsp <= previous_rsp {
             break;
         }
@@ -242,6 +271,7 @@ pub fn build_stacktrace(
                 ip: context.rip,
                 symbol: format_symbol(debugger, &trace, context.rip),
                 source: FrameSource::Unwind,
+                trap_frame: None,
             },
         );
     }
@@ -255,6 +285,7 @@ pub fn build_stacktrace(
                 ip,
                 symbol: format_symbol(debugger, &trace, ip),
                 source: FrameSource::Scan,
+                trap_frame: None,
             },
         );
     }
@@ -290,6 +321,7 @@ impl RegisterContext {
             rip: register_map.read_u64("rip", regs).unwrap_or(0),
             rsp: register_map.read_u64("rsp", regs).unwrap_or(0),
             regs: register_values,
+            last_trap_frame: None,
         }
     }
 
@@ -308,6 +340,10 @@ impl RegisterContext {
         if let Some(slot) = self.regs.get_mut(register as usize) {
             *slot = Some(value);
         }
+    }
+
+    fn take_last_trap_frame(&mut self) -> Option<u64> {
+        self.last_trap_frame.take()
     }
 }
 
@@ -336,11 +372,27 @@ impl ThreadTraceContext {
 
 impl<'a> StackTracer<'a> {
     fn new(debugger: &'a DebuggerContext, trace: &'a ThreadTraceContext) -> Self {
+        let trap_frame_layout = debugger
+            .symbols
+            .find_type_across_modules(trace.kernel_dtb, "_KTRAP_FRAME")
+            .and_then(|ty| {
+                let rip_offset = u64::from(ty.fields.get("Rip")?.offset);
+                let error_code_offset = ty
+                    .fields
+                    .get("ErrorCode")
+                    .map(|field| u64::from(field.offset));
+                Some(TrapFrameLayout {
+                    rip_offset,
+                    error_code_offset,
+                })
+            });
+
         Self {
             trace,
             kvm: &debugger.kvm,
             memory: AddressSpace::new(&debugger.kvm, trace.active_dtb),
             modules: HashMap::new(),
+            trap_frame_layout,
         }
     }
 
@@ -392,6 +444,9 @@ impl<'a> StackTracer<'a> {
                     .is_none()
             {
                 return false;
+            }
+            if context.last_trap_frame.is_some() {
+                return true;
             }
 
             index += slots_used;
@@ -472,8 +527,25 @@ impl<'a> StackTracer<'a> {
                     context.set(slot.op_info, saved);
                 }
             }
-            // TODO unwind interrupt/trap frames explicitly instead of treating them as scan-only boundaries.
-            UWOP_PUSH_MACHFRAME => return None,
+            UWOP_PUSH_MACHFRAME => {
+                let has_error_code = slot.op_info != 0;
+                let machine_frame = context.rsp;
+                let rip_slot = machine_frame.saturating_add(if has_error_code { 8 } else { 0 });
+                let saved_rip = self.memory.read::<u64>(VirtAddr(rip_slot)).ok()?;
+                let saved_rsp = self
+                    .memory
+                    .read::<u64>(VirtAddr(rip_slot.saturating_add(24)))
+                    .ok()?;
+
+                context.rip = saved_rip;
+                context.rsp = saved_rsp;
+                context.last_trap_frame = self
+                    .trap_frame_layout
+                    .and_then(|layout| {
+                        layout.base_from_machine_frame(machine_frame, has_error_code)
+                    })
+                    .or(Some(machine_frame));
+            }
             _ => return None,
         }
 
@@ -642,8 +714,8 @@ fn slot_u16(codes: &[UnwindCodeSlot], index: usize) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FrameSource, ParsedUnwindInfo, RegisterContext, StackFrame, StackTrace, UnwindCodeSlot,
-        frame_base, record_stack_frame, slot_u16, unwind_slot_count,
+        FrameSource, ParsedUnwindInfo, RegisterContext, StackFrame, StackTrace, TrapFrameLayout,
+        UnwindCodeSlot, frame_base, record_stack_frame, slot_u16, unwind_slot_count,
     };
 
     #[test]
@@ -684,6 +756,7 @@ mod tests {
             rip: 0,
             rsp: 0x1800,
             regs,
+            last_trap_frame: None,
         };
         let unwind = ParsedUnwindInfo {
             size_of_prolog: 0,
@@ -694,6 +767,23 @@ mod tests {
         };
 
         assert_eq!(frame_base(&context, &unwind), Some(0x1fe0));
+    }
+
+    #[test]
+    fn trap_frame_layout_maps_machine_frame_to_ktrap_frame_base() {
+        let layout = TrapFrameLayout {
+            rip_offset: 0x238,
+            error_code_offset: Some(0x230),
+        };
+
+        assert_eq!(
+            layout.base_from_machine_frame(0xffff_8000_0000_1238, false),
+            Some(0xffff_8000_0000_1000)
+        );
+        assert_eq!(
+            layout.base_from_machine_frame(0xffff_8000_0000_1230, true),
+            Some(0xffff_8000_0000_1000)
+        );
     }
 
     #[test]
@@ -709,6 +799,7 @@ mod tests {
                     ip,
                     symbol: String::new(),
                     source: FrameSource::Current,
+                    trap_frame: None,
                 },
             );
         }

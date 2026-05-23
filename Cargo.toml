@@ -1,6 +1,6 @@
 [package]
 name = "ntoseye"
-version = "0.10.1"
+version = "0.11.1"
 edition = "2024"
 authors = [ "dmaivel" ]
 description = "Windows kernel debugger for Linux hosts running Windows under KVM/QEMU"
@@ -35,6 +35,8 @@ derive_more = { version = "2.1.1", features = ["full"] }
 pdb2 = "0.10.1"
 spin = "0.10.0"
 dashmap = "6.1.0"
+sha2 = "0.10.9"
+mlua = { version = "0.11", features = ["lua54", "vendored"] }
 
 # The profile that 'dist' will build with
 [profile.dist]

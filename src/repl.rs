@@ -8,6 +8,7 @@ use reedline::{
     DescriptionMode, Emacs, Highlighter, IdeMenu, KeyCode, KeyModifiers, MenuBuilder,
     ReedlineEvent, ReedlineMenu, StyledText, default_emacs_keybindings,
 };
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -30,13 +31,14 @@ use std::path::{Path, PathBuf};
 
 use crate::backend::MemoryOps;
 use crate::dbg_backend::DebugBackend;
-use crate::debugger::{AttachReport, DebuggerContext};
+use crate::debugger::{AttachReport, DebuggerContext, DriverObjectInfo};
 use crate::error::{Error, Result};
 use crate::expr::Expr;
 use crate::gdb::{BreakpointHitResult, BreakpointManager, RegisterMap};
 use crate::guest::{ModuleInfo, ModuleSymbolLoadReport};
 use crate::memory::AddressSpace;
-use crate::symbols::{ModuleSymbolDiscovery, ParsedType, SymbolIndex, SymbolStore};
+use crate::script::{LoadReport, ScriptHost};
+use crate::symbols::{ModuleSymbolDiscovery, ParsedType, SymbolIndex, SymbolStore, TypeInfo};
 use crate::types::{Dtb, Value, VirtAddr};
 use crate::unwind::{
     FrameSource, ThreadTraceContext, build_stacktrace, format_symbol, preferred_code_dtb,
@@ -83,13 +85,30 @@ impl Prompt for CustomPrompt {
     }
 }
 
-enum CompletionStrategy {
+#[derive(Clone, Copy)]
+pub enum CompletionStrategy {
     None,
     Symbol,
     Type,
     Process,
     Thread,
     Breakpoint,
+    Driver,
+}
+
+impl CompletionStrategy {
+    pub fn from_kebab(s: &str) -> Option<Self> {
+        Some(match s {
+            "none" | "" => Self::None,
+            "symbol" => Self::Symbol,
+            "type" => Self::Type,
+            "process" => Self::Process,
+            "thread" => Self::Thread,
+            "breakpoint" => Self::Breakpoint,
+            "driver" => Self::Driver,
+            _ => return None,
+        })
+    }
 }
 
 fn make_suggestions(
@@ -309,6 +328,10 @@ enum ReplCommand {
         message = "Enable QEMU logging through the monitor.\n(usage: qlog [items] [logfile])\ndefault items: int,cpu_reset,guest_errors"
     )]
     Qlog,
+    #[strum(
+        message = "Inspect the pool page containing an address.\n(usage: pool <address-expression>)"
+    )]
+    Pool,
 
     // execution
     #[strum(message = "Resume VM execution.\n(usage: continue)")]
@@ -333,8 +356,20 @@ enum ReplCommand {
     // inspection
     #[strum(message = "Display CPU registers.\n(usage: registers)")]
     Registers,
+    #[strum(
+        serialize = "cregs",
+        serialize = "control-registers",
+        message = "Display control registers.\n(usage: cregs)"
+    )]
+    Cregs,
     #[strum(message = "Display stack backtrace.\n(usage: k [count])")]
     K,
+    #[strum(
+        serialize = "trap-frame",
+        serialize = "tf",
+        message = "Dump a _KTRAP_FRAME at an address.\n(usage: trap-frame <address> [field])"
+    )]
+    TrapFrame,
     #[strum(message = "Display current VM status.\n(usage: status)")]
     Status,
 
@@ -351,10 +386,19 @@ enum ReplCommand {
         message = "Load symbols for loaded modules from a local directory.\n(usage: load-symbols <directory> [module-filter])"
     )]
     LoadSymbols,
+    #[strum(
+        message = "List driver objects from the \\Driver object directory.\n(usage: drivers [filter])"
+    )]
+    Drivers,
     #[strum(message = "Attach to a process by PID.\n(usage: attach <pid>)")]
     Attach,
     #[strum(message = "Detach from current process.\n(usage: detach)")]
     Detach,
+
+    #[strum(
+        message = "Reload Lua command scripts from $XDG_CONFIG_HOME/ntoseye/commands.\n(usage: reload)"
+    )]
+    Reload,
 
     #[strum(message = "Exit the application.")]
     Quit,
@@ -374,6 +418,8 @@ impl ReplCommand {
             | Self::S
             | Self::Ev
             | Self::Pte
+            | Self::Pool
+            | Self::TrapFrame
             | Self::Bp => CompletionStrategy::Symbol,
             Self::Dt => CompletionStrategy::Type,
             Self::Attach => CompletionStrategy::Process,
@@ -393,6 +439,12 @@ type ThreadCache = Vec<String>;
 /// Cached breakpoint info for completion (id, enabled, address, symbol)
 type BreakpointCache = Vec<(u32, bool, VirtAddr, Option<String>)>;
 
+/// Cached driver object info for completion
+type DriverObjectCache = Vec<DriverObjectInfo>;
+
+/// Cached (name, help, per-arg strategies) for script-registered commands
+type UserCommandCache = Vec<(String, String, Vec<CompletionStrategy>)>;
+
 struct MyCompleter {
     symbols: Arc<RwLock<SymbolIndex>>,
     types: Arc<RwLock<SymbolIndex>>,
@@ -401,6 +453,8 @@ struct MyCompleter {
     processes: Arc<RwLock<ProcessCache>>,
     threads: Arc<RwLock<ThreadCache>>,
     breakpoints: Arc<RwLock<BreakpointCache>>,
+    drivers: Arc<RwLock<DriverObjectCache>>,
+    user_commands: Arc<RwLock<UserCommandCache>>,
 }
 
 impl Completer for MyCompleter {
@@ -412,7 +466,7 @@ impl Completer for MyCompleter {
         let is_command_context = !text_before_cursor.contains(' ');
 
         if is_command_context {
-            return ReplCommand::iter()
+            let mut suggestions: Vec<Suggestion> = ReplCommand::iter()
                 .filter_map(|cmd| {
                     let c_str = cmd.to_string();
                     if c_str.starts_with(command_str) {
@@ -430,6 +484,22 @@ impl Completer for MyCompleter {
                     }
                 })
                 .collect();
+
+            let user_cmds = self.user_commands.read().unwrap();
+            for (name, help, _) in user_cmds.iter() {
+                if name.starts_with(command_str) {
+                    suggestions.push(Suggestion {
+                        value: name.clone(),
+                        description: Some(help.clone()),
+                        style: None,
+                        extra: None,
+                        match_indices: None,
+                        span: Span::new(0, pos),
+                        append_whitespace: true,
+                    });
+                }
+            }
+            return suggestions;
         }
 
         if let Ok(cmd) = ReplCommand::from_str(command_str) {
@@ -446,130 +516,213 @@ impl Completer for MyCompleter {
             let span_start = arg_start + ident_start;
 
             match cmd.completion_type() {
-                CompletionStrategy::None => return vec![],
-
-                CompletionStrategy::Symbol => {
-                    if ident_start > 0 {
-                        let preceding = &raw_prefix[..ident_start];
-
-                        // after +/-/[ numeric operand expected, no completion
-                        if preceding.ends_with('+')
-                            || preceding.ends_with('-')
-                            || preceding.ends_with('[')
-                        {
-                            return vec![];
-                        }
-
-                        // after -> complete field names from the resolved type
-                        if let Some(expr_text) = preceding.strip_suffix("->") {
-                            if let Ok(expr) = Expr::parse(expr_text) {
-                                let dtb = *self.dtb.read().unwrap();
-                                let fields = expr.complete_fields(&self.symbol_store, dtb, prefix);
-                                if !fields.is_empty() {
-                                    return make_suggestions(fields, "Field", span_start, pos);
-                                }
-                            }
-                            return vec![];
-                        }
-
-                        // inside parentheses: likely a cast, try type completion first
-                        if preceding.ends_with('(') {
-                            let types = self.types.read().unwrap();
-                            let mut results = types.search(prefix, 512);
-                            // also try with underscore prefix (_EPROCESS, etc.)
-                            if !prefix.starts_with('_') {
-                                results.extend(types.search(&format!("_{}", prefix), 512));
-                            }
-                            if !results.is_empty() {
-                                return make_suggestions(results, "Type", span_start, pos);
-                            }
-                        }
-                    }
-
-                    let symbols = self.symbols.read().unwrap();
-                    let results = symbols.search(prefix, 1024);
-                    return make_suggestions(results, "Symbol", span_start, pos);
-                }
-
                 CompletionStrategy::Type => {
+                    // dt has a special third-arg promotion to symbol completion
                     let mut arg_count = text_before_cursor.split_whitespace().count();
                     if text_before_cursor.ends_with(char::is_whitespace) {
                         arg_count += 1;
                     }
-
-                    let results = if arg_count > 2 {
-                        let symbols = self.symbols.read().unwrap();
-                        symbols.search(prefix, 1024)
-                    } else {
-                        let types = self.types.read().unwrap();
-                        types.search(prefix, 1024)
-                    };
-
-                    let description = if arg_count > 2 { "Symbol" } else { "Structure" };
-                    return make_suggestions(results, description, span_start, pos);
+                    if arg_count > 2 {
+                        return self.apply_strategy(
+                            CompletionStrategy::Symbol,
+                            raw_prefix,
+                            ident_start,
+                            prefix,
+                            span_start,
+                            pos,
+                        );
+                    }
+                    return self.apply_strategy(
+                        CompletionStrategy::Type,
+                        raw_prefix,
+                        ident_start,
+                        prefix,
+                        span_start,
+                        pos,
+                    );
                 }
-
-                CompletionStrategy::Process => {
-                    let processes = self.processes.read().unwrap();
-                    let prefix_lower = prefix.to_lowercase();
-                    return processes
-                        .iter()
-                        .filter(|(name, pid)| {
-                            name.to_lowercase().contains(&prefix_lower)
-                                || pid.to_string().starts_with(prefix)
-                        })
-                        .map(|(name, pid)| Suggestion {
-                            value: pid.to_string(),
-                            description: Some(format!("{} (PID {})", name, pid)),
-                            style: None,
-                            extra: None,
-                            match_indices: None,
-                            span: Span::new(span_start, pos),
-                            append_whitespace: false,
-                        })
-                        .collect();
-                }
-
-                CompletionStrategy::Thread => {
-                    let threads = self.threads.read().unwrap();
-                    return threads
-                        .iter()
-                        .filter(|tid| tid.starts_with(prefix))
-                        .map(|tid| Suggestion {
-                            value: tid.clone(),
-                            description: Some("Thread/vCPU".to_string()),
-                            style: None,
-                            extra: None,
-                            match_indices: None,
-                            span: Span::new(span_start, pos),
-                            append_whitespace: false,
-                        })
-                        .collect();
-                }
-
-                CompletionStrategy::Breakpoint => {
-                    let breakpoints = self.breakpoints.read().unwrap();
-                    return breakpoints
-                        .iter()
-                        .filter(|(id, _, _, _)| id.to_string().starts_with(prefix))
-                        .map(|(id, _, addr, symbol)| {
-                            let sym_str = symbol.as_deref().unwrap_or("-");
-                            Suggestion {
-                                value: id.to_string(),
-                                description: Some(format!("{} @ {:#x}", sym_str, addr.0)),
-                                style: None,
-                                extra: None,
-                                match_indices: None,
-                                span: Span::new(span_start, pos),
-                                append_whitespace: false,
-                            }
-                        })
-                        .collect();
+                strat => {
+                    return self.apply_strategy(
+                        strat,
+                        raw_prefix,
+                        ident_start,
+                        prefix,
+                        span_start,
+                        pos,
+                    );
                 }
             }
         }
 
+        // Fallback: script-registered command with per-arg completion hints
+        let user_cmds = self.user_commands.read().unwrap();
+        if let Some((_, _, strategies)) = user_cmds.iter().find(|(n, _, _)| n == command_str) {
+            let mut arg_count = text_before_cursor.split_whitespace().count();
+            if text_before_cursor.ends_with(char::is_whitespace) {
+                arg_count += 1;
+            }
+            let arg_index = arg_count.saturating_sub(2);
+            let strat = strategies
+                .get(arg_index)
+                .copied()
+                .unwrap_or(CompletionStrategy::None);
+
+            let arg_start = text_before_cursor.rfind(' ').map(|i| i + 1).unwrap_or(0);
+            let raw_prefix = &text_before_cursor[arg_start..];
+            let ident_start = raw_prefix
+                .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let prefix = &raw_prefix[ident_start..];
+            let span_start = arg_start + ident_start;
+            return self.apply_strategy(strat, raw_prefix, ident_start, prefix, span_start, pos);
+        }
+
         vec![]
+    }
+}
+
+impl MyCompleter {
+    fn apply_strategy(
+        &self,
+        strategy: CompletionStrategy,
+        raw_prefix: &str,
+        ident_start: usize,
+        prefix: &str,
+        span_start: usize,
+        pos: usize,
+    ) -> Vec<Suggestion> {
+        match strategy {
+            CompletionStrategy::None => vec![],
+
+            CompletionStrategy::Symbol => {
+                if ident_start > 0 {
+                    let preceding = &raw_prefix[..ident_start];
+
+                    if preceding.ends_with('+')
+                        || preceding.ends_with('-')
+                        || preceding.ends_with('[')
+                    {
+                        return vec![];
+                    }
+
+                    if let Some(expr_text) = preceding.strip_suffix("->") {
+                        if let Ok(expr) = Expr::parse(expr_text) {
+                            let dtb = *self.dtb.read().unwrap();
+                            let fields = expr.complete_fields(&self.symbol_store, dtb, prefix);
+                            if !fields.is_empty() {
+                                return make_suggestions(fields, "Field", span_start, pos);
+                            }
+                        }
+                        return vec![];
+                    }
+
+                    if preceding.ends_with('(') {
+                        let types = self.types.read().unwrap();
+                        let mut results = types.search(prefix, 512);
+                        if !prefix.starts_with('_') {
+                            results.extend(types.search(&format!("_{}", prefix), 512));
+                        }
+                        if !results.is_empty() {
+                            return make_suggestions(results, "Type", span_start, pos);
+                        }
+                    }
+                }
+
+                let symbols = self.symbols.read().unwrap();
+                let results = symbols.search(prefix, 1024);
+                make_suggestions(results, "Symbol", span_start, pos)
+            }
+
+            CompletionStrategy::Type => {
+                let types = self.types.read().unwrap();
+                let results = types.search(prefix, 1024);
+                make_suggestions(results, "Structure", span_start, pos)
+            }
+
+            CompletionStrategy::Process => {
+                let processes = self.processes.read().unwrap();
+                let prefix_lower = prefix.to_lowercase();
+                processes
+                    .iter()
+                    .filter(|(name, pid)| {
+                        name.to_lowercase().contains(&prefix_lower)
+                            || pid.to_string().starts_with(prefix)
+                    })
+                    .map(|(name, pid)| Suggestion {
+                        value: pid.to_string(),
+                        description: Some(format!("{} (PID {})", name, pid)),
+                        style: None,
+                        extra: None,
+                        match_indices: None,
+                        span: Span::new(span_start, pos),
+                        append_whitespace: false,
+                    })
+                    .collect()
+            }
+
+            CompletionStrategy::Thread => {
+                let threads = self.threads.read().unwrap();
+                threads
+                    .iter()
+                    .filter(|tid| tid.starts_with(prefix))
+                    .map(|tid| Suggestion {
+                        value: tid.clone(),
+                        description: Some("Thread/vCPU".to_string()),
+                        style: None,
+                        extra: None,
+                        match_indices: None,
+                        span: Span::new(span_start, pos),
+                        append_whitespace: false,
+                    })
+                    .collect()
+            }
+
+            CompletionStrategy::Breakpoint => {
+                let breakpoints = self.breakpoints.read().unwrap();
+                breakpoints
+                    .iter()
+                    .filter(|(id, _, _, _)| id.to_string().starts_with(prefix))
+                    .map(|(id, _, addr, symbol)| {
+                        let sym_str = symbol.as_deref().unwrap_or("-");
+                        Suggestion {
+                            value: id.to_string(),
+                            description: Some(format!("{} @ {:#x}", sym_str, addr.0)),
+                            style: None,
+                            extra: None,
+                            match_indices: None,
+                            span: Span::new(span_start, pos),
+                            append_whitespace: false,
+                        }
+                    })
+                    .collect()
+            }
+
+            CompletionStrategy::Driver => {
+                let drivers = self.drivers.read().unwrap();
+                let prefix_lower = prefix.to_lowercase();
+                let arg_start = span_start - ident_start;
+                drivers
+                    .iter()
+                    .filter(|driver| {
+                        driver.name.to_lowercase().contains(&prefix_lower)
+                            || format!("{:#x}", driver.object.0).starts_with(prefix)
+                    })
+                    .map(|driver| Suggestion {
+                        value: format!("{:#x}", driver.object.0),
+                        description: Some(format!(
+                            "{} start={:#x}",
+                            driver.name, driver.driver_start.0
+                        )),
+                        style: None,
+                        extra: None,
+                        match_indices: None,
+                        span: Span::new(arg_start, pos),
+                        append_whitespace: false,
+                    })
+                    .collect()
+            }
+        }
     }
 }
 
@@ -602,6 +755,25 @@ fn print_qemu_monitor_output(output: &str) {
         println!("{}\n", "qemu monitor command completed".bright_black());
     } else {
         println!("{}\n", output.trim_end());
+    }
+}
+
+fn print_script_load_report(report: &LoadReport, startup_hint: bool) {
+    if report.loaded.is_empty() && report.failed.is_empty() {
+        if startup_hint {
+            println!("scripts: 0 installed (run `ntoseye scripts install` to add bundled scripts)");
+        } else {
+            println!("scripts: 0 loaded");
+        }
+    } else {
+        let mut summary = format!("scripts: loaded {}", report.loaded.len());
+        if !report.failed.is_empty() {
+            summary.push_str(&format!(", {} failed", report.failed.len()));
+        }
+        println!("{}", summary);
+        for (path, err) in &report.failed {
+            eprintln!("{} {}: {}", "error:".red(), path.display(), err);
+        }
     }
 }
 
@@ -674,6 +846,138 @@ fn print_registers(register_map: &RegisterMap, regs: &[u8]) {
         read_reg("r15"),
         read_reg("eflags")
     );
+}
+
+fn print_control_registers(register_map: &RegisterMap, regs: &[u8]) {
+    let read_reg = |name: &str| -> String {
+        register_map
+            .read_u64(name, regs)
+            .map(|v| format!("{:#018x}", VirtAddr(v)))
+            .unwrap_or_else(|_| "N/A".to_string())
+    };
+
+    println!(
+        "{}",
+        "─── control registers ─────────────────────────────────────────────".bright_black()
+    );
+    println!(
+        "cr0={}  cr2={}  cr3={}",
+        read_reg("cr0"),
+        read_reg("cr2"),
+        read_reg("cr3")
+    );
+    println!("cr4={}  cr8={}", read_reg("cr4"), read_reg("cr8"));
+}
+
+fn typed_field_value(
+    debugger: &DebuggerContext,
+    address: VirtAddr,
+    info: &crate::symbols::FieldInfo,
+) -> Result<String> {
+    if address.0 == 0 {
+        return Ok(String::new());
+    }
+
+    let mem = debugger.get_current_process().memory(&debugger.kvm);
+    let value = match &info.type_data {
+        ParsedType::Primitive(p) => {
+            if p.contains("*") || p.contains("LONGLONG") {
+                let val: u64 = mem.read(address + info.offset)?;
+                format!(" = {:#x}", Value(val))
+            } else if p.contains("LONG") {
+                let val: u32 = mem.read(address + info.offset)?;
+                format!(" = {:#x}", Value(val))
+            } else if p.contains("SHORT") || p.contains("WCHAR") {
+                let val: u16 = mem.read(address + info.offset)?;
+                format!(" = {:#x}", Value(val))
+            } else if p.contains("CHAR") {
+                let val: u8 = mem.read(address + info.offset)?;
+                format!(" = {:#x}", Value(val))
+            } else {
+                String::new()
+            }
+        }
+        ParsedType::Pointer(_) => {
+            let val: u64 = mem.read(address + info.offset)?;
+            format!(" = {:#x}", Value(val))
+        }
+        ParsedType::Bitfield { pos, len, .. } => {
+            let val: u64 = mem.read(address + info.offset)?;
+            let mask = if *len == 64 {
+                u64::MAX
+            } else {
+                (1u64 << *len) - 1
+            };
+            let val = (val >> pos) & mask;
+
+            if *len == 1 {
+                if val == 1 {
+                    format!(" = {}", "Y".green())
+                } else {
+                    format!(" = {}", "N".red())
+                }
+            } else {
+                format!(" = {}", Value(val))
+            }
+        }
+        _ => String::new(),
+    };
+
+    Ok(value)
+}
+
+fn print_type_instance(
+    debugger: &DebuggerContext,
+    type_info: &TypeInfo,
+    address: VirtAddr,
+    field_name: Option<&str>,
+) -> Result<()> {
+    let mut builder = Builder::default();
+    builder.push_record(vec![format!(
+        "{} ({} bytes)",
+        type_info.name,
+        Value(type_info.size)
+    )]);
+
+    let mut sorted_fields: Vec<_> = type_info.fields.iter().collect();
+    sorted_fields.sort_by_key(|(_, info)| {
+        let bitfield_pos = match &info.type_data {
+            ParsedType::Bitfield { pos, .. } => *pos,
+            _ => 0,
+        };
+        (info.offset, bitfield_pos)
+    });
+
+    for (name, info) in sorted_fields {
+        if field_name.is_some_and(|field| field != name) {
+            continue;
+        }
+
+        builder.push_record(vec![
+            format!("  + {:#06x} {:-12}", VirtAddr(info.offset.into()), name),
+            format!("  : {}", info.type_data.green()),
+            format!("  {}", typed_field_value(debugger, address, info)?),
+        ]);
+    }
+
+    let mut table = builder.build();
+    table
+        .with(tabled::settings::Style::empty())
+        .with(Padding::zero());
+    println!("{}\n", table);
+    Ok(())
+}
+
+fn dump_trap_frame(
+    debugger: &DebuggerContext,
+    address: VirtAddr,
+    field_name: Option<&str>,
+) -> Result<()> {
+    let type_info = debugger
+        .symbols
+        .find_type_across_modules(debugger.current_dtb(), "_KTRAP_FRAME")
+        .ok_or_else(|| Error::StructNotFound("_KTRAP_FRAME".to_string()))?;
+    print_type_instance(debugger, &type_info, address, field_name)
 }
 
 /// Single-step the current thread and clear `TF` from its RFLAGS afterwards.
@@ -957,13 +1261,22 @@ fn print_stacktrace(
         } else {
             String::new()
         };
+        let trap_frame = frame
+            .trap_frame
+            .map(|addr| {
+                format!("  trap_frame={:#018x}", VirtAddr(addr))
+                    .cyan()
+                    .to_string()
+            })
+            .unwrap_or_default();
         println!(
-            " {:>2}  {:#018x}  {:#018x}  {}{}",
+            " {:>2}  {:#018x}  {:#018x}  {}{}{}",
             num,
             VirtAddr(frame.sp),
             VirtAddr(frame.ip),
             frame.symbol,
-            suffix
+            suffix,
+            trap_frame
         );
     }
 
@@ -1709,6 +2022,545 @@ fn load_symbols_from_directory(
     Ok(report)
 }
 
+const POOL_ALIGN: u64 = 0x10;
+const POOL_PAGE_SIZE: u64 = 0x1000;
+const POOL_FREE_TAG: u32 = 0x6565_7246;
+const POOL_MAX_GAP_UNITS: u64 = 4;
+
+#[derive(Clone, Copy)]
+struct PoolHeader {
+    header: VirtAddr,
+    body: VirtAddr,
+    size: u64,
+    previous_size: u64,
+    pool_type: u8,
+    tag: u32,
+    synthetic_free: bool,
+}
+
+struct BigPoolEntry {
+    va: VirtAddr,
+    entry: VirtAddr,
+    index: u64,
+    nonpaged: bool,
+    size: u64,
+    tag: u32,
+    pattern: u8,
+    pool_flags: u16,
+    slush_size: u16,
+}
+
+/// PDB-driven layout for `_POOL_HEADER` and `_POOL_TRACKER_BIG_PAGES`. Field
+/// presence varies across Windows builds; the `*_uses_struct` flags say whether
+/// we can decode each entry field-by-field or have to fall back to fixed offsets
+struct PoolLayout {
+    pool_header: TypeInfo,
+    header_size: u64,
+    pool_tag_offset: u64,
+    pool_header_uses_struct: bool,
+    big_pool_type: Option<TypeInfo>,
+    big_pool_uses_struct: bool,
+    big_pool_has_pool_type: bool,
+    big_pool_has_slush: bool,
+    big_pool_entry_size: Option<u64>,
+}
+
+fn pool_layout(debugger: &DebuggerContext) -> Result<PoolLayout> {
+    let pool_header = debugger
+        .symbols
+        .find_type_across_modules(debugger.current_dtb(), "_POOL_HEADER")
+        .ok_or_else(|| Error::StructNotFound("_POOL_HEADER".to_string()))?;
+    let pool_tag_offset = pool_header.try_get_field_offset("PoolTag")?;
+    let pool_header_uses_struct = [
+        "PreviousSize",
+        "PoolIndex",
+        "BlockSize",
+        "PoolType",
+        "PoolTag",
+    ]
+    .iter()
+    .all(|name| pool_header.fields.contains_key(*name));
+
+    let big_pool_type = debugger
+        .symbols
+        .find_type_across_modules(debugger.current_dtb(), "_POOL_TRACKER_BIG_PAGES");
+    let (big_pool_uses_struct, big_pool_has_pool_type, big_pool_has_slush) = match &big_pool_type {
+        Some(ti) => (
+            ["Va", "Key", "NumberOfBytes", "Pattern"]
+                .iter()
+                .all(|name| ti.fields.contains_key(*name)),
+            ti.fields.contains_key("PoolType"),
+            ti.fields.contains_key("SlushSize"),
+        ),
+        None => (false, false, false),
+    };
+    let big_pool_entry_size = big_pool_type.as_ref().map(|ti| ti.size as u64);
+
+    Ok(PoolLayout {
+        header_size: pool_header.size as u64,
+        pool_header,
+        pool_tag_offset,
+        pool_header_uses_struct,
+        big_pool_type,
+        big_pool_uses_struct,
+        big_pool_has_pool_type,
+        big_pool_has_slush,
+        big_pool_entry_size,
+    })
+}
+
+fn read_pool_field(
+    ti: &TypeInfo,
+    mem: &impl MemoryOps<VirtAddr>,
+    addr: VirtAddr,
+    field: &str,
+) -> Option<u64> {
+    let f = ti.fields.get(field)?;
+    let field_addr = addr + f.offset as u64;
+    if let ParsedType::Bitfield { pos, len, .. } = &f.type_data {
+        let raw: u64 = mem.read(field_addr).ok()?;
+        let mask = if *len == 64 {
+            u64::MAX
+        } else {
+            (1u64 << *len) - 1
+        };
+        return Some((raw >> *pos) & mask);
+    }
+
+    match field {
+        "PreviousSize" | "PoolIndex" | "BlockSize" | "PoolType" | "Pattern" => {
+            let value: u32 = mem.read(field_addr).ok()?;
+            Some(value as u8 as u64)
+        }
+        "SlushSize" => {
+            let value: u32 = mem.read(field_addr).ok()?;
+            Some((value & 0xfff) as u64)
+        }
+        "PoolTag" | "Key" => {
+            let value: u32 = mem.read(field_addr).ok()?;
+            Some(value as u64)
+        }
+        "Va" | "NumberOfBytes" => mem.read(field_addr).ok(),
+        _ => None,
+    }
+}
+
+fn tag_string(tag: u32) -> String {
+    let mut s = String::with_capacity(4);
+    for i in 0..4 {
+        let c = ((tag >> (i * 8)) & 0xff) as u8;
+        s.push(if (0x20..=0x7e).contains(&c) {
+            c as char
+        } else {
+            '.'
+        });
+    }
+    s
+}
+
+fn tag_looks_printable(tag: u32) -> bool {
+    (0..4).all(|i| (0x20..=0x7e).contains(&((tag >> (i * 8)) & 0xff)))
+}
+
+fn plausible_pool_tag(tag: u32) -> bool {
+    tag == POOL_FREE_TAG || tag_looks_printable(tag)
+}
+
+fn pool_block_state(h: &PoolHeader) -> &'static str {
+    if h.synthetic_free || h.tag == POOL_FREE_TAG {
+        "Free"
+    } else if h.pool_type == 0 {
+        "Free?"
+    } else if tag_looks_printable(h.tag) {
+        "Allocated"
+    } else {
+        "Allocated?"
+    }
+}
+
+fn parse_pool_header(
+    debugger: &DebuggerContext,
+    layout: &PoolLayout,
+    header: VirtAddr,
+) -> Option<PoolHeader> {
+    let mem = debugger.get_current_process().memory(&debugger.kvm);
+    let (previous_size, block_units, pool_type, tag) = if layout.pool_header_uses_struct {
+        let previous_size =
+            read_pool_field(&layout.pool_header, &mem, header, "PreviousSize")? as u8;
+        let block_units = read_pool_field(&layout.pool_header, &mem, header, "BlockSize")? as u8;
+        let pool_type = read_pool_field(&layout.pool_header, &mem, header, "PoolType")? as u8;
+        let tag = read_pool_field(&layout.pool_header, &mem, header, "PoolTag")? as u32;
+        (previous_size, block_units, pool_type, tag)
+    } else {
+        let word0: u32 = mem.read(header).ok()?;
+        let tag: u32 = mem.read(header + layout.pool_tag_offset).ok()?;
+        (
+            (word0 & 0xff) as u8,
+            ((word0 >> 16) & 0xff) as u8,
+            ((word0 >> 24) & 0xff) as u8,
+            tag,
+        )
+    };
+    if block_units == 0 {
+        return None;
+    }
+    Some(PoolHeader {
+        header,
+        body: header + layout.header_size,
+        size: block_units as u64 * POOL_ALIGN,
+        previous_size: previous_size as u64 * POOL_ALIGN,
+        pool_type,
+        tag,
+        synthetic_free: false,
+    })
+}
+
+fn pool_header_plausible(layout: &PoolLayout, h: &PoolHeader) -> bool {
+    h.size >= layout.header_size
+        && h.size <= POOL_PAGE_SIZE
+        && (h.header.0 & !(POOL_PAGE_SIZE - 1))
+            == ((h.header.0 + h.size - 1) & !(POOL_PAGE_SIZE - 1))
+        && (plausible_pool_tag(h.tag) || (h.pool_type == 0 && h.previous_size == 0))
+}
+
+fn try_pool_header_lax(
+    debugger: &DebuggerContext,
+    layout: &PoolLayout,
+    addr: VirtAddr,
+) -> Option<PoolHeader> {
+    let h = parse_pool_header(debugger, layout, addr)?;
+    pool_header_plausible(layout, &h).then_some(h)
+}
+
+fn gap_free_pool_block(
+    debugger: &DebuggerContext,
+    layout: &PoolLayout,
+    header: VirtAddr,
+    size: u64,
+) -> PoolHeader {
+    let mem = debugger.get_current_process().memory(&debugger.kvm);
+    let tag: u32 = mem.read(header + layout.pool_tag_offset).unwrap_or(0);
+    PoolHeader {
+        header,
+        body: header + layout.header_size,
+        size,
+        previous_size: 0,
+        pool_type: 0,
+        tag,
+        synthetic_free: true,
+    }
+}
+
+fn walk_pool_page_lax(
+    debugger: &DebuggerContext,
+    layout: &PoolLayout,
+    base: VirtAddr,
+) -> Vec<PoolHeader> {
+    let mut blocks = Vec::new();
+    let mut addr = base;
+    while addr.0 < base.0 + POOL_PAGE_SIZE {
+        if let Some(h) = try_pool_header_lax(debugger, layout, addr)
+            .filter(|h| h.header.0 + h.size <= base.0 + POOL_PAGE_SIZE)
+        {
+            addr += h.size;
+            blocks.push(h);
+        } else {
+            let mut advanced = false;
+            for step in 1..=POOL_MAX_GAP_UNITS {
+                let probe = addr + step * POOL_ALIGN;
+                if probe.0 >= base.0 + POOL_PAGE_SIZE {
+                    break;
+                }
+                if let Some(h2) = try_pool_header_lax(debugger, layout, probe)
+                    .filter(|h| h.header.0 + h.size <= base.0 + POOL_PAGE_SIZE)
+                {
+                    addr = h2.header;
+                    advanced = true;
+                    break;
+                }
+            }
+            if !advanced {
+                break;
+            }
+        }
+    }
+    blocks
+}
+
+fn scan_pool_page_lax(
+    debugger: &DebuggerContext,
+    layout: &PoolLayout,
+    base: VirtAddr,
+) -> Vec<PoolHeader> {
+    let mut candidates = Vec::new();
+    let mut off = 0;
+    while off < POOL_PAGE_SIZE {
+        let addr = base + off;
+        if let Some(h) = try_pool_header_lax(debugger, layout, addr)
+            .filter(|h| h.header.0 + h.size <= base.0 + POOL_PAGE_SIZE)
+        {
+            candidates.push(h);
+        }
+        off += POOL_ALIGN;
+    }
+    let mut blocks = Vec::new();
+    let mut cursor = base;
+    for (i, h) in candidates.iter().copied().enumerate() {
+        if h.header < cursor {
+            continue;
+        }
+        if h.header == cursor
+            && h.size == POOL_ALIGN
+            && pool_block_state(&h) == "Free?"
+            && let Some(next) = candidates.get(i + 1)
+            && next.header.0 > h.header.0 + POOL_ALIGN
+        {
+            let free_size = next.header.0 - h.header.0 - POOL_ALIGN;
+            blocks.push(gap_free_pool_block(debugger, layout, h.header, free_size));
+            cursor = h.header + free_size;
+        } else {
+            if h.header > cursor {
+                let free_size = h.header.0.saturating_sub(cursor.0 + POOL_ALIGN);
+                if free_size >= POOL_ALIGN * 2 {
+                    blocks.push(gap_free_pool_block(debugger, layout, cursor, free_size));
+                }
+            }
+            blocks.push(h);
+            cursor = h.header + h.size;
+        }
+    }
+    blocks
+}
+
+fn find_pool_block_index(blocks: &[PoolHeader], needle: &PoolHeader) -> Option<usize> {
+    blocks
+        .iter()
+        .position(|h| h.header == needle.header && h.size == needle.size)
+}
+
+fn locate_pool_block_in_page(
+    debugger: &DebuggerContext,
+    layout: &PoolLayout,
+    target: VirtAddr,
+) -> (Vec<PoolHeader>, Option<usize>, VirtAddr) {
+    let base = VirtAddr(target.0 & !(POOL_PAGE_SIZE - 1));
+    let aligned = VirtAddr(target.0 & !(POOL_ALIGN - 1));
+    let mut anchor = None;
+    let mut addr = aligned;
+    loop {
+        if let Some(h) = try_pool_header_lax(debugger, layout, addr)
+            .filter(|h| target >= h.header && target.0 < h.header.0 + h.size)
+        {
+            anchor = Some(h);
+            break;
+        }
+        if addr <= base {
+            break;
+        }
+        addr -= POOL_ALIGN;
+    }
+    let Some(anchor) = anchor else {
+        return (Vec::new(), None, base);
+    };
+    let blocks = walk_pool_page_lax(debugger, layout, base);
+    if let Some(idx) = find_pool_block_index(&blocks, &anchor) {
+        return (blocks, Some(idx), base);
+    }
+    let blocks = scan_pool_page_lax(debugger, layout, base);
+    if let Some(idx) = find_pool_block_index(&blocks, &anchor) {
+        return (blocks, Some(idx), base);
+    }
+    (vec![anchor], Some(0), base)
+}
+
+fn classify_pool_region(
+    debugger: &DebuggerContext,
+    addr: VirtAddr,
+) -> Option<(&'static str, VirtAddr, VirtAddr)> {
+    for (name, start, stop) in [
+        ("NonPagedPool", "MmNonPagedPoolStart", "MmNonPagedPoolEnd"),
+        ("PagedPool", "MmPagedPoolStart", "MmPagedPoolEnd"),
+        ("SpecialPool", "MmSpecialPoolStart", "MmSpecialPoolEnd"),
+    ] {
+        let s_addr = debugger
+            .symbols
+            .find_symbol_across_modules(debugger.current_dtb(), start)?;
+        let e_addr = debugger
+            .symbols
+            .find_symbol_across_modules(debugger.current_dtb(), stop)?;
+        let mem = debugger.get_current_process().memory(&debugger.kvm);
+        let s = VirtAddr(mem.read::<u64>(s_addr).ok()?);
+        let e = VirtAddr(mem.read::<u64>(e_addr).ok()?);
+        if addr >= s && addr < e {
+            return Some((name, s, e));
+        }
+    }
+    None
+}
+
+fn parse_big_pool_entry(
+    debugger: &DebuggerContext,
+    layout: &PoolLayout,
+    entry: VirtAddr,
+) -> Option<BigPoolEntry> {
+    let mem = debugger.get_current_process().memory(&debugger.kvm);
+    let ti = layout.big_pool_type.as_ref()?;
+    let (va_raw, size, tag, pattern, pool_flags, slush_size) = if layout.big_pool_uses_struct {
+        let va_raw = read_pool_field(ti, &mem, entry, "Va")?;
+        let size = read_pool_field(ti, &mem, entry, "NumberOfBytes")?;
+        let tag = read_pool_field(ti, &mem, entry, "Key")? as u32;
+        let pattern = read_pool_field(ti, &mem, entry, "Pattern")? as u8;
+        let pool_flags = if layout.big_pool_has_pool_type {
+            read_pool_field(ti, &mem, entry, "PoolType").unwrap_or(0) as u16 & 0xfff
+        } else {
+            0
+        };
+        let slush_size = if layout.big_pool_has_slush {
+            read_pool_field(ti, &mem, entry, "SlushSize").unwrap_or(0) as u16 & 0xfff
+        } else {
+            0
+        };
+        (va_raw, size, tag, pattern, pool_flags, slush_size)
+    } else {
+        let va_raw: u64 = mem.read(entry + ti.try_get_field_offset("Va").ok()?).ok()?;
+        let size: u64 = mem
+            .read(entry + ti.try_get_field_offset("NumberOfBytes").ok()?)
+            .ok()?;
+        let tag: u32 = mem
+            .read(entry + ti.try_get_field_offset("Key").ok()?)
+            .ok()?;
+        let flags_word: u32 = mem
+            .read(entry + ti.try_get_field_offset("Pattern").ok()?)
+            .ok()?;
+        (
+            va_raw,
+            size,
+            tag,
+            (flags_word & 0xff) as u8,
+            ((flags_word >> 8) & 0xfff) as u16,
+            ((flags_word >> 20) & 0xfff) as u16,
+        )
+    };
+    let va = VirtAddr(va_raw & !1);
+    if va.is_zero() || size == 0 || !plausible_pool_tag(tag) {
+        return None;
+    }
+    Some(BigPoolEntry {
+        va,
+        entry,
+        index: 0,
+        nonpaged: va_raw & 1 != 0,
+        size,
+        tag,
+        pattern,
+        pool_flags,
+        slush_size,
+    })
+}
+
+fn find_big_pool(
+    debugger: &DebuggerContext,
+    layout: &PoolLayout,
+    target: VirtAddr,
+) -> Option<BigPoolEntry> {
+    let table_sym = debugger
+        .symbols
+        .find_symbol_across_modules(debugger.current_dtb(), "PoolBigPageTable")?;
+    let mem = debugger.get_current_process().memory(&debugger.kvm);
+    let table_addr = VirtAddr(mem.read::<u64>(table_sym).ok()?);
+    let count_sym = debugger
+        .symbols
+        .find_symbol_across_modules(debugger.current_dtb(), "PoolBigPageTableSize")?;
+    let count: u64 = mem.read(count_sym).ok()?;
+    if count == 0 || count > 0x100000 {
+        return None;
+    }
+    let entry_size = layout.big_pool_entry_size?;
+    for i in 0..count {
+        let entry_addr = table_addr + i * entry_size;
+        if let Some(mut entry) = parse_big_pool_entry(debugger, layout, entry_addr)
+            .filter(|e| target >= e.va && target.0 < e.va.0 + e.size)
+        {
+            entry.index = i;
+            return Some(entry);
+        }
+    }
+    None
+}
+
+fn segment_heap_hint(debugger: &DebuggerContext) -> Option<&'static str> {
+    debugger
+        .symbols
+        .find_symbol_across_modules(debugger.current_dtb(), "RtlpHpHeapGlobals")?;
+    Some(
+        "kernel has RtlpHpHeapGlobals (segment heap is enabled); address may be a _HEAP_VS_CHUNK_HEADER / LFH chunk instead of a _POOL_HEADER",
+    )
+}
+
+fn annotate_near_symbol(debugger: &DebuggerContext, addr: VirtAddr) -> Option<String> {
+    let (module, name, offset) = debugger
+        .symbols
+        .find_closest_symbol_for_address(debugger.current_dtb(), addr)?;
+    (offset <= 0x1000).then(|| format!("{}!{}+0x{:x}", module, name, offset))
+}
+
+fn print_pool_page_listing(blocks: &[PoolHeader], target_idx: Option<usize>, target: VirtAddr) {
+    if blocks.is_empty() {
+        println!("  (no plausible pool block found for this address)");
+        return;
+    }
+    println!(
+        "  {:<3} {:<18} {:<8} {:<8} {:<12} {:<6} tag",
+        "", "header", "size", "prev", "state", "type"
+    );
+    for (i, h) in blocks.iter().enumerate() {
+        let marker = if Some(i) == target_idx { "->" } else { "  " };
+        println!(
+            "  {:<3} {:#018x} 0x{:<6x} 0x{:<6x} {:<12} 0x{:<4x} '{}'",
+            marker,
+            h.header,
+            h.size,
+            h.previous_size,
+            pool_block_state(h),
+            h.pool_type,
+            tag_string(h.tag)
+        );
+    }
+    if let Some(idx) = target_idx {
+        let h = &blocks[idx];
+        let offset = target.0.saturating_sub(h.body.0);
+        println!(
+            "  target offset : 0x{:x} into body (block @ {:#x}, body @ {:#x})",
+            offset, h.header, h.body
+        );
+    }
+}
+
+fn print_big_pool(target: VirtAddr, entry: &BigPoolEntry) {
+    let offset = target.0 - entry.va.0;
+    let end_addr = entry.va + entry.size;
+    println!("big pool @ {:#x}", entry.va);
+    println!("  target        : {:#x}", target);
+    println!(
+        "  range         : {:#x} - {:#x} ({} bytes)",
+        entry.va, end_addr, entry.size
+    );
+    println!("  offset        : 0x{:x} / 0x{:x}", offset, entry.size);
+    println!(
+        "  tag           : '{}' (0x{:08x})",
+        tag_string(entry.tag),
+        entry.tag
+    );
+    println!("  table entry   : {:#x}[{}]", entry.entry, entry.index);
+    println!(
+        "  nonpaged      : {}",
+        if entry.nonpaged { "yes" } else { "no" }
+    );
+    println!("  pattern       : 0x{:x}", entry.pattern);
+    println!("  pool flags    : 0x{:x}", entry.pool_flags);
+    println!("  slush size    : 0x{:x}", entry.slush_size);
+}
+
 struct TrackingHighlighter {
     had_content: Arc<AtomicBool>,
 }
@@ -1829,6 +2681,15 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
     let shared_threads: Arc<RwLock<ThreadCache>> = Arc::new(RwLock::new(initial_threads));
 
     let shared_breakpoints: Arc<RwLock<BreakpointCache>> = Arc::new(RwLock::new(Vec::new()));
+    let initial_drivers = debugger.enumerate_driver_objects().unwrap_or_default();
+    let shared_drivers: Arc<RwLock<DriverObjectCache>> = Arc::new(RwLock::new(initial_drivers));
+
+    let mut script_host = ScriptHost::new();
+    let builtin_names: HashSet<String> = ReplCommand::iter().map(|c| c.to_string()).collect();
+    let load_report = script_host.load_all(&builtin_names, Some(debugger));
+    print_script_load_report(&load_report, true);
+    let shared_user_cmds: Arc<RwLock<UserCommandCache>> =
+        Arc::new(RwLock::new(script_host.command_names()));
 
     let completor = Box::new(MyCompleter {
         symbols: Arc::clone(&shared_symbols),
@@ -1838,6 +2699,8 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
         processes: Arc::clone(&shared_processes),
         threads: Arc::clone(&shared_threads),
         breakpoints: Arc::clone(&shared_breakpoints),
+        drivers: Arc::clone(&shared_drivers),
+        user_commands: Arc::clone(&shared_user_cmds),
     });
 
     let had_content = Arc::new(AtomicBool::new(false));
@@ -2141,6 +3004,76 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                     );
                                 }
                                 Err(e) => error!("failed to enable QEMU logging: {}", e),
+                            }
+                        }
+                        Ok(ReplCommand::Pool) => {
+                            let Some(expr) = parts.get(1).copied() else {
+                                println!(
+                                    "{}\n",
+                                    ReplCommand::Pool.get_message().unwrap_or("invalid usage")
+                                );
+                                continue;
+                            };
+
+                            let target = match Expr::eval(expr, debugger) {
+                                Ok(target) => target,
+                                Err(e) => {
+                                    error!("{}", e);
+                                    continue;
+                                }
+                            };
+
+                            let layout = match pool_layout(debugger) {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    error!("{}", e);
+                                    continue;
+                                }
+                            };
+
+                            if target.0 & (POOL_PAGE_SIZE - 1) == 0
+                                && let Some(big) = find_big_pool(debugger, &layout, target)
+                            {
+                                print_big_pool(target, &big);
+                                continue;
+                            }
+
+                            let region = classify_pool_region(debugger, target);
+                            let (blocks, idx, base) =
+                                locate_pool_block_in_page(debugger, &layout, target);
+                            println!("pool page {:#x}", base);
+                            println!("  target        : {:#x}", target);
+                            if let Some((name, start, end)) = region {
+                                println!("  region        : {} [{:#x} - {:#x}]", name, start, end);
+                            }
+                            if let Some(idx) = idx {
+                                println!(
+                                    "  blocks in run : {} (target is #{})",
+                                    blocks.len(),
+                                    idx + 1
+                                );
+                            }
+                            println!();
+                            print_pool_page_listing(&blocks, idx, target);
+
+                            if idx.is_none() {
+                                if let Some(big) = find_big_pool(debugger, &layout, target) {
+                                    println!();
+                                    print_big_pool(target, &big);
+                                    continue;
+                                }
+                                println!(
+                                    "  address does not lie inside a recognizable _POOL_HEADER block."
+                                );
+                                println!(
+                                    "  it may be segment heap, special pool, a mapped view, or image/stack."
+                                );
+                                if let Some(hint) = segment_heap_hint(debugger) {
+                                    println!("  hint          : {}", hint);
+                                }
+                                if let Some(near) = annotate_near_symbol(debugger, target) {
+                                    println!("  near symbol   : {}", near);
+                                }
                             }
                         }
                         Ok(ReplCommand::Db) => {
@@ -2928,96 +3861,14 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                 .find_type_across_modules(debugger.current_dtb(), arg)
                             {
                                 Some(type_info) => {
-                                    let mut builder = Builder::default();
-                                    builder.push_record(vec![format!(
-                                        "{} ({} bytes)",
-                                        type_info.name,
-                                        Value(type_info.size)
-                                    )]);
-
-                                    let mut sorted_fields: Vec<_> =
-                                        type_info.fields.iter().collect();
-                                    sorted_fields.sort_by_key(|(_, info)| {
-                                        let bitfield_pos = match &info.type_data {
-                                            ParsedType::Bitfield { pos, .. } => *pos,
-                                            _ => 0,
-                                        };
-                                        (info.offset, bitfield_pos)
-                                    });
-
-                                    for (name, info) in sorted_fields {
-                                        let value = if address.0 != 0 {
-                                            let mem = debugger
-                                                .get_current_process()
-                                                .memory(&debugger.kvm);
-                                            match &info.type_data {
-                                                ParsedType::Primitive(p) => {
-                                                    if p.contains("*") || p.contains("LONGLONG") {
-                                                        let val: u64 =
-                                                            mem.read(address + info.offset)?;
-                                                        format!(" = {:#x}", Value(val))
-                                                    } else if p.contains("LONG") {
-                                                        let val: u32 =
-                                                            mem.read(address + info.offset)?;
-                                                        format!(" = {:#x}", Value(val))
-                                                    } else if p.contains("SHORT")
-                                                        || p.contains("WCHAR")
-                                                    {
-                                                        let val: u16 =
-                                                            mem.read(address + info.offset)?;
-                                                        format!(" = {:#x}", Value(val))
-                                                    } else if p.contains("CHAR") {
-                                                        let val: u8 =
-                                                            mem.read(address + info.offset)?;
-                                                        format!(" = {:#x}", Value(val))
-                                                    } else {
-                                                        "".into()
-                                                    }
-                                                }
-                                                ParsedType::Pointer(_) => {
-                                                    let val: u64 =
-                                                        mem.read(address + info.offset)?;
-                                                    format!(" = {:#x}", Value(val))
-                                                }
-                                                ParsedType::Bitfield { pos, len, .. } => {
-                                                    let val: u64 =
-                                                        mem.read(address + info.offset)?;
-                                                    let val = (val >> pos) & ((1u64 << len) - 1);
-
-                                                    if *len == 1 {
-                                                        if val == 1 {
-                                                            format!(" = {}", "Y".green())
-                                                        } else {
-                                                            format!(" = {}", "N".red())
-                                                        }
-                                                    } else {
-                                                        format!(" = {}", Value(val))
-                                                    }
-                                                }
-                                                _ => "".into(),
-                                            }
-                                        } else {
-                                            "".into()
-                                        };
-
-                                        if field_name.is_none() || field_name.unwrap() == name {
-                                            builder.push_record(vec![
-                                                format!(
-                                                    "  + {:#06x} {:-12}",
-                                                    VirtAddr(info.offset.into()),
-                                                    name
-                                                ),
-                                                format!("  : {}", info.type_data.green()),
-                                                format!("  {}", value),
-                                            ]);
-                                        }
+                                    if let Err(e) = print_type_instance(
+                                        debugger,
+                                        &type_info,
+                                        address,
+                                        field_name.copied(),
+                                    ) {
+                                        error!("{}", e);
                                     }
-
-                                    let mut table = builder.build();
-                                    table
-                                        .with(tabled::settings::Style::empty())
-                                        .with(Padding::zero());
-                                    println!("{}\n", table);
                                 }
                                 None => {
                                     error!(
@@ -3025,6 +3876,22 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                         arg
                                     );
                                 }
+                            }
+                        }
+                        Ok(ReplCommand::TrapFrame) => {
+                            let address_arg = require_arg!(parts, 1, ReplCommand::TrapFrame);
+                            let address = match Expr::eval(address_arg, debugger) {
+                                Ok(a) => a,
+                                Err(e) => {
+                                    error!("{}", e);
+                                    continue;
+                                }
+                            };
+
+                            if let Err(e) =
+                                dump_trap_frame(debugger, address, parts.get(2).copied())
+                            {
+                                error!("{}", e);
                             }
                         }
                         Ok(ReplCommand::Ps) => {
@@ -3074,6 +3941,66 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                 }
                                 Err(e) => {
                                     error!("failed to enumerate processes: {}", e);
+                                }
+                            }
+                        }
+                        Ok(ReplCommand::Drivers) => {
+                            let filter = parts.get(1).map(|s| s.to_lowercase());
+
+                            match debugger.enumerate_driver_objects() {
+                                Ok(drivers) => {
+                                    let mut builder = Builder::default();
+                                    builder.push_record(vec![
+                                        "DriverObject  ".to_string(),
+                                        "Name  ".to_string(),
+                                        "DriverStart  ".to_string(),
+                                        "Size  ".to_string(),
+                                        "Module  ".to_string(),
+                                        "DeviceObject  ".to_string(),
+                                        "DriverUnload".to_string(),
+                                    ]);
+
+                                    let mut count = 0;
+                                    for driver in &drivers {
+                                        if let Some(ref f) = filter
+                                            && !driver.name.to_lowercase().contains(f)
+                                            && !format!("{:#x}", driver.object.0).starts_with(f)
+                                        {
+                                            continue;
+                                        }
+                                        count += 1;
+                                        let module = debugger
+                                            .symbols
+                                            .find_module_for_address(
+                                                debugger.guest.ntoskrnl.dtb(),
+                                                driver.driver_start,
+                                            )
+                                            .map(|module| module.name)
+                                            .unwrap_or_else(|| "-".to_string());
+                                        builder.push_record(vec![
+                                            format!("{:#018x}  ", driver.object),
+                                            format!("{}  ", driver.name),
+                                            format!("{:#018x}  ", driver.driver_start),
+                                            format!("0x{:x}  ", driver.driver_size),
+                                            format!("{}  ", module),
+                                            format!("{:#018x}  ", driver.device_object),
+                                            format!("{:#018x}", driver.driver_unload),
+                                        ]);
+                                    }
+
+                                    if count == 0 {
+                                        println!("{}\n", "no matching drivers".bright_black());
+                                    } else {
+                                        let mut table = builder.build();
+                                        table
+                                            .with(tabled::settings::Style::empty())
+                                            .with(Padding::zero());
+                                        println!("{}\n", table);
+                                    }
+                                    *shared_drivers.write().unwrap() = drivers;
+                                }
+                                Err(e) => {
+                                    error!("failed to list drivers: {}", e);
                                 }
                             }
                         }
@@ -3212,6 +4139,12 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                 }
                             }
                         }
+                        Ok(ReplCommand::Reload) => {
+                            script_host.reset();
+                            let report = script_host.load_all(&builtin_names, Some(debugger));
+                            print_script_load_report(&report, false);
+                            *shared_user_cmds.write().unwrap() = script_host.command_names();
+                        }
                         Ok(ReplCommand::Detach) => {
                             if debugger.current_process.is_none() {
                                 error!("not attached to any process");
@@ -3247,6 +4180,9 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
 
                             debugger.registers = Some(register_map.to_hashmap(&regs));
                             print_registers(&register_map, &regs);
+                            println!();
+                            print_control_registers(&register_map, &regs);
+                            println!();
 
                             let read_reg = |name: &str| -> String {
                                 register_map
@@ -3254,16 +4190,6 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                     .map(|v| format!("{:#018x}", VirtAddr(v)))
                                     .unwrap_or_else(|_| "N/A".to_string())
                             };
-
-                            println!();
-                            println!(
-                                "cr0={}  cr2={}  cr3={}",
-                                read_reg("cr0"),
-                                read_reg("cr2"),
-                                read_reg("cr3")
-                            );
-                            println!("cr4={}  cr8={}", read_reg("cr4"), read_reg("cr8"));
-                            println!();
 
                             println!(
                                 "cs={}  ds={}  es={}",
@@ -3277,6 +4203,29 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                 read_reg("gs"),
                                 read_reg("ss")
                             );
+                            println!();
+                        }
+                        Ok(ReplCommand::Cregs) => {
+                            if client.is_running() {
+                                error!("VM is running");
+                                continue;
+                            }
+
+                            if let Err(e) = client.set_current_thread(&current_thread) {
+                                error!("failed to set thread context: {:?}", e);
+                                continue;
+                            }
+
+                            let regs = match client.read_registers() {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    error!("failed to read registers: {:?}", e);
+                                    continue;
+                                }
+                            };
+
+                            debugger.registers = Some(register_map.to_hashmap(&regs));
+                            print_control_registers(&register_map, &regs);
                             println!();
                         }
                         Ok(ReplCommand::Si) => {
@@ -3575,10 +4524,23 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                             }
                         }
                         Err(_) => {
-                            println!(
-                                "unknown command: '{}' (try pressing tab to see available commands)\n",
-                                cmd_str
-                            );
+                            if script_host.has(cmd_str) {
+                                let args: Vec<&str> = parts.iter().skip(1).copied().collect();
+                                if let Err(e) = script_host.dispatch(
+                                    cmd_str,
+                                    &args,
+                                    debugger,
+                                    &mut *client,
+                                    &register_map,
+                                ) {
+                                    error!("{}: {}", cmd_str, e);
+                                }
+                            } else {
+                                println!(
+                                    "unknown command: '{}' (try pressing tab to see available commands)\n",
+                                    cmd_str
+                                );
+                            }
                         }
                     }
                 }
@@ -3603,6 +4565,9 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                     }
                     if let Err(e) = refresh_process_cache(debugger, &shared_processes) {
                         error!("failed to refresh process cache: {}", e);
+                    }
+                    if let Ok(drivers) = debugger.enumerate_driver_objects() {
+                        *shared_drivers.write().unwrap() = drivers;
                     }
                     println!();
                     print_break_context(&mut *client, &register_map, debugger, &current_thread);

@@ -19,7 +19,10 @@ Windows kernel debugger for Linux hosts running Windows under KVM/QEMU. Essentia
 
 ### Disclaimer
 
-`ntoseye` needs to download symbols to initialize required offsets, it will only download symbols from Microsoft's official symbol server. All files which will be read/written to will be located in `$XDG_CONFIG_HOME/ntoseye`.
+`ntoseye` needs to download symbols and images to initialize required offsets, it will only download symbols from Microsoft's official symbol server. All files which will be read/written to will be located in `$XDG_CONFIG_HOME/ntoseye`, which includes the following subfolders:
+- `commands/` for custom scripted commands
+- `images/` for binaries downloaded from the VM
+- `symbols/` for PDBs
 
 ### Preview
 
@@ -144,6 +147,68 @@ Then connect: `ntoseye --backend kd`.
 </domain>
 ```
 
+## Scripting
+
+`ntoseye` auto-loads any `*.lua` file in `$XDG_CONFIG_HOME/ntoseye/commands/` at REPL startup. Scripts can register new commands that appear in tab completion and dispatch alongside the builtins. Run `reload` in the REPL to pick up script edits without restarting.
+
+Bundled scripts can be installed/updated with:
+
+```bash
+ntoseye scripts install --force
+ntoseye scripts list
+```
+
+`ntoseye scripts install <source>` also accepts:
+- a local `.lua` file
+- a local directory of `.lua` files
+- single HTTPS URL ending in `.lua`
+
+Local and remote installs print a trust warning and prompt before copying; use `--yes` for non-interactive installs and `--force` to overwrite existing scripts. Remote installs are limited to one `.lua` file and print the downloaded content's SHA-256.
+
+```lua
+register_command("name", "help text", function(arg1, arg2) ... end)
+
+-- with per-argument tab-completion hints:
+register_command("name", "help text", {"process", "symbol"}, function(a, b) ... end)
+```
+
+Completion strategies: `"none"`, `"symbol"`, `"type"`, `"process"`, `"thread"`, `"breakpoint"`, `"driver"`. The strategies table is positional; arg 1 uses the first entry, arg 2 the second, etc. Missing positions fall back to `"none"`. Pass `{}` for an empty table if you want completion turned off explicitly.
+
+Scripts run with a constrained Lua standard library: base globals plus `table`, `string`, `math`, and `utf8`. Host filesystem/process/module access through Lua's `io`, `os`, and `package` libraries is not available; debugger interaction should go through `ntos`.
+
+Host API is exposed under a global `ntos` table:
+
+| function | returns |
+|---|---|
+| `ntos.ps([filter])` | array of `{pid, name, eprocess}` |
+| `ntos.process(target)` / `ntos.try_process(target)` | one `{pid, name, eprocess}`; strict form raises with a candidate list when ambiguous, try_ form collapses both no-match and ambiguous into nil (call `process()` if you need to surface the ambiguity to the user); numeric targets require exact PID |
+| `ntos.command_usage()` | nil (prints the current command's registered help) |
+| `ntos.eval(expr)` / `ntos.try_eval(expr)` | Address / Address or nil |
+| `ntos.read_byte/word/dword/qword(addr)` | integer / integer / integer / Address |
+| `ntos.try_read_byte/word/dword/qword(addr)` | value or nil |
+| `ntos.read_bytes(addr, len)` / `ntos.try_read_bytes(addr, len)` | Lua string / Lua string or nil |
+| `ntos.read_struct(type, addr)` / `ntos.try_read_struct(type, addr)` | table / table or nil (raises if `type` is unknown, that always indicates a script bug, not a runtime condition); only top-level pointer/primitive/bitfield/enum fields decode (nested struct/union/array fields come back as raw byte strings; read those explicitly with `try_read_field_*` using `offset_of`) |
+| `ntos.try_read_unicode_string(addr)` | string or nil (`addr` points to a `_UNICODE_STRING`) |
+| `ntos.write_byte/word/dword/qword(addr, v)` | nil |
+| `ntos.write_bytes(addr, str)` | nil |
+| `ntos.loaded_module_list()` | Address (value printed in the startup banner) |
+| `ntos.driver_objects()` / `ntos.try_find_driver_object(name)` | array of driver tables / driver table or nil |
+| `ntos.kernel_modules()` / `ntos.try_find_kernel_module(name)` | array of `{name, short_name, base, size, end}` / one module or nil (match is exact on `short_name`, substring on `name`, case-insensitive) |
+| `ntos.search(addr, len, pattern)` / `ntos.search_first(addr, len, pattern)` | array of Addresses / Address or nil (`pattern` is a raw Lua byte string, e.g. `"\x48\x83..."`) |
+| `ntos.offset_of(type, field)` / `ntos.try_offset_of(type, field)` | integer / integer or nil |
+| `ntos.type_size(type)` / `ntos.try_type_size(type)` | integer / integer or nil |
+| `ntos.fields_of(type)` / `ntos.try_fields_of(type)` | array of field tables / array or nil |
+| `ntos.try_read_field_byte/word/dword/qword(type, field, addr)` | value or nil (raises if `type`/`field` is unknown, that always indicates a script bug, not a runtime condition) |
+| `ntos.containing_record(entry, type, field)` | Address |
+| `ntos.can_read(addr, len)` | boolean |
+| `ntos.is_kernel_address(addr)` | boolean (true if `addr` is in the canonical kernel half) |
+| `ntos.try_closest_symbol(addr)` / `ntos.try_closest_symbol_any(addr)` | symbol table or nil |
+| `ntos.format_symbol(addr)` | `"module!name+0x<offset>"` (no offset suffix when zero); falls back to hex if no symbol resolves |
+| `ntos.read_register(name)` | Address (read-only; returned as Address so high-half values render correctly and compose with pointer math, use `:to_int()` for bit-tests on small values) |
+| `ntos.addr(n)` | Address (constructor for literals) |
+
+Addresses are an opaque userdata supporting `+ - & | ^ << >> < ==` and `tostring` (renders as hex).
+
 ## Credits
 
 Functionality regarding initialization of guest information was written with the help of the following sources:
@@ -152,10 +217,3 @@ Functionality regarding initialization of guest information was written with the
 - [pcileech](https://github.com/ufrisk/pcileech)
 - [MemProcFS](https://github.com/ufrisk/MemProcFS)
 - [ReactOS](https://github.com/reactos/reactos)
-
-## Usage examples
-
-### Privilege escalation
-
-1. Run `ps <filter>` to get the `EPROCESS` address of the process you wish to escalate
-2. Run `eq (_EPROCESS)(AddressOfEPROCESS)->Token *(_EPROCESS)*PsInitialSystemProcess->Token` where `AddressOfEPROCESS` is the address from step 1

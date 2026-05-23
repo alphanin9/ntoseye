@@ -104,6 +104,14 @@ pub enum Error {
     #[error("KVM process not found")]
     KvmNotFound,
 
+    #[error(
+        "permission denied reading from KVM process (PID {pid}).\n\
+         /proc/sys/kernel/yama/ptrace_scope is currently {scope}. to allow attaching, run:\n    \
+             echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope\n\
+         (or run ntoseye as root)"
+    )]
+    PtraceDenied { pid: i32, scope: String },
+
     #[error("Another instance of ntoseye is running")]
     AlreadyRunning,
 

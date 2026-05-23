@@ -7,6 +7,7 @@ use crate::{
     gdb::GdbClient,
     kd::KdBackend,
     repl::start_repl,
+    script::ScriptInstallOptions,
 };
 
 mod backend;
@@ -20,6 +21,7 @@ mod host;
 mod kd;
 mod memory;
 mod repl;
+mod script;
 mod symbols;
 mod types;
 mod unwind;
@@ -66,7 +68,52 @@ struct Args {
     /// backend connection target. Defaults: '127.0.0.1:1234' for gdb, '/tmp/ntoseye-kd.sock' for kd.
     #[argh(option, long = "connect")]
     connect: Option<String>,
+    #[argh(subcommand)]
+    command: Option<Command>,
 }
+
+#[derive(FromArgs)]
+#[argh(subcommand)]
+enum Command {
+    Scripts(ScriptsCommand),
+}
+
+#[derive(FromArgs)]
+#[argh(subcommand, name = "scripts")]
+/// manage Lua command scripts
+struct ScriptsCommand {
+    #[argh(subcommand)]
+    command: ScriptsSubcommand,
+}
+
+#[derive(FromArgs)]
+#[argh(subcommand)]
+enum ScriptsSubcommand {
+    Install(ScriptsInstallCommand),
+    List(ScriptsListCommand),
+}
+
+#[derive(FromArgs)]
+#[argh(subcommand, name = "install")]
+/// install Lua command scripts
+struct ScriptsInstallCommand {
+    /// optional source: local .lua file, local directory, or HTTPS .lua URL; omit to install bundled scripts
+    #[argh(positional)]
+    source: Option<String>,
+
+    /// overwrite existing scripts
+    #[argh(switch, long = "force")]
+    force: bool,
+
+    /// skip trust prompt for local or remote scripts
+    #[argh(switch, long = "yes", short = 'y')]
+    yes: bool,
+}
+
+#[derive(FromArgs)]
+#[argh(subcommand, name = "list")]
+/// list installed Lua command scripts
+struct ScriptsListCommand {}
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("This application only runs on Linux hosts.");
@@ -156,7 +203,14 @@ debugger), run:
 
 ntoseye --backend kd --connect /tmp/ntoseye-kd.sock";
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     let args: Args = argh::from_env();
     if args.version {
         println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
@@ -171,6 +225,21 @@ fn main() -> Result<()> {
     if args.kd_instructions {
         println!("{}", KD_INSTRUCTIONS);
         return Ok(());
+    }
+
+    if let Some(command) = args.command {
+        return match command {
+            Command::Scripts(scripts) => match scripts.command {
+                ScriptsSubcommand::Install(install) => {
+                    script::install_scripts(ScriptInstallOptions {
+                        source: install.source,
+                        force: install.force,
+                        yes: install.yes,
+                    })
+                }
+                ScriptsSubcommand::List(_) => script::list_scripts(),
+            },
+        };
     }
 
     let instance = SingleInstance::new("ntoseye").unwrap();
