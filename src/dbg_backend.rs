@@ -23,6 +23,14 @@ pub trait DebugBackend {
     fn set_breakpoint(&mut self, addr: u64) -> Result<()>;
     fn remove_breakpoint(&mut self, addr: u64) -> Result<()>;
 
+    fn set_hardware_breakpoint(&mut self, _addr: u64) -> Result<()> {
+        Err(crate::error::Error::NotSupported)
+    }
+
+    fn remove_hardware_breakpoint(&mut self, _addr: u64) -> Result<()> {
+        Err(crate::error::Error::NotSupported)
+    }
+
     fn supports_process_breakpoints(&self) -> bool {
         false
     }

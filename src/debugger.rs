@@ -62,9 +62,9 @@ pub struct AttachReport {
 }
 
 pub struct DebuggerPte {
-    name: String, // TODO maybe enum instead?
-    address: VirtAddr,
-    value: PageTableEntry,
+    pub name: String, // TODO maybe enum instead?
+    pub address: VirtAddr,
+    pub value: PageTableEntry,
 }
 
 pub struct DebuggerPteTraversal {

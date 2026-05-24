@@ -34,7 +34,7 @@ use crate::dbg_backend::DebugBackend;
 use crate::debugger::{AttachReport, DebuggerContext, DriverObjectInfo};
 use crate::error::{Error, Result};
 use crate::expr::Expr;
-use crate::gdb::{BreakpointHitResult, BreakpointManager, RegisterMap};
+use crate::gdb::{BreakpointHitResult, BreakpointKind, BreakpointManager, RegisterMap};
 use crate::guest::{ModuleInfo, ModuleSymbolLoadReport};
 use crate::memory::AddressSpace;
 use crate::script::{LoadReport, ScriptHost};
@@ -344,6 +344,8 @@ enum ReplCommand {
     // breakpoints
     #[strum(message = "Set a breakpoint.\n(usage: bp <address>)")]
     Bp,
+    #[strum(message = "Set a hardware execution breakpoint.\n(usage: hbp <address>)")]
+    Hbp,
     #[strum(message = "List all breakpoints.\n(usage: bl)")]
     Bl,
     #[strum(message = "Clear a breakpoint by ID.\n(usage: bc <id>)")]
@@ -420,7 +422,8 @@ impl ReplCommand {
             | Self::Pte
             | Self::Pool
             | Self::TrapFrame
-            | Self::Bp => CompletionStrategy::Symbol,
+            | Self::Bp
+            | Self::Hbp => CompletionStrategy::Symbol,
             Self::Dt => CompletionStrategy::Type,
             Self::Attach => CompletionStrategy::Process,
             Self::Thread => CompletionStrategy::Thread,
@@ -1079,10 +1082,7 @@ fn rewind_threads_off_breakpoints(
         let Some(prev) = rip.checked_sub(1) else {
             continue;
         };
-        if !matches!(
-            breakpoints.check_breakpoint_hit(prev, cr3),
-            BreakpointHitResult::Hit(_)
-        ) {
+        if !breakpoints.int3_breakpoint_hit_at(prev, cr3) {
             continue;
         }
         let mut adjusted = regs.clone();
@@ -4307,17 +4307,16 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                             current_thread = thread_id.to_string();
                             println!("switched to thread {}\n", current_thread);
                         }
-                        Ok(ReplCommand::Bp) => {
+                        Ok(cmd @ (ReplCommand::Bp | ReplCommand::Hbp)) => {
                             if client.is_running() {
                                 error!("VM is running");
                                 continue;
                             }
 
-                            // Process-scope BP support is per-backend; the
-                            // manager returns `Error::NotSupported` for
-                            // backends that can't honour them.
+                            // Software process-scope BP support is per-backend;
+                            // hardware BPs can still be CR3-filtered by the manager.
 
-                            let addr_str = require_arg!(parts, 1, ReplCommand::Bp);
+                            let addr_str = require_arg!(parts, 1, cmd);
                             let address = match Expr::eval(addr_str, debugger) {
                                 Ok(a) => a,
                                 Err(e) => {
@@ -4337,11 +4336,30 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                     }
                                 });
 
-                            match breakpoints.add(&mut *client, debugger, address, symbol.clone()) {
+                            let kind = match cmd {
+                                ReplCommand::Bp => BreakpointKind::Software,
+                                ReplCommand::Hbp => BreakpointKind::Hardware,
+                                _ => unreachable!(),
+                            };
+
+                            let add_result = match kind {
+                                BreakpointKind::Software => {
+                                    breakpoints.add(&mut *client, debugger, address, symbol.clone())
+                                }
+                                BreakpointKind::Hardware => breakpoints.add_hardware(
+                                    &mut *client,
+                                    debugger,
+                                    address,
+                                    symbol.clone(),
+                                ),
+                            };
+
+                            match add_result {
                                 Ok(id) => {
                                     update_breakpoint_cache!(breakpoints, shared_breakpoints);
                                     println!(
-                                        "breakpoint {} set at {}{}{}\n",
+                                        "{} breakpoint {} set at {}{}{}\n",
+                                        kind.label(),
                                         format!("#{}", id).cyan(),
                                         format!("{:#x}", address).yellow(),
                                         symbol
@@ -4374,6 +4392,7 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                 builder.push_record(vec![
                                     "ID".to_string(),
                                     "Status".to_string(),
+                                    "Type".to_string(),
                                     "Address".to_string(),
                                     "Symbol".to_string(),
                                     "Scope".to_string(),
@@ -4386,6 +4405,7 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                     builder.push_record(vec![
                                         format!("{}   ", bp.id),
                                         format!("{}  ", status),
+                                        format!("{}  ", bp.kind.label()),
                                         format!("{:#018x}  ", bp.address),
                                         format!("{}  ", bp.symbol.as_deref().unwrap_or("-")),
                                         scope,

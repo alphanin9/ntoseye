@@ -65,10 +65,31 @@ For examples, refer [here](#usage-examples).
 |---|---|---|
 | Transport | QEMU's `gdbstub` | Windows KD over a serial pipe (KDCOM) |
 | Requires in-guest configuration | No (guest is unaware it's being debugged) | Yes (`bcdedit /debug on`; anti-debug code, PatchGuard, and some Windows behaviour change once enabled) |
-| Supports usermode breakpoints | No | Yes |
-| Native breakpoints | gdb `Z0` packets | `DbgKdWriteBreakPointApi` |
+| Supports usermode breakpoints | Hardware execution breakpoints only (`hbp`) | Yes |
+| Native breakpoints | gdb `Z0`/`Z1` packets | `DbgKdWriteBreakPointApi` |
 
 See [VM configuration](#vm-configuration) for the host-side setup of each backend.
+
+## Agent stdio protocol
+
+Use `--agent-stdio` to run a newline-delimited JSON control protocol instead of the interactive REPL:
+
+```bash
+ntoseye --backend gdb --connect 127.0.0.1:1234 --agent-stdio
+```
+
+The first line is a `ready` event. Each request is one JSON object with an optional `id`, a `command`, and command fields. Responses are one JSON object per line:
+
+```json
+{"id":1,"command":"eval","expr":"nt!MmAccessFault"}
+{"id":2,"command":"memory.read","address":"nt!MmAccessFault","length":16}
+{"id":3,"command":"disasm","address":"nt!MmAccessFault","length":32}
+{"id":4,"command":"dt","type":"KTRAP_FRAME","address":"$rsp","field":"Rip"}
+{"id":5,"command":"bp.set","address":"nt!MmAccessFault","kind":"hardware"}
+{"id":6,"command":"continue","timeout_ms":1000}
+```
+
+Core commands: `status`, `eval`, `registers`, `memory.read`, `memory.write`, `memory.search`, `memory.fill`, `disasm`, `dt`, `pte`, `k`, `drivers`, `ps`, `lm`, `attach`, `detach`, `threads`, `thread.set`, `bp.set`, `bp.clear`, `bp.disable`, `bp.enable`, `bp.list`, `continue`, `interrupt`, `step`, `qcmd`, and `quit`. Addresses are expression strings, so symbols, `module!symbol`, arithmetic, casts, and register expressions follow the same parser as the REPL. Binary memory payloads are hex strings.
 
 ## VM configuration
 

@@ -26,12 +26,28 @@ use std::{
     mem::size_of,
     path::{Path, PathBuf},
     ptr,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use std::{fmt, io::Cursor};
 
 // NOTE global is probably fine here?
 pub static FORCE_DOWNLOADS: OnceLock<bool> = OnceLock::new();
+static QUIET_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+pub fn set_quiet_progress(quiet: bool) {
+    QUIET_PROGRESS.store(quiet, Ordering::SeqCst);
+}
+
+pub fn progress_bar(len: u64) -> ProgressBar {
+    if QUIET_PROGRESS.load(Ordering::SeqCst) {
+        ProgressBar::hidden()
+    } else {
+        ProgressBar::new(len)
+    }
+}
 
 #[derive(Default, Clone)]
 pub struct SymbolIndex {
@@ -244,7 +260,7 @@ pub fn download_jobs_parallel(jobs: Vec<DownloadJob>) -> Vec<Result<PathBuf>> {
             }
 
             let mp = Arc::clone(&mp);
-            download_job(&job, mp.add(ProgressBar::new(0))).map(|_| job.path)
+            download_job(&job, mp.add(progress_bar(0))).map(|_| job.path)
         })
         .collect::<Vec<_>>()
 }
@@ -354,6 +370,11 @@ impl LoadedModule {
 
     fn contains_address(&self, address: VirtAddr) -> bool {
         address.0 >= self.base_address.0 && address.0 < self.end_address().0
+    }
+
+    fn matches_qualifier(&self, qualifier: &str) -> bool {
+        ModuleInfo::derive_short_name(&self.name).eq_ignore_ascii_case(qualifier)
+            || self.name.eq_ignore_ascii_case(qualifier)
     }
 }
 
@@ -819,7 +840,7 @@ impl SymbolStore {
             .iter()
             .filter(|module| dtb.is_none_or(|filter_dtb| module.dtb == filter_dtb))
             .count();
-        let progress = ProgressBar::new((total_modules + 1) as u64);
+        let progress = progress_bar((total_modules + 1) as u64);
         progress.set_style(task_progress_style());
         progress.set_message("Building symbol completions");
 
@@ -866,7 +887,7 @@ impl SymbolStore {
             .iter()
             .filter(|module| dtb.is_none_or(|filter_dtb| module.dtb == filter_dtb))
             .count();
-        let progress = ProgressBar::new((total_modules + 1) as u64);
+        let progress = progress_bar((total_modules + 1) as u64);
         progress.set_style(task_progress_style());
         progress.set_message("Building type completions");
 
@@ -920,6 +941,30 @@ impl SymbolStore {
     }
 
     pub fn find_symbol_across_modules(&self, dtb: Dtb, symbol_name: &str) -> Option<VirtAddr> {
+        if let Some((module_name, unqualified_symbol)) = symbol_name.split_once('!') {
+            let module_name = module_name.trim();
+            let unqualified_symbol = unqualified_symbol.trim();
+            if module_name.is_empty() || unqualified_symbol.is_empty() {
+                return None;
+            }
+
+            for module in self.modules.iter() {
+                if module.dtb != dtb {
+                    continue;
+                }
+
+                if !module.matches_qualifier(module_name) {
+                    continue;
+                }
+
+                if let Some(rva) = self.get_rva_of_symbol(module.guid, unqualified_symbol) {
+                    return Some(module.base_address + rva as u64);
+                }
+            }
+
+            return None;
+        }
+
         for module in self.modules.iter() {
             if module.dtb != dtb {
                 continue;
@@ -1344,5 +1389,26 @@ impl SymbolIndex {
         }
 
         results
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LoadedModule;
+    use crate::types::VirtAddr;
+
+    #[test]
+    fn nt_kernel_modules_match_nt_qualifier() {
+        let module = LoadedModule {
+            name: "\\SystemRoot\\system32\\ntoskrnl.exe".to_string(),
+            guid: 1,
+            base_address: VirtAddr(0xffff_f800_0000_0000),
+            size: 0x1000,
+            dtb: 0,
+        };
+
+        assert!(module.matches_qualifier("nt"));
+        assert!(module.matches_qualifier("\\SystemRoot\\system32\\ntoskrnl.exe"));
+        assert!(!module.matches_qualifier("win32k"));
     }
 }
