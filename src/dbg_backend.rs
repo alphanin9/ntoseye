@@ -7,6 +7,10 @@ use crate::gdb::RegisterMap;
 pub struct StopEvent {
     /// Backend thread/vCPU id, if the stop packet provided one
     pub thread_id: Option<String>,
+    /// Human-readable stop/exit reason, if the backend provided one
+    pub summary: Option<String>,
+    /// True if the debug target exited, was terminated, or reports no resumed threads
+    pub target_exited: bool,
 }
 
 /// Debug transport abstraction; memory access stays on `/dev/kvm`
@@ -18,6 +22,14 @@ pub trait DebugBackend {
 
     fn set_breakpoint(&mut self, addr: u64) -> Result<()>;
     fn remove_breakpoint(&mut self, addr: u64) -> Result<()>;
+
+    fn set_hardware_breakpoint(&mut self, _addr: u64) -> Result<()> {
+        Err(crate::error::Error::NotSupported)
+    }
+
+    fn remove_hardware_breakpoint(&mut self, _addr: u64) -> Result<()> {
+        Err(crate::error::Error::NotSupported)
+    }
 
     fn supports_process_breakpoints(&self) -> bool {
         false
@@ -42,6 +54,11 @@ pub trait DebugBackend {
 
     /// Return the currently stopped thread
     fn get_stopped_thread_id(&mut self) -> Result<String>;
+
+    /// Run a QEMU monitor command through the gdbstub, if this backend supports it.
+    fn monitor_command(&mut self, _command: &str) -> Result<String> {
+        Err(crate::error::Error::NotSupported)
+    }
 
     fn is_running(&self) -> bool;
 }

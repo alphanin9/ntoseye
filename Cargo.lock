@@ -1164,6 +1164,8 @@ dependencies = [
  "rayon",
  "reedline",
  "reqwest",
+ "serde",
+ "serde_json",
  "sha2",
  "single-instance",
  "spin",

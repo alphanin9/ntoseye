@@ -9,7 +9,7 @@ use crate::{
     },
     types::*,
 };
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressStyle;
 use pelite::pe64::{Pe, PeView};
 use rayon::prelude::*;
 use zerocopy::IntoBytes;
@@ -942,7 +942,7 @@ impl Guest {
         }
 
         if !ready_to_load.is_empty() {
-            let pb = ProgressBar::new(ready_to_load.len() as u64);
+            let pb = crate::symbols::progress_bar(ready_to_load.len() as u64);
             pb.set_style(
                 ProgressStyle::with_template("Indexing [{bar:40}] {pos}/{len}")
                     .unwrap()

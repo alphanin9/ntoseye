@@ -1020,8 +1020,7 @@ impl ScriptHost {
                     if len == 0 || len as usize > 0x1000 {
                         return Ok(None);
                     }
-                    let Ok(buffer) = mem.read::<VirtAddr>(VirtAddr(addr.0) + buf_off)
-                    else {
+                    let Ok(buffer) = mem.read::<VirtAddr>(VirtAddr(addr.0) + buf_off) else {
                         return Ok(None);
                     };
                     let mut bytes = vec![0u8; len as usize];
@@ -1034,41 +1033,45 @@ impl ScriptHost {
 
             ntos.set(
                 "search",
-                scope.create_function(|lua, (addr, len, pattern): (Address, usize, mlua::String)| {
-                    let pattern = pattern.as_bytes();
-                    let out = lua.create_table()?;
-                    if pattern.is_empty() || pattern.len() > len {
-                        return Ok(out);
-                    }
-                    let d = dbg.borrow();
-                    let buf = read_vec(&d, addr, len)?;
-                    let mut idx = 1i64;
-                    for i in 0..=buf.len() - pattern.len() {
-                        if &buf[i..i + pattern.len()] == &*pattern {
-                            out.set(idx, Address(addr.0.wrapping_add(i as u64)))?;
-                            idx += 1;
+                scope.create_function(
+                    |lua, (addr, len, pattern): (Address, usize, mlua::String)| {
+                        let pattern = pattern.as_bytes();
+                        let out = lua.create_table()?;
+                        if pattern.is_empty() || pattern.len() > len {
+                            return Ok(out);
                         }
-                    }
-                    Ok(out)
-                })?,
+                        let d = dbg.borrow();
+                        let buf = read_vec(&d, addr, len)?;
+                        let mut idx = 1i64;
+                        for i in 0..=buf.len() - pattern.len() {
+                            if &buf[i..i + pattern.len()] == &*pattern {
+                                out.set(idx, Address(addr.0.wrapping_add(i as u64)))?;
+                                idx += 1;
+                            }
+                        }
+                        Ok(out)
+                    },
+                )?,
             )?;
 
             ntos.set(
                 "search_first",
-                scope.create_function(|_, (addr, len, pattern): (Address, usize, mlua::String)| {
-                    let pattern = pattern.as_bytes();
-                    if pattern.is_empty() || pattern.len() > len {
-                        return Ok(None);
-                    }
-                    let d = dbg.borrow();
-                    let buf = read_vec(&d, addr, len)?;
-                    for i in 0..=buf.len() - pattern.len() {
-                        if &buf[i..i + pattern.len()] == &*pattern {
-                            return Ok(Some(Address(addr.0.wrapping_add(i as u64))));
+                scope.create_function(
+                    |_, (addr, len, pattern): (Address, usize, mlua::String)| {
+                        let pattern = pattern.as_bytes();
+                        if pattern.is_empty() || pattern.len() > len {
+                            return Ok(None);
                         }
-                    }
-                    Ok(None)
-                })?,
+                        let d = dbg.borrow();
+                        let buf = read_vec(&d, addr, len)?;
+                        for i in 0..=buf.len() - pattern.len() {
+                            if &buf[i..i + pattern.len()] == &*pattern {
+                                return Ok(Some(Address(addr.0.wrapping_add(i as u64))));
+                            }
+                        }
+                        Ok(None)
+                    },
+                )?,
             )?;
 
             ntos.set(

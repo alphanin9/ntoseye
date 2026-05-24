@@ -2,6 +2,7 @@ use argh::{FromArgValue, FromArgs};
 use single_instance::SingleInstance;
 
 use crate::{
+    agent::start_agent_stdio,
     dbg_backend::DebugBackend,
     error::{Error, Result},
     gdb::GdbClient,
@@ -10,6 +11,7 @@ use crate::{
     script::ScriptInstallOptions,
 };
 
+mod agent;
 mod backend;
 mod dbg_backend;
 mod debugger;
@@ -68,6 +70,11 @@ struct Args {
     /// backend connection target. Defaults: '127.0.0.1:1234' for gdb, '/tmp/ntoseye-kd.sock' for kd.
     #[argh(option, long = "connect")]
     connect: Option<String>,
+
+    /// run a newline-delimited JSON agent protocol on stdin/stdout instead of the interactive REPL
+    #[argh(switch, long = "agent-stdio")]
+    agent_stdio: bool,
+
     #[argh(subcommand)]
     command: Option<Command>,
 }
@@ -124,6 +131,15 @@ registers and breakpointing. To enable it, you must pass the
 following arguments to QEMU:
 
 -s -S
+
+For crash/reset logging while developing low-level code, add QEMU
+logging and prevent immediate reboot:
+
+-d int,cpu_reset,guest_errors -D /tmp/qemu-ntoseye.log -no-reboot
+
+Inside ntoseye, the same log masks can be enabled after connection with:
+
+qlog int,cpu_reset,guest_errors /tmp/qemu-ntoseye.log
 
 If you are running QEMU via commandline, simply append them
 to your existing command.
@@ -241,6 +257,7 @@ fn run() -> Result<()> {
     symbols::FORCE_DOWNLOADS
         .set(args.redownload_symbols)
         .unwrap();
+    symbols::set_quiet_progress(args.agent_stdio);
 
     let mut debugger = debugger::DebuggerContext::new()?;
 
@@ -255,7 +272,11 @@ fn run() -> Result<()> {
         }
     };
 
-    start_repl(&mut debugger, backend.as_mut())
+    if args.agent_stdio {
+        start_agent_stdio(&mut debugger, backend.as_mut())
+    } else {
+        start_repl(&mut debugger, backend.as_mut())
+    }
 }
 
 // #[cfg(test)]

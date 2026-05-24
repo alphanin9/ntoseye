@@ -600,12 +600,16 @@ impl DebugBackend for KdBackend {
             self.record_stop(stop);
             return Ok(StopEvent {
                 thread_id: Some(thread_id_for(stop.processor)),
+                summary: None,
+                target_exited: false,
             });
         }
         let stop = await_state_change(&mut self.framing)?;
         self.record_stop(stop);
         Ok(StopEvent {
             thread_id: Some(thread_id_for(stop.processor)),
+            summary: None,
+            target_exited: false,
         })
     }
 
@@ -618,6 +622,8 @@ impl DebugBackend for KdBackend {
             self.record_stop(stop);
             return Ok(Some(StopEvent {
                 thread_id: Some(thread_id_for(stop.processor)),
+                summary: None,
+                target_exited: false,
             }));
         }
         kd_trace!(
@@ -675,6 +681,8 @@ impl DebugBackend for KdBackend {
         self.record_stop(stop);
         Ok(Some(StopEvent {
             thread_id: Some(thread_id_for(stop.processor)),
+            summary: None,
+            target_exited: false,
         }))
     }
 

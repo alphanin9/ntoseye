@@ -27,17 +27,18 @@ use iced_x86::{
 };
 use owo_colors::OwoColorize;
 use std::borrow::Cow;
+use std::path::{Path, PathBuf};
 
 use crate::backend::MemoryOps;
 use crate::dbg_backend::DebugBackend;
 use crate::debugger::{AttachReport, DebuggerContext, DriverObjectInfo};
 use crate::error::{Error, Result};
 use crate::expr::Expr;
-use crate::gdb::{BreakpointHitResult, BreakpointManager, RegisterMap};
-use crate::guest::ModuleSymbolLoadReport;
+use crate::gdb::{BreakpointHitResult, BreakpointKind, BreakpointManager, RegisterMap};
+use crate::guest::{ModuleInfo, ModuleSymbolLoadReport};
 use crate::memory::AddressSpace;
 use crate::script::{LoadReport, ScriptHost};
-use crate::symbols::{ParsedType, SymbolIndex, SymbolStore, TypeInfo};
+use crate::symbols::{ModuleSymbolDiscovery, ParsedType, SymbolIndex, SymbolStore, TypeInfo};
 use crate::types::{Dtb, Value, VirtAddr};
 use crate::unwind::{
     FrameSource, ThreadTraceContext, build_stacktrace, format_symbol, preferred_code_dtb,
@@ -310,6 +311,24 @@ enum ReplCommand {
     #[strum(message = "Display page table entries for an address.\n(usage: pte <address>)")]
     Pte,
     #[strum(
+        message = "Dump the current processor's interrupt descriptor table.\n(usage: idt [count])"
+    )]
+    Idt,
+    #[strum(
+        message = "Dump the current processor's global descriptor table.\n(usage: gdt [count])"
+    )]
+    Gdt,
+    #[strum(message = "Dump the current processor's TSS stack bases.\n(usage: tss [selector])")]
+    Tss,
+    #[strum(
+        message = "Run a raw QEMU monitor command through the gdbstub.\n(usage: qcmd <command>)"
+    )]
+    Qcmd,
+    #[strum(
+        message = "Enable QEMU logging through the monitor.\n(usage: qlog [items] [logfile])\ndefault items: int,cpu_reset,guest_errors"
+    )]
+    Qlog,
+    #[strum(
         message = "Inspect the pool page containing an address.\n(usage: pool <address-expression>)"
     )]
     Pool,
@@ -325,6 +344,8 @@ enum ReplCommand {
     // breakpoints
     #[strum(message = "Set a breakpoint.\n(usage: bp <address>)")]
     Bp,
+    #[strum(message = "Set a hardware execution breakpoint.\n(usage: hbp <address>)")]
+    Hbp,
     #[strum(message = "List all breakpoints.\n(usage: bl)")]
     Bl,
     #[strum(message = "Clear a breakpoint by ID.\n(usage: bc <id>)")]
@@ -337,8 +358,20 @@ enum ReplCommand {
     // inspection
     #[strum(message = "Display CPU registers.\n(usage: registers)")]
     Registers,
+    #[strum(
+        serialize = "cregs",
+        serialize = "control-registers",
+        message = "Display control registers.\n(usage: cregs)"
+    )]
+    Cregs,
     #[strum(message = "Display stack backtrace.\n(usage: k [count])")]
     K,
+    #[strum(
+        serialize = "trap-frame",
+        serialize = "tf",
+        message = "Dump a _KTRAP_FRAME at an address.\n(usage: trap-frame <address> [field])"
+    )]
+    TrapFrame,
     #[strum(message = "Display current VM status.\n(usage: status)")]
     Status,
 
@@ -351,6 +384,10 @@ enum ReplCommand {
     Ps,
     #[strum(message = "List loaded modules.\n(usage: lm [filter])")]
     Lm,
+    #[strum(
+        message = "Load symbols for loaded modules from a local directory.\n(usage: load-symbols <directory> [module-filter])"
+    )]
+    LoadSymbols,
     #[strum(
         message = "List driver objects from the \\Driver object directory.\n(usage: drivers [filter])"
     )]
@@ -384,7 +421,9 @@ impl ReplCommand {
             | Self::Ev
             | Self::Pte
             | Self::Pool
-            | Self::Bp => CompletionStrategy::Symbol,
+            | Self::TrapFrame
+            | Self::Bp
+            | Self::Hbp => CompletionStrategy::Symbol,
             Self::Dt => CompletionStrategy::Type,
             Self::Attach => CompletionStrategy::Process,
             Self::Thread => CompletionStrategy::Thread,
@@ -714,12 +753,18 @@ fn print_module_symbol_report(report: &ModuleSymbolLoadReport) {
     println!("{summary}");
 }
 
+fn print_qemu_monitor_output(output: &str) {
+    if output.trim().is_empty() {
+        println!("{}\n", "qemu monitor command completed".bright_black());
+    } else {
+        println!("{}\n", output.trim_end());
+    }
+}
+
 fn print_script_load_report(report: &LoadReport, startup_hint: bool) {
     if report.loaded.is_empty() && report.failed.is_empty() {
         if startup_hint {
-            println!(
-                "scripts: 0 installed (run `ntoseye scripts install` to add bundled scripts)"
-            );
+            println!("scripts: 0 installed (run `ntoseye scripts install` to add bundled scripts)");
         } else {
             println!("scripts: 0 loaded");
         }
@@ -804,6 +849,138 @@ fn print_registers(register_map: &RegisterMap, regs: &[u8]) {
         read_reg("r15"),
         read_reg("eflags")
     );
+}
+
+fn print_control_registers(register_map: &RegisterMap, regs: &[u8]) {
+    let read_reg = |name: &str| -> String {
+        register_map
+            .read_u64(name, regs)
+            .map(|v| format!("{:#018x}", VirtAddr(v)))
+            .unwrap_or_else(|_| "N/A".to_string())
+    };
+
+    println!(
+        "{}",
+        "─── control registers ─────────────────────────────────────────────".bright_black()
+    );
+    println!(
+        "cr0={}  cr2={}  cr3={}",
+        read_reg("cr0"),
+        read_reg("cr2"),
+        read_reg("cr3")
+    );
+    println!("cr4={}  cr8={}", read_reg("cr4"), read_reg("cr8"));
+}
+
+fn typed_field_value(
+    debugger: &DebuggerContext,
+    address: VirtAddr,
+    info: &crate::symbols::FieldInfo,
+) -> Result<String> {
+    if address.0 == 0 {
+        return Ok(String::new());
+    }
+
+    let mem = debugger.get_current_process().memory(&debugger.kvm);
+    let value = match &info.type_data {
+        ParsedType::Primitive(p) => {
+            if p.contains("*") || p.contains("LONGLONG") {
+                let val: u64 = mem.read(address + info.offset)?;
+                format!(" = {:#x}", Value(val))
+            } else if p.contains("LONG") {
+                let val: u32 = mem.read(address + info.offset)?;
+                format!(" = {:#x}", Value(val))
+            } else if p.contains("SHORT") || p.contains("WCHAR") {
+                let val: u16 = mem.read(address + info.offset)?;
+                format!(" = {:#x}", Value(val))
+            } else if p.contains("CHAR") {
+                let val: u8 = mem.read(address + info.offset)?;
+                format!(" = {:#x}", Value(val))
+            } else {
+                String::new()
+            }
+        }
+        ParsedType::Pointer(_) => {
+            let val: u64 = mem.read(address + info.offset)?;
+            format!(" = {:#x}", Value(val))
+        }
+        ParsedType::Bitfield { pos, len, .. } => {
+            let val: u64 = mem.read(address + info.offset)?;
+            let mask = if *len == 64 {
+                u64::MAX
+            } else {
+                (1u64 << *len) - 1
+            };
+            let val = (val >> pos) & mask;
+
+            if *len == 1 {
+                if val == 1 {
+                    format!(" = {}", "Y".green())
+                } else {
+                    format!(" = {}", "N".red())
+                }
+            } else {
+                format!(" = {}", Value(val))
+            }
+        }
+        _ => String::new(),
+    };
+
+    Ok(value)
+}
+
+fn print_type_instance(
+    debugger: &DebuggerContext,
+    type_info: &TypeInfo,
+    address: VirtAddr,
+    field_name: Option<&str>,
+) -> Result<()> {
+    let mut builder = Builder::default();
+    builder.push_record(vec![format!(
+        "{} ({} bytes)",
+        type_info.name,
+        Value(type_info.size)
+    )]);
+
+    let mut sorted_fields: Vec<_> = type_info.fields.iter().collect();
+    sorted_fields.sort_by_key(|(_, info)| {
+        let bitfield_pos = match &info.type_data {
+            ParsedType::Bitfield { pos, .. } => *pos,
+            _ => 0,
+        };
+        (info.offset, bitfield_pos)
+    });
+
+    for (name, info) in sorted_fields {
+        if field_name.is_some_and(|field| field != name) {
+            continue;
+        }
+
+        builder.push_record(vec![
+            format!("  + {:#06x} {:-12}", VirtAddr(info.offset.into()), name),
+            format!("  : {}", info.type_data.green()),
+            format!("  {}", typed_field_value(debugger, address, info)?),
+        ]);
+    }
+
+    let mut table = builder.build();
+    table
+        .with(tabled::settings::Style::empty())
+        .with(Padding::zero());
+    println!("{}\n", table);
+    Ok(())
+}
+
+fn dump_trap_frame(
+    debugger: &DebuggerContext,
+    address: VirtAddr,
+    field_name: Option<&str>,
+) -> Result<()> {
+    let type_info = debugger
+        .symbols
+        .find_type_across_modules(debugger.current_dtb(), "_KTRAP_FRAME")
+        .ok_or_else(|| Error::StructNotFound("_KTRAP_FRAME".to_string()))?;
+    print_type_instance(debugger, &type_info, address, field_name)
 }
 
 /// Single-step the current thread and clear `TF` from its RFLAGS afterwards.
@@ -905,10 +1082,7 @@ fn rewind_threads_off_breakpoints(
         let Some(prev) = rip.checked_sub(1) else {
             continue;
         };
-        if !matches!(
-            breakpoints.check_breakpoint_hit(prev, cr3),
-            BreakpointHitResult::Hit(_)
-        ) {
+        if !breakpoints.int3_breakpoint_hit_at(prev, cr3) {
             continue;
         }
         let mut adjusted = regs.clone();
@@ -1087,13 +1261,22 @@ fn print_stacktrace(
         } else {
             String::new()
         };
+        let trap_frame = frame
+            .trap_frame
+            .map(|addr| {
+                format!("  trap_frame={:#018x}", VirtAddr(addr))
+                    .cyan()
+                    .to_string()
+            })
+            .unwrap_or_default();
         println!(
-            " {:>2}  {:#018x}  {:#018x}  {}{}",
+            " {:>2}  {:#018x}  {:#018x}  {}{}{}",
             num,
             VirtAddr(frame.sp),
             VirtAddr(frame.ip),
             frame.symbol,
-            suffix
+            suffix,
+            trap_frame
         );
     }
 
@@ -1268,6 +1451,577 @@ fn display_memory(start_address: VirtAddr, data: &[u8], mode: &MemoryDisplayMode
     println!();
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Idtr {
+    base: VirtAddr,
+    limit: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Gdtr {
+    base: VirtAddr,
+    limit: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IdtEntry {
+    vector: usize,
+    handler: VirtAddr,
+    selector: u16,
+    ist: u8,
+    gate_type: u8,
+    dpl: u8,
+    present: bool,
+}
+
+#[derive(Debug, Clone)]
+struct GdtEntry {
+    index: usize,
+    selector: u16,
+    base: u64,
+    effective_limit: u64,
+    ty: u8,
+    system: bool,
+    dpl: u8,
+    present: bool,
+    long_mode: bool,
+    default_big: bool,
+    granularity: bool,
+    avl: bool,
+    raw: u128,
+}
+
+#[derive(Debug, Clone)]
+struct TssStackBases {
+    rsp: [VirtAddr; 3],
+    ist: [VirtAddr; 7],
+    io_map_base: u16,
+}
+
+fn parse_hex_u64(token: &str) -> Option<u64> {
+    let stripped = token
+        .trim_matches(|c: char| c == ',' || c == ';')
+        .trim_start_matches("0x")
+        .trim_start_matches("0X");
+    u64::from_str_radix(stripped, 16).ok()
+}
+
+fn parse_idtr_from_qemu_registers(output: &str) -> Option<Idtr> {
+    for line in output.lines() {
+        let Some((_, rest)) = line.split_once("IDT=") else {
+            continue;
+        };
+        let mut values = rest.split_whitespace().filter_map(parse_hex_u64);
+        let base = values.next()?;
+        let limit = values.next()?;
+        return Some(Idtr {
+            base: VirtAddr(base),
+            limit: limit as u16,
+        });
+    }
+    None
+}
+
+fn parse_gdtr_from_qemu_registers(output: &str) -> Option<Gdtr> {
+    for line in output.lines() {
+        let Some((_, rest)) = line.split_once("GDT=") else {
+            continue;
+        };
+        let mut values = rest.split_whitespace().filter_map(parse_hex_u64);
+        let base = values.next()?;
+        let limit = values.next()?;
+        return Some(Gdtr {
+            base: VirtAddr(base),
+            limit: limit as u16,
+        });
+    }
+    None
+}
+
+fn parse_tr_selector_from_qemu_registers(output: &str) -> Option<u16> {
+    for line in output.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("TR") else {
+            continue;
+        };
+        let Some((_, value_text)) = rest.split_once('=') else {
+            continue;
+        };
+        let selector = value_text
+            .split_whitespace()
+            .next()
+            .and_then(parse_hex_u64)?;
+        return Some(selector as u16);
+    }
+    None
+}
+
+fn parse_idt_entry(vector: usize, bytes: &[u8]) -> IdtEntry {
+    let offset_low = u16::from_le_bytes([bytes[0], bytes[1]]) as u64;
+    let selector = u16::from_le_bytes([bytes[2], bytes[3]]);
+    let ist = bytes[4] & 0x07;
+    let attr = bytes[5];
+    let offset_mid = u16::from_le_bytes([bytes[6], bytes[7]]) as u64;
+    let offset_high = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as u64;
+
+    IdtEntry {
+        vector,
+        handler: VirtAddr(offset_low | (offset_mid << 16) | (offset_high << 32)),
+        selector,
+        ist,
+        gate_type: attr & 0x1f,
+        dpl: (attr >> 5) & 0x03,
+        present: attr & 0x80 != 0,
+    }
+}
+
+fn read_gdt_entry(
+    debugger: &DebuggerContext,
+    register_map: &RegisterMap,
+    regs: &[u8],
+    gdtr: Gdtr,
+    selector: u16,
+) -> Result<GdtEntry> {
+    const CR3_PAGE_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
+    let index = (selector >> 3) as usize;
+    let offset = index * 8;
+    if offset + 8 > gdtr.limit as usize + 1 {
+        return Err(Error::InvalidRange);
+    }
+
+    let cr3 = register_map.read_u64("cr3", regs)? & CR3_PAGE_MASK;
+    let memory = AddressSpace::new(&debugger.kvm, cr3);
+    let mut bytes = [0u8; 16];
+    memory.read_bytes(gdtr.base + offset as u64, &mut bytes[..8])?;
+
+    let lo = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+    let system = ((lo >> 44) & 1) == 0;
+    let ty = ((lo >> 40) & 0x0f) as u8;
+    if system && matches!(ty, 0x2 | 0x9 | 0xb) && offset + 16 <= gdtr.limit as usize + 1 {
+        memory.read_bytes(gdtr.base + offset as u64 + 8u64, &mut bytes[8..16])?;
+    }
+
+    Ok(parse_gdt_entry(index, &bytes))
+}
+
+fn parse_gdt_entry(index: usize, data: &[u8]) -> GdtEntry {
+    let lo = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    let ty = ((lo >> 40) & 0x0f) as u8;
+    let system = ((lo >> 44) & 1) == 0;
+    let dpl = ((lo >> 45) & 0x03) as u8;
+    let present = ((lo >> 47) & 1) != 0;
+    let long_mode = ((lo >> 53) & 1) != 0;
+    let default_big = ((lo >> 54) & 1) != 0;
+    let granularity = ((lo >> 55) & 1) != 0;
+    let avl = ((lo >> 52) & 1) != 0;
+
+    let limit = ((lo & 0xffff) | (((lo >> 48) & 0x0f) << 16)) as u32;
+    let effective_limit = if granularity {
+        ((limit as u64) << 12) | 0xfff
+    } else {
+        limit as u64
+    };
+
+    let base_low = ((lo >> 16) & 0x00ff_ffff) | (((lo >> 56) & 0xff) << 24);
+    let base = if system && data.len() >= 16 {
+        let hi = u64::from_le_bytes(data[8..16].try_into().unwrap()) & 0xffff_ffff;
+        base_low | (hi << 32)
+    } else {
+        base_low
+    };
+
+    let raw = if data.len() >= 16 {
+        u128::from_le_bytes(data[0..16].try_into().unwrap())
+    } else {
+        lo as u128
+    };
+
+    GdtEntry {
+        index,
+        selector: (index * 8) as u16,
+        base,
+        effective_limit,
+        ty,
+        system,
+        dpl,
+        present,
+        long_mode,
+        default_big,
+        granularity,
+        avl,
+        raw,
+    }
+}
+
+fn parse_tss_stack_bases(data: &[u8]) -> Result<TssStackBases> {
+    if data.len() < 0x68 {
+        return Err(Error::BufferNotEnough);
+    }
+
+    let read_u64 = |offset: usize| -> VirtAddr {
+        VirtAddr(u64::from_le_bytes(
+            data[offset..offset + 8].try_into().unwrap(),
+        ))
+    };
+
+    Ok(TssStackBases {
+        rsp: [read_u64(0x04), read_u64(0x0c), read_u64(0x14)],
+        ist: [
+            read_u64(0x24),
+            read_u64(0x2c),
+            read_u64(0x34),
+            read_u64(0x3c),
+            read_u64(0x44),
+            read_u64(0x4c),
+            read_u64(0x54),
+        ],
+        io_map_base: u16::from_le_bytes(data[0x66..0x68].try_into().unwrap()),
+    })
+}
+
+fn gdt_type_label(entry: &GdtEntry) -> String {
+    if !entry.system {
+        let exec = entry.ty & 0x08 != 0;
+        let conforming_or_expand_down = entry.ty & 0x04 != 0;
+        let writable_or_readable = entry.ty & 0x02 != 0;
+        let accessed = entry.ty & 0x01 != 0;
+        let mut flags = String::new();
+        flags.push(if exec { 'C' } else { 'D' });
+        if conforming_or_expand_down {
+            flags.push(if exec { 'c' } else { 'e' });
+        }
+        if writable_or_readable {
+            flags.push(if exec { 'r' } else { 'w' });
+        }
+        if accessed {
+            flags.push('a');
+        }
+        return flags;
+    }
+
+    match entry.ty {
+        0x2 => "LDT".to_string(),
+        0x9 => "TSS64-avail".to_string(),
+        0xb => "TSS64-busy".to_string(),
+        0xc => "call-gate64".to_string(),
+        0xe => "int-gate64".to_string(),
+        0xf => "trap-gate64".to_string(),
+        _ => format!("sys-{:#x}", entry.ty),
+    }
+}
+
+fn parse_selector_arg(arg: &str) -> Option<u16> {
+    let stripped = arg.trim_start_matches("0x").trim_start_matches("0X");
+    u16::from_str_radix(stripped, 16)
+        .or_else(|_| arg.parse::<u16>())
+        .ok()
+}
+
+fn dump_idt(
+    debugger: &DebuggerContext,
+    register_map: &RegisterMap,
+    regs: &[u8],
+    idtr: Idtr,
+    max_entries: Option<usize>,
+) -> Result<()> {
+    const CR3_PAGE_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
+    let cr3 = register_map.read_u64("cr3", regs)? & CR3_PAGE_MASK;
+    let idt_size = idtr.limit as usize + 1;
+    let entry_count = max_entries.map_or(idt_size / 16, |count| count.min(idt_size / 16));
+    if entry_count == 0 {
+        return Err(Error::InvalidRange);
+    }
+
+    let mut data = vec![0u8; entry_count * 16];
+    let memory = AddressSpace::new(&debugger.kvm, cr3);
+    memory.read_bytes(idtr.base, &mut data)?;
+
+    println!(
+        "IDTR base={:#018x} limit={:#06x} entries={}\n",
+        idtr.base, idtr.limit, entry_count
+    );
+
+    let mut builder = Builder::default();
+    builder.push_record(vec![
+        "Vec  ".to_string(),
+        "Handler             ".to_string(),
+        "Sel     ".to_string(),
+        "IST  ".to_string(),
+        "Type  ".to_string(),
+        "DPL  ".to_string(),
+        "P  ".to_string(),
+        "Symbol".to_string(),
+    ]);
+
+    for entry in data
+        .chunks_exact(16)
+        .enumerate()
+        .map(|(vector, bytes)| parse_idt_entry(vector, bytes))
+    {
+        let symbol = debugger
+            .symbols
+            .find_closest_symbol_for_address(debugger.guest.ntoskrnl.dtb(), entry.handler)
+            .map(|(module, sym, offset)| {
+                if offset == 0 {
+                    format!("{}!{}", module, sym)
+                } else {
+                    format!("{}!{}+{:#x}", module, sym, offset)
+                }
+            })
+            .unwrap_or_else(|| "-".to_string());
+
+        builder.push_record(vec![
+            format!("{:#04x}  ", entry.vector),
+            format!("{:#018x}  ", entry.handler),
+            format!("{:#06x}  ", entry.selector),
+            format!("{}  ", entry.ist),
+            format!("{:#04x}  ", entry.gate_type),
+            format!("{}  ", entry.dpl),
+            format!("{}  ", if entry.present { "Y" } else { "N" }),
+            symbol,
+        ]);
+    }
+
+    let mut table = builder.build();
+    table
+        .with(tabled::settings::Style::empty())
+        .with(Padding::zero());
+    println!("{}\n", table);
+    Ok(())
+}
+
+fn dump_tss_stack_bases(
+    debugger: &DebuggerContext,
+    register_map: &RegisterMap,
+    regs: &[u8],
+    gdtr: Gdtr,
+    selector: u16,
+) -> Result<()> {
+    const CR3_PAGE_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
+    let entry = read_gdt_entry(debugger, register_map, regs, gdtr, selector)?;
+    if !entry.system || !matches!(entry.ty, 0x9 | 0xb) {
+        return Err(Error::InvalidExpression(format!(
+            "selector {:#x} is not an x64 TSS descriptor ({})",
+            selector,
+            gdt_type_label(&entry)
+        )));
+    }
+
+    let size = ((entry.effective_limit + 1).min(0x1000) as usize).max(0x68);
+    let mut data = vec![0u8; size];
+    let cr3 = register_map.read_u64("cr3", regs)? & CR3_PAGE_MASK;
+    let memory = AddressSpace::new(&debugger.kvm, cr3);
+    memory.read_bytes(VirtAddr(entry.base), &mut data)?;
+    let stacks = parse_tss_stack_bases(&data)?;
+
+    println!(
+        "TSS selector={:#06x} base={:#018x} limit={:#x} type={}\n",
+        selector,
+        VirtAddr(entry.base),
+        entry.effective_limit,
+        gdt_type_label(&entry)
+    );
+
+    let mut builder = Builder::default();
+    builder.push_record(vec!["Slot  ".to_string(), "Base".to_string()]);
+    for (idx, addr) in stacks.rsp.iter().enumerate() {
+        builder.push_record(vec![format!("RSP{}  ", idx), format!("{:#018x}", addr)]);
+    }
+    for (idx, addr) in stacks.ist.iter().enumerate() {
+        builder.push_record(vec![format!("IST{}  ", idx + 1), format!("{:#018x}", addr)]);
+    }
+    builder.push_record(vec![
+        "I/O map  ".to_string(),
+        format!("{:#06x}", stacks.io_map_base),
+    ]);
+
+    let mut table = builder.build();
+    table
+        .with(tabled::settings::Style::empty())
+        .with(Padding::zero());
+    println!("{}\n", table);
+    Ok(())
+}
+
+fn dump_gdt(
+    debugger: &DebuggerContext,
+    register_map: &RegisterMap,
+    regs: &[u8],
+    gdtr: Gdtr,
+    max_entries: Option<usize>,
+) -> Result<()> {
+    const CR3_PAGE_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
+    let cr3 = register_map.read_u64("cr3", regs)? & CR3_PAGE_MASK;
+    let gdt_size = gdtr.limit as usize + 1;
+    let entry_count = max_entries.map_or(gdt_size / 8, |count| count.min(gdt_size / 8));
+    if entry_count == 0 {
+        return Err(Error::InvalidRange);
+    }
+
+    let read_len = gdt_size.min(entry_count * 8 + 8);
+    let mut data = vec![0u8; read_len];
+    let memory = AddressSpace::new(&debugger.kvm, cr3);
+    memory.read_bytes(gdtr.base, &mut data)?;
+
+    println!(
+        "GDTR base={:#018x} limit={:#06x} entries={}\n",
+        gdtr.base, gdtr.limit, entry_count
+    );
+
+    let mut builder = Builder::default();
+    builder.push_record(vec![
+        "Idx  ".to_string(),
+        "Sel     ".to_string(),
+        "Base                ".to_string(),
+        "Limit       ".to_string(),
+        "Type        ".to_string(),
+        "DPL  ".to_string(),
+        "P  ".to_string(),
+        "L  ".to_string(),
+        "DB  ".to_string(),
+        "G  ".to_string(),
+        "AVL  ".to_string(),
+        "Raw".to_string(),
+    ]);
+
+    for index in 0..entry_count {
+        let offset = index * 8;
+        let Some(first) = data.get(offset..offset + 8) else {
+            break;
+        };
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(first);
+
+        let lo = u64::from_le_bytes(first.try_into().unwrap());
+        let system = ((lo >> 44) & 1) == 0;
+        if system
+            && matches!(((lo >> 40) & 0x0f) as u8, 0x2 | 0x9 | 0xb)
+            && let Some(second) = data.get(offset + 8..offset + 16)
+        {
+            bytes[8..16].copy_from_slice(second);
+        }
+
+        let entry = parse_gdt_entry(index, &bytes);
+        builder.push_record(vec![
+            format!("{:<5}", entry.index),
+            format!("{:#06x}  ", entry.selector),
+            format!("{:#018x}  ", VirtAddr(entry.base)),
+            format!("{:#010x}  ", entry.effective_limit),
+            format!("{}  ", gdt_type_label(&entry)),
+            format!("{}  ", entry.dpl),
+            format!("{}  ", if entry.present { "Y" } else { "N" }),
+            format!("{}  ", if entry.long_mode { "Y" } else { "N" }),
+            format!("{}   ", if entry.default_big { "Y" } else { "N" }),
+            format!("{}  ", if entry.granularity { "Y" } else { "N" }),
+            format!("{}    ", if entry.avl { "Y" } else { "N" }),
+            format!("{:#018x}", entry.raw),
+        ]);
+    }
+
+    let mut table = builder.build();
+    table
+        .with(tabled::settings::Style::empty())
+        .with(Padding::zero());
+    println!("{}\n", table);
+    Ok(())
+}
+
+fn find_file_case_insensitive(dir: &Path, filename: &str) -> Option<PathBuf> {
+    let wanted = filename.to_lowercase();
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .find_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_string_lossy().to_lowercase();
+            if name == wanted { Some(path) } else { None }
+        })
+}
+
+fn local_symbol_plan_for_module(
+    debugger: &DebuggerContext,
+    dir: &Path,
+    dtb: Dtb,
+    module: &ModuleInfo,
+) -> Result<Option<(PathBuf, u128)>> {
+    match SymbolStore::extract_download_job(&debugger.kvm, dtb, &module.name, module.base_address)?
+    {
+        ModuleSymbolDiscovery::Ready { job, guid, .. } => {
+            Ok(find_file_case_insensitive(dir, &job.filename).map(|path| (path, guid)))
+        }
+        ModuleSymbolDiscovery::NeedsImage { image_job } => {
+            let Some(image_path) = find_file_case_insensitive(dir, &image_job.filename) else {
+                return Ok(None);
+            };
+            let Some((job, guid)) = SymbolStore::extract_download_job_from_image_file(&image_path)?
+            else {
+                return Ok(None);
+            };
+            Ok(find_file_case_insensitive(dir, &job.filename).map(|path| (path, guid)))
+        }
+    }
+}
+
+fn load_symbols_from_directory(
+    debugger: &DebuggerContext,
+    dir: &Path,
+    filter: Option<&str>,
+) -> Result<ModuleSymbolLoadReport> {
+    let (modules, dtb) = if let Some(process_info) = &debugger.current_process_info {
+        (
+            debugger
+                .guest
+                .get_process_modules(&debugger.kvm, &debugger.symbols, process_info)?,
+            process_info.dtb,
+        )
+    } else {
+        (
+            debugger
+                .guest
+                .get_kernel_modules(&debugger.kvm, &debugger.symbols)?,
+            debugger.guest.ntoskrnl.dtb(),
+        )
+    };
+
+    let filter = filter.map(str::to_lowercase);
+    let selected: Vec<ModuleInfo> = modules
+        .into_iter()
+        .filter(|module| {
+            filter.as_ref().is_none_or(|filter| {
+                module.short_name.to_lowercase().contains(filter)
+                    || module.name.to_lowercase().contains(filter)
+            })
+        })
+        .collect();
+
+    let mut report = ModuleSymbolLoadReport {
+        total: selected.len(),
+        ..ModuleSymbolLoadReport::default()
+    };
+
+    for module in selected {
+        match local_symbol_plan_for_module(debugger, dir, dtb, &module) {
+            Ok(Some((pdb_path, guid))) => {
+                match debugger
+                    .symbols
+                    .load_local_pdb_for_module(dtb, module, guid, &pdb_path)
+                {
+                    Ok(()) => report.loaded += 1,
+                    Err(_) => report.failed += 1,
+                }
+            }
+            Ok(None) => report.no_pdb += 1,
+            Err(_) => report.failed += 1,
+        }
+    }
+
+    Ok(report)
+}
+
 const POOL_ALIGN: u64 = 0x10;
 const POOL_PAGE_SIZE: u64 = 0x1000;
 const POOL_FREE_TAG: u32 = 0x6565_7246;
@@ -1431,10 +2185,9 @@ fn parse_pool_header(
 ) -> Option<PoolHeader> {
     let mem = debugger.get_current_process().memory(&debugger.kvm);
     let (previous_size, block_units, pool_type, tag) = if layout.pool_header_uses_struct {
-        let previous_size = read_pool_field(&layout.pool_header, &mem, header, "PreviousSize")?
-            as u8;
-        let block_units =
-            read_pool_field(&layout.pool_header, &mem, header, "BlockSize")? as u8;
+        let previous_size =
+            read_pool_field(&layout.pool_header, &mem, header, "PreviousSize")? as u8;
+        let block_units = read_pool_field(&layout.pool_header, &mem, header, "BlockSize")? as u8;
         let pool_type = read_pool_field(&layout.pool_header, &mem, header, "PoolType")? as u8;
         let tag = read_pool_field(&layout.pool_header, &mem, header, "PoolTag")? as u32;
         (previous_size, block_units, pool_type, tag)
@@ -2013,6 +2766,246 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                 }
                             }
                         }
+                        Ok(ReplCommand::Idt) => {
+                            if client.is_running() {
+                                error!("VM is running");
+                                continue;
+                            }
+
+                            let max_entries = match parts.get(1) {
+                                Some(count) => match count.parse::<usize>() {
+                                    Ok(count) => Some(count),
+                                    Err(_) => {
+                                        error!("invalid IDT entry count: {}", count);
+                                        continue;
+                                    }
+                                },
+                                None => None,
+                            };
+
+                            if let Err(e) = client.set_current_thread(&current_thread) {
+                                error!("failed to set thread context: {:?}", e);
+                                continue;
+                            }
+
+                            let regs = match client.read_registers() {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    error!("failed to read registers: {:?}", e);
+                                    continue;
+                                }
+                            };
+
+                            let monitor_output = match client.monitor_command("info registers") {
+                                Ok(output) => output,
+                                Err(Error::NotSupported) => {
+                                    error!(
+                                        "backend does not expose QEMU monitor commands over gdbstub"
+                                    );
+                                    continue;
+                                }
+                                Err(e) => {
+                                    error!("failed to read QEMU registers: {}", e);
+                                    continue;
+                                }
+                            };
+
+                            let Some(idtr) = parse_idtr_from_qemu_registers(&monitor_output) else {
+                                error!("QEMU monitor output did not contain an IDT descriptor");
+                                continue;
+                            };
+
+                            if let Err(e) =
+                                dump_idt(debugger, &register_map, &regs, idtr, max_entries)
+                            {
+                                error!("failed to dump IDT: {}", e);
+                            }
+                        }
+                        Ok(ReplCommand::Gdt) => {
+                            if client.is_running() {
+                                error!("VM is running");
+                                continue;
+                            }
+
+                            let max_entries = match parts.get(1) {
+                                Some(count) => match count.parse::<usize>() {
+                                    Ok(count) => Some(count),
+                                    Err(_) => {
+                                        error!("invalid GDT entry count: {}", count);
+                                        continue;
+                                    }
+                                },
+                                None => None,
+                            };
+
+                            if let Err(e) = client.set_current_thread(&current_thread) {
+                                error!("failed to set thread context: {:?}", e);
+                                continue;
+                            }
+
+                            let regs = match client.read_registers() {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    error!("failed to read registers: {:?}", e);
+                                    continue;
+                                }
+                            };
+
+                            let monitor_output = match client.monitor_command("info registers") {
+                                Ok(output) => output,
+                                Err(Error::NotSupported) => {
+                                    error!(
+                                        "backend does not expose QEMU monitor commands over gdbstub"
+                                    );
+                                    continue;
+                                }
+                                Err(e) => {
+                                    error!("failed to read QEMU registers: {}", e);
+                                    continue;
+                                }
+                            };
+
+                            let Some(gdtr) = parse_gdtr_from_qemu_registers(&monitor_output) else {
+                                error!("QEMU monitor output did not contain a GDT descriptor");
+                                continue;
+                            };
+
+                            if let Err(e) =
+                                dump_gdt(debugger, &register_map, &regs, gdtr, max_entries)
+                            {
+                                error!("failed to dump GDT: {}", e);
+                            }
+                        }
+                        Ok(ReplCommand::Tss) => {
+                            if client.is_running() {
+                                error!("VM is running");
+                                continue;
+                            }
+
+                            let selector_arg = match parts.get(1) {
+                                Some(selector) => match parse_selector_arg(selector) {
+                                    Some(selector) => Some(selector),
+                                    None => {
+                                        error!("invalid TSS selector: {}", selector);
+                                        continue;
+                                    }
+                                },
+                                None => None,
+                            };
+
+                            if let Err(e) = client.set_current_thread(&current_thread) {
+                                error!("failed to set thread context: {:?}", e);
+                                continue;
+                            }
+
+                            let regs = match client.read_registers() {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    error!("failed to read registers: {:?}", e);
+                                    continue;
+                                }
+                            };
+
+                            let monitor_output = match client.monitor_command("info registers") {
+                                Ok(output) => output,
+                                Err(Error::NotSupported) => {
+                                    error!(
+                                        "backend does not expose QEMU monitor commands over gdbstub"
+                                    );
+                                    continue;
+                                }
+                                Err(e) => {
+                                    error!("failed to read QEMU registers: {}", e);
+                                    continue;
+                                }
+                            };
+
+                            let Some(gdtr) = parse_gdtr_from_qemu_registers(&monitor_output) else {
+                                error!("QEMU monitor output did not contain a GDT descriptor");
+                                continue;
+                            };
+
+                            let selector = match selector_arg {
+                                Some(selector) => selector,
+                                None => {
+                                    match parse_tr_selector_from_qemu_registers(&monitor_output) {
+                                        Some(selector) => selector,
+                                        None => {
+                                            error!(
+                                                "QEMU monitor output did not contain a TR selector"
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                }
+                            };
+
+                            if let Err(e) =
+                                dump_tss_stack_bases(debugger, &register_map, &regs, gdtr, selector)
+                            {
+                                error!("failed to dump TSS stack bases: {}", e);
+                            }
+                        }
+                        Ok(ReplCommand::Qcmd) => {
+                            if parts.len() < 2 {
+                                println!(
+                                    "{}\n",
+                                    ReplCommand::Qcmd.get_message().unwrap_or("invalid usage")
+                                );
+                                continue;
+                            }
+
+                            let command = parts[1..].join(" ");
+                            match client.monitor_command(&command) {
+                                Ok(output) => print_qemu_monitor_output(&output),
+                                Err(Error::NotSupported) => {
+                                    error!(
+                                        "backend does not expose QEMU monitor commands over gdbstub"
+                                    );
+                                }
+                                Err(e) => error!("QEMU monitor command failed: {}", e),
+                            }
+                        }
+                        Ok(ReplCommand::Qlog) => {
+                            let items = parts
+                                .get(1)
+                                .copied()
+                                .unwrap_or("int,cpu_reset,guest_errors");
+                            let logfile = parts.get(2).copied();
+
+                            if let Some(path) = logfile {
+                                match client.monitor_command(&format!("logfile {}", path)) {
+                                    Ok(output) => print_qemu_monitor_output(&output),
+                                    Err(Error::NotSupported) => {
+                                        error!(
+                                            "backend does not expose QEMU monitor commands over gdbstub"
+                                        );
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        error!("failed to set QEMU logfile: {}", e);
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            match client.monitor_command(&format!("log {}", items)) {
+                                Ok(output) => {
+                                    print_qemu_monitor_output(&output);
+                                    println!(
+                                        "{} {}\n",
+                                        "enabled QEMU log masks:".bright_black(),
+                                        items.green()
+                                    );
+                                }
+                                Err(Error::NotSupported) => {
+                                    error!(
+                                        "backend does not expose QEMU monitor commands over gdbstub"
+                                    );
+                                }
+                                Err(e) => error!("failed to enable QEMU logging: {}", e),
+                            }
+                        }
                         Ok(ReplCommand::Pool) => {
                             let Some(expr) = parts.get(1).copied() else {
                                 println!(
@@ -2051,10 +3044,7 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                             println!("pool page {:#x}", base);
                             println!("  target        : {:#x}", target);
                             if let Some((name, start, end)) = region {
-                                println!(
-                                    "  region        : {} [{:#x} - {:#x}]",
-                                    name, start, end
-                                );
+                                println!("  region        : {} [{:#x} - {:#x}]", name, start, end);
                             }
                             if let Some(idx) = idx {
                                 println!(
@@ -2690,6 +3680,22 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
 
                                     match client.try_wait_for_stop(Duration::from_millis(100)) {
                                         Ok(Some(event)) => {
+                                            if let Some(summary) = &event.summary {
+                                                println!(
+                                                    "{} {}",
+                                                    "target stop:".yellow(),
+                                                    summary.bright_black()
+                                                );
+                                            }
+                                            if event.target_exited {
+                                                println!(
+                                                    "{}",
+                                                    "target is no longer stopped at guest CPU state; use QEMU logs/QMP for reset cause details"
+                                                        .yellow()
+                                                );
+                                                break;
+                                            }
+
                                             let stopped_tid = event
                                                 .thread_id
                                                 .or_else(|| client.get_stopped_thread_id().ok());
@@ -2855,96 +3861,14 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                 .find_type_across_modules(debugger.current_dtb(), arg)
                             {
                                 Some(type_info) => {
-                                    let mut builder = Builder::default();
-                                    builder.push_record(vec![format!(
-                                        "{} ({} bytes)",
-                                        type_info.name,
-                                        Value(type_info.size)
-                                    )]);
-
-                                    let mut sorted_fields: Vec<_> =
-                                        type_info.fields.iter().collect();
-                                    sorted_fields.sort_by_key(|(_, info)| {
-                                        let bitfield_pos = match &info.type_data {
-                                            ParsedType::Bitfield { pos, .. } => *pos,
-                                            _ => 0,
-                                        };
-                                        (info.offset, bitfield_pos)
-                                    });
-
-                                    for (name, info) in sorted_fields {
-                                        let value = if address.0 != 0 {
-                                            let mem = debugger
-                                                .get_current_process()
-                                                .memory(&debugger.kvm);
-                                            match &info.type_data {
-                                                ParsedType::Primitive(p) => {
-                                                    if p.contains("*") || p.contains("LONGLONG") {
-                                                        let val: u64 =
-                                                            mem.read(address + info.offset)?;
-                                                        format!(" = {:#x}", Value(val))
-                                                    } else if p.contains("LONG") {
-                                                        let val: u32 =
-                                                            mem.read(address + info.offset)?;
-                                                        format!(" = {:#x}", Value(val))
-                                                    } else if p.contains("SHORT")
-                                                        || p.contains("WCHAR")
-                                                    {
-                                                        let val: u16 =
-                                                            mem.read(address + info.offset)?;
-                                                        format!(" = {:#x}", Value(val))
-                                                    } else if p.contains("CHAR") {
-                                                        let val: u8 =
-                                                            mem.read(address + info.offset)?;
-                                                        format!(" = {:#x}", Value(val))
-                                                    } else {
-                                                        "".into()
-                                                    }
-                                                }
-                                                ParsedType::Pointer(_) => {
-                                                    let val: u64 =
-                                                        mem.read(address + info.offset)?;
-                                                    format!(" = {:#x}", Value(val))
-                                                }
-                                                ParsedType::Bitfield { pos, len, .. } => {
-                                                    let val: u64 =
-                                                        mem.read(address + info.offset)?;
-                                                    let val = (val >> pos) & ((1u64 << len) - 1);
-
-                                                    if *len == 1 {
-                                                        if val == 1 {
-                                                            format!(" = {}", "Y".green())
-                                                        } else {
-                                                            format!(" = {}", "N".red())
-                                                        }
-                                                    } else {
-                                                        format!(" = {}", Value(val))
-                                                    }
-                                                }
-                                                _ => "".into(),
-                                            }
-                                        } else {
-                                            "".into()
-                                        };
-
-                                        if field_name.is_none() || field_name.unwrap() == name {
-                                            builder.push_record(vec![
-                                                format!(
-                                                    "  + {:#06x} {:-12}",
-                                                    VirtAddr(info.offset.into()),
-                                                    name
-                                                ),
-                                                format!("  : {}", info.type_data.green()),
-                                                format!("  {}", value),
-                                            ]);
-                                        }
+                                    if let Err(e) = print_type_instance(
+                                        debugger,
+                                        &type_info,
+                                        address,
+                                        field_name.copied(),
+                                    ) {
+                                        error!("{}", e);
                                     }
-
-                                    let mut table = builder.build();
-                                    table
-                                        .with(tabled::settings::Style::empty())
-                                        .with(Padding::zero());
-                                    println!("{}\n", table);
                                 }
                                 None => {
                                     error!(
@@ -2952,6 +3876,22 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                         arg
                                     );
                                 }
+                            }
+                        }
+                        Ok(ReplCommand::TrapFrame) => {
+                            let address_arg = require_arg!(parts, 1, ReplCommand::TrapFrame);
+                            let address = match Expr::eval(address_arg, debugger) {
+                                Ok(a) => a,
+                                Err(e) => {
+                                    error!("{}", e);
+                                    continue;
+                                }
+                            };
+
+                            if let Err(e) =
+                                dump_trap_frame(debugger, address, parts.get(2).copied())
+                            {
+                                error!("{}", e);
                             }
                         }
                         Ok(ReplCommand::Ps) => {
@@ -3146,6 +4086,28 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                 }
                             }
                         }
+                        Ok(ReplCommand::LoadSymbols) => {
+                            let dir_arg = require_arg!(parts, 1, ReplCommand::LoadSymbols);
+                            let dir = Path::new(dir_arg);
+                            if !dir.is_dir() {
+                                error!("not a directory: {}", dir.display());
+                                continue;
+                            }
+
+                            match load_symbols_from_directory(debugger, dir, parts.get(2).copied())
+                            {
+                                Ok(report) => {
+                                    *shared_symbols.write().unwrap() =
+                                        debugger.current_symbol_index();
+                                    *shared_types.write().unwrap() = debugger.current_types_index();
+                                    print_module_symbol_report(&report);
+                                    println!();
+                                }
+                                Err(e) => {
+                                    error!("failed to load local symbols: {}", e);
+                                }
+                            }
+                        }
                         Ok(ReplCommand::Attach) => {
                             let pid_str = require_arg!(parts, 1, ReplCommand::Attach);
                             match pid_str.parse::<u64>() {
@@ -3218,6 +4180,9 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
 
                             debugger.registers = Some(register_map.to_hashmap(&regs));
                             print_registers(&register_map, &regs);
+                            println!();
+                            print_control_registers(&register_map, &regs);
+                            println!();
 
                             let read_reg = |name: &str| -> String {
                                 register_map
@@ -3225,16 +4190,6 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                     .map(|v| format!("{:#018x}", VirtAddr(v)))
                                     .unwrap_or_else(|_| "N/A".to_string())
                             };
-
-                            println!();
-                            println!(
-                                "cr0={}  cr2={}  cr3={}",
-                                read_reg("cr0"),
-                                read_reg("cr2"),
-                                read_reg("cr3")
-                            );
-                            println!("cr4={}  cr8={}", read_reg("cr4"), read_reg("cr8"));
-                            println!();
 
                             println!(
                                 "cs={}  ds={}  es={}",
@@ -3248,6 +4203,29 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                 read_reg("gs"),
                                 read_reg("ss")
                             );
+                            println!();
+                        }
+                        Ok(ReplCommand::Cregs) => {
+                            if client.is_running() {
+                                error!("VM is running");
+                                continue;
+                            }
+
+                            if let Err(e) = client.set_current_thread(&current_thread) {
+                                error!("failed to set thread context: {:?}", e);
+                                continue;
+                            }
+
+                            let regs = match client.read_registers() {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    error!("failed to read registers: {:?}", e);
+                                    continue;
+                                }
+                            };
+
+                            debugger.registers = Some(register_map.to_hashmap(&regs));
+                            print_control_registers(&register_map, &regs);
                             println!();
                         }
                         Ok(ReplCommand::Si) => {
@@ -3329,17 +4307,16 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                             current_thread = thread_id.to_string();
                             println!("switched to thread {}\n", current_thread);
                         }
-                        Ok(ReplCommand::Bp) => {
+                        Ok(cmd @ (ReplCommand::Bp | ReplCommand::Hbp)) => {
                             if client.is_running() {
                                 error!("VM is running");
                                 continue;
                             }
 
-                            // Process-scope BP support is per-backend; the
-                            // manager returns `Error::NotSupported` for
-                            // backends that can't honour them.
+                            // Software process-scope BP support is per-backend;
+                            // hardware BPs can still be CR3-filtered by the manager.
 
-                            let addr_str = require_arg!(parts, 1, ReplCommand::Bp);
+                            let addr_str = require_arg!(parts, 1, cmd);
                             let address = match Expr::eval(addr_str, debugger) {
                                 Ok(a) => a,
                                 Err(e) => {
@@ -3359,11 +4336,30 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                     }
                                 });
 
-                            match breakpoints.add(&mut *client, debugger, address, symbol.clone()) {
+                            let kind = match cmd {
+                                ReplCommand::Bp => BreakpointKind::Software,
+                                ReplCommand::Hbp => BreakpointKind::Hardware,
+                                _ => unreachable!(),
+                            };
+
+                            let add_result = match kind {
+                                BreakpointKind::Software => {
+                                    breakpoints.add(&mut *client, debugger, address, symbol.clone())
+                                }
+                                BreakpointKind::Hardware => breakpoints.add_hardware(
+                                    &mut *client,
+                                    debugger,
+                                    address,
+                                    symbol.clone(),
+                                ),
+                            };
+
+                            match add_result {
                                 Ok(id) => {
                                     update_breakpoint_cache!(breakpoints, shared_breakpoints);
                                     println!(
-                                        "breakpoint {} set at {}{}{}\n",
+                                        "{} breakpoint {} set at {}{}{}\n",
+                                        kind.label(),
                                         format!("#{}", id).cyan(),
                                         format!("{:#x}", address).yellow(),
                                         symbol
@@ -3396,6 +4392,7 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                 builder.push_record(vec![
                                     "ID".to_string(),
                                     "Status".to_string(),
+                                    "Type".to_string(),
                                     "Address".to_string(),
                                     "Symbol".to_string(),
                                     "Scope".to_string(),
@@ -3408,6 +4405,7 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                     builder.push_record(vec![
                                         format!("{}   ", bp.id),
                                         format!("{}  ", status),
+                                        format!("{}  ", bp.kind.label()),
                                         format!("{:#018x}  ", bp.address),
                                         format!("{}  ", bp.symbol.as_deref().unwrap_or("-")),
                                         scope,

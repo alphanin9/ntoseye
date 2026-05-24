@@ -66,8 +66,24 @@ pub struct Breakpoint {
     pub address: VirtAddr,
     pub enabled: bool,
     pub symbol: Option<String>,
+    pub kind: BreakpointKind,
     pub scope: BreakpointScope,
     backend: BreakpointBackend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakpointKind {
+    Software,
+    Hardware,
+}
+
+impl BreakpointKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Software => "software",
+            Self::Hardware => "hardware",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,11 +111,15 @@ impl BreakpointScope {
     }
 }
 
-/// Who owns the int3 byte for a breakpoint.
+/// Who owns the target-side breakpoint state.
 ///
-/// * `Kernel`: written via the target's kernel debugger API
-///   (`DbgKdWriteBreakPointApi` / gdb `Z0`). The kernel tracks the original
-///   byte and handles step-over.
+/// * `Software`: written via the debug transport
+///   (`DbgKdWriteBreakPointApi` / gdb `Z0`). The transport tracks the
+///   original byte and handles removal.
+///
+/// * `Hardware`: written via the debug transport's hardware execution
+///   breakpoint primitive (gdb `Z1`). No guest code byte is modified, and RIP
+///   is expected to report the breakpoint address directly on hit.
 ///
 /// * `GuestMemoryPatch`: we write 0xCC ourselves through `/dev/kvm` against a
 ///   specific process's page table. No Kdp primitive supports per-process BPs
@@ -111,7 +131,8 @@ impl BreakpointScope {
 ///   the trap.
 #[derive(Debug, Clone)]
 enum BreakpointBackend {
-    Kernel,
+    Software,
+    Hardware,
     GuestMemoryPatch { original_byte: u8 },
 }
 
@@ -135,8 +156,30 @@ impl BreakpointManager {
         address: VirtAddr,
         symbol: Option<String>,
     ) -> Result<u32> {
+        self.add_with_kind(client, debugger, address, symbol, BreakpointKind::Software)
+    }
+
+    pub fn add_hardware(
+        &mut self,
+        client: &mut dyn DebugBackend,
+        debugger: &DebuggerContext,
+        address: VirtAddr,
+        symbol: Option<String>,
+    ) -> Result<u32> {
+        self.add_with_kind(client, debugger, address, symbol, BreakpointKind::Hardware)
+    }
+
+    fn add_with_kind(
+        &mut self,
+        client: &mut dyn DebugBackend,
+        debugger: &DebuggerContext,
+        address: VirtAddr,
+        symbol: Option<String>,
+        kind: BreakpointKind,
+    ) -> Result<u32> {
         let scope = Self::scope_for_current_context(debugger);
         if matches!(scope, BreakpointScope::Process { .. })
+            && matches!(kind, BreakpointKind::Software)
             && !client.supports_process_breakpoints()
         {
             return Err(Error::NotSupported);
@@ -146,13 +189,14 @@ impl BreakpointManager {
         self.next_id += 1;
 
         Self::validate_breakpoint_target(debugger, address)?;
-        let backend = Self::install_breakpoint(client, debugger, address, &scope)?;
+        let backend = Self::install_breakpoint(client, debugger, address, &scope, kind)?;
 
         let bp = Breakpoint {
             id,
             address,
             enabled: true,
             symbol,
+            kind,
             scope,
             backend,
         };
@@ -243,8 +287,8 @@ impl BreakpointManager {
                 bp.enabled = false;
                 Ok(())
             }
-            BreakpointBackend::Kernel => Err(Error::Rsp(
-                "cannot address-space-disable a kernel breakpoint".into(),
+            BreakpointBackend::Software | BreakpointBackend::Hardware => Err(Error::Rsp(
+                "cannot address-space-disable a transport-managed breakpoint".into(),
             )),
         }
     }
@@ -295,6 +339,18 @@ impl BreakpointManager {
             .map(|bp| bp.id)
     }
 
+    pub fn int3_breakpoint_hit_at(&self, rip: u64, cr3: u64) -> bool {
+        self.breakpoints.values().any(|bp| {
+            bp.enabled
+                && bp.address.0 == rip
+                && bp.scope.matches_cr3(cr3)
+                && matches!(
+                    bp.backend,
+                    BreakpointBackend::Software | BreakpointBackend::GuestMemoryPatch { .. }
+                )
+        })
+    }
+
     fn scope_for_current_context(debugger: &DebuggerContext) -> BreakpointScope {
         match &debugger.current_process_info {
             Some(ProcessInfo { pid, name, dtb, .. }) => BreakpointScope::Process {
@@ -311,13 +367,14 @@ impl BreakpointManager {
         debugger: &DebuggerContext,
         address: VirtAddr,
         scope: &BreakpointScope,
+        kind: BreakpointKind,
     ) -> Result<BreakpointBackend> {
-        match scope {
-            BreakpointScope::Kernel => {
+        match (kind, scope) {
+            (BreakpointKind::Software, BreakpointScope::Kernel) => {
                 client.set_breakpoint(address.0)?;
-                Ok(BreakpointBackend::Kernel)
+                Ok(BreakpointBackend::Software)
             }
-            BreakpointScope::Process { dtb, .. } => {
+            (BreakpointKind::Software, BreakpointScope::Process { dtb, .. }) => {
                 let memory = AddressSpace::new(&debugger.kvm, *dtb);
                 let mut original = [0u8; 1];
                 memory.read_bytes(address, &mut original)?;
@@ -330,6 +387,10 @@ impl BreakpointManager {
                     original_byte: original[0],
                 })
             }
+            (BreakpointKind::Hardware, _) => {
+                client.set_hardware_breakpoint(address.0)?;
+                Ok(BreakpointBackend::Hardware)
+            }
         }
     }
 
@@ -339,9 +400,10 @@ impl BreakpointManager {
         bp: &Breakpoint,
     ) -> Result<()> {
         match (&bp.scope, &bp.backend) {
-            (BreakpointScope::Kernel, BreakpointBackend::Kernel) => {
+            (BreakpointScope::Kernel, BreakpointBackend::Software) => {
                 client.set_breakpoint(bp.address.0)
             }
+            (_, BreakpointBackend::Hardware) => client.set_hardware_breakpoint(bp.address.0),
             (BreakpointScope::Process { dtb, .. }, BreakpointBackend::GuestMemoryPatch { .. }) => {
                 let memory = AddressSpace::new(&debugger.kvm, *dtb);
                 memory.write_bytes(bp.address, &[0xcc])?;
@@ -358,9 +420,10 @@ impl BreakpointManager {
         bp: &Breakpoint,
     ) -> Result<()> {
         match (&bp.scope, &bp.backend) {
-            (BreakpointScope::Kernel, BreakpointBackend::Kernel) => {
+            (BreakpointScope::Kernel, BreakpointBackend::Software) => {
                 client.remove_breakpoint(bp.address.0)
             }
+            (_, BreakpointBackend::Hardware) => client.remove_hardware_breakpoint(bp.address.0),
             (
                 BreakpointScope::Process { dtb, .. },
                 BreakpointBackend::GuestMemoryPatch { original_byte },
@@ -628,8 +691,9 @@ impl GdbClient {
 
         client.force_stop_and_resync()?;
 
-        let supported =
-            client.send_packet("qSupported:multiprocess+;swbreak+;qRelocInsn+;vContSupported+")?;
+        let supported = client.send_packet(
+            "qSupported:multiprocess+;swbreak+;hwbreak+;qRelocInsn+;vContSupported+",
+        )?;
         client.features = StubFeatures::parse(&supported);
 
         if client.features.no_ack_mode {
@@ -881,6 +945,34 @@ impl GdbClient {
         }
     }
 
+    fn set_hardware_breakpoint(&mut self, addr: u64) -> Result<()> {
+        let response = self.send_packet(&format!("Z1,{:x},1", addr))?;
+        if response == "OK" {
+            Ok(())
+        } else if response.starts_with('E') {
+            Err(Error::Rsp(format!(
+                "failed to set hardware breakpoint at {:#x}: {}",
+                addr, response
+            )))
+        } else {
+            Err(Error::NotSupported)
+        }
+    }
+
+    fn remove_hardware_breakpoint(&mut self, addr: u64) -> Result<()> {
+        let response = self.send_packet(&format!("z1,{:x},1", addr))?;
+        if response == "OK" {
+            Ok(())
+        } else if response.starts_with('E') {
+            Err(Error::Rsp(format!(
+                "failed to remove hardware breakpoint at {:#x}: {}",
+                addr, response
+            )))
+        } else {
+            Err(Error::NotSupported)
+        }
+    }
+
     fn read_registers(&mut self) -> Result<Vec<u8>> {
         let response = self.send_packet("g")?;
 
@@ -914,6 +1006,38 @@ impl GdbClient {
     fn send_command_no_reply(&mut self, data: &str) -> Result<()> {
         let packet = Self::encode_packet(data);
         self.send_raw_command(&packet)
+    }
+
+    fn monitor_command(&mut self, command: &str) -> Result<String> {
+        let encoded_command = hex::encode(command.as_bytes());
+        let packet = Self::encode_packet(&format!("qRcmd,{}", encoded_command));
+        self.send_raw_command(&packet)?;
+
+        let mut output = String::new();
+        loop {
+            let response = self.read_response_packet()?;
+            if response == "OK" {
+                return Ok(output);
+            }
+            if response.is_empty() {
+                return Err(Error::NotSupported);
+            }
+            if let Some(hex_output) = response.strip_prefix('O') {
+                let bytes = hex::decode(hex_output)?;
+                output.push_str(&String::from_utf8_lossy(&bytes));
+                continue;
+            }
+            if response.starts_with('E') {
+                return Err(Error::Rsp(format!(
+                    "monitor command failed for '{}': {}",
+                    command, response
+                )));
+            }
+            return Err(Error::Rsp(format!(
+                "unexpected qRcmd response for '{}': {}",
+                command, response
+            )));
+        }
     }
 
     fn continue_execution(&mut self) -> Result<()> {
@@ -1004,6 +1128,37 @@ impl GdbClient {
                 }
             }
         }
+    }
+
+    fn stop_reply_summary(response: &str) -> Option<String> {
+        let first = response.as_bytes().first().copied()?;
+        match first {
+            b'W' => Some(format!(
+                "gdbstub target exited with status 0x{}",
+                response.get(1..).unwrap_or("")
+            )),
+            b'X' => Some(format!(
+                "gdbstub target terminated with signal 0x{}",
+                response.get(1..).unwrap_or("")
+            )),
+            b'N' => Some("gdbstub reports no resumed threads".to_string()),
+            b'S' => Some(format!(
+                "gdbstub stop signal 0x{}",
+                response.get(1..).unwrap_or("")
+            )),
+            b'T' => {
+                let signal = response.get(1..3).unwrap_or("");
+                Some(format!("gdbstub stop signal 0x{signal}"))
+            }
+            _ => None,
+        }
+    }
+
+    fn stop_reply_is_terminal(response: &str) -> bool {
+        matches!(
+            response.as_bytes().first().copied(),
+            Some(b'W' | b'X' | b'N')
+        )
     }
 
     fn interrupt(&mut self) -> Result<()> {
@@ -1216,6 +1371,14 @@ impl DebugBackend for GdbClient {
         GdbClient::remove_breakpoint(self, addr)
     }
 
+    fn set_hardware_breakpoint(&mut self, addr: u64) -> Result<()> {
+        GdbClient::set_hardware_breakpoint(self, addr)
+    }
+
+    fn remove_hardware_breakpoint(&mut self, addr: u64) -> Result<()> {
+        GdbClient::remove_hardware_breakpoint(self, addr)
+    }
+
     fn continue_execution(&mut self) -> Result<()> {
         GdbClient::continue_execution(self)
     }
@@ -1232,6 +1395,8 @@ impl DebugBackend for GdbClient {
         let response = GdbClient::wait_for_stop(self)?;
         Ok(StopEvent {
             thread_id: Self::parse_stop_reply_thread_id(&response),
+            summary: Self::stop_reply_summary(&response),
+            target_exited: Self::stop_reply_is_terminal(&response),
         })
     }
 
@@ -1242,6 +1407,8 @@ impl DebugBackend for GdbClient {
         let _ = self.stream.set_read_timeout(None);
         Ok(result?.map(|response| StopEvent {
             thread_id: Self::parse_stop_reply_thread_id(&response),
+            summary: Self::stop_reply_summary(&response),
+            target_exited: Self::stop_reply_is_terminal(&response),
         }))
     }
 
@@ -1257,6 +1424,10 @@ impl DebugBackend for GdbClient {
         GdbClient::get_stopped_thread_id(self)
     }
 
+    fn monitor_command(&mut self, command: &str) -> Result<String> {
+        GdbClient::monitor_command(self, command)
+    }
+
     fn is_running(&self) -> bool {
         self.is_running
     }
@@ -1265,8 +1436,8 @@ impl DebugBackend for GdbClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        Breakpoint, BreakpointBackend, BreakpointHitResult, BreakpointManager, BreakpointScope,
-        GdbClient, RegisterMap, StubFeatures,
+        Breakpoint, BreakpointBackend, BreakpointHitResult, BreakpointKind, BreakpointManager,
+        BreakpointScope, GdbClient, RegisterMap, StubFeatures,
     };
     use crate::types::VirtAddr;
 
@@ -1336,8 +1507,9 @@ mod tests {
                 address: VirtAddr(0x1000),
                 enabled: true,
                 symbol: None,
+                kind: BreakpointKind::Software,
                 scope: BreakpointScope::Kernel,
-                backend: BreakpointBackend::Kernel,
+                backend: BreakpointBackend::Software,
             },
         );
 
@@ -1357,6 +1529,7 @@ mod tests {
                 address: VirtAddr(0x7ff7_1234_1000),
                 enabled: true,
                 symbol: None,
+                kind: BreakpointKind::Software,
                 scope: BreakpointScope::Process {
                     pid: 42,
                     dtb: 0x1234_5000,
@@ -1384,5 +1557,28 @@ mod tests {
             manager.check_breakpoint_hit(0x7ff7_1234_1000, 0x1234_4000),
             BreakpointHitResult::NotBreakpoint
         ));
+    }
+
+    #[test]
+    fn hardware_breakpoint_hits_exact_rip_but_is_not_int3_rewind_candidate() {
+        let mut manager = BreakpointManager::new();
+        manager.breakpoints.insert(
+            0,
+            Breakpoint {
+                id: 0,
+                address: VirtAddr(0x2000),
+                enabled: true,
+                symbol: None,
+                kind: BreakpointKind::Hardware,
+                scope: BreakpointScope::Kernel,
+                backend: BreakpointBackend::Hardware,
+            },
+        );
+
+        assert!(matches!(
+            manager.check_breakpoint_hit(0x2000, 0),
+            BreakpointHitResult::Hit(_)
+        ));
+        assert!(!manager.int3_breakpoint_hit_at(0x2000, 0));
     }
 }
