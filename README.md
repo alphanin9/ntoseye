@@ -89,7 +89,7 @@ The first line is a `ready` event. Each request is one JSON object with an optio
 {"id":6,"command":"continue","timeout_ms":1000}
 ```
 
-Core commands: `status`, `eval`, `registers`, `memory.read`, `memory.write`, `memory.search`, `memory.fill`, `disasm`, `dt`, `pte`, `k`, `drivers`, `ps`, `lm`, `attach`, `detach`, `threads`, `thread.set`, `bp.set`, `bp.clear`, `bp.disable`, `bp.enable`, `bp.list`, `continue`, `interrupt`, `step`, `qcmd`, and `quit`. Addresses are expression strings, so symbols, `module!symbol`, arithmetic, casts, and register expressions follow the same parser as the REPL. Binary memory payloads are hex strings.
+Core commands: `status`, `eval`, `registers`, `memory.read`, `memory.write`, `memory.search`, `memory.fill`, `disasm`, `dt`, `trap-frame`, `pte`, `idt`, `gdt`, `tss`, `pool`, `k`, `drivers`, `ps`, `lm`, `load-symbols`, `attach`, `detach`, `threads`, `thread.set`, `bp.set`, `bp.clear`, `bp.disable`, `bp.enable`, `bp.list`, `continue`, `interrupt`, `step`, `qcmd`, `qlog`, `script.list`, `script.reload`, and `quit`. Addresses are expression strings, so symbols, `module!symbol`, arithmetic, casts, and register expressions follow the same parser as the REPL. Binary memory payloads are hex strings.
 
 ## VM configuration
 
