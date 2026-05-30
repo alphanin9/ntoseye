@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use mlua::{
@@ -629,7 +630,8 @@ impl ScriptHost {
         debugger: &mut DebuggerContext,
         client: &mut dyn DebugBackend,
         register_map: &RegisterMap,
-    ) -> mlua::Result<()> {
+        output: ScriptOutput,
+    ) -> mlua::Result<String> {
         let entry = self
             .commands
             .get(name)
@@ -638,6 +640,10 @@ impl ScriptHost {
         let dbg = RefCell::new(debugger);
         let cli = RefCell::new(client);
         let regs_cache: RefCell<Option<Vec<u8>>> = RefCell::new(None);
+        // Script output (`print`, `ntos.command_usage`) streams to stdout for the
+        // interactive REPL, but is captured for the agent so it cannot corrupt
+        // the newline-delimited JSON stream.
+        let captured: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
 
         self.lua.scope(|scope| {
             let ntos = self.lua.create_table()?;
@@ -665,8 +671,9 @@ impl ScriptHost {
                 "command_usage",
                 scope.create_function({
                     let help = entry.help.clone();
+                    let captured = Rc::clone(&captured);
                     move |_, ()| {
-                        println!("{}", help);
+                        emit_script_output(output, &captured, &format!("{help}\n"));
                         Ok(())
                     }
                 })?,
@@ -1205,6 +1212,27 @@ impl ScriptHost {
 
             self.lua.globals().set("ntos", ntos)?;
 
+            // Redirect Lua's `print` into the same sink as `command_usage` so
+            // captured output is complete and the agent's JSON stream stays clean.
+            let previous_print: Value = self.lua.globals().get("print")?;
+            let tostring: Function = self.lua.globals().get("tostring")?;
+            let print_fn = scope.create_function({
+                let captured = Rc::clone(&captured);
+                move |_, args: Variadic<Value>| {
+                    let mut line = String::new();
+                    for (i, value) in args.iter().enumerate() {
+                        if i > 0 {
+                            line.push('\t');
+                        }
+                        line.push_str(&tostring.call::<String>(value.clone())?);
+                    }
+                    line.push('\n');
+                    emit_script_output(output, &captured, &line);
+                    Ok(())
+                }
+            })?;
+            self.lua.globals().set("print", print_fn)?;
+
             let result = (|| {
                 let cb: Function = self.lua.registry_value(&entry.callback)?;
                 let lua_args: Variadic<Value> = args
@@ -1213,9 +1241,29 @@ impl ScriptHost {
                     .collect::<mlua::Result<_>>()?;
                 cb.call::<()>(lua_args)
             })();
+            self.lua.globals().set("print", previous_print)?;
             self.lua.globals().set("ntos", Value::Nil)?;
-            result
+            result.map(|()| captured.borrow().clone())
         })
+    }
+}
+
+/// Where script output (`print`, `ntos.command_usage`) is sent.
+#[derive(Clone, Copy)]
+pub enum ScriptOutput {
+    /// Stream directly to the process stdout (interactive REPL).
+    Stdout,
+    /// Accumulate into the returned string (agent stdio / programmatic use).
+    Capture,
+}
+
+fn emit_script_output(output: ScriptOutput, captured: &RefCell<String>, text: &str) {
+    match output {
+        ScriptOutput::Stdout => {
+            print!("{text}");
+            let _ = io::stdout().flush();
+        }
+        ScriptOutput::Capture => captured.borrow_mut().push_str(text),
     }
 }
 
