@@ -34,7 +34,8 @@ use crate::dbg_backend::DebugBackend;
 use crate::debugger::{AttachReport, DebuggerContext, DriverObjectInfo};
 use crate::error::{Error, Result};
 use crate::expr::Expr;
-use crate::gdb::{BreakpointHitResult, BreakpointKind, BreakpointManager, RegisterMap};
+use crate::gdb::{Breakpoint, BreakpointKind, RegisterMap};
+use crate::session::{DebuggerSession, StopOutcome};
 use crate::guest::ModuleSymbolLoadReport;
 use crate::inspect::descriptors::{
     Gdtr, Idtr, gdt_type_label, parse_gdtr_from_qemu_registers, parse_idtr_from_qemu_registers,
@@ -750,6 +751,22 @@ macro_rules! error {
     };
 }
 
+/// Report breakpoints the session dropped because their address space no
+/// longer exists (e.g. the owning process exited while stepping over them).
+fn print_discarded_breakpoints(discarded: &[Breakpoint]) {
+    for bp in discarded {
+        println!(
+            "{}",
+            format!(
+                "breakpoint #{} removed: {} address space no longer exists",
+                bp.id,
+                bp.scope.label()
+            )
+            .yellow()
+        );
+    }
+}
+
 fn print_module_symbol_report(report: &ModuleSymbolLoadReport) {
     let mut summary = format!("symbols: loaded {}/{}", report.loaded, report.total);
     if report.failed_count() > 0 {
@@ -992,118 +1009,6 @@ fn dump_trap_frame(
         .find_type_across_modules(debugger.current_dtb(), "_KTRAP_FRAME")
         .ok_or_else(|| Error::StructNotFound("_KTRAP_FRAME".to_string()))?;
     print_type_instance(debugger, &type_info, address, field_name)
-}
-
-/// Single-step the current thread and clear `TF` from its RFLAGS afterwards.
-/// KVM sets `TF` when enabling `KVM_GUESTDBG_SINGLESTEP` but doesn't clear it
-/// when SINGLESTEP is removed; without this clear, the stepped thread keeps
-/// trapping after every instruction on resume
-fn step_one_and_clear_tf(client: &mut dyn DebugBackend, register_map: &RegisterMap) -> Result<()> {
-    client.step()?;
-    client.wait_for_stop()?;
-
-    if let Ok(mut regs) = client.read_registers()
-        && let Ok(eflags) = register_map.read_u64("eflags", &regs)
-    {
-        let cleared = eflags & !(1u64 << 8);
-        if cleared != eflags && register_map.write_u64("eflags", &mut regs, cleared).is_ok() {
-            client.write_registers(&regs)?;
-        }
-    }
-
-    Ok(())
-}
-
-/// If the current thread's RIP sits on one of our enabled breakpoints,
-/// disable it, step the underlying instruction, then re-enable. Returns
-/// whether a step was performed. Caller must have set the gdb stub's
-/// control thread first
-fn step_over_current_breakpoint(
-    client: &mut dyn DebugBackend,
-    register_map: &RegisterMap,
-    debugger: &DebuggerContext,
-    breakpoints: &mut BreakpointManager,
-) -> Result<bool> {
-    let regs = client.read_registers()?;
-    let rip = register_map.read_u64("rip", &regs)?;
-    let cr3 = register_map.read_u64("cr3", &regs)?;
-
-    // Scope-agnostic: a wrong-process hit on a shared-page BP still needs the
-    // disable/step/enable dance so the wrong process can make forward progress
-    let Some(bp_id) = breakpoints.breakpoint_id_at_address(rip) else {
-        return Ok(false);
-    };
-
-    if let Err(err) = breakpoints.disable(client, debugger, bp_id) {
-        if matches!(err, Error::BadVirtualAddress(_)) {
-            breakpoints
-                .disable_guest_memory_patch_in_address_space(client, debugger, bp_id, cr3)?;
-        } else {
-            return Err(err);
-        }
-    }
-
-    step_one_and_clear_tf(client, register_map)?;
-
-    if let Err(err) = breakpoints.enable(client, debugger, bp_id) {
-        if matches!(err, Error::BadVirtualAddress(_)) {
-            let removed = breakpoints.discard(bp_id)?;
-            println!(
-                "{}",
-                format!(
-                    "breakpoint #{} removed: {} address space no longer exists",
-                    removed.id,
-                    removed.scope.label()
-                )
-                .yellow()
-            );
-        } else {
-            return Err(err);
-        }
-    }
-    Ok(true)
-}
-
-/// For every gdb thread whose RIP sits one byte past one of our breakpoints,
-/// rewind it back to the breakpoint address. The stub doesn't always adjust
-/// RIP back to the int3 when multiple vCPUs hit the same BP simultaneously;
-/// resuming an un-adjusted vCPU would decode the remainder of the original
-/// instruction's bytes as a different instruction and corrupt guest state.
-/// Restores Hg/Hc to `restore_thread` before returning
-fn rewind_threads_off_breakpoints(
-    client: &mut dyn DebugBackend,
-    register_map: &RegisterMap,
-    breakpoints: &BreakpointManager,
-    restore_thread: &str,
-) {
-    let threads = match client.get_thread_list() {
-        Ok(t) => t,
-        Err(_) => return,
-    };
-
-    for tid in &threads {
-        if client.set_current_thread(tid).is_err() {
-            continue;
-        }
-        let Ok(regs) = client.read_registers() else {
-            continue;
-        };
-        let rip = register_map.read_u64("rip", &regs).unwrap_or(0);
-        let cr3 = register_map.read_u64("cr3", &regs).unwrap_or(0);
-        let Some(prev) = rip.checked_sub(1) else {
-            continue;
-        };
-        if !breakpoints.int3_breakpoint_hit_at(prev, cr3) {
-            continue;
-        }
-        let mut adjusted = regs.clone();
-        if register_map.write_u64("rip", &mut adjusted, prev).is_err() {
-            continue;
-        }
-        let _ = client.write_registers(&adjusted);
-    }
-
-    let _ = client.set_current_thread(restore_thread);
 }
 
 fn print_disasm_context(debugger: &DebuggerContext, trace: &ThreadTraceContext, rip: u64) {
@@ -1718,13 +1623,13 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
 
     let register_map = client.register_map().clone();
 
-    let mut current_thread = client
+    let current_thread = client
         .get_stopped_thread_id()
         .unwrap_or_else(|_| "1".to_string());
 
-    let mut breakpoints = BreakpointManager::new();
+    let mut session = DebuggerSession::new(register_map.clone(), current_thread);
 
-    print_break_context(&mut *client, &register_map, debugger, &current_thread);
+    print_break_context(&mut *client, &register_map, debugger, &session.current_thread);
 
     let min_completion_width: u16 = 0;
     let max_completion_width: u16 = 50;
@@ -1897,7 +1802,7 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                 None => None,
                             };
 
-                            if let Err(e) = client.set_current_thread(&current_thread) {
+                            if let Err(e) = client.set_current_thread(&session.current_thread) {
                                 error!("failed to set thread context: {:?}", e);
                                 continue;
                             }
@@ -1952,7 +1857,7 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                 None => None,
                             };
 
-                            if let Err(e) = client.set_current_thread(&current_thread) {
+                            if let Err(e) = client.set_current_thread(&session.current_thread) {
                                 error!("failed to set thread context: {:?}", e);
                                 continue;
                             }
@@ -2007,7 +1912,7 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                 None => None,
                             };
 
-                            if let Err(e) = client.set_current_thread(&current_thread) {
+                            if let Err(e) = client.set_current_thread(&session.current_thread) {
                                 error!("failed to set thread context: {:?}", e);
                                 continue;
                             }
@@ -2726,28 +2631,16 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                 continue;
                             }
 
-                            // If we're sitting on one of our breakpoints, step past it
-                            // before resuming; otherwise the int3 at RIP fires the BP
-                            // again on the very next cycle
-                            if breakpoints.has_enabled_breakpoints() {
-                                if let Err(e) = client.set_current_thread(&current_thread) {
-                                    error!("failed to set thread context: {:?}", e);
+                            // If we're sitting on one of our breakpoints, step
+                            // past it before resuming (otherwise the int3 at RIP
+                            // fires the BP again immediately), then sync the
+                            // transport's breakpoint view.
+                            match session.prepare_resume(&mut *client, debugger) {
+                                Ok(discarded) => print_discarded_breakpoints(&discarded),
+                                Err(e) => {
+                                    error!("failed to prepare resume: {:?}", e);
                                     continue;
                                 }
-                                if let Err(e) = step_over_current_breakpoint(
-                                    &mut *client,
-                                    &register_map,
-                                    debugger,
-                                    &mut breakpoints,
-                                ) {
-                                    error!("failed to step over current breakpoint: {:?}", e);
-                                    continue;
-                                }
-                            }
-
-                            if let Err(e) = breakpoints.refresh_enabled(&mut *client, debugger) {
-                                error!("failed to refresh breakpoints: {}", e);
-                                continue;
                             }
 
                             if let Err(e) = client.continue_execution() {
@@ -2755,9 +2648,9 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                 continue;
                             }
 
-                            debugger.registers = None;
+                            session.invalidate_register_cache(debugger);
 
-                            if breakpoints.has_enabled_breakpoints() {
+                            if session.breakpoints.has_enabled_breakpoints() {
                                 println!(
                                     "{}",
                                     "VM running, waiting for breakpoint (Ctrl+C to pause)..."
@@ -2775,7 +2668,7 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                         }
 
                                         if let Ok(tid) = client.get_stopped_thread_id() {
-                                            current_thread = tid;
+                                            session.current_thread = tid;
                                         }
                                         if let Err(e) =
                                             refresh_process_cache(debugger, &shared_processes)
@@ -2787,144 +2680,88 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                             &mut *client,
                                             &register_map,
                                             debugger,
-                                            &current_thread,
+                                            &session.current_thread,
                                         );
                                         break;
                                     }
 
-                                    match client.try_wait_for_stop(Duration::from_millis(100)) {
-                                        Ok(Some(event)) => {
-                                            if let Some(summary) = &event.summary {
-                                                println!(
-                                                    "{} {}",
-                                                    "target stop:".yellow(),
-                                                    summary.bright_black()
-                                                );
-                                            }
-                                            if event.target_exited {
-                                                println!(
-                                                    "{}",
-                                                    "target is no longer stopped at guest CPU state; use QEMU logs/QMP for reset cause details"
-                                                        .yellow()
-                                                );
+                                    let event =
+                                        match client.try_wait_for_stop(Duration::from_millis(100)) {
+                                            Ok(Some(event)) => event,
+                                            Ok(None) => continue, // timeout
+                                            Err(e) => {
+                                                error!("error waiting for stop: {:?}", e);
                                                 break;
                                             }
+                                        };
 
-                                            let stopped_tid = event
-                                                .thread_id
-                                                .or_else(|| client.get_stopped_thread_id().ok());
-                                            if let Some(tid) = stopped_tid {
-                                                current_thread = tid;
-                                                let _ = client.set_current_thread(&current_thread);
-                                            }
+                                    if let Some(summary) = &event.summary {
+                                        println!(
+                                            "{} {}",
+                                            "target stop:".yellow(),
+                                            summary.bright_black()
+                                        );
+                                    }
+
+                                    match session.process_stop(&mut *client, debugger, &event) {
+                                        // wrong-process int3 stepped over and resumed
+                                        Ok(StopOutcome::Resumed) => {}
+                                        Ok(StopOutcome::TargetExited) => {
+                                            println!(
+                                                "{}",
+                                                "target is no longer stopped at guest CPU state; use QEMU logs/QMP for reset cause details"
+                                                    .yellow()
+                                            );
+                                            break;
+                                        }
+                                        Ok(StopOutcome::Breakpoint(bp)) => {
                                             if let Err(e) =
                                                 refresh_process_cache(debugger, &shared_processes)
                                             {
                                                 error!("failed to refresh process cache: {}", e);
                                             }
-
-                                            // Done before reading the current thread's regs so
-                                            // the BP-hit check below sees the post-rewind RIP
-                                            rewind_threads_off_breakpoints(
+                                            println!();
+                                            println!(
+                                                "{} {} {}",
+                                                "breakpoint".magenta(),
+                                                format!("#{}", bp.id).cyan(),
+                                                bp.symbol
+                                                    .as_ref()
+                                                    .map(|s| format!("({})", s))
+                                                    .unwrap_or_default()
+                                                    .green()
+                                            );
+                                            print_break_context(
                                                 &mut *client,
                                                 &register_map,
-                                                &breakpoints,
-                                                &current_thread,
+                                                debugger,
+                                                &session.current_thread,
                                             );
-
-                                            let regs = match client.read_registers() {
-                                                Ok(r) => r,
-                                                Err(e) => {
-                                                    error!("failed to read registers: {:?}", e);
-                                                    break;
-                                                }
-                                            };
-
-                                            let rip =
-                                                register_map.read_u64("rip", &regs).unwrap_or(0);
-                                            let cr3 =
-                                                register_map.read_u64("cr3", &regs).unwrap_or(0);
-
-                                            let hit_result =
-                                                breakpoints.check_breakpoint_hit(rip, cr3);
-
-                                            // Wrong-process hit on a `GuestMemoryPatch` BP
-                                            // (shared page, e.g. ntdll/user32): step past
-                                            // the int3 silently so the wrong process keeps
-                                            // running, then resume waiting for the right one.
-                                            if matches!(
-                                                hit_result,
-                                                BreakpointHitResult::NotBreakpoint
-                                            ) && breakpoints
-                                                .breakpoint_id_at_address(rip)
-                                                .is_some()
-                                            {
-                                                if let Err(e) = step_over_current_breakpoint(
-                                                    &mut *client,
-                                                    &register_map,
-                                                    debugger,
-                                                    &mut breakpoints,
-                                                ) {
-                                                    error!(
-                                                        "failed to silent-step over wrong-process int3: {:?}",
-                                                        e
-                                                    );
-                                                    break;
-                                                }
-                                                if let Err(e) = client.continue_execution() {
-                                                    error!(
-                                                        "failed to resume after silent step over wrong-process int3: {:?}",
-                                                        e
-                                                    );
-                                                    break;
-                                                }
-                                                continue;
-                                            }
-
-                                            match hit_result {
-                                                BreakpointHitResult::Hit(bp) => {
-                                                    println!();
-                                                    println!(
-                                                        "{} {} {}",
-                                                        "breakpoint".magenta(),
-                                                        format!("#{}", bp.id).cyan(),
-                                                        bp.symbol
-                                                            .as_ref()
-                                                            .map(|s| format!("({})", s))
-                                                            .unwrap_or_default()
-                                                            .green()
-                                                    );
-                                                    print_break_context(
-                                                        &mut *client,
-                                                        &register_map,
-                                                        debugger,
-                                                        &current_thread,
-                                                    );
-
-                                                    // refresh all breakpoints, the stub may have
-                                                    // lost non-hit breakpoints when the VM stopped
-                                                    let _ = breakpoints
-                                                        .refresh_enabled(&mut *client, debugger);
-
-                                                    break;
-                                                }
-                                                BreakpointHitResult::NotBreakpoint => {
-                                                    println!();
-                                                    print_break_context(
-                                                        &mut *client,
-                                                        &register_map,
-                                                        debugger,
-                                                        &current_thread,
-                                                    );
-                                                    break;
-                                                }
-                                            }
+                                            // refresh all breakpoints; the stub may
+                                            // have lost non-hit breakpoints when the
+                                            // VM stopped
+                                            let _ = session
+                                                .breakpoints
+                                                .refresh_enabled(&mut *client, debugger);
+                                            break;
                                         }
-                                        Ok(None) => {
-                                            // timeout
+                                        Ok(StopOutcome::Stopped) => {
+                                            if let Err(e) =
+                                                refresh_process_cache(debugger, &shared_processes)
+                                            {
+                                                error!("failed to refresh process cache: {}", e);
+                                            }
+                                            println!();
+                                            print_break_context(
+                                                &mut *client,
+                                                &register_map,
+                                                debugger,
+                                                &session.current_thread,
+                                            );
+                                            break;
                                         }
                                         Err(e) => {
-                                            error!("error waiting for stop: {:?}", e);
+                                            error!("error handling stop: {:?}", e);
                                             break;
                                         }
                                     }
@@ -2943,7 +2780,7 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                             }
 
                             if let Ok(tid) = client.get_stopped_thread_id() {
-                                current_thread = tid;
+                                session.current_thread = tid;
                             }
                             if let Err(e) = refresh_process_cache(debugger, &shared_processes) {
                                 error!("failed to refresh process cache: {}", e);
@@ -2953,7 +2790,7 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                 &mut *client,
                                 &register_map,
                                 debugger,
-                                &current_thread,
+                                &session.current_thread,
                             );
                         }
                         Ok(ReplCommand::Dt) => {
@@ -3279,7 +3116,7 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                 continue;
                             }
 
-                            if let Err(e) = client.set_current_thread(&current_thread) {
+                            if let Err(e) = client.set_current_thread(&session.current_thread) {
                                 error!("failed to set thread context: {:?}", e);
                                 continue;
                             }
@@ -3325,7 +3162,7 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                 continue;
                             }
 
-                            if let Err(e) = client.set_current_thread(&current_thread) {
+                            if let Err(e) = client.set_current_thread(&session.current_thread) {
                                 error!("failed to set thread context: {:?}", e);
                                 continue;
                             }
@@ -3348,37 +3185,12 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                 continue;
                             }
 
-                            if let Err(e) = client.set_current_thread(&current_thread) {
-                                error!("failed to set thread context: {:?}", e);
-                                continue;
-                            }
-
-                            let stepped = match step_over_current_breakpoint(
-                                &mut *client,
-                                &register_map,
-                                debugger,
-                                &mut breakpoints,
-                            ) {
-                                Ok(stepped) => stepped,
+                            match session.step(&mut *client, debugger) {
+                                Ok(discarded) => print_discarded_breakpoints(&discarded),
                                 Err(e) => {
-                                    error!("failed to step over breakpoint: {:?}", e);
+                                    error!("failed to step: {:?}", e);
                                     continue;
                                 }
-                            };
-
-                            if !stepped
-                                && let Err(e) = step_one_and_clear_tf(&mut *client, &register_map)
-                            {
-                                error!("failed to step: {:?}", e);
-                                continue;
-                            }
-
-                            if let Err(e) = breakpoints.refresh_enabled(&mut *client, debugger) {
-                                error!("failed to refresh breakpoints after step: {}", e);
-                            }
-
-                            if let Ok(tid) = client.get_stopped_thread_id() {
-                                current_thread = tid;
                             }
 
                             println!();
@@ -3386,7 +3198,7 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                 &mut *client,
                                 &register_map,
                                 debugger,
-                                &current_thread,
+                                &session.current_thread,
                             );
                         }
                         Ok(ReplCommand::Thread) => {
@@ -3418,8 +3230,8 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                 continue;
                             }
 
-                            current_thread = thread_id.to_string();
-                            println!("switched to thread {}\n", current_thread);
+                            session.current_thread = thread_id.to_string();
+                            println!("switched to thread {}\n", session.current_thread);
                         }
                         Ok(cmd @ (ReplCommand::Bp | ReplCommand::Hbp)) => {
                             if client.is_running() {
@@ -3458,9 +3270,9 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
 
                             let add_result = match kind {
                                 BreakpointKind::Software => {
-                                    breakpoints.add(&mut *client, debugger, address, symbol.clone())
+                                    session.breakpoints.add(&mut *client, debugger, address, symbol.clone())
                                 }
-                                BreakpointKind::Hardware => breakpoints.add_hardware(
+                                BreakpointKind::Hardware => session.breakpoints.add_hardware(
                                     &mut *client,
                                     debugger,
                                     address,
@@ -3470,7 +3282,7 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
 
                             match add_result {
                                 Ok(id) => {
-                                    update_breakpoint_cache!(breakpoints, shared_breakpoints);
+                                    update_breakpoint_cache!(session.breakpoints, shared_breakpoints);
                                     println!(
                                         "{} breakpoint {} set at {}{}{}\n",
                                         kind.label(),
@@ -3482,7 +3294,7 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                             .green(),
                                         format!(
                                             " ({})",
-                                            breakpoints
+                                            session.breakpoints
                                                 .list()
                                                 .into_iter()
                                                 .find(|bp| bp.id == id)
@@ -3498,7 +3310,7 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                             }
                         }
                         Ok(ReplCommand::Bl) => {
-                            let bps = breakpoints.list();
+                            let bps = session.breakpoints.list();
                             if bps.is_empty() {
                                 println!("no breakpoints set\n");
                             } else {
@@ -3548,9 +3360,9 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                 }
                             };
 
-                            match breakpoints.remove(&mut *client, debugger, id) {
+                            match session.breakpoints.remove(&mut *client, debugger, id) {
                                 Ok(()) => {
-                                    update_breakpoint_cache!(breakpoints, shared_breakpoints);
+                                    update_breakpoint_cache!(session.breakpoints, shared_breakpoints);
                                     println!("breakpoint #{} cleared\n", id);
                                 }
                                 Err(e) => {
@@ -3573,9 +3385,9 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                 }
                             };
 
-                            match breakpoints.disable(&mut *client, debugger, id) {
+                            match session.breakpoints.disable(&mut *client, debugger, id) {
                                 Ok(()) => {
-                                    update_breakpoint_cache!(breakpoints, shared_breakpoints);
+                                    update_breakpoint_cache!(session.breakpoints, shared_breakpoints);
                                     println!("breakpoint #{} disabled\n", id);
                                 }
                                 Err(e) => {
@@ -3598,9 +3410,9 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                 }
                             };
 
-                            match breakpoints.enable(&mut *client, debugger, id) {
+                            match session.breakpoints.enable(&mut *client, debugger, id) {
                                 Ok(()) => {
-                                    update_breakpoint_cache!(breakpoints, shared_breakpoints);
+                                    update_breakpoint_cache!(session.breakpoints, shared_breakpoints);
                                     println!("breakpoint #{} enabled\n", id);
                                 }
                                 Err(e) => {
@@ -3619,7 +3431,7 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                             let frame_limit: usize =
                                 parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(64);
 
-                            if let Err(e) = client.set_current_thread(&current_thread) {
+                            if let Err(e) = client.set_current_thread(&session.current_thread) {
                                 error!("failed to set thread context: {:?}", e);
                                 continue;
                             }
@@ -3645,7 +3457,7 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                             if client.is_running() {
                                 println!("VM is running\n");
                             } else {
-                                if let Err(e) = client.set_current_thread(&current_thread) {
+                                if let Err(e) = client.set_current_thread(&session.current_thread) {
                                     error!("failed to set thread context: {:?}", e);
                                     continue;
                                 }
@@ -3653,7 +3465,7 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                                     &mut *client,
                                     &register_map,
                                     debugger,
-                                    &current_thread,
+                                    &session.current_thread,
                                 );
                             }
                         }
@@ -3696,7 +3508,7 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                     }
 
                     if let Ok(thread_id) = client.get_stopped_thread_id() {
-                        current_thread = thread_id;
+                        session.current_thread = thread_id;
                     }
                     if let Err(e) = refresh_process_cache(debugger, &shared_processes) {
                         error!("failed to refresh process cache: {}", e);
@@ -3705,7 +3517,7 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                         *shared_drivers.write().unwrap() = drivers;
                     }
                     println!();
-                    print_break_context(&mut *client, &register_map, debugger, &current_thread);
+                    print_break_context(&mut *client, &register_map, debugger, &session.current_thread);
                 } else {
                     error!("VM is already paused");
                 }
@@ -3717,9 +3529,9 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
         let _ = client.interrupt();
     }
 
-    let bp_ids: Vec<u32> = breakpoints.list().iter().map(|bp| bp.id).collect();
+    let bp_ids: Vec<u32> = session.breakpoints.list().iter().map(|bp| bp.id).collect();
     for id in bp_ids {
-        if let Err(e) = breakpoints.remove(&mut *client, debugger, id) {
+        if let Err(e) = session.breakpoints.remove(&mut *client, debugger, id) {
             error!("failed to uninstall breakpoint #{} on exit: {}", id, e);
         }
     }

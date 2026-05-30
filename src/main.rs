@@ -25,6 +25,7 @@ mod kd;
 mod memory;
 mod repl;
 mod script;
+mod session;
 mod symbols;
 mod types;
 mod unwind;

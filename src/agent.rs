@@ -1,17 +1,18 @@
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::backend::MemoryOps;
-use crate::dbg_backend::{DebugBackend, StopEvent};
+use crate::dbg_backend::DebugBackend;
 use crate::debugger::{AttachReport, DebuggerContext, DriverObjectInfo};
 use crate::error::{Error, Result};
 use crate::expr::Expr;
-use crate::gdb::{BreakpointKind, BreakpointManager, RegisterMap};
+use crate::gdb::{Breakpoint, BreakpointKind};
+use crate::session::{DebuggerSession, StopOutcome};
 use crate::guest::{ModuleInfo, ModuleSymbolLoadReport};
 use crate::inspect::descriptors::{
     GdtEntry, gdt_type_label, parse_gdtr_from_qemu_registers, parse_idtr_from_qemu_registers,
@@ -72,9 +73,7 @@ struct AgentRequest {
 struct AgentSession<'a> {
     debugger: &'a mut DebuggerContext,
     client: &'a mut dyn DebugBackend,
-    register_map: RegisterMap,
-    current_thread: String,
-    breakpoints: BreakpointManager,
+    session: DebuggerSession,
     script_host: ScriptHost,
 }
 
@@ -91,9 +90,7 @@ pub fn start_agent_stdio(
     let mut session = AgentSession {
         debugger,
         client,
-        register_map,
-        current_thread,
-        breakpoints: BreakpointManager::new(),
+        session: DebuggerSession::new(register_map, current_thread),
         script_host,
     };
 
@@ -235,7 +232,7 @@ impl AgentSession<'_> {
                 args,
                 self.debugger,
                 self.client,
-                &self.register_map,
+                &self.session.register_map,
                 ScriptOutput::Capture,
             )
             .map_err(|e| Error::InvalidExpression(e.to_string()))?;
@@ -251,7 +248,7 @@ impl AgentSession<'_> {
 
         json!({
             "running": self.client.is_running(),
-            "current_thread": self.current_thread,
+            "current_thread": self.session.current_thread,
             "current_dtb": fmt_addr(self.debugger.current_dtb()),
             "current_process": process,
         })
@@ -262,12 +259,10 @@ impl AgentSession<'_> {
             return Err(Error::InvalidExpression("VM is running".into()));
         }
 
-        self.client.set_current_thread(&self.current_thread)?;
-        let regs = self.client.read_registers()?;
-        let map = self.register_map.to_hashmap(&regs);
-        self.debugger.registers = Some(map.clone());
+        let regs = self.session.refresh_register_cache(self.client, self.debugger)?;
+        let map = self.session.register_map.to_hashmap(&regs);
         Ok(json!({
-            "thread": self.current_thread,
+            "thread": self.session.current_thread,
             "registers": map.into_iter()
                 .map(|(name, value)| (name, json!(fmt_addr(value))))
                 .collect::<serde_json::Map<_, _>>()
@@ -555,10 +550,7 @@ impl AgentSession<'_> {
         if self.client.is_running() {
             return Err(Error::InvalidExpression("VM is running".into()));
         }
-        self.client.set_current_thread(&self.current_thread)?;
-        let regs = self.client.read_registers()?;
-        self.debugger.registers = Some(self.register_map.to_hashmap(&regs));
-        Ok(regs)
+        self.session.refresh_register_cache(self.client, self.debugger)
     }
 
     fn qemu_register_descriptors(&mut self) -> Result<String> {
@@ -578,7 +570,7 @@ impl AgentSession<'_> {
             Error::InvalidExpression("QEMU monitor output did not contain IDT".into())
         })?;
         let entries =
-            read_idt_entries(self.debugger, &self.register_map, &regs, idtr, max_entries)?;
+            read_idt_entries(self.debugger, &self.session.register_map, &regs, idtr, max_entries)?;
         Ok(json!({
             "base": fmt_addr(idtr.base.0),
             "limit": idtr.limit,
@@ -602,7 +594,7 @@ impl AgentSession<'_> {
             Error::InvalidExpression("QEMU monitor output did not contain GDT".into())
         })?;
         let entries =
-            read_gdt_entries(self.debugger, &self.register_map, &regs, gdtr, max_entries)?;
+            read_gdt_entries(self.debugger, &self.session.register_map, &regs, gdtr, max_entries)?;
         Ok(json!({
             "base": fmt_addr(gdtr.base.0),
             "limit": gdtr.limit,
@@ -625,7 +617,7 @@ impl AgentSession<'_> {
             })?,
         };
         let (entry, stacks) =
-            read_tss_stack_bases(self.debugger, &self.register_map, &regs, gdtr, selector)?;
+            read_tss_stack_bases(self.debugger, &self.session.register_map, &regs, gdtr, selector)?;
         Ok(json!({
             "selector": selector,
             "descriptor": gdt_entry_json(entry),
@@ -664,13 +656,11 @@ impl AgentSession<'_> {
         if self.client.is_running() {
             return Err(Error::InvalidExpression("VM is running".into()));
         }
-        self.client.set_current_thread(&self.current_thread)?;
-        let regs = self.client.read_registers()?;
-        self.debugger.registers = Some(self.register_map.to_hashmap(&regs));
+        let regs = self.session.refresh_register_cache(self.client, self.debugger)?;
         let limit = limit.unwrap_or(64);
-        let trace = build_stacktrace(self.debugger, &self.register_map, &regs, limit);
+        let trace = build_stacktrace(self.debugger, &self.session.register_map, &regs, limit);
         Ok(json!({
-            "thread": self.current_thread,
+            "thread": self.session.current_thread,
             "truncated": trace.truncated,
             "frames": trace.frames.into_iter().map(|frame| json!({
                 "sp": fmt_addr(frame.sp),
@@ -785,7 +775,7 @@ impl AgentSession<'_> {
 
     fn set_thread(&mut self, thread: String) -> Result<Value> {
         self.client.set_current_thread(&thread)?;
-        self.current_thread = thread;
+        self.session.current_thread = thread;
         Ok(self.status())
     }
 
@@ -818,10 +808,10 @@ impl AgentSession<'_> {
 
         let id = match kind {
             BreakpointKind::Software => {
-                self.breakpoints
+                self.session.breakpoints
                     .add(self.client, self.debugger, address, symbol.clone())?
             }
-            BreakpointKind::Hardware => self.breakpoints.add_hardware(
+            BreakpointKind::Hardware => self.session.breakpoints.add_hardware(
                 self.client,
                 self.debugger,
                 address,
@@ -839,25 +829,25 @@ impl AgentSession<'_> {
 
     fn clear_breakpoint(&mut self, id: Option<u32>) -> Result<Value> {
         let id = id.ok_or_else(|| Error::InvalidExpression("missing breakpoint".into()))?;
-        self.breakpoints.remove(self.client, self.debugger, id)?;
+        self.session.breakpoints.remove(self.client, self.debugger, id)?;
         Ok(json!({ "cleared": id }))
     }
 
     fn disable_breakpoint(&mut self, id: Option<u32>) -> Result<Value> {
         let id = id.ok_or_else(|| Error::InvalidExpression("missing breakpoint".into()))?;
-        self.breakpoints.disable(self.client, self.debugger, id)?;
+        self.session.breakpoints.disable(self.client, self.debugger, id)?;
         Ok(json!({ "disabled": id }))
     }
 
     fn enable_breakpoint(&mut self, id: Option<u32>) -> Result<Value> {
         let id = id.ok_or_else(|| Error::InvalidExpression("missing breakpoint".into()))?;
-        self.breakpoints.enable(self.client, self.debugger, id)?;
+        self.session.breakpoints.enable(self.client, self.debugger, id)?;
         Ok(json!({ "enabled": id }))
     }
 
     fn list_breakpoints(&self) -> Result<Value> {
         Ok(json!({
-            "breakpoints": self.breakpoints.list().into_iter().map(|bp| json!({
+            "breakpoints": self.session.breakpoints.list().into_iter().map(|bp| json!({
                 "id": bp.id,
                 "enabled": bp.enabled,
                 "kind": bp.kind.label(),
@@ -873,28 +863,44 @@ impl AgentSession<'_> {
             return Err(Error::InvalidExpression("VM is running".into()));
         }
 
-        self.breakpoints
-            .refresh_enabled(self.client, self.debugger)?;
+        // Step over a breakpoint at the current RIP and refresh the transport's
+        // breakpoint view, matching the REPL's resume path.
+        self.session.prepare_resume(self.client, self.debugger)?;
         self.client.continue_execution()?;
         self.debugger.registers = None;
 
-        if let Some(timeout_ms) = timeout_ms {
-            match self
-                .client
-                .try_wait_for_stop(Duration::from_millis(timeout_ms))?
-            {
-                Some(event) => self.stopped(event),
-                None => Ok(json!({ "running": true, "stopped": false })),
+        let Some(timeout_ms) = timeout_ms else {
+            return Ok(json!({ "running": true }));
+        };
+
+        // Poll for a stop within the timeout budget, silently stepping over
+        // wrong-process int3 hits and resuming until a real stop or the
+        // deadline.
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Some(event) = self.client.try_wait_for_stop(remaining)? else {
+                return Ok(json!({ "running": true, "stopped": false }));
+            };
+
+            let summary = event.summary.clone();
+            match self.session.process_stop(self.client, self.debugger, &event)? {
+                StopOutcome::Resumed => {
+                    if Instant::now() >= deadline {
+                        return Ok(json!({ "running": true, "stopped": false }));
+                    }
+                }
+                StopOutcome::TargetExited => return self.stop_json(summary, true, None),
+                StopOutcome::Stopped => return self.stop_json(summary, false, None),
+                StopOutcome::Breakpoint(bp) => return self.stop_json(summary, false, Some(&bp)),
             }
-        } else {
-            Ok(json!({ "running": true }))
         }
     }
 
     fn interrupt(&mut self) -> Result<Value> {
         self.client.interrupt()?;
         if let Ok(thread) = self.client.get_stopped_thread_id() {
-            self.current_thread = thread;
+            self.session.current_thread = thread;
         }
         Ok(self.status())
     }
@@ -904,10 +910,9 @@ impl AgentSession<'_> {
             return Err(Error::InvalidExpression("VM is running".into()));
         }
 
-        self.client.set_current_thread(&self.current_thread)?;
-        self.client.step()?;
-        let event = self.client.wait_for_stop()?;
-        self.stopped(event)
+        // Shared step-over/single-step path (handles sitting on a breakpoint).
+        self.session.step(self.client, self.debugger)?;
+        self.stop_json(None, false, None)
     }
 
     fn qlog(&mut self, request: AgentRequest) -> Result<Value> {
@@ -925,29 +930,37 @@ impl AgentSession<'_> {
         }))
     }
 
-    fn stopped(&mut self, event: StopEvent) -> Result<Value> {
-        if let Some(thread) = event
-            .thread_id
-            .or_else(|| self.client.get_stopped_thread_id().ok())
-        {
-            self.current_thread = thread;
-            let _ = self.client.set_current_thread(&self.current_thread);
-        }
-
+    /// Serialize a stop into the agent's JSON shape. The session has already
+    /// updated the current thread and refreshed the register cache; this reads
+    /// the current thread's registers for RIP/CR3/symbol context.
+    fn stop_json(
+        &mut self,
+        summary: Option<String>,
+        target_exited: bool,
+        breakpoint: Option<&Breakpoint>,
+    ) -> Result<Value> {
         let mut out = json!({
             "running": false,
             "stopped": true,
-            "thread": self.current_thread,
-            "summary": event.summary,
-            "target_exited": event.target_exited,
+            "thread": self.session.current_thread,
+            "summary": summary,
+            "target_exited": target_exited,
         });
 
-        if !event.target_exited
+        if let Some(bp) = breakpoint {
+            out["breakpoint"] = json!({
+                "id": bp.id,
+                "symbol": bp.symbol,
+                "address": fmt_addr(bp.address.0),
+            });
+        }
+
+        if !target_exited
             && let Ok(regs) = self.client.read_registers()
         {
-            let rip = self.register_map.read_u64("rip", &regs).unwrap_or(0);
-            let cr3 = self.register_map.read_u64("cr3", &regs).unwrap_or(0);
-            self.debugger.registers = Some(self.register_map.to_hashmap(&regs));
+            let rip = self.session.register_map.read_u64("rip", &regs).unwrap_or(0);
+            let cr3 = self.session.register_map.read_u64("cr3", &regs).unwrap_or(0);
+            self.debugger.registers = Some(self.session.register_map.to_hashmap(&regs));
             out["rip"] = json!(fmt_addr(rip));
             out["cr3"] = json!(fmt_addr(cr3));
             if let Some((module, symbol, offset)) = self
@@ -975,9 +988,8 @@ impl AgentSession<'_> {
         if self.debugger.registers.is_some() || self.client.is_running() {
             return Ok(());
         }
-        self.client.set_current_thread(&self.current_thread)?;
-        let regs = self.client.read_registers()?;
-        self.debugger.registers = Some(self.register_map.to_hashmap(&regs));
+        self.session
+            .refresh_register_cache(self.client, self.debugger)?;
         Ok(())
     }
 
