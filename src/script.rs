@@ -411,6 +411,12 @@ struct Registered {
 pub struct ScriptHost {
     lua: Lua,
     commands: HashMap<String, Registered>,
+    output: Rc<RefCell<ScriptOutputState>>,
+}
+
+struct ScriptOutputState {
+    mode: ScriptOutput,
+    buffer: String,
 }
 
 pub struct LoadReport {
@@ -421,10 +427,20 @@ pub struct LoadReport {
 impl ScriptHost {
     pub fn new() -> Self {
         let libs = StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8;
+        let lua = Lua::new_with(libs, LuaOptions::default())
+            .expect("failed to create Lua scripting runtime");
+        let output = Rc::new(RefCell::new(ScriptOutputState {
+            mode: ScriptOutput::Stdout,
+            buffer: String::new(),
+        }));
+        // Install the `print` redirect once, at load time, so scripts that cache
+        // `print` in an upvalue (`local p = print`) still route through the sink
+        // and `dispatch` only has to flip the destination.
+        install_script_print(&lua, Rc::clone(&output));
         Self {
-            lua: Lua::new_with(libs, LuaOptions::default())
-                .expect("failed to create Lua scripting runtime"),
+            lua,
             commands: HashMap::new(),
+            output,
         }
     }
 
@@ -640,12 +656,17 @@ impl ScriptHost {
         let dbg = RefCell::new(debugger);
         let cli = RefCell::new(client);
         let regs_cache: RefCell<Option<Vec<u8>>> = RefCell::new(None);
-        // Script output (`print`, `ntos.command_usage`) streams to stdout for the
-        // interactive REPL, but is captured for the agent so it cannot corrupt
-        // the newline-delimited JSON stream.
-        let captured: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        // Point script output (`print`, `ntos.command_usage`) at the requested
+        // sink: streamed to stdout for the interactive REPL, or captured for the
+        // agent so it cannot corrupt the newline-delimited JSON stream.
+        {
+            let mut state = self.output.borrow_mut();
+            state.mode = output;
+            state.buffer.clear();
+        }
+        let captured = Rc::clone(&self.output);
 
-        self.lua.scope(|scope| {
+        let run = self.lua.scope(|scope| {
             let ntos = self.lua.create_table()?;
 
             ntos.set(
@@ -673,7 +694,7 @@ impl ScriptHost {
                     let help = entry.help.clone();
                     let captured = Rc::clone(&captured);
                     move |_, ()| {
-                        emit_script_output(output, &captured, &format!("{help}\n"));
+                        emit_script_output(&captured, &format!("{help}\n"));
                         Ok(())
                     }
                 })?,
@@ -1212,27 +1233,6 @@ impl ScriptHost {
 
             self.lua.globals().set("ntos", ntos)?;
 
-            // Redirect Lua's `print` into the same sink as `command_usage` so
-            // captured output is complete and the agent's JSON stream stays clean.
-            let previous_print: Value = self.lua.globals().get("print")?;
-            let tostring: Function = self.lua.globals().get("tostring")?;
-            let print_fn = scope.create_function({
-                let captured = Rc::clone(&captured);
-                move |_, args: Variadic<Value>| {
-                    let mut line = String::new();
-                    for (i, value) in args.iter().enumerate() {
-                        if i > 0 {
-                            line.push('\t');
-                        }
-                        line.push_str(&tostring.call::<String>(value.clone())?);
-                    }
-                    line.push('\n');
-                    emit_script_output(output, &captured, &line);
-                    Ok(())
-                }
-            })?;
-            self.lua.globals().set("print", print_fn)?;
-
             let result = (|| {
                 let cb: Function = self.lua.registry_value(&entry.callback)?;
                 let lua_args: Variadic<Value> = args
@@ -1241,10 +1241,16 @@ impl ScriptHost {
                     .collect::<mlua::Result<_>>()?;
                 cb.call::<()>(lua_args)
             })();
-            self.lua.globals().set("print", previous_print)?;
             self.lua.globals().set("ntos", Value::Nil)?;
-            result.map(|()| captured.borrow().clone())
-        })
+            result
+        });
+
+        // Restore streaming mode and hand back whatever was captured (empty in
+        // stdout mode). Done after the scope so it runs even on script error.
+        let mut state = captured.borrow_mut();
+        state.mode = ScriptOutput::Stdout;
+        let text = std::mem::take(&mut state.buffer);
+        run.map(|()| text)
     }
 }
 
@@ -1257,13 +1263,38 @@ pub enum ScriptOutput {
     Capture,
 }
 
-fn emit_script_output(output: ScriptOutput, captured: &RefCell<String>, text: &str) {
-    match output {
+/// Install a permanent `print` that mirrors Lua's builtin but routes through the
+/// host output sink, so cached `print` upvalues and global lookups share a
+/// switchable destination.
+fn install_script_print(lua: &Lua, output: Rc<RefCell<ScriptOutputState>>) {
+    let print_fn = lua
+        .create_function(move |lua, args: Variadic<Value>| {
+            let tostring: Function = lua.globals().get("tostring")?;
+            let mut line = String::new();
+            for (i, value) in args.iter().enumerate() {
+                if i > 0 {
+                    line.push('\t');
+                }
+                line.push_str(&tostring.call::<String>(value.clone())?);
+            }
+            line.push('\n');
+            emit_script_output(&output, &line);
+            Ok(())
+        })
+        .expect("failed to create script print");
+    lua.globals()
+        .set("print", print_fn)
+        .expect("failed to install script print");
+}
+
+fn emit_script_output(state: &RefCell<ScriptOutputState>, text: &str) {
+    let mut state = state.borrow_mut();
+    match state.mode {
         ScriptOutput::Stdout => {
             print!("{text}");
             let _ = io::stdout().flush();
         }
-        ScriptOutput::Capture => captured.borrow_mut().push_str(text),
+        ScriptOutput::Capture => state.buffer.push_str(text),
     }
 }
 
