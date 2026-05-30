@@ -885,7 +885,7 @@ impl AgentSession<'_> {
 
             let summary = event.summary.clone();
             match self.session.process_stop(self.client, self.debugger, &event)? {
-                StopOutcome::Resumed => {
+                StopOutcome::Resumed(_) => {
                     if Instant::now() >= deadline {
                         return Ok(json!({ "running": true, "stopped": false }));
                     }
@@ -911,8 +911,8 @@ impl AgentSession<'_> {
         }
 
         // Shared step-over/single-step path (handles sitting on a breakpoint).
-        self.session.step(self.client, self.debugger)?;
-        self.stop_json(None, false, None)
+        let result = self.session.step(self.client, self.debugger)?;
+        self.stop_json(result.event.summary, result.event.target_exited, None)
     }
 
     fn qlog(&mut self, request: AgentRequest) -> Result<Value> {

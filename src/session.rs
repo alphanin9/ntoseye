@@ -15,10 +15,20 @@ use crate::gdb::{Breakpoint, BreakpointHitResult, BreakpointManager, RegisterMap
 
 /// Result of [`DebuggerSession::step_over_current_breakpoint`].
 pub struct StepOver {
-    /// Whether an underlying instruction was stepped (i.e. RIP was on a BP).
-    pub stepped: bool,
     /// Breakpoints removed because their address space no longer exists.
     pub discarded: Vec<Breakpoint>,
+    /// The stop event from the underlying single step. `Some` when RIP was on
+    /// a breakpoint (a step-over was performed); `None` when nothing was
+    /// stepped.
+    pub event: Option<StopEvent>,
+}
+
+/// Result of [`DebuggerSession::step`].
+pub struct StepResult {
+    /// Breakpoints removed because their address space no longer exists.
+    pub discarded: Vec<Breakpoint>,
+    /// The stop event the single step landed on.
+    pub event: StopEvent,
 }
 
 /// What a stop event turned out to be after [`DebuggerSession::process_stop`].
@@ -32,7 +42,8 @@ pub enum StopOutcome {
     TargetExited,
     /// A wrong-process `int3` on a shared page was stepped over silently and
     /// execution was resumed. Callers should keep waiting for the next stop.
-    Resumed,
+    /// Carries any breakpoints discarded while stepping over the int3.
+    Resumed(Vec<Breakpoint>),
 }
 
 /// Backend-neutral debugger state shared by the REPL and the agent protocol.
@@ -74,9 +85,9 @@ impl DebuggerSession {
     /// KVM sets `TF` when enabling `KVM_GUESTDBG_SINGLESTEP` but doesn't clear
     /// it when SINGLESTEP is removed; without this clear, the stepped thread
     /// keeps trapping after every instruction on resume.
-    fn single_step(&self, client: &mut dyn DebugBackend) -> Result<()> {
+    fn single_step(&self, client: &mut dyn DebugBackend) -> Result<StopEvent> {
         client.step()?;
-        client.wait_for_stop()?;
+        let event = client.wait_for_stop()?;
 
         if let Ok(mut regs) = client.read_registers()
             && let Ok(eflags) = self.register_map.read_u64("eflags", &regs)
@@ -92,7 +103,7 @@ impl DebuggerSession {
             }
         }
 
-        Ok(())
+        Ok(event)
     }
 
     /// If the current thread's RIP sits on one of our enabled breakpoints,
@@ -114,8 +125,8 @@ impl DebuggerSession {
         // progress.
         let Some(bp_id) = self.breakpoints.breakpoint_id_at_address(rip) else {
             return Ok(StepOver {
-                stepped: false,
                 discarded: Vec::new(),
+                event: None,
             });
         };
 
@@ -128,7 +139,7 @@ impl DebuggerSession {
             }
         }
 
-        self.single_step(client)?;
+        let event = self.single_step(client)?;
 
         let mut discarded = Vec::new();
         if let Err(err) = self.breakpoints.enable(client, debugger, bp_id) {
@@ -140,8 +151,8 @@ impl DebuggerSession {
         }
 
         Ok(StepOver {
-            stepped: true,
             discarded,
+            event: Some(event),
         })
     }
 
@@ -250,10 +261,12 @@ impl DebuggerSession {
         if matches!(hit_result, BreakpointHitResult::NotBreakpoint)
             && self.breakpoints.breakpoint_id_at_address(rip).is_some()
         {
-            self.step_over_current_breakpoint(client, debugger)?;
+            let discarded = self
+                .step_over_current_breakpoint(client, debugger)?
+                .discarded;
             client.continue_execution()?;
             self.invalidate_register_cache(debugger);
-            return Ok(StopOutcome::Resumed);
+            return Ok(StopOutcome::Resumed(discarded));
         }
 
         debugger.registers = Some(self.register_map.to_hashmap(&regs));
@@ -267,19 +280,29 @@ impl DebuggerSession {
     /// Single-step the current thread one instruction. If RIP is on one of our
     /// breakpoints, step over it (disable/step/enable); otherwise do a plain
     /// single step. Refreshes enabled breakpoints and updates the current
-    /// thread afterwards. Returns any discarded breakpoints.
+    /// thread afterwards. Returns any discarded breakpoints and the stop event
+    /// the step landed on.
     pub fn step(
         &mut self,
         client: &mut dyn DebugBackend,
         debugger: &DebuggerContext,
-    ) -> Result<Vec<Breakpoint>> {
+    ) -> Result<StepResult> {
         client.set_current_thread(&self.current_thread)?;
 
-        let StepOver { stepped, discarded } =
-            self.step_over_current_breakpoint(client, debugger)?;
+        let StepOver {
+            discarded, event, ..
+        } = self.step_over_current_breakpoint(client, debugger)?;
 
-        if !stepped {
-            self.single_step(client)?;
+        // `event` is `Some` when RIP was on a breakpoint (the step-over did the
+        // single step); otherwise do a plain single step here.
+        let event = match event {
+            Some(event) => event,
+            None => self.single_step(client)?,
+        };
+
+        // If the target exited mid-step there is no live state to refresh.
+        if event.target_exited {
+            return Ok(StepResult { discarded, event });
         }
 
         self.breakpoints.refresh_enabled(client, debugger)?;
@@ -288,6 +311,6 @@ impl DebuggerSession {
             self.current_thread = tid;
         }
 
-        Ok(discarded)
+        Ok(StepResult { discarded, event })
     }
 }

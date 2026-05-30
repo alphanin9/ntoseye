@@ -2705,7 +2705,9 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
 
                                     match session.process_stop(&mut *client, debugger, &event) {
                                         // wrong-process int3 stepped over and resumed
-                                        Ok(StopOutcome::Resumed) => {}
+                                        Ok(StopOutcome::Resumed(discarded)) => {
+                                            print_discarded_breakpoints(&discarded);
+                                        }
                                         Ok(StopOutcome::TargetExited) => {
                                             println!(
                                                 "{}",
@@ -3186,7 +3188,7 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                             }
 
                             match session.step(&mut *client, debugger) {
-                                Ok(discarded) => print_discarded_breakpoints(&discarded),
+                                Ok(result) => print_discarded_breakpoints(&result.discarded),
                                 Err(e) => {
                                     error!("failed to step: {:?}", e);
                                     continue;
