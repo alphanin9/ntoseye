@@ -20,6 +20,7 @@ mod expr;
 mod gdb;
 mod guest;
 mod host;
+mod inspect;
 mod kd;
 mod memory;
 mod repl;
