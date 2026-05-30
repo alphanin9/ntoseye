@@ -15,7 +15,7 @@ Start by discovering the actual local setup:
 
 - Use `virsh -c qemu:///system list --all` to find the VM.
 - Inspect the QEMU command line with `ps -eo pid,cmd | rg -i "qemu|virtiofs|guest-agent|qga|qmp|serial"`.
-- Prefer existing virtiofs mounts for bytes. In the known setup, libvirt exposes `virtiofsd --shared-dir /home/user/dev/windows_shared` and the QEMU fs tag is `win_share`.
+- Prefer existing virtiofs mounts for bytes. In the known setup, libvirt exposes `virtiofsd --shared-dir /home/user/dev/windows_shared` and the QEMU fs tag is `win_share`. This may not be the case for other setups.
 - Test QGA before assuming it is usable:
 
 ```bash
@@ -24,6 +24,7 @@ virsh -c qemu:///system qemu-agent-command 'Win11 Debug target' \
 ```
 
 If `guest-ping` succeeds, QGA command execution is available. On the current Windows debug VM, `guest-exec` runs as `nt authority\system`.
+In `virt-manager`-based setups, QEMU will expose a serial port at COM1 that can be listened to via a PTY on `virsh -c qemu:///system console {domain}`. Reading directly from the serial port will generally require root, which is inadvisable.
 
 ## Driver Deploy Loop
 
