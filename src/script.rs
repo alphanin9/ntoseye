@@ -13,21 +13,21 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use mlua::{
-    Function, Lua, LuaOptions, MetaMethod, RegistryKey, StdLib, UserData, UserDataMethods, Value,
-    Variadic,
+    FromLua, Function, Lua, LuaOptions, MetaMethod, MultiValue, RegistryKey, StdLib, Table,
+    UserData, UserDataMethods, Value, Variadic,
 };
-use owo_colors::OwoColorize;
 use sha2::{Digest, Sha256};
 
 use crate::backend::MemoryOps;
 use crate::dbg_backend::DebugBackend;
 use crate::debugger::{DebuggerContext, DriverObjectInfo};
+use crate::diagnostics;
 use crate::error::{Error, Result};
 use crate::expr::Expr;
 use crate::gdb::RegisterMap;
 use crate::guest::{ModuleInfo, ProcessInfo};
 use crate::repl::CompletionStrategy;
-use crate::symbols::{ParsedType, SymbolStore, TypeInfo, get_cache_root};
+use crate::symbols::{ParsedType, SymbolStore, TypeInfo, cache_root};
 use crate::types::{Dtb, VirtAddr};
 
 /// Wraps a 64-bit address. Exposed to Lua as userdata so pointer math stays
@@ -80,7 +80,7 @@ struct AddrOrInt {
     is_address: bool,
 }
 
-impl mlua::FromLua for AddrOrInt {
+impl FromLua for AddrOrInt {
     fn from_lua(value: Value, _: &Lua) -> mlua::Result<Self> {
         match value {
             Value::Integer(i) => Ok(AddrOrInt {
@@ -104,7 +104,7 @@ impl mlua::FromLua for AddrOrInt {
     }
 }
 
-impl mlua::FromLua for Address {
+impl FromLua for Address {
     fn from_lua(value: Value, _: &Lua) -> mlua::Result<Self> {
         match value {
             Value::Integer(i) => Ok(Address(i as u64)),
@@ -215,16 +215,16 @@ fn read_memory_exact(
     buf: &mut [u8],
 ) -> mlua::Result<()> {
     debugger
-        .get_current_process()
-        .memory(&debugger.kvm)
+        .current_process()
+        .memory()
         .read_bytes(VirtAddr(addr.0), buf)
         .map_err(mlua::Error::external)
 }
 
 fn write_memory_exact(debugger: &DebuggerContext, addr: Address, bytes: &[u8]) -> mlua::Result<()> {
     debugger
-        .get_current_process()
-        .memory(&debugger.kvm)
+        .current_process()
+        .memory()
         .write_bytes(VirtAddr(addr.0), bytes)
         .map_err(mlua::Error::external)
 }
@@ -251,13 +251,11 @@ fn field_address(
         .symbols
         .find_type_across_modules(debugger.current_dtb(), ty)
         .ok_or_else(|| mlua::Error::external(format!("unknown type: {}", ty)))?;
-    let offset = ti
-        .try_get_field_offset(field)
-        .map_err(mlua::Error::external)?;
+    let offset = ti.field_offset(field).map_err(mlua::Error::external)?;
     Ok(Address(base.0.wrapping_add(offset)))
 }
 
-fn fields_table(lua: &Lua, ti: &TypeInfo) -> mlua::Result<mlua::Table> {
+fn fields_table(lua: &Lua, ti: &TypeInfo) -> mlua::Result<Table> {
     let mut entries: Vec<_> = ti.fields.iter().collect();
     entries.sort_by_key(|(_, f)| f.offset);
 
@@ -278,7 +276,7 @@ fn fields_table(lua: &Lua, ti: &TypeInfo) -> mlua::Result<mlua::Table> {
 }
 
 fn match_processes(d: &DebuggerContext, target: &str) -> Result<Vec<ProcessInfo>> {
-    let procs = d.guest.enumerate_processes(&d.kvm, &d.symbols)?;
+    let procs = d.guest.enumerate_processes()?;
     Ok(if let Ok(pid) = target.parse::<u64>() {
         procs.into_iter().filter(|p| p.pid == pid).collect()
     } else {
@@ -290,7 +288,7 @@ fn match_processes(d: &DebuggerContext, target: &str) -> Result<Vec<ProcessInfo>
     })
 }
 
-fn process_row(lua: &Lua, p: &ProcessInfo) -> mlua::Result<mlua::Table> {
+fn process_row(lua: &Lua, p: &ProcessInfo) -> mlua::Result<Table> {
     let row = lua.create_table()?;
     row.set("pid", p.pid as i64)?;
     row.set("name", p.name.as_str())?;
@@ -298,7 +296,7 @@ fn process_row(lua: &Lua, p: &ProcessInfo) -> mlua::Result<mlua::Table> {
     Ok(row)
 }
 
-fn module_table(lua: &Lua, m: &ModuleInfo) -> mlua::Result<mlua::Table> {
+fn module_table(lua: &Lua, m: &ModuleInfo) -> mlua::Result<Table> {
     let out = lua.create_table()?;
     out.set("name", m.name.as_str())?;
     out.set("short_name", m.short_name.as_str())?;
@@ -308,7 +306,7 @@ fn module_table(lua: &Lua, m: &ModuleInfo) -> mlua::Result<mlua::Table> {
     Ok(out)
 }
 
-fn driver_object_table(lua: &Lua, driver: &DriverObjectInfo) -> mlua::Result<mlua::Table> {
+fn driver_object_table(lua: &Lua, driver: &DriverObjectInfo) -> mlua::Result<Table> {
     let out = lua.create_table()?;
     out.set("name", driver.name.as_str())?;
     out.set("object", Address(driver.object.0))?;
@@ -319,7 +317,7 @@ fn driver_object_table(lua: &Lua, driver: &DriverObjectInfo) -> mlua::Result<mlu
     Ok(out)
 }
 
-fn struct_table(lua: &Lua, ti: &TypeInfo, addr: Address, buf: &[u8]) -> mlua::Result<mlua::Table> {
+fn struct_table(lua: &Lua, ti: &TypeInfo, addr: Address, buf: &[u8]) -> mlua::Result<Table> {
     let out = lua.create_table()?;
     out.set("__addr", addr)?;
     out.set("__size", ti.size as i64)?;
@@ -334,7 +332,7 @@ fn struct_table(lua: &Lua, ti: &TypeInfo, addr: Address, buf: &[u8]) -> mlua::Re
 
 fn install_metadata_ntos(
     lua: &Lua,
-    ntos: &mlua::Table,
+    ntos: &Table,
     symbols: Arc<SymbolStore>,
     dtb: Dtb,
 ) -> mlua::Result<()> {
@@ -354,7 +352,7 @@ fn install_metadata_ntos(
             let ti = symbols
                 .find_type_across_modules(dtb, &ty)
                 .ok_or_else(|| mlua::Error::external(format!("unknown type: {}", ty)))?;
-            ti.try_get_field_offset(&field)
+            ti.field_offset(&field)
                 .map(|o| o as i64)
                 .map_err(mlua::Error::external)
         })?
@@ -375,7 +373,7 @@ fn install_metadata_ntos(
             let Some(ti) = symbols.find_type_across_modules(dtb, &ty) else {
                 return Ok(None);
             };
-            Ok(ti.try_get_field_offset(&field).ok().map(|o| o as i64))
+            Ok(ti.field_offset(&field).ok().map(|o| o as i64))
         })?
     })?;
 
@@ -536,7 +534,7 @@ impl ScriptHost {
         }
 
         let result = self.lua.scope(|scope| {
-            let register = scope.create_function(|lua, args: mlua::MultiValue| {
+            let register = scope.create_function(|lua, args: MultiValue| {
                 let mut iter = args.into_iter();
                 let name: String = match iter.next() {
                     Some(Value::String(s)) => s.to_str()?.to_string(),
@@ -559,7 +557,7 @@ impl ScriptHost {
                             let s = v?;
                             let strat = CompletionStrategy::from_kebab(&s).ok_or_else(|| {
                                 mlua::Error::external(format!(
-                                    "unknown completion strategy: '{}' (expected one of: none, symbol, type, process, thread, breakpoint, driver)",
+                                    "unknown completion strategy: '{}' (expected one of: none, symbol, type, process, vcpu, breakpoint, driver)",
                                     s
                                 ))
                             })?;
@@ -625,7 +623,7 @@ impl ScriptHost {
         }
 
         for w in warnings.into_inner() {
-            eprintln!("{} {}: {}", "warning:".yellow(), path.display(), w);
+            diagnostics::eprint_warning(format!("{}: {}", path.display(), w));
         }
 
         let mut names = Vec::new();
@@ -724,8 +722,8 @@ impl ScriptHost {
                     let d = dbg.borrow();
                     d.guest
                         .ntoskrnl
-                        .symbol(&d.symbols, "PsLoadedModuleList")
-                        .and_then(|s| s.read(&d.kvm))
+                        .symbol("PsLoadedModuleList")
+                        .and_then(|s| s.read())
                         .map(|va: VirtAddr| Address(va.0))
                         .map_err(mlua::Error::external)
                 })?,
@@ -735,10 +733,7 @@ impl ScriptHost {
                 "kernel_modules",
                 scope.create_function(|lua, ()| {
                     let d = dbg.borrow();
-                    let modules = d
-                        .guest
-                        .get_kernel_modules(&d.kvm, &d.symbols)
-                        .map_err(mlua::Error::external)?;
+                    let modules = d.guest.kernel_modules().map_err(mlua::Error::external)?;
                     let out = lua.create_table()?;
                     for (idx, m) in modules.iter().enumerate() {
                         out.set((idx + 1) as i64, module_table(lua, m)?)?;
@@ -752,10 +747,7 @@ impl ScriptHost {
                 scope.create_function(|lua, name: String| {
                     let d = dbg.borrow();
                     let needle = name.to_lowercase();
-                    let modules = d
-                        .guest
-                        .get_kernel_modules(&d.kvm, &d.symbols)
-                        .map_err(mlua::Error::external)?;
+                    let modules = d.guest.kernel_modules().map_err(mlua::Error::external)?;
                     for m in &modules {
                         if m.short_name.eq_ignore_ascii_case(&needle)
                             || m.name.to_lowercase().contains(&needle)
@@ -816,8 +808,8 @@ impl ScriptHost {
                         .find_type_across_modules(dtb, &ty)
                         .ok_or_else(|| mlua::Error::external(format!("unknown type: {}", ty)))?;
                     let mut buf = vec![0u8; ti.size];
-                    d.get_current_process()
-                        .memory(&d.kvm)
+                    d.current_process()
+                        .memory()
                         .read_bytes(VirtAddr(addr.0), &mut buf)
                         .map_err(mlua::Error::external)?;
                     struct_table(lua, &ti, addr, &buf)
@@ -830,7 +822,7 @@ impl ScriptHost {
                     let d = dbg.borrow();
                     let procs = d
                         .guest
-                        .enumerate_processes(&d.kvm, &d.symbols)
+                        .enumerate_processes()
                         .map_err(mlua::Error::external)?;
                     let filter_l = filter.as_deref().map(|s| s.to_lowercase());
                     let out = lua.create_table()?;
@@ -1035,13 +1027,13 @@ impl ScriptHost {
                         .symbols
                         .find_type_across_modules(d.current_dtb(), "_UNICODE_STRING");
                     let Some(ti) = ti else { return Ok(None) };
-                    let Ok(len_off) = ti.try_get_field_offset("Length") else {
+                    let Ok(len_off) = ti.field_offset("Length") else {
                         return Ok(None);
                     };
-                    let Ok(buf_off) = ti.try_get_field_offset("Buffer") else {
+                    let Ok(buf_off) = ti.field_offset("Buffer") else {
                         return Ok(None);
                     };
-                    let mem = d.get_current_process().memory(&d.kvm);
+                    let mem = d.current_process().memory();
                     let Ok(len) = mem.read::<u16>(VirtAddr(addr.0) + len_off) else {
                         return Ok(None);
                     };
@@ -1072,7 +1064,8 @@ impl ScriptHost {
                         let buf = read_vec(&d, addr, len)?;
                         let mut idx = 1i64;
                         for i in 0..=buf.len() - pattern.len() {
-                            if &buf[i..i + pattern.len()] == &*pattern {
+                            let window = &buf[i..i + pattern.len()];
+                            if pattern == window {
                                 out.set(idx, Address(addr.0.wrapping_add(i as u64)))?;
                                 idx += 1;
                             }
@@ -1093,7 +1086,8 @@ impl ScriptHost {
                         let d = dbg.borrow();
                         let buf = read_vec(&d, addr, len)?;
                         for i in 0..=buf.len() - pattern.len() {
-                            if &buf[i..i + pattern.len()] == &*pattern {
+                            let window = &buf[i..i + pattern.len()];
+                            if pattern == window {
                                 return Ok(Some(Address(addr.0.wrapping_add(i as u64))));
                             }
                         }
@@ -1152,11 +1146,7 @@ impl ScriptHost {
                 "try_closest_symbol",
                 scope.create_function(|lua, addr: Address| {
                     let d = dbg.borrow();
-                    match d
-                        .guest
-                        .ntoskrnl
-                        .closest_symbol(&d.symbols, VirtAddr(addr.0))
-                    {
+                    match d.guest.ntoskrnl.closest_symbol(VirtAddr(addr.0)) {
                         Ok((name, offset)) => {
                             let t = lua.create_table()?;
                             t.set("name", name)?;
@@ -1194,18 +1184,9 @@ impl ScriptHost {
                 scope.create_function(|_, addr: Address| {
                     let d = dbg.borrow();
                     let dtb = d.current_dtb();
-                    Ok(
-                        match d
-                            .symbols
-                            .find_closest_symbol_for_address(dtb, VirtAddr(addr.0))
-                        {
-                            Some((module, name, 0)) => format!("{}!{}", module, name),
-                            Some((module, name, offset)) => {
-                                format!("{}!{}+0x{:x}", module, name, offset)
-                            }
-                            None => format!("{:#x}", addr.0),
-                        },
-                    )
+                    Ok(d.symbols
+                        .format_closest_symbol_for_address(dtb, VirtAddr(addr.0))
+                        .unwrap_or_else(|| format!("{:#x}", addr.0)))
                 })?,
             )?;
 
@@ -1299,7 +1280,7 @@ fn emit_script_output(state: &RefCell<ScriptOutputState>, text: &str) {
 }
 
 fn scripts_dir() -> Option<PathBuf> {
-    get_cache_root().map(|r| r.join("commands"))
+    cache_root().map(|r| r.join("commands"))
 }
 
 fn is_valid_command_name(name: &str) -> bool {
@@ -1325,14 +1306,6 @@ const BUILTIN_SCRIPTS: &[BuiltinScript] = &[
     BuiltinScript {
         name: "drvobj.lua",
         source: include_str!("../scripts/drvobj.lua"),
-    },
-    BuiltinScript {
-        name: "ethread.lua",
-        source: include_str!("../scripts/ethread.lua"),
-    },
-    BuiltinScript {
-        name: "ethreads.lua",
-        source: include_str!("../scripts/ethreads.lua"),
     },
     BuiltinScript {
         name: "hide.lua",
@@ -1527,7 +1500,6 @@ fn looks_like_url(source: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlua::FromLua;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn write_temp_script(source: &str) -> PathBuf {

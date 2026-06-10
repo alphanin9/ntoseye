@@ -1,0 +1,500 @@
+use std::env::VarError;
+use std::io::ErrorKind;
+use std::os::unix::net::UnixStream;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use owo_colors::OwoColorize;
+
+use crate::error::{Error, Result};
+use crate::kd::api;
+use crate::kd::framing::{
+    KdFraming, PACKET_TYPE_KD_DEBUG_IO, PACKET_TYPE_KD_FILE_IO, PACKET_TYPE_KD_STATE_CHANGE64,
+};
+use crate::kd::wire::{read_u16, read_u32, read_u64};
+use crate::types::VirtAddr;
+
+use super::{
+    BUGCHECK_MANUALLY_INITIATED_CRASH, BUGCHECK_REFRESH_ASSIST_GRACE, BugcheckCapture,
+    DBG_KD_COMMAND_STRING_STATE_CHANGE, DBG_KD_EXCEPTION_STATE_CHANGE,
+    DBG_KD_LOAD_SYMBOLS_STATE_CHANGE, KD_INITIAL_PROGRESS_INTERVAL, KD_INITIAL_TIMEOUT_DEFAULT,
+    KD_INITIAL_TIMEOUT_ENV, KD_REFRESH_BREAKIN_INTERVAL, KD_REFRESH_BREAKIN_TRACE_EVERY,
+    KD_REQUEST_TIMEOUT, PUMP_POLL, StateChange, handle_debug_io_with_output, handle_file_io,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitialHandshakeStimulus {
+    BreakIn,
+    Reset,
+}
+
+pub fn initial_handshake_stimulus(attempt: u32) -> InitialHandshakeStimulus {
+    if attempt.is_multiple_of(2) {
+        InitialHandshakeStimulus::BreakIn
+    } else {
+        InitialHandshakeStimulus::Reset
+    }
+}
+
+pub fn parse_state_change(payload: &[u8]) -> Result<StateChange> {
+    // DBGKD_ANY_WAIT_STATE_CHANGE on x64 starts with:
+    //   ULONG NewState         @ 0
+    //   USHORT ProcessorLevel  @ 4
+    //   USHORT Processor       @ 6
+    //   ULONG NumberProcessors @ 8
+    //   <4 bytes pad to 8-byte align>
+    //   ULONG64 Thread         @ 16
+    //   ULONG64 ProgramCounter @ 24
+    //   <union starts at 32>:
+    //     DBGKM_EXCEPTION64.ExceptionRecord.ExceptionCode @ 32
+    //     (and more EXCEPTION_RECORD64 fields)
+    if payload.len() < 32 {
+        return Err(Error::Kd(format!(
+            "state-change payload too short: {} bytes",
+            payload.len()
+        )));
+    }
+    let new_state = read_u32(payload, 0);
+    let exception_code = if new_state == DBG_KD_EXCEPTION_STATE_CHANGE && payload.len() >= 36 {
+        read_u32(payload, 32)
+    } else {
+        0
+    };
+    let kernel_base_hint = if new_state == DBG_KD_LOAD_SYMBOLS_STATE_CHANGE && payload.len() >= 48 {
+        let base = read_u64(payload, 40);
+        (base != 0).then_some(VirtAddr(base))
+    } else {
+        None
+    };
+    let number_processors_u32 = read_u32(payload, 8);
+    Ok(StateChange {
+        new_state,
+        processor: read_u16(payload, 6),
+        number_processors: number_processors_u32.min(u16::MAX as u32) as u16,
+        exception_code,
+        program_counter: read_u64(payload, 24),
+        kernel_base_hint,
+        is_bugcheck: false,
+        bugcheck: None,
+        target_reloaded: false,
+        assisted_breakin: false,
+    })
+}
+
+pub fn kd_socket_connect_error(socket_path: &str, err: std::io::Error) -> Error {
+    let message = match err.kind() {
+        ErrorKind::NotFound => format!(
+            "KD serial socket '{socket_path}' does not exist.\n\
+             Start the VM with a Unix serial socket at this path, or pass --connect <path>.\n\
+             If this guest is not configured for Windows KD, use --backend gdb or --backend memory."
+        ),
+        ErrorKind::ConnectionRefused => format!(
+            "KD serial socket '{socket_path}' exists but is not accepting connections.\n\
+             Start or restart the VM so QEMU owns the socket, or pass --connect <path>.\n\
+             If this guest is not configured for Windows KD, use --backend gdb or --backend memory."
+        ),
+        ErrorKind::PermissionDenied => format!(
+            "permission denied connecting to KD serial socket '{socket_path}'.\n\
+             Check the socket owner/mode or run ntoseye with sufficient permissions."
+        ),
+        _ => format!("failed to connect to KD serial socket '{socket_path}': {err}"),
+    };
+    Error::Kd(message)
+}
+
+pub fn parse_kd_initial_timeout(value: Option<&str>) -> Result<Duration> {
+    let Some(value) = value else {
+        return Ok(KD_INITIAL_TIMEOUT_DEFAULT);
+    };
+    let value = value.trim();
+    let seconds = value.parse::<u64>().map_err(|_| {
+        Error::Kd(format!(
+            "invalid {KD_INITIAL_TIMEOUT_ENV}='{value}': expected positive integer seconds"
+        ))
+    })?;
+    if seconds == 0 {
+        return Err(Error::Kd(format!(
+            "invalid {KD_INITIAL_TIMEOUT_ENV}=0: expected positive integer seconds"
+        )));
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+pub fn kd_initial_timeout() -> Result<Duration> {
+    match std::env::var(KD_INITIAL_TIMEOUT_ENV) {
+        Ok(value) => parse_kd_initial_timeout(Some(&value)),
+        Err(VarError::NotPresent) => parse_kd_initial_timeout(None),
+        Err(VarError::NotUnicode(_)) => Err(Error::Kd(format!(
+            "{KD_INITIAL_TIMEOUT_ENV} must be valid UTF-8 integer seconds"
+        ))),
+    }
+}
+
+/// Initial break-in: send break-in first, then alternate RESET and break-in
+pub fn poll_for_initial_break(
+    framing: &mut KdFraming<UnixStream>,
+    budget: Duration,
+) -> Result<StateChange> {
+    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+    let deadline = Instant::now() + budget;
+
+    framing
+        .transport_mut()
+        .set_read_timeout(Some(ATTEMPT_TIMEOUT))?;
+
+    let mut attempts = 0u32;
+    let mut next_progress_at = Instant::now() + KD_INITIAL_PROGRESS_INTERVAL;
+    let result = loop {
+        match initial_handshake_stimulus(attempts) {
+            InitialHandshakeStimulus::BreakIn => framing.send_breakin()?,
+            InitialHandshakeStimulus::Reset => {
+                framing.send_reset()?;
+                kd_trace!("kd: RESET sent during initial handshake");
+            }
+        }
+        attempts += 1;
+
+        // Initial handshake: surface whatever state-change arrives first
+        match await_state_change(framing, None, true, None, None) {
+            Ok(stop) => break Ok(stop),
+            Err(Error::Io(e))
+                if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+            {
+                let elapsed =
+                    budget.saturating_sub(deadline.saturating_duration_since(Instant::now()));
+                let now = Instant::now();
+                if now >= next_progress_at {
+                    eprintln!(
+                        "{}",
+                        format!("kd: no response after {}s", elapsed.as_secs()).bright_black()
+                    );
+                    next_progress_at += KD_INITIAL_PROGRESS_INTERVAL;
+                }
+                if now >= deadline {
+                    break Err(Error::Kd(format!(
+                        "host serial socket is connected, but Windows KD did not send packets within {}s.\n\
+                         Check:\n\
+                           - Windows has `bcdedit /debug on` enabled\n\
+                           - `bcdedit /dbgsettings serial debugport:N baudrate:115200` matches the QEMU serial port\n\
+                           - the guest was rebooted after changing BCD settings\n\
+                           - the VM is not paused or suspended\n\
+                           - virt-manager/libvirt may reserve COM1 for its console serial; use debugport:2 if KD is wired as COM2\n\
+                           - set NTOSEYE_KD_TIMEOUT=<seconds> if the guest is unusually slow to reach KD\n\
+                           - use `--backend gdb` for gdbstub guests, or `--backend memory` for passive memory introspection",
+                        budget.as_secs()
+                    )));
+                }
+            }
+            Err(e) => break Err(e),
+        }
+    };
+
+    let _ = framing.transport_mut().set_read_timeout(None);
+    result
+}
+
+/// Send one break-in byte and wait for the resulting state-change
+pub fn breakin_and_wait(
+    framing: &mut KdFraming<UnixStream>,
+    budget: Duration,
+) -> Result<StateChange> {
+    framing.send_breakin()?;
+    framing.transport_mut().set_read_timeout(Some(budget))?;
+    let result = match await_state_change(framing, None, false, None, None) {
+        Ok(stop) => Ok(stop),
+        Err(Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+            Err(Error::Kd(format!(
+                "no break-in response within {}s",
+                budget.as_secs()
+            )))
+        }
+        Err(e) => Err(e),
+    };
+    let _ = framing.transport_mut().set_read_timeout(None);
+    result
+}
+
+pub fn is_temporary_io_error(kind: ErrorKind) -> bool {
+    matches!(kind, ErrorKind::WouldBlock | ErrorKind::TimedOut)
+}
+
+pub fn with_framing_read_timeout_raw<R>(
+    framing: &mut KdFraming<UnixStream>,
+    timeout: Duration,
+    f: impl FnOnce(&mut KdFraming<UnixStream>) -> Result<R>,
+) -> Result<R> {
+    framing.transport_mut().set_read_timeout(Some(timeout))?;
+    let result = f(framing);
+    let restore = framing.transport_mut().set_read_timeout(None);
+    match (result, restore) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(err), _) => Err(err),
+        (Ok(_), Err(err)) => Err(err.into()),
+    }
+}
+
+pub fn with_framing_read_timeout<R>(
+    framing: &mut KdFraming<UnixStream>,
+    timeout: Duration,
+    f: impl FnOnce(&mut KdFraming<UnixStream>) -> Result<R>,
+) -> Result<R> {
+    match with_framing_read_timeout_raw(framing, timeout, f) {
+        Err(Error::Io(e)) if is_temporary_io_error(e.kind()) => Err(Error::Kd(format!(
+            "KD request timed out after {}s",
+            timeout.as_secs()
+        ))),
+        other => other,
+    }
+}
+
+pub fn is_initial_resync_error(error: &Error) -> bool {
+    match error {
+        Error::Io(e) => is_temporary_io_error(e.kind()),
+        Error::Kd(message) => message == "send exceeded retry budget",
+        _ => false,
+    }
+}
+
+pub fn probe_initial_request(framing: &mut KdFraming<UnixStream>, processor: u16) -> Result<()> {
+    with_framing_read_timeout_raw(framing, KD_REQUEST_TIMEOUT, |framing| {
+        api::get_version(framing, processor).map(|_| ())
+    })
+}
+
+/// Whether a wait-state-change is a transparent notification (symbol load/unload
+/// or command string) the debugger acknowledges and continues past, rather than
+/// surfacing as a user break. Unknown kinds are treated as breaks to be safe
+pub fn is_transparent_state_change(new_state: u32) -> bool {
+    matches!(
+        new_state,
+        DBG_KD_LOAD_SYMBOLS_STATE_CHANGE | DBG_KD_COMMAND_STRING_STATE_CHANGE
+    )
+}
+
+/// Acknowledge a non-exception wait-state-change (load-symbols / command-string)
+/// by sending a continue, so the kernel resumes past it. Preserves the framing's
+/// current read timeout (the pump runs with a short one)
+pub fn continue_transparent_state_change(
+    framing: &mut KdFraming<UnixStream>,
+    stop: &StateChange,
+) -> Result<()> {
+    let prev = framing.transport_mut().read_timeout().ok().flatten();
+    framing
+        .transport_mut()
+        .set_read_timeout(Some(KD_REQUEST_TIMEOUT))?;
+    let result = api::continue_api2(framing, stop.processor, api::DBG_CONTINUE, false);
+    let _ = framing.transport_mut().set_read_timeout(prev);
+    result
+}
+
+/// Receive packets until a state-change we should surface arrives.
+///
+/// - `surface_all`: return the first state-change of any kind (initial handshake)
+/// - `bugcheck`: when `Some`, run in bugcheck-aware mode - the refresh message
+///   sets the flag, after which the next state-change is surfaced rather than
+///   continued, so the user catches the (frozen) bugcheck instead of riding its
+///   symbol-unload teardown to reboot. The flag is the caller's so it survives
+///   poll timeouts between the refresh print and the state-change
+/// - otherwise: continue load-symbols / command-string notifications
+///   transparently (like WinDbg) and surface only exception breaks
+pub fn await_state_change(
+    framing: &mut KdFraming<UnixStream>,
+    mut saw_kd_refresh: Option<&mut bool>,
+    surface_all: bool,
+    mut bugcheck: Option<&mut bool>,
+    mut bugcheck_capture: Option<&mut BugcheckCapture>,
+) -> Result<StateChange> {
+    let mut target_reloaded = false;
+    loop {
+        let pkt = framing.recv_data()?;
+        match pkt.packet_type {
+            PACKET_TYPE_KD_STATE_CHANGE64 => {
+                let mut stop = parse_state_change(&pkt.payload)?;
+                target_reloaded |= framing.take_peer_reset_seen();
+                stop.target_reloaded = target_reloaded;
+                let in_bugcheck = bugcheck.as_deref().copied().unwrap_or(false);
+                // Surface exception breaks (and anything unrecognised); during a
+                // bugcheck, surface even the notification kinds. Otherwise the
+                // load-symbols / command-string notifications are continued
+                if surface_all
+                    || target_reloaded
+                    || in_bugcheck
+                    || !is_transparent_state_change(stop.new_state)
+                {
+                    if in_bugcheck {
+                        stop.is_bugcheck = true;
+                        stop.bugcheck = bugcheck_capture
+                            .as_ref()
+                            .and_then(|capture| capture.finish());
+                    }
+                    return Ok(stop);
+                }
+                // a load-symbols notification means a kernel image (driver)
+                // loaded or unloaded, record it so the foreground can refresh
+                // module-dependent caches (driver completions) on the next stop
+                if stop.new_state == DBG_KD_LOAD_SYMBOLS_STATE_CHANGE {
+                    framing.note_modules_changed();
+                }
+                kd_trace!(
+                    "kd: await: transparent state-change new_state={:#x} at {:#x}, continuing",
+                    stop.new_state,
+                    stop.program_counter
+                );
+                continue_transparent_state_change(framing, &stop)?;
+            }
+            PACKET_TYPE_KD_DEBUG_IO => {
+                let detect = saw_kd_refresh.is_some() || bugcheck.is_some();
+                let saw_refresh = handle_debug_io_with_output(
+                    framing,
+                    &pkt.payload,
+                    detect,
+                    bugcheck_capture.as_deref_mut(),
+                    bugcheck.as_deref().copied().unwrap_or(false),
+                    &mut std::io::stderr(),
+                )?;
+                if saw_refresh {
+                    if let Some(flag) = bugcheck.as_deref_mut() {
+                        // Bugcheck starting: stop riding the teardown, surface
+                        // the next state-change so the crash can be inspected.
+                        // Do not break in immediately here: Windows often emits
+                        // the fatal-system-error packet before a separate
+                        // "Driver at fault" packet, and an eager break-in stops
+                        // in the middle of that print sequence.
+                        *flag = true;
+                        kd_trace!(
+                            "kd: await: bugcheck refresh seen, will surface next state-change"
+                        );
+                    } else if let Some(flag) = saw_kd_refresh.as_deref_mut() {
+                        *flag = true;
+                    }
+                }
+            }
+            PACKET_TYPE_KD_FILE_IO => {
+                handle_file_io(framing, &pkt.payload)?;
+            }
+            _ => {
+                // Orphan packet, likely a manipulate reply from a previous
+                // session. Discard and keep listening
+            }
+        }
+    }
+}
+
+pub fn pump_assist_breakin(
+    framing: &mut KdFraming<UnixStream>,
+    next_breakin: &mut Instant,
+    breakin_count: &mut u32,
+    reason: &str,
+) -> Result<()> {
+    let now = Instant::now();
+    if now < *next_breakin {
+        return Ok(());
+    }
+
+    framing.send_breakin()?;
+    *next_breakin = now + KD_REFRESH_BREAKIN_INTERVAL;
+    *breakin_count = breakin_count.saturating_add(1);
+    if *breakin_count == 1 || breakin_count.is_multiple_of(KD_REFRESH_BREAKIN_TRACE_EVERY) {
+        kd_trace!("kd: pump: sent {} break-in #{}", reason, *breakin_count);
+    }
+    Ok(())
+}
+
+/// Handle to the background servicing pump (see [`run_pump`])
+pub struct PumpHandle {
+    pub join: JoinHandle<KdFraming<UnixStream>>,
+    pub stop_rx: Receiver<std::result::Result<StateChange, String>>,
+    pub shutdown: Arc<AtomicBool>,
+}
+
+/// Background servicing pump. While the VM runs this thread owns the framing
+/// and is the *sole* socket reader: it ACKs and prints debug I/O as it arrives,
+/// which keeps the connection live so the kernel never marks the debugger absent
+/// (`KdDebuggerNotPresent`). It reports the first state-change to the foreground
+/// before exiting, handing the framing back via its join value.
+///
+/// Break-in bytes for an explicit interrupt are written from the foreground via
+/// a cloned socket fd, so they don't need the framing this thread holds
+pub fn run_pump(
+    mut framing: KdFraming<UnixStream>,
+    stop_tx: mpsc::Sender<std::result::Result<StateChange, String>>,
+    shutdown: Arc<AtomicBool>,
+    reconnect_assist_delay: Option<Duration>,
+) -> KdFraming<UnixStream> {
+    let _ = framing.transport_mut().set_read_timeout(Some(PUMP_POLL));
+    // Persists across poll iterations: once the bugcheck refresh is seen, the
+    // next state-change is surfaced even if a timeout intervened first
+    let mut bugcheck = false;
+    let reconnect_assist_at = reconnect_assist_delay.map(|delay| Instant::now() + delay);
+    let mut bugcheck_refresh_seen_at = None;
+    let mut bugcheck_capture = BugcheckCapture::default();
+    let mut next_assist_breakin = Instant::now();
+    let mut assist_breakin_count = 0u32;
+    let mut assisted_breakin_pending = false;
+    while !shutdown.load(Ordering::SeqCst) {
+        match await_state_change(
+            &mut framing,
+            None,
+            false,
+            Some(&mut bugcheck),
+            Some(&mut bugcheck_capture),
+        ) {
+            Ok(mut stop) => {
+                stop.assisted_breakin = assisted_breakin_pending;
+                let _ = stop_tx.send(Ok(stop));
+                break;
+            }
+            Err(Error::Io(e))
+                if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+            {
+                // Idle gap between packets. After a reboot/reset, KDCOM may be
+                // waiting for the debugger to break in before it emits the
+                // state-change we need to rediscover the new kernel.
+                let now = Instant::now();
+                let bugcheck_needs_assist = if bugcheck {
+                    let bugcheck_refresh_seen_at = *bugcheck_refresh_seen_at.get_or_insert(now);
+                    now.duration_since(bugcheck_refresh_seen_at) >= BUGCHECK_REFRESH_ASSIST_GRACE
+                        && !matches!(
+                            bugcheck_capture.code(),
+                            Some(code) if code != BUGCHECK_MANUALLY_INITIATED_CRASH
+                        )
+                } else {
+                    false
+                };
+                let reconnect_assist_ready =
+                    reconnect_assist_at.is_some_and(|assist_at| now >= assist_at);
+                let assist_reason = if bugcheck_needs_assist {
+                    Some("refresh")
+                } else if reconnect_assist_ready || framing.peer_reset_seen() {
+                    Some("reconnect")
+                } else {
+                    None
+                };
+                if let Some(reason) = assist_reason {
+                    if let Err(e) = pump_assist_breakin(
+                        &mut framing,
+                        &mut next_assist_breakin,
+                        &mut assist_breakin_count,
+                        reason,
+                    ) {
+                        let _ = stop_tx.send(Err(e.to_string()));
+                        break;
+                    }
+                    assisted_breakin_pending = true;
+                } else {
+                    next_assist_breakin = Instant::now();
+                    assist_breakin_count = 0;
+                }
+            }
+            Err(e) => {
+                let _ = stop_tx.send(Err(e.to_string()));
+                break;
+            }
+        }
+    }
+    let _ = framing.transport_mut().set_read_timeout(None);
+    framing
+}

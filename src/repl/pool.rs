@@ -1,43 +1,46 @@
-//! Shared kernel pool (heap) block inspection.
-//!
-//! Walks `_POOL_HEADER` chains and the big-page pool table from guest memory.
-//! Returns plain structs; the REPL renders them as text and the agent
-//! serializes them as JSON.
+use owo_colors::OwoColorize;
 
 use crate::backend::MemoryOps;
 use crate::debugger::DebuggerContext;
 use crate::error::{Error, Result};
-use crate::symbols::{ParsedType, TypeInfo};
+use crate::symbols::{ParsedType, TypeInfo, format_symbol_with_offset};
 use crate::types::VirtAddr;
+use crate::ui;
 
-const POOL_ALIGN: u64 = 0x10;
+pub const POOL_ALIGN: u64 = 0x10;
+
 pub const POOL_PAGE_SIZE: u64 = 0x1000;
-const POOL_FREE_TAG: u32 = 0x6565_7246;
-const POOL_MAX_GAP_UNITS: u64 = 4;
+
+pub const POOL_FREE_TAG: u32 = 0x6565_7246;
+
+pub const POOL_MAX_GAP_UNITS: u64 = 4;
 
 #[derive(Clone, Copy)]
 pub struct PoolHeader {
-    pub header: VirtAddr,
-    pub body: VirtAddr,
-    pub size: u64,
-    pub previous_size: u64,
-    pub pool_type: u8,
-    pub tag: u32,
-    pub synthetic_free: bool,
+    header: VirtAddr,
+    body: VirtAddr,
+    size: u64,
+    previous_size: u64,
+    pool_type: u8,
+    tag: u32,
+    synthetic_free: bool,
 }
 
 pub struct BigPoolEntry {
-    pub va: VirtAddr,
-    pub entry: VirtAddr,
-    pub index: u64,
-    pub nonpaged: bool,
-    pub size: u64,
-    pub tag: u32,
-    pub pattern: u8,
-    pub pool_flags: u16,
-    pub slush_size: u16,
+    va: VirtAddr,
+    entry: VirtAddr,
+    index: u64,
+    nonpaged: bool,
+    size: u64,
+    tag: u32,
+    pattern: u8,
+    pool_flags: u16,
+    slush_size: u16,
 }
 
+/// PDB-driven layout for `_POOL_HEADER` and `_POOL_TRACKER_BIG_PAGES`. Field
+/// presence varies across Windows builds; the `*_uses_struct` flags say whether
+/// we can decode each entry field-by-field or have to fall back to fixed offsets
 pub struct PoolLayout {
     pool_header: TypeInfo,
     header_size: u64,
@@ -65,6 +68,7 @@ pub fn pool_layout(debugger: &DebuggerContext) -> Result<PoolLayout> {
     ]
     .iter()
     .all(|name| pool_header.fields.contains_key(*name));
+
     let big_pool_type = debugger
         .symbols
         .find_type_across_modules(debugger.current_dtb(), "_POOL_TRACKER_BIG_PAGES");
@@ -79,6 +83,7 @@ pub fn pool_layout(debugger: &DebuggerContext) -> Result<PoolLayout> {
         None => (false, false, false),
     };
     let big_pool_entry_size = big_pool_type.as_ref().map(|ti| ti.size as u64);
+
     Ok(PoolLayout {
         header_size: pool_header.size as u64,
         pool_header,
@@ -92,7 +97,7 @@ pub fn pool_layout(debugger: &DebuggerContext) -> Result<PoolLayout> {
     })
 }
 
-fn read_pool_field(
+pub fn read_pool_field(
     ti: &TypeInfo,
     mem: &impl MemoryOps<VirtAddr>,
     addr: VirtAddr,
@@ -109,6 +114,7 @@ fn read_pool_field(
         };
         return Some((raw >> *pos) & mask);
     }
+
     match field {
         "PreviousSize" | "PoolIndex" | "BlockSize" | "PoolType" | "Pattern" => {
             let value: u32 = mem.read(field_addr).ok()?;
@@ -127,6 +133,44 @@ fn read_pool_field(
     }
 }
 
+fn buf_u32(buf: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        buf.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+fn buf_u64(buf: &[u8], offset: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(
+        buf.get(offset..offset + 8)?.try_into().ok()?,
+    ))
+}
+
+/// `read_pool_field` against an already-read entry buffer
+pub fn pool_field_from_buf(ti: &TypeInfo, buf: &[u8], field: &str) -> Option<u64> {
+    let f = ti.fields.get(field)?;
+    let offset = f.offset as usize;
+    if let ParsedType::Bitfield { pos, len, .. } = &f.type_data {
+        // the storage unit may be narrower than 8 bytes at the end of the entry
+        let raw = buf_u64(buf, offset).or_else(|| buf_u32(buf, offset).map(u64::from))?;
+        let mask = if *len == 64 {
+            u64::MAX
+        } else {
+            (1u64 << *len) - 1
+        };
+        return Some((raw >> *pos) & mask);
+    }
+
+    match field {
+        "PreviousSize" | "PoolIndex" | "BlockSize" | "PoolType" | "Pattern" => {
+            Some(buf_u32(buf, offset)? as u8 as u64)
+        }
+        "SlushSize" => Some((buf_u32(buf, offset)? & 0xfff) as u64),
+        "PoolTag" | "Key" => Some(buf_u32(buf, offset)? as u64),
+        "Va" | "NumberOfBytes" => buf_u64(buf, offset),
+        _ => None,
+    }
+}
+
 pub fn tag_string(tag: u32) -> String {
     let mut s = String::with_capacity(4);
     for i in 0..4 {
@@ -140,11 +184,11 @@ pub fn tag_string(tag: u32) -> String {
     s
 }
 
-fn tag_looks_printable(tag: u32) -> bool {
+pub fn tag_looks_printable(tag: u32) -> bool {
     (0..4).all(|i| (0x20..=0x7e).contains(&((tag >> (i * 8)) & 0xff)))
 }
 
-fn plausible_pool_tag(tag: u32) -> bool {
+pub fn plausible_pool_tag(tag: u32) -> bool {
     tag == POOL_FREE_TAG || tag_looks_printable(tag)
 }
 
@@ -160,19 +204,19 @@ pub fn pool_block_state(h: &PoolHeader) -> &'static str {
     }
 }
 
-fn parse_pool_header(
+pub fn parse_pool_header(
     debugger: &DebuggerContext,
     layout: &PoolLayout,
     header: VirtAddr,
 ) -> Option<PoolHeader> {
     let mem = debugger.current_process().memory();
     let (previous_size, block_units, pool_type, tag) = if layout.pool_header_uses_struct {
-        (
-            read_pool_field(&layout.pool_header, &mem, header, "PreviousSize")? as u8,
-            read_pool_field(&layout.pool_header, &mem, header, "BlockSize")? as u8,
-            read_pool_field(&layout.pool_header, &mem, header, "PoolType")? as u8,
-            read_pool_field(&layout.pool_header, &mem, header, "PoolTag")? as u32,
-        )
+        let previous_size =
+            read_pool_field(&layout.pool_header, &mem, header, "PreviousSize")? as u8;
+        let block_units = read_pool_field(&layout.pool_header, &mem, header, "BlockSize")? as u8;
+        let pool_type = read_pool_field(&layout.pool_header, &mem, header, "PoolType")? as u8;
+        let tag = read_pool_field(&layout.pool_header, &mem, header, "PoolTag")? as u32;
+        (previous_size, block_units, pool_type, tag)
     } else {
         let word0: u32 = mem.read(header).ok()?;
         let tag: u32 = mem.read(header + layout.pool_tag_offset).ok()?;
@@ -197,7 +241,7 @@ fn parse_pool_header(
     })
 }
 
-fn pool_header_plausible(layout: &PoolLayout, h: &PoolHeader) -> bool {
+pub fn pool_header_plausible(layout: &PoolLayout, h: &PoolHeader) -> bool {
     h.size >= layout.header_size
         && h.size <= POOL_PAGE_SIZE
         && (h.header.0 & !(POOL_PAGE_SIZE - 1))
@@ -205,7 +249,7 @@ fn pool_header_plausible(layout: &PoolLayout, h: &PoolHeader) -> bool {
         && (plausible_pool_tag(h.tag) || (h.pool_type == 0 && h.previous_size == 0))
 }
 
-fn try_pool_header_lax(
+pub fn try_pool_header_lax(
     debugger: &DebuggerContext,
     layout: &PoolLayout,
     addr: VirtAddr,
@@ -214,7 +258,7 @@ fn try_pool_header_lax(
     pool_header_plausible(layout, &h).then_some(h)
 }
 
-fn gap_free_pool_block(
+pub fn gap_free_pool_block(
     debugger: &DebuggerContext,
     layout: &PoolLayout,
     header: VirtAddr,
@@ -233,7 +277,7 @@ fn gap_free_pool_block(
     }
 }
 
-fn walk_pool_page_lax(
+pub fn walk_pool_page_lax(
     debugger: &DebuggerContext,
     layout: &PoolLayout,
     base: VirtAddr,
@@ -269,7 +313,7 @@ fn walk_pool_page_lax(
     blocks
 }
 
-fn scan_pool_page_lax(
+pub fn scan_pool_page_lax(
     debugger: &DebuggerContext,
     layout: &PoolLayout,
     base: VirtAddr,
@@ -314,7 +358,7 @@ fn scan_pool_page_lax(
     blocks
 }
 
-fn find_pool_block_index(blocks: &[PoolHeader], needle: &PoolHeader) -> Option<usize> {
+pub fn find_pool_block_index(blocks: &[PoolHeader], needle: &PoolHeader) -> Option<usize> {
     blocks
         .iter()
         .position(|h| h.header == needle.header && h.size == needle.size)
@@ -380,37 +424,33 @@ pub fn classify_pool_region(
     None
 }
 
-fn parse_big_pool_entry(
-    debugger: &DebuggerContext,
+pub fn parse_big_pool_entry(
     layout: &PoolLayout,
     entry: VirtAddr,
+    buf: &[u8],
 ) -> Option<BigPoolEntry> {
-    let mem = debugger.current_process().memory();
     let ti = layout.big_pool_type.as_ref()?;
     let (va_raw, size, tag, pattern, pool_flags, slush_size) = if layout.big_pool_uses_struct {
-        (
-            read_pool_field(ti, &mem, entry, "Va")?,
-            read_pool_field(ti, &mem, entry, "NumberOfBytes")?,
-            read_pool_field(ti, &mem, entry, "Key")? as u32,
-            read_pool_field(ti, &mem, entry, "Pattern")? as u8,
-            if layout.big_pool_has_pool_type {
-                read_pool_field(ti, &mem, entry, "PoolType").unwrap_or(0) as u16 & 0xfff
-            } else {
-                0
-            },
-            if layout.big_pool_has_slush {
-                read_pool_field(ti, &mem, entry, "SlushSize").unwrap_or(0) as u16 & 0xfff
-            } else {
-                0
-            },
-        )
+        let va_raw = pool_field_from_buf(ti, buf, "Va")?;
+        let size = pool_field_from_buf(ti, buf, "NumberOfBytes")?;
+        let tag = pool_field_from_buf(ti, buf, "Key")? as u32;
+        let pattern = pool_field_from_buf(ti, buf, "Pattern")? as u8;
+        let pool_flags = if layout.big_pool_has_pool_type {
+            pool_field_from_buf(ti, buf, "PoolType").unwrap_or(0) as u16 & 0xfff
+        } else {
+            0
+        };
+        let slush_size = if layout.big_pool_has_slush {
+            pool_field_from_buf(ti, buf, "SlushSize").unwrap_or(0) as u16 & 0xfff
+        } else {
+            0
+        };
+        (va_raw, size, tag, pattern, pool_flags, slush_size)
     } else {
-        let va_raw: u64 = mem.read(entry + ti.field_offset("Va").ok()?).ok()?;
-        let size: u64 = mem
-            .read(entry + ti.field_offset("NumberOfBytes").ok()?)
-            .ok()?;
-        let tag: u32 = mem.read(entry + ti.field_offset("Key").ok()?).ok()?;
-        let flags_word: u32 = mem.read(entry + ti.field_offset("Pattern").ok()?).ok()?;
+        let va_raw = buf_u64(buf, ti.field_offset("Va").ok()? as usize)?;
+        let size = buf_u64(buf, ti.field_offset("NumberOfBytes").ok()? as usize)?;
+        let tag = buf_u32(buf, ti.field_offset("Key").ok()? as usize)?;
+        let flags_word = buf_u32(buf, ti.field_offset("Pattern").ok()? as usize)?;
         (
             va_raw,
             size,
@@ -454,15 +494,36 @@ pub fn find_big_pool(
     if count == 0 || count > 0x100000 {
         return None;
     }
-    let entry_size = layout.big_pool_entry_size?;
-    for i in 0..count {
-        let entry_addr = table_addr + i * entry_size;
-        if let Some(mut entry) = parse_big_pool_entry(debugger, layout, entry_addr)
-            .filter(|e| target >= e.va && target.0 < e.va.0 + e.size)
-        {
-            entry.index = i;
-            return Some(entry);
+    let entry_size = layout.big_pool_entry_size.filter(|s| *s > 0)?;
+    // Scan the table in bulk reads; per-field reads would cost a page-table
+    // walk and a syscall per field, times up to 0x100000 entries
+    const CHUNK_ENTRIES: u64 = 1024;
+    let mut chunk = vec![0u8; (CHUNK_ENTRIES * entry_size) as usize];
+    let mut i = 0;
+    while i < count {
+        let n = CHUNK_ENTRIES.min(count - i);
+        let chunk_addr = table_addr + i * entry_size;
+        let chunk = &mut chunk[..(n * entry_size) as usize];
+        if mem.read_bytes(chunk_addr, chunk).is_err() {
+            // Retry per entry so one unreadable page doesn't hide the rest;
+            // entries left zeroed parse to None and are skipped
+            chunk.fill(0);
+            for j in 0..n {
+                let buf = &mut chunk[(j * entry_size) as usize..((j + 1) * entry_size) as usize];
+                let _ = mem.read_bytes(chunk_addr + j * entry_size, buf);
+            }
         }
+        for j in 0..n {
+            let buf = &chunk[(j * entry_size) as usize..((j + 1) * entry_size) as usize];
+            let entry_addr = chunk_addr + j * entry_size;
+            if let Some(mut entry) = parse_big_pool_entry(layout, entry_addr, buf)
+                .filter(|e| target >= e.va && target.0 < e.va.0 + e.size)
+            {
+                entry.index = i + j;
+                return Some(entry);
+            }
+        }
+        i += n;
     }
     None
 }
@@ -471,12 +532,83 @@ pub fn segment_heap_hint(debugger: &DebuggerContext) -> Option<&'static str> {
     debugger
         .symbols
         .find_symbol_across_modules(debugger.current_dtb(), "RtlpHpHeapGlobals")?;
-    Some("kernel has RtlpHpHeapGlobals; address may be segment heap instead of _POOL_HEADER")
+    Some(
+        "kernel has RtlpHpHeapGlobals (segment heap is enabled); address may be a _HEAP_VS_CHUNK_HEADER / LFH chunk instead of a _POOL_HEADER",
+    )
 }
 
 pub fn annotate_near_symbol(debugger: &DebuggerContext, addr: VirtAddr) -> Option<String> {
     let (module, name, offset) = debugger
         .symbols
         .find_closest_symbol_for_address(debugger.current_dtb(), addr)?;
-    (offset <= 0x1000).then(|| format!("{}!{}+0x{:x}", module, name, offset))
+    (offset <= 0x1000).then(|| format_symbol_with_offset(&module, &name, offset))
+}
+
+pub fn print_pool_page_listing(blocks: &[PoolHeader], target_idx: Option<usize>, target: VirtAddr) {
+    if blocks.is_empty() {
+        println!("  (no plausible pool block found for this address)");
+        return;
+    }
+    println!(
+        "    {:<16} {:<8} {:<8} {:<12} {:<6} tag",
+        "header", "size", "prev", "state", "type"
+    );
+    for (i, h) in blocks.iter().enumerate() {
+        let marker = if Some(i) == target_idx {
+            ">".yellow().to_string()
+        } else {
+            " ".to_string()
+        };
+        println!(
+            "  {} {} 0x{:<6x} 0x{:<6x} {:<12} 0x{:<4x} '{}'",
+            marker,
+            ui::addr(h.header.0),
+            h.size,
+            h.previous_size,
+            pool_block_state(h),
+            h.pool_type,
+            tag_string(h.tag)
+        );
+    }
+    if let Some(idx) = target_idx {
+        let h = &blocks[idx];
+        let offset = target.0.saturating_sub(h.body.0);
+        println!(
+            "  target offset : 0x{:x} into body (block @ {}, body @ {})",
+            offset,
+            ui::addr(h.header.0),
+            ui::addr(h.body.0)
+        );
+    }
+}
+
+pub fn print_big_pool(target: VirtAddr, entry: &BigPoolEntry) {
+    let offset = target.0 - entry.va.0;
+    let end_addr = entry.va + entry.size;
+    println!("big pool @ {}", ui::addr(entry.va.0));
+    println!("  target        : {}", ui::addr(target.0));
+    println!(
+        "  range         : {} - {} ({} bytes)",
+        ui::addr(entry.va.0),
+        ui::addr(end_addr.0),
+        entry.size
+    );
+    println!("  offset        : 0x{:x} / 0x{:x}", offset, entry.size);
+    println!(
+        "  tag           : '{}' (0x{:08x})",
+        tag_string(entry.tag),
+        entry.tag
+    );
+    println!(
+        "  table entry   : {}[{}]",
+        ui::addr(entry.entry.0),
+        entry.index
+    );
+    println!(
+        "  nonpaged      : {}",
+        if entry.nonpaged { "yes" } else { "no" }
+    );
+    println!("  pattern       : 0x{:x}", entry.pattern);
+    println!("  pool flags    : 0x{:x}", entry.pool_flags);
+    println!("  slush size    : 0x{:x}", entry.slush_size);
 }

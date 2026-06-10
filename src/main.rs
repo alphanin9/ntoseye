@@ -7,14 +7,17 @@ use crate::{
     error::{Error, Result},
     gdb::GdbClient,
     kd::KdBackend,
+    memory_backend::MemoryBackend,
     repl::start_repl,
     script::ScriptInstallOptions,
 };
 
 mod agent;
 mod backend;
+mod bugchecks;
 mod dbg_backend;
 mod debugger;
+mod diagnostics;
 mod error;
 mod expr;
 mod gdb;
@@ -23,17 +26,21 @@ mod host;
 mod inspect;
 mod kd;
 mod memory;
+mod memory_backend;
 mod repl;
 mod script;
 mod session;
 mod symbols;
 mod types;
+mod ui;
 mod unwind;
+mod virsh;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BackendKind {
     Gdb,
     Kd,
+    Memory,
 }
 
 impl FromArgValue for BackendKind {
@@ -41,7 +48,10 @@ impl FromArgValue for BackendKind {
         match value {
             "gdb" => Ok(BackendKind::Gdb),
             "kd" => Ok(BackendKind::Kd),
-            other => Err(format!("unknown backend '{other}': expected 'gdb' or 'kd'")),
+            "memory" => Ok(BackendKind::Memory),
+            other => Err(format!(
+                "unknown backend '{other}': expected 'kd', 'gdb', or 'memory'"
+            )),
         }
     }
 }
@@ -65,11 +75,11 @@ struct Args {
     #[argh(switch, long = "kd-instructions")]
     kd_instructions: bool,
 
-    /// debugger backend: 'gdb' (QEMU gdbstub, default) or 'kd' (Windows KD over serial pipe)
-    #[argh(option, short = 'b', long = "backend", default = "BackendKind::Gdb")]
+    /// debugger backend: 'kd' (Windows KD over serial pipe, default), 'gdb' (QEMU gdbstub), or 'memory' (passive /dev/kvm introspection)
+    #[argh(option, short = 'b', long = "backend", default = "BackendKind::Kd")]
     backend: BackendKind,
 
-    /// backend connection target. Defaults: '127.0.0.1:1234' for gdb, '/tmp/ntoseye-kd.sock' for kd.
+    /// backend connection target. Defaults: '127.0.0.1:1234' for gdb, '/tmp/ntoseye-kd.sock' for kd; unused by memory.
     #[argh(option, long = "connect")]
     connect: Option<String>,
 
@@ -85,7 +95,13 @@ struct Args {
 #[argh(subcommand)]
 enum Command {
     Scripts(ScriptsCommand),
+    Virsh(VirshCommand),
 }
+
+#[derive(FromArgs)]
+#[argh(subcommand, name = "virsh")]
+/// interactively edit libvirt XML for ntoseye debug backends
+struct VirshCommand {}
 
 #[derive(FromArgs)]
 #[argh(subcommand, name = "scripts")]
@@ -127,12 +143,17 @@ struct ScriptsListCommand {}
 #[cfg(not(target_os = "linux"))]
 compile_error!("This application only runs on Linux hosts.");
 
-static GDBSTUB_INSTRUCTIONS: &str = "Although it isn't required, gdbstub allows ntoseye to perform
-introspection upon the guests VCPUs, allowing for viewing of
-registers and breakpointing. To enable it, you must pass the
-following arguments to QEMU:
+static GDBSTUB_INSTRUCTIONS: &str = "The gdb backend talks to QEMU's gdbstub instead of Windows KD.
+It does not require Windows debug mode, but it loses Windows-native
+KD behavior such as bugcheck debug text and KD reboot signalling.
+
+To enable it, pass the following arguments to QEMU:
 
 -s -S
+
+Then run ntoseye with:
+
+ntoseye --backend gdb
 
 For crash/reset logging while developing low-level code, add QEMU
 logging and prevent immediate reboot:
@@ -143,12 +164,11 @@ Inside ntoseye, the same log masks can be enabled after connection with:
 
 qlog int,cpu_reset,guest_errors /tmp/qemu-ntoseye.log
 
-If you are running QEMU via commandline, simply append them
+If you are running QEMU via commandline, simply append the arguments
 to your existing command.
 
-If you are running QEMU via virt-manager, you must edit the
-libvirt XML file, which can be done through their GUI. Once
-there, you must edit & add the following:
+If you are running QEMU via virt-manager, you must edit the libvirt
+XML file, which can be done through their GUI. Once there, add:
 
 <domain xmlns:qemu=\"http://libvirt.org/schemas/domain/qemu/1.0\" type=\"kvm\">
   ...
@@ -158,11 +178,12 @@ there, you must edit & add the following:
   </qemu:commandline>
 </domain>";
 
-static KD_INSTRUCTIONS: &str = "The KD backend speaks the same wire protocol WinDbg uses, over a
-serial pipe between QEMU and ntoseye. It requires Windows to be
-booted in debug mode (which removes the 'stealth' property of the
-gdb backend: anti-debug code, PatchGuard, and even some Windows
-behaviors change when /debug is on).
+static KD_INSTRUCTIONS: &str = "The KD backend is ntoseye's default backend.
+It speaks the same wire protocol WinDbg uses, over a serial pipe
+between QEMU and ntoseye. It requires Windows to be booted in debug
+mode (which removes the 'stealth' property of the gdb backend:
+anti-debug code, PatchGuard, and even some Windows behaviors change
+when /debug is on).
 
 GUEST: enable kernel debugging over a serial port (run as
 Administrator, then reboot):
@@ -210,11 +231,16 @@ chardev via qemu:commandline. KD ends up as COM2, so use
 Once the guest is booting (or already booted and waiting for the
 debugger), run:
 
-ntoseye --backend kd --connect /tmp/ntoseye-kd.sock";
+ntoseye --connect /tmp/ntoseye-kd.sock
+
+ntoseye waits 8 seconds for the initial KD handshake by default.
+For unusually slow guests, override it with:
+
+NTOSEYE_KD_TIMEOUT=20 ntoseye";
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("Error: {}", e);
+        diagnostics::print_error(e);
         std::process::exit(1);
     }
 }
@@ -238,6 +264,7 @@ fn run() -> Result<()> {
 
     if let Some(command) = args.command {
         return match command {
+            Command::Virsh(_) => virsh::run_interactive(),
             Command::Scripts(scripts) => match scripts.command {
                 ScriptsSubcommand::Install(install) => {
                     script::install_scripts(ScriptInstallOptions {
@@ -251,14 +278,18 @@ fn run() -> Result<()> {
         };
     }
 
-    let instance = SingleInstance::new("ntoseye").unwrap();
+    let instance = SingleInstance::new("ntoseye").map_err(|err| {
+        Error::DebugInfo(format!("failed to create single-instance guard: {err:?}"))
+    })?;
     if !instance.is_single() {
         return Err(Error::AlreadyRunning);
     }
 
     symbols::FORCE_DOWNLOADS
         .set(args.redownload_symbols)
-        .unwrap();
+        .map_err(|_| {
+            Error::DebugInfo("symbol download flag was initialized before startup".into())
+        })?;
     symbols::set_quiet_progress(args.agent_stdio);
 
     let mut debugger = debugger::DebuggerContext::new()?;
@@ -271,6 +302,14 @@ fn run() -> Result<()> {
         BackendKind::Kd => {
             let path = args.connect.as_deref().unwrap_or("/tmp/ntoseye-kd.sock");
             Box::new(KdBackend::connect(path)?)
+        }
+        BackendKind::Memory => {
+            if args.connect.is_some() {
+                return Err(Error::DebugInfo(
+                    "memory backend does not use --connect".to_string(),
+                ));
+            }
+            Box::new(MemoryBackend::new())
         }
     };
 
@@ -288,7 +327,7 @@ fn run() -> Result<()> {
 //     #[test]
 //     fn test_startup() -> Result<()> {
 //         let mut debugger = debugger::DebuggerContext::new()?;
-//         let _ = debugger.get_startup_message_data()?;
+//         let _ = debugger.startup_message_data()?;
 
 //         Ok(())
 //     }

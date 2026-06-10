@@ -6,16 +6,18 @@
 //! ```
 
 use std::collections::VecDeque;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 
 use crate::error::{Error, Result};
+
+use super::wire::{read_u16, read_u32};
 
 const DATA_PACKET_LEADER: u32 = 0x30303030;
 const CONTROL_PACKET_LEADER: u32 = 0x69696969;
 const DATA_LEADER_BYTE: u8 = 0x30;
 const CONTROL_LEADER_BYTE: u8 = 0x69;
 const PACKET_TRAILING_BYTE: u8 = 0xAA;
-const BREAKIN_BYTE: u8 = 0x62;
+pub const BREAKIN_BYTE: u8 = 0x62;
 
 const INITIAL_PACKET_ID: u32 = 0x80800000;
 const SYNC_PACKET_ID: u32 = 0x00000800;
@@ -29,6 +31,7 @@ pub const PACKET_TYPE_KD_DEBUG_IO: u16 = 3;
 pub const PACKET_TYPE_KD_ACKNOWLEDGE: u16 = 4;
 pub const PACKET_TYPE_KD_RESEND: u16 = 5;
 pub const PACKET_TYPE_KD_RESET: u16 = 6;
+pub const PACKET_TYPE_KD_FILE_IO: u16 = 11;
 
 #[derive(Debug, Clone, Copy)]
 struct Header {
@@ -52,11 +55,11 @@ impl Header {
 
     fn decode(buf: &[u8; HEADER_SIZE]) -> Self {
         Self {
-            leader: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
-            packet_type: u16::from_le_bytes(buf[4..6].try_into().unwrap()),
-            byte_count: u16::from_le_bytes(buf[6..8].try_into().unwrap()),
-            packet_id: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
-            checksum: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+            leader: read_u32(buf, 0),
+            packet_type: read_u16(buf, 4),
+            byte_count: read_u16(buf, 6),
+            packet_id: read_u32(buf, 8),
+            checksum: read_u32(buf, 12),
         }
     }
 }
@@ -65,6 +68,10 @@ fn checksum(bytes: &[u8]) -> u32 {
     bytes
         .iter()
         .fold(0u32, |acc, &b| acc.wrapping_add(b as u32))
+}
+
+fn is_temporary_read_error(kind: ErrorKind) -> bool {
+    matches!(kind, ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +88,9 @@ pub struct KdFraming<T> {
     current_packet_id: u32,
     remote_packet_id: u32,
     queued_data: VecDeque<DataPacket>,
+    awaiting_reset_ack: bool,
+    peer_reset_seen: bool,
+    modules_changed: bool,
 }
 
 impl<T> KdFraming<T> {
@@ -104,7 +114,36 @@ impl<T: Read + Write> KdFraming<T> {
             current_packet_id: INITIAL_PACKET_ID,
             remote_packet_id: INITIAL_PACKET_ID,
             queued_data: VecDeque::new(),
+            awaiting_reset_ack: false,
+            peer_reset_seen: false,
+            modules_changed: false,
         }
+    }
+
+    /// Returns whether the target reset its packet stream since the last call.
+    /// KD does this with RESET control packets or SYNC-flagged data packets.
+    pub fn take_peer_reset_seen(&mut self) -> bool {
+        std::mem::take(&mut self.peer_reset_seen)
+    }
+
+    /// Mark that a kernel image (driver/module) loaded or unloaded, set when a
+    /// load-symbols state-change is seen, so the foreground can invalidate caches
+    /// that depend on the module set (e.g. driver completions).
+    pub fn note_modules_changed(&mut self) {
+        self.modules_changed = true;
+    }
+
+    /// Returns (and clears) whether a module load/unload was seen since the last
+    /// call. The flag rides the framing back from the pump on stop.
+    pub fn take_modules_changed(&mut self) -> bool {
+        std::mem::take(&mut self.modules_changed)
+    }
+
+    /// Returns whether the target reset its packet stream without clearing the
+    /// flag. Used by the running pump to assist reboot reconnects while still
+    /// preserving the reload marker for the eventual state-change.
+    pub fn peer_reset_seen(&self) -> bool {
+        self.peer_reset_seen
     }
 
     /// Send an unframed break-in byte
@@ -119,7 +158,22 @@ impl<T: Read + Write> KdFraming<T> {
         self.current_packet_id = INITIAL_PACKET_ID;
         self.remote_packet_id = INITIAL_PACKET_ID;
         self.queued_data.clear();
+        self.awaiting_reset_ack = true;
         self.send_control(PACKET_TYPE_KD_RESET, 0)
+    }
+
+    fn handle_reset(&mut self, context: &str) -> Result<()> {
+        kd_trace!("kd: {context}: got RESET, resyncing ids");
+        self.current_packet_id = INITIAL_PACKET_ID;
+        self.remote_packet_id = INITIAL_PACKET_ID;
+        self.queued_data.clear();
+        self.peer_reset_seen = true;
+        if self.awaiting_reset_ack {
+            self.awaiting_reset_ack = false;
+        } else {
+            self.send_control(PACKET_TYPE_KD_RESET, 0)?;
+        }
+        Ok(())
     }
 
     pub fn send_data(&mut self, packet_type: u16, payload: &[u8]) -> Result<()> {
@@ -158,8 +212,13 @@ impl<T: Read + Write> KdFraming<T> {
             // fresh packets for the next `recv_data`; breaking out of this
             // inner loop triggers a resend via the outer loop
             loop {
-                match self.recv_any()? {
-                    Received::Ack { packet_id }
+                match self.recv_any() {
+                    Err(Error::Io(e)) if is_temporary_read_error(e.kind()) => {
+                        kd_trace!("kd: send_data: no ACK before read timeout, retransmitting");
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                    Ok(Received::Ack { packet_id })
                         if (packet_id & !SYNC_PACKET_ID)
                             == (self.current_packet_id & !SYNC_PACKET_ID) =>
                     {
@@ -168,18 +227,15 @@ impl<T: Read + Write> KdFraming<T> {
                         self.current_packet_id &= !SYNC_PACKET_ID;
                         return Ok(());
                     }
-                    Received::Reset => {
-                        kd_trace!("kd: send_data: got RESET, resyncing ids");
-                        self.current_packet_id = INITIAL_PACKET_ID;
-                        self.remote_packet_id = INITIAL_PACKET_ID;
-                        self.queued_data.clear();
+                    Ok(Received::Reset) => {
+                        self.handle_reset("send_data")?;
                         break;
                     }
-                    Received::Resend => {
+                    Ok(Received::Resend) => {
                         kd_trace!("kd: send_data: got RESEND, retransmitting");
                         break;
                     }
-                    Received::Ack { packet_id } => {
+                    Ok(Received::Ack { packet_id }) => {
                         kd_trace!(
                             "kd: send_data: stray ACK id={:#x} (expected {:#x}), retransmitting",
                             packet_id,
@@ -187,14 +243,14 @@ impl<T: Read + Write> KdFraming<T> {
                         );
                         break;
                     }
-                    Received::Data {
+                    Ok(Received::Data {
                         packet_id,
                         packet_type,
                         payload,
-                    } => {
+                    }) => {
                         let ack_id = packet_id & !SYNC_PACKET_ID;
                         self.send_control(PACKET_TYPE_KD_ACKNOWLEDGE, ack_id)?;
-                        if ack_id != self.remote_packet_id {
+                        if !self.accept_remote_packet(packet_id) {
                             kd_trace!(
                                 "kd: send_data: skip stale queued data type={} id={:#x} (expected {:#x}), ACKed",
                                 packet_type,
@@ -209,8 +265,6 @@ impl<T: Read + Write> KdFraming<T> {
                             packet_id,
                             payload.len()
                         );
-                        self.remote_packet_id ^= 1;
-                        self.remote_packet_id &= !SYNC_PACKET_ID;
                         self.queued_data.push_back(DataPacket {
                             packet_type,
                             payload,
@@ -221,6 +275,24 @@ impl<T: Read + Write> KdFraming<T> {
         }
 
         Err(Error::Kd("send exceeded retry budget".into()))
+    }
+
+    /// Decide whether an incoming data packet should be accepted, advancing
+    /// `remote_packet_id` if so. A packet with `SYNC_PACKET_ID` set means the
+    /// kernel reset its send-id stream (e.g. it re-entered the debugger after
+    /// thinking we were gone), so we realign to it unconditionally. A plain
+    /// id that doesn't match the expected one is a stale retransmit to skip
+    fn accept_remote_packet(&mut self, packet_id: u32) -> bool {
+        let base = packet_id & !SYNC_PACKET_ID;
+        let is_sync = packet_id & SYNC_PACKET_ID != 0;
+        if is_sync {
+            self.peer_reset_seen = true;
+        }
+        if !is_sync && base != self.remote_packet_id {
+            return false;
+        }
+        self.remote_packet_id = (base ^ 1) & !SYNC_PACKET_ID;
+        true
     }
 
     /// Receive the next data packet, ACK'ing it. Discards (but ACKs) any
@@ -246,7 +318,7 @@ impl<T: Read + Write> KdFraming<T> {
                     // with SYNC masked off, so always strip SYNC here
                     let ack_id = packet_id & !SYNC_PACKET_ID;
                     self.send_control(PACKET_TYPE_KD_ACKNOWLEDGE, ack_id)?;
-                    if ack_id != self.remote_packet_id {
+                    if !self.accept_remote_packet(packet_id) {
                         kd_trace!(
                             "kd: recv_data: skip stale type={} id={:#x} (expected {:#x}), ACKed",
                             packet_type,
@@ -261,21 +333,13 @@ impl<T: Read + Write> KdFraming<T> {
                         packet_id,
                         payload.len()
                     );
-                    self.remote_packet_id ^= 1;
-                    self.remote_packet_id &= !SYNC_PACKET_ID;
                     return Ok(DataPacket {
                         packet_type,
                         payload,
                     });
                 }
                 Received::Reset => {
-                    kd_trace!("kd: recv_data: got RESET, resyncing ids");
-                    // Kernel echoed RESET (or initiated one). Resync our ids
-                    // and keep listening; don't echo (kernel's RESET handler
-                    // also echoes, so we'd ping-pong)
-                    self.current_packet_id = INITIAL_PACKET_ID;
-                    self.remote_packet_id = INITIAL_PACKET_ID;
-                    self.queued_data.clear();
+                    self.handle_reset("recv_data")?;
                 }
                 Received::Ack { .. } | Received::Resend => {
                     // stray control packet; keep waiting for data
@@ -366,7 +430,9 @@ impl<T: Read + Write> KdFraming<T> {
             match self.transport.read_exact(&mut byte) {
                 Ok(()) => {}
                 Err(e) => {
-                    kd_trace!("kd-trace: read error: {e}");
+                    if !is_temporary_read_error(e.kind()) {
+                        kd_trace!("kd-trace: read error: {e}");
+                    }
                     return Err(e.into());
                 }
             }
@@ -449,11 +515,15 @@ mod tests {
     }
 
     fn ack_for(id: u32) -> Vec<u8> {
+        control_packet(PACKET_TYPE_KD_ACKNOWLEDGE, id)
+    }
+
+    fn control_packet(packet_type: u16, packet_id: u32) -> Vec<u8> {
         let h = Header {
             leader: CONTROL_PACKET_LEADER,
-            packet_type: PACKET_TYPE_KD_ACKNOWLEDGE,
+            packet_type,
             byte_count: 0,
-            packet_id: id,
+            packet_id,
             checksum: 0,
         };
         h.encode().to_vec()
@@ -581,6 +651,36 @@ mod tests {
     }
 
     #[test]
+    fn recv_data_accepts_sync_flagged_packet_despite_id_mismatch() {
+        // The kernel reset its send-id stream (e.g. re-entered the debugger on
+        // a bugcheck) and sent a SYNC-flagged packet whose base id no longer
+        // matches our advanced expectation. It must be accepted, not skipped -
+        // skipping it dropped the real bugcheck state-change
+        let inbound = data_packet(
+            PACKET_TYPE_KD_STATE_CHANGE64,
+            INITIAL_PACKET_ID | SYNC_PACKET_ID,
+            b"bugcheck",
+        );
+        let mut framing = KdFraming::new(Loopback::new(inbound));
+        // Pretend a prior packet advanced the expected id past the base
+        framing.remote_packet_id = INITIAL_PACKET_ID ^ 1;
+
+        let pkt = framing.recv_data().unwrap();
+        assert_eq!(pkt.payload, b"bugcheck");
+        // Realigned to the kernel's stream, SYNC stripped, toggled for next
+        assert_eq!(framing.remote_packet_id, INITIAL_PACKET_ID ^ 1);
+
+        // ACK carried the base id with SYNC stripped
+        let out = &framing.transport.outbound;
+        assert_eq!(out.len(), HEADER_SIZE);
+        let ack = Header::decode(out[0..HEADER_SIZE].try_into().unwrap());
+        assert_eq!(ack.packet_type, PACKET_TYPE_KD_ACKNOWLEDGE);
+        assert_eq!(ack.packet_id, INITIAL_PACKET_ID);
+        assert!(framing.take_peer_reset_seen());
+        assert!(!framing.take_peer_reset_seen());
+    }
+
+    #[test]
     fn recv_data_requests_resend_after_bad_checksum() {
         let payload = vec![0x11, 0x22];
         let mut inbound = data_packet(PACKET_TYPE_KD_STATE_CHANGE64, INITIAL_PACKET_ID, &payload);
@@ -605,6 +705,58 @@ mod tests {
     }
 
     #[test]
+    fn recv_data_echoes_peer_initiated_reset_before_data() {
+        let mut inbound = control_packet(PACKET_TYPE_KD_RESET, 0);
+        inbound.extend(data_packet(
+            PACKET_TYPE_KD_STATE_CHANGE64,
+            INITIAL_PACKET_ID,
+            b"stop",
+        ));
+        let mut framing = KdFraming::new(Loopback::new(inbound));
+        framing.current_packet_id = INITIAL_PACKET_ID ^ 1;
+        framing.remote_packet_id = INITIAL_PACKET_ID ^ 1;
+
+        let pkt = framing.recv_data().unwrap();
+        assert_eq!(pkt.payload, b"stop");
+        assert_eq!(framing.current_packet_id, INITIAL_PACKET_ID);
+        assert_eq!(framing.remote_packet_id, INITIAL_PACKET_ID ^ 1);
+        assert!(framing.take_peer_reset_seen());
+
+        let out = &framing.transport.outbound;
+        assert_eq!(out.len(), 2 * HEADER_SIZE);
+        let reset = Header::decode(out[0..HEADER_SIZE].try_into().unwrap());
+        assert_eq!(reset.leader, CONTROL_PACKET_LEADER);
+        assert_eq!(reset.packet_type, PACKET_TYPE_KD_RESET);
+        let ack = Header::decode(out[HEADER_SIZE..2 * HEADER_SIZE].try_into().unwrap());
+        assert_eq!(ack.packet_type, PACKET_TYPE_KD_ACKNOWLEDGE);
+        assert_eq!(ack.packet_id, INITIAL_PACKET_ID);
+    }
+
+    #[test]
+    fn recv_data_does_not_echo_reset_ack_after_local_reset() {
+        let mut inbound = control_packet(PACKET_TYPE_KD_RESET, 0);
+        inbound.extend(data_packet(
+            PACKET_TYPE_KD_STATE_CHANGE64,
+            INITIAL_PACKET_ID,
+            b"stop",
+        ));
+        let mut framing = KdFraming::new(Loopback::new(inbound));
+        framing.send_reset().unwrap();
+
+        let pkt = framing.recv_data().unwrap();
+        assert_eq!(pkt.payload, b"stop");
+        assert!(!framing.awaiting_reset_ack);
+
+        let out = &framing.transport.outbound;
+        assert_eq!(out.len(), 2 * HEADER_SIZE);
+        let local_reset = Header::decode(out[0..HEADER_SIZE].try_into().unwrap());
+        assert_eq!(local_reset.packet_type, PACKET_TYPE_KD_RESET);
+        let ack = Header::decode(out[HEADER_SIZE..2 * HEADER_SIZE].try_into().unwrap());
+        assert_eq!(ack.packet_type, PACKET_TYPE_KD_ACKNOWLEDGE);
+        assert_eq!(ack.packet_id, INITIAL_PACKET_ID);
+    }
+
+    #[test]
     fn send_breakin_writes_one_breakin_byte() {
         let mut framing = KdFraming::new(Loopback::new(Vec::new()));
         framing.send_breakin().unwrap();
@@ -614,16 +766,7 @@ mod tests {
     #[test]
     fn send_data_retries_on_resend() {
         // first response is RESEND, second is the expected ACK
-        let resend = {
-            let h = Header {
-                leader: CONTROL_PACKET_LEADER,
-                packet_type: PACKET_TYPE_KD_RESEND,
-                byte_count: 0,
-                packet_id: 0,
-                checksum: 0,
-            };
-            h.encode().to_vec()
-        };
+        let resend = control_packet(PACKET_TYPE_KD_RESEND, 0);
         let mut inbound = resend;
         inbound.extend(ack_for(
             (INITIAL_PACKET_ID | SYNC_PACKET_ID) & !SYNC_PACKET_ID,
@@ -633,6 +776,49 @@ mod tests {
             .send_data(PACKET_TYPE_KD_STATE_MANIPULATE, b"x")
             .unwrap();
         // We should have written the data packet twice
+        let expected_per_attempt = HEADER_SIZE + 1 + 1;
+        assert_eq!(framing.transport.outbound.len(), expected_per_attempt * 2);
+    }
+
+    #[test]
+    fn send_data_retries_on_missing_ack_timeout() {
+        struct TimeoutThenAck {
+            ack: Cursor<Vec<u8>>,
+            timed_out: bool,
+            outbound: Vec<u8>,
+        }
+
+        impl Read for TimeoutThenAck {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.timed_out {
+                    self.timed_out = true;
+                    return Err(std::io::Error::from(ErrorKind::WouldBlock));
+                }
+                self.ack.read(buf)
+            }
+        }
+
+        impl Write for TimeoutThenAck {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.outbound.write(buf)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let transport = TimeoutThenAck {
+            ack: Cursor::new(ack_for(INITIAL_PACKET_ID)),
+            timed_out: false,
+            outbound: Vec::new(),
+        };
+        let mut framing = KdFraming::new(transport);
+
+        framing
+            .send_data(PACKET_TYPE_KD_STATE_MANIPULATE, b"x")
+            .unwrap();
+
         let expected_per_attempt = HEADER_SIZE + 1 + 1;
         assert_eq!(framing.transport.outbound.len(), expected_per_attempt * 2);
     }

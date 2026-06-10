@@ -9,8 +9,12 @@ use std::io::{Read, Write};
 use crate::error::{Error, Result};
 use crate::kd::context;
 use crate::kd::{
-    framing::{DataPacket, KdFraming, PACKET_TYPE_KD_DEBUG_IO, PACKET_TYPE_KD_STATE_MANIPULATE},
-    print_debug_io,
+    framing::{
+        DataPacket, KdFraming, PACKET_TYPE_KD_DEBUG_IO, PACKET_TYPE_KD_FILE_IO,
+        PACKET_TYPE_KD_STATE_MANIPULATE,
+    },
+    handle_debug_io, handle_file_io,
+    wire::{read_u16, read_u32, read_u64, write_u16, write_u32, write_u64},
 };
 
 pub const DBGKD_READ_VIRTUAL_MEMORY: u32 = 0x0000_3130;
@@ -32,30 +36,6 @@ const UNION_OFFSET: usize = 16;
 
 pub const DBG_CONTINUE: u32 = 0x0001_0002;
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
-
-fn write_u16(buf: &mut [u8], offset: usize, value: u16) {
-    buf[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
-}
-
-fn write_u32(buf: &mut [u8], offset: usize, value: u32) {
-    buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-}
-
-fn write_u64(buf: &mut [u8], offset: usize, value: u64) {
-    buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-}
-
-fn read_u16(buf: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes(buf[offset..offset + 2].try_into().unwrap())
-}
-
-fn read_u32(buf: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
-}
-
-fn read_u64(buf: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap())
-}
 
 /// Build a zeroed manipulate-state request header
 fn make_header(api_number: u32, processor: u16) -> [u8; MANIPULATE_HEADER_SIZE] {
@@ -125,7 +105,11 @@ fn send_manipulate(
             }
             PACKET_TYPE_KD_DEBUG_IO => {
                 // Debug print emitted mid-request
-                print_debug_io(&pkt.payload);
+                handle_debug_io(framing, &pkt.payload, false)?;
+                continue;
+            }
+            PACKET_TYPE_KD_FILE_IO => {
+                handle_file_io(framing, &pkt.payload)?;
                 continue;
             }
             other => {
@@ -146,10 +130,10 @@ fn check_status(header: &ManipulateHeader, api: u32) -> Result<()> {
         )));
     }
     if (header.return_status & 0x8000_0000) != 0 {
-        return Err(Error::Kd(format!(
-            "kernel returned NTSTATUS {:#x} for api {:#x}",
-            header.return_status, api
-        )));
+        return Err(Error::KdStatus {
+            ntstatus: header.return_status,
+            api,
+        });
     }
     Ok(())
 }
@@ -182,7 +166,7 @@ pub fn get_version<T: Read + Write>(framing: &mut KdFraming<T>, processor: u16) 
 
     let u = UNION_OFFSET;
     Ok(Version {
-        major: read_u16(&reply_header, u + 0),
+        major: read_u16(&reply_header, u),
         minor: read_u16(&reply_header, u + 2),
         protocol_version: reply_header[u + 4],
         kd_secondary_version: reply_header[u + 5],
@@ -216,7 +200,7 @@ pub fn set_context<T: Read + Write>(
     let mut header = make_header(DBGKD_SET_CONTEXT, processor);
     // The kernel reads ContextFlags from both the union and the CONTEXT
     if context.len() >= 0x34 {
-        let flags = u32::from_le_bytes(context[0x30..0x34].try_into().unwrap());
+        let flags = read_u32(context, 0x30);
         write_u32(&mut header, UNION_OFFSET, flags);
     }
     let (parsed, _, _) = send_manipulate(framing, &header, context)?;
@@ -594,7 +578,10 @@ mod tests {
         };
         let err = check_status(&h, DBGKD_GET_CONTEXT).unwrap_err();
         match err {
-            Error::Kd(msg) => assert!(msg.contains("NTSTATUS")),
+            Error::KdStatus { ntstatus, api } => {
+                assert_eq!(ntstatus, 0xC000_0005);
+                assert_eq!(api, DBGKD_GET_CONTEXT);
+            }
             other => panic!("unexpected error: {other:?}"),
         }
     }

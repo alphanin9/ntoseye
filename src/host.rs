@@ -4,6 +4,7 @@ use std::fs;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::io::{IoSlice, IoSliceMut};
+use std::path::Path;
 
 use crate::backend::MemoryOps;
 use crate::error::{Error, Result};
@@ -39,7 +40,7 @@ pub struct KvmHandle {
  *    been exposed to begin with...
  */
 
-fn get_kvm_pid() -> Result<i32> {
+fn kvm_pid() -> Result<i32> {
     for entry in fs::read_dir("/proc")? {
         let entry = match entry {
             Ok(e) => e,
@@ -63,7 +64,7 @@ fn get_kvm_pid() -> Result<i32> {
             };
 
             if let Ok(target) = fs::read_link(fd_entry.path())
-                && target == std::path::Path::new("/dev/kvm")
+                && target == Path::new("/dev/kvm")
                 && let Some(pid_str) = entry.file_name().to_str()
                 && let Ok(pid) = pid_str.parse::<i32>()
             {
@@ -75,7 +76,7 @@ fn get_kvm_pid() -> Result<i32> {
     Err(Error::KvmNotFound)
 }
 
-fn get_kvm_primary_memory(pid: i32) -> Result<MemoryRegion> {
+fn kvm_primary_memory(pid: i32) -> Result<MemoryRegion> {
     let maps = File::open(format!("/proc/{}/maps", pid))?;
     let reader = BufReader::new(maps);
 
@@ -140,8 +141,8 @@ fn probe_ptrace_access(pid: Pid, addr: u64) -> Result<()> {
 
 impl KvmHandle {
     pub fn new() -> Result<Self> {
-        let pid = get_kvm_pid()?;
-        let memory = get_kvm_primary_memory(pid)?;
+        let pid = kvm_pid()?;
+        let memory = kvm_primary_memory(pid)?;
         let nix_pid = Pid::from_raw(pid);
 
         probe_ptrace_access(nix_pid, memory.start)?;

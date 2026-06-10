@@ -12,7 +12,6 @@ use crate::debugger::{AttachReport, DebuggerContext, DriverObjectInfo};
 use crate::error::{Error, Result};
 use crate::expr::Expr;
 use crate::gdb::{Breakpoint, BreakpointKind};
-use crate::session::{DebuggerSession, StopOutcome};
 use crate::guest::{ModuleInfo, ModuleSymbolLoadReport};
 use crate::inspect::descriptors::{
     GdtEntry, gdt_type_label, parse_gdtr_from_qemu_registers, parse_idtr_from_qemu_registers,
@@ -25,6 +24,7 @@ use crate::inspect::pool::{
     locate_pool_block_in_page, pool_block_state, pool_layout, segment_heap_hint, tag_string,
 };
 use crate::script::{LoadReport, ScriptHost, ScriptOutput};
+use crate::session::{DebuggerSession, StopOutcome};
 use crate::symbols::{ParsedType, TypeInfo};
 use crate::types::VirtAddr;
 use crate::unwind::{FrameSource, build_stacktrace};
@@ -259,7 +259,9 @@ impl AgentSession<'_> {
             return Err(Error::InvalidExpression("VM is running".into()));
         }
 
-        let regs = self.session.refresh_register_cache(self.client, self.debugger)?;
+        let regs = self
+            .session
+            .refresh_register_cache(self.client, self.debugger)?;
         let map = self.session.register_map.to_hashmap(&regs);
         Ok(json!({
             "thread": self.session.current_thread,
@@ -274,8 +276,8 @@ impl AgentSession<'_> {
         let length = request.length.unwrap_or(16);
         let mut bytes = vec![0u8; length];
         self.debugger
-            .get_current_process()
-            .memory(&self.debugger.kvm)
+            .current_process()
+            .memory()
             .read_bytes(address, &mut bytes)?;
         Ok(json!({
             "address": fmt_addr(address.0),
@@ -287,8 +289,8 @@ impl AgentSession<'_> {
         let address = self.eval_address(required(request.address, "address")?)?;
         let data = hex::decode(required(request.data, "data")?)?;
         self.debugger
-            .get_current_process()
-            .memory(&self.debugger.kvm)
+            .current_process()
+            .memory()
             .write_bytes(address, &data)?;
         Ok(json!({
             "address": fmt_addr(address.0),
@@ -306,8 +308,8 @@ impl AgentSession<'_> {
 
         let mut bytes = vec![0u8; length];
         self.debugger
-            .get_current_process()
-            .memory(&self.debugger.kvm)
+            .current_process()
+            .memory()
             .read_bytes(address, &mut bytes)?;
 
         let mut matches = Vec::new();
@@ -349,8 +351,8 @@ impl AgentSession<'_> {
         }
 
         self.debugger
-            .get_current_process()
-            .memory(&self.debugger.kvm)
+            .current_process()
+            .memory()
             .write_bytes(address, &bytes)?;
         Ok(json!({
             "address": fmt_addr(address.0),
@@ -364,8 +366,8 @@ impl AgentSession<'_> {
         let length = request.length.unwrap_or(32);
         let mut bytes = vec![0u8; length];
         self.debugger
-            .get_current_process()
-            .memory(&self.debugger.kvm)
+            .current_process()
+            .memory()
             .read_bytes(address, &mut bytes)?;
 
         let mut decoder = Decoder::with_ip(64, &bytes, address.0, DecoderOptions::NONE);
@@ -481,10 +483,7 @@ impl AgentSession<'_> {
     }
 
     fn read_typed_field_value(&self, address: VirtAddr, ty: &ParsedType) -> Result<Value> {
-        let mem = self
-            .debugger
-            .get_current_process()
-            .memory(&self.debugger.kvm);
+        let mem = self.debugger.current_process().memory();
         match ty {
             ParsedType::Primitive(name) => {
                 let value = match name.as_str() {
@@ -550,7 +549,8 @@ impl AgentSession<'_> {
         if self.client.is_running() {
             return Err(Error::InvalidExpression("VM is running".into()));
         }
-        self.session.refresh_register_cache(self.client, self.debugger)
+        self.session
+            .refresh_register_cache(self.client, self.debugger)
     }
 
     fn qemu_register_descriptors(&mut self) -> Result<String> {
@@ -569,8 +569,13 @@ impl AgentSession<'_> {
         let idtr = parse_idtr_from_qemu_registers(&monitor_output).ok_or_else(|| {
             Error::InvalidExpression("QEMU monitor output did not contain IDT".into())
         })?;
-        let entries =
-            read_idt_entries(self.debugger, &self.session.register_map, &regs, idtr, max_entries)?;
+        let entries = read_idt_entries(
+            self.debugger,
+            &self.session.register_map,
+            &regs,
+            idtr,
+            max_entries,
+        )?;
         Ok(json!({
             "base": fmt_addr(idtr.base.0),
             "limit": idtr.limit,
@@ -593,8 +598,13 @@ impl AgentSession<'_> {
         let gdtr = parse_gdtr_from_qemu_registers(&monitor_output).ok_or_else(|| {
             Error::InvalidExpression("QEMU monitor output did not contain GDT".into())
         })?;
-        let entries =
-            read_gdt_entries(self.debugger, &self.session.register_map, &regs, gdtr, max_entries)?;
+        let entries = read_gdt_entries(
+            self.debugger,
+            &self.session.register_map,
+            &regs,
+            gdtr,
+            max_entries,
+        )?;
         Ok(json!({
             "base": fmt_addr(gdtr.base.0),
             "limit": gdtr.limit,
@@ -616,8 +626,13 @@ impl AgentSession<'_> {
                 Error::InvalidExpression("QEMU monitor output did not contain TR".into())
             })?,
         };
-        let (entry, stacks) =
-            read_tss_stack_bases(self.debugger, &self.session.register_map, &regs, gdtr, selector)?;
+        let (entry, stacks) = read_tss_stack_bases(
+            self.debugger,
+            &self.session.register_map,
+            &regs,
+            gdtr,
+            selector,
+        )?;
         Ok(json!({
             "selector": selector,
             "descriptor": gdt_entry_json(entry),
@@ -656,7 +671,9 @@ impl AgentSession<'_> {
         if self.client.is_running() {
             return Err(Error::InvalidExpression("VM is running".into()));
         }
-        let regs = self.session.refresh_register_cache(self.client, self.debugger)?;
+        let regs = self
+            .session
+            .refresh_register_cache(self.client, self.debugger)?;
         let limit = limit.unwrap_or(64);
         let trace = build_stacktrace(self.debugger, &self.session.register_map, &regs, limit);
         Ok(json!({
@@ -692,7 +709,7 @@ impl AgentSession<'_> {
         let rows: Vec<_> = self
             .debugger
             .guest
-            .enumerate_processes(&self.debugger.kvm, &self.debugger.symbols)?
+            .enumerate_processes()?
             .into_iter()
             .filter(|p| {
                 filter.as_ref().is_none_or(|f| {
@@ -714,15 +731,9 @@ impl AgentSession<'_> {
     fn modules(&self, filter: Option<String>) -> Result<Value> {
         let filter = filter.map(|s| s.to_lowercase());
         let modules = if let Some(process_info) = &self.debugger.current_process_info {
-            self.debugger.guest.get_process_modules(
-                &self.debugger.kvm,
-                &self.debugger.symbols,
-                process_info,
-            )?
+            self.debugger.guest.process_modules(process_info)?
         } else {
-            self.debugger
-                .guest
-                .get_kernel_modules(&self.debugger.kvm, &self.debugger.symbols)?
+            self.debugger.guest.kernel_modules()?
         };
         Ok(json!({
             "modules": modules
@@ -807,10 +818,13 @@ impl AgentSession<'_> {
             });
 
         let id = match kind {
-            BreakpointKind::Software => {
-                self.session.breakpoints
-                    .add(self.client, self.debugger, address, symbol.clone())?
-            }
+            BreakpointKind::Software => self.session.breakpoints.add(
+                self.client,
+                self.debugger,
+                address,
+                symbol.clone(),
+                None,
+            )?,
             BreakpointKind::Hardware => self.session.breakpoints.add_hardware(
                 self.client,
                 self.debugger,
@@ -829,19 +843,25 @@ impl AgentSession<'_> {
 
     fn clear_breakpoint(&mut self, id: Option<u32>) -> Result<Value> {
         let id = id.ok_or_else(|| Error::InvalidExpression("missing breakpoint".into()))?;
-        self.session.breakpoints.remove(self.client, self.debugger, id)?;
+        self.session
+            .breakpoints
+            .remove(self.client, self.debugger, id)?;
         Ok(json!({ "cleared": id }))
     }
 
     fn disable_breakpoint(&mut self, id: Option<u32>) -> Result<Value> {
         let id = id.ok_or_else(|| Error::InvalidExpression("missing breakpoint".into()))?;
-        self.session.breakpoints.disable(self.client, self.debugger, id)?;
+        self.session
+            .breakpoints
+            .disable(self.client, self.debugger, id)?;
         Ok(json!({ "disabled": id }))
     }
 
     fn enable_breakpoint(&mut self, id: Option<u32>) -> Result<Value> {
         let id = id.ok_or_else(|| Error::InvalidExpression("missing breakpoint".into()))?;
-        self.session.breakpoints.enable(self.client, self.debugger, id)?;
+        self.session
+            .breakpoints
+            .enable(self.client, self.debugger, id)?;
         Ok(json!({ "enabled": id }))
     }
 
@@ -884,7 +904,10 @@ impl AgentSession<'_> {
             };
 
             let summary = event.summary.clone();
-            match self.session.process_stop(self.client, self.debugger, &event)? {
+            match self
+                .session
+                .process_stop(self.client, self.debugger, &event)?
+            {
                 StopOutcome::Resumed(_) => {
                     if Instant::now() >= deadline {
                         return Ok(json!({ "running": true, "stopped": false }));
@@ -955,11 +978,17 @@ impl AgentSession<'_> {
             });
         }
 
-        if !target_exited
-            && let Ok(regs) = self.client.read_registers()
-        {
-            let rip = self.session.register_map.read_u64("rip", &regs).unwrap_or(0);
-            let cr3 = self.session.register_map.read_u64("cr3", &regs).unwrap_or(0);
+        if !target_exited && let Ok(regs) = self.client.read_registers() {
+            let rip = self
+                .session
+                .register_map
+                .read_u64("rip", &regs)
+                .unwrap_or(0);
+            let cr3 = self
+                .session
+                .register_map
+                .read_u64("cr3", &regs)
+                .unwrap_or(0);
             self.debugger.registers = Some(self.session.register_map.to_hashmap(&regs));
             out["rip"] = json!(fmt_addr(rip));
             out["cr3"] = json!(fmt_addr(cr3));
@@ -1215,6 +1244,7 @@ fn completion_strategy_name(strategy: crate::repl::CompletionStrategy) -> &'stat
         crate::repl::CompletionStrategy::Type => "type",
         crate::repl::CompletionStrategy::Process => "process",
         crate::repl::CompletionStrategy::Thread => "thread",
+        crate::repl::CompletionStrategy::Vcpu => "vcpu",
         crate::repl::CompletionStrategy::Breakpoint => "breakpoint",
         crate::repl::CompletionStrategy::Driver => "driver",
     }

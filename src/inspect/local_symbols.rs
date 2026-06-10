@@ -57,16 +57,12 @@ pub fn load_symbols_from_directory(
     }
     let (modules, dtb) = if let Some(process_info) = &debugger.current_process_info {
         (
-            debugger
-                .guest
-                .get_process_modules(&debugger.kvm, &debugger.symbols, process_info)?,
+            debugger.guest.process_modules(process_info)?,
             process_info.dtb,
         )
     } else {
         (
-            debugger
-                .guest
-                .get_kernel_modules(&debugger.kvm, &debugger.symbols)?,
+            debugger.guest.kernel_modules()?,
             debugger.guest.ntoskrnl.dtb(),
         )
     };
