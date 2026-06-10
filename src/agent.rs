@@ -1071,6 +1071,7 @@ impl AgentSession<'_> {
         }
         self.client.set_current_thread(&vcpu)?;
         self.session.current_thread = vcpu;
+        self.debugger.clear_context_dtb_override();
         refresh_windows_thread_context_for_backend_thread(
             self.debugger,
             &self.session.current_thread,
