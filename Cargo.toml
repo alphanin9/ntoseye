@@ -1,6 +1,6 @@
 [package]
 name = "ntoseye"
-version = "0.11.1"
+version = "0.12.0"
 edition = "2024"
 authors = [ "dmaivel" ]
 description = "Windows kernel debugger for Linux hosts running Windows under KVM/QEMU"
@@ -13,7 +13,7 @@ categories = [ "security", "os" ]
 [dependencies]
 ctrlc = "3.4"
 argh = "0.1.13"
-fst = "0.4.7"
+dialoguer = { version = "0.12.0", default-features = false }
 iced-x86 = "1.21.0"
 indicatif = "0.18.3"
 memmap2 = "0.9.9"
@@ -37,6 +37,7 @@ spin = "0.10.0"
 dashmap = "6.1.0"
 sha2 = "0.10.9"
 mlua = { version = "0.11", features = ["lua54", "vendored"] }
+nucleo-matcher = "0.3.1"
 
 # The profile that 'dist' will build with
 [profile.dist]

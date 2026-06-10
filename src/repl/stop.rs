@@ -1,0 +1,904 @@
+use std::time::Duration;
+
+use owo_colors::OwoColorize;
+
+use crate::dbg_backend::{BugcheckInfo, DebugBackend, StopEvent};
+use crate::debugger::{DebuggerContext, DebuggerReloadReport, ThreadInfo, kthread_state_name};
+use crate::error::{Error, Result};
+use crate::gdb::{BreakpointHitResult, BreakpointManager, RegisterMap};
+use crate::types::VirtAddr;
+use crate::ui;
+use crate::unwind::{format_symbol, resolve_thread_trace_context};
+
+use crate::repl::*;
+
+/// Returns whether new kernel modules appeared (their symbols were just loaded),
+/// which the caller uses as a "module set changed" signal for backends without a
+/// load event.
+pub fn refresh_kernel_module_symbols_on_stop(
+    debugger: &DebuggerContext,
+    caches: &ReplCaches,
+) -> bool {
+    let Ok(report) = debugger.refresh_kernel_module_symbols() else {
+        return false;
+    };
+    if report.total == 0 || report.loaded == 0 {
+        return false;
+    }
+
+    print_module_symbol_report(&report);
+    caches.refresh_symbol_context(debugger);
+    true
+}
+
+pub fn print_target_reload_report(report: &DebuggerReloadReport) {
+    if let Some(startup) = &report.startup {
+        println!(
+            "{} kernel reloaded: {} -> {}, psmods {}",
+            "target:".bright_black(),
+            ui::addr(report.previous_base_address.0),
+            ui::addr(startup.base_address.0),
+            ui::addr_opt(startup.loaded_module_list)
+        );
+    } else {
+        println!(
+            "{} kernel reloaded: previous base {}",
+            "target:".bright_black(),
+            ui::addr(report.previous_base_address.0)
+        );
+    }
+
+    if let Some(symbol_report) = &report.symbol_report {
+        print_module_symbol_report(symbol_report);
+    }
+    if let Some(err) = &report.symbol_error {
+        error!(
+            "failed to refresh kernel module symbols after reload: {}",
+            err
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetReloadStatus {
+    Unchanged,
+    Reloaded { loaded_module_list_available: bool },
+    PendingRediscovery { kernel_base_hint: Option<VirtAddr> },
+}
+
+impl TargetReloadStatus {
+    pub fn target_reloaded(self) -> bool {
+        matches!(self, Self::Reloaded { .. })
+    }
+
+    pub fn pending_rediscovery(self) -> bool {
+        matches!(self, Self::PendingRediscovery { .. })
+    }
+
+    fn loaded_module_list_available(self) -> bool {
+        match self {
+            Self::Reloaded {
+                loaded_module_list_available,
+            } => loaded_module_list_available,
+            Self::Unchanged | Self::PendingRediscovery { .. } => false,
+        }
+    }
+
+    fn kernel_base_hint(self) -> Option<VirtAddr> {
+        match self {
+            Self::PendingRediscovery { kernel_base_hint } => kernel_base_hint,
+            _ => None,
+        }
+    }
+}
+
+pub fn reload_report_has_loaded_module_list(report: &DebuggerReloadReport) -> bool {
+    report
+        .startup
+        .as_ref()
+        .is_some_and(|startup| !startup.loaded_module_list.is_zero())
+}
+
+pub fn update_reload_module_list_pending(pending: &mut bool, reload_status: TargetReloadStatus) {
+    match reload_status {
+        TargetReloadStatus::Reloaded {
+            loaded_module_list_available,
+        } => *pending = !loaded_module_list_available,
+        TargetReloadStatus::PendingRediscovery { .. } => *pending = true,
+        TargetReloadStatus::Unchanged => {}
+    }
+}
+
+pub fn try_complete_pending_module_list_reload(
+    client: &mut dyn DebugBackend,
+    debugger: &mut DebuggerContext,
+    caches: &ReplCaches,
+    pending: &mut bool,
+) -> bool {
+    if !*pending {
+        return false;
+    }
+
+    let Ok(startup) = debugger.startup_message_data() else {
+        return false;
+    };
+    if startup.loaded_module_list.is_zero() {
+        return false;
+    }
+
+    println!(
+        "{} module list available: {}",
+        "target:".bright_black(),
+        ui::addr(startup.loaded_module_list.0)
+    );
+    refresh_kernel_module_symbols_on_stop(debugger, caches);
+    caches.refresh_symbol_context(debugger);
+    if let Err(e) = caches.refresh_processes(debugger) {
+        error!(
+            "failed to refresh process cache after module-list recovery: {}",
+            e
+        );
+    }
+    caches.clear_threads();
+    caches.refresh_drivers(debugger);
+    caches.refresh_vcpus(client);
+    client.note_target_rediscovery_complete();
+    *pending = false;
+    true
+}
+
+/// Detect whether `event` reflects a guest reboot and, if so, rebuild debugger
+/// state for the new kernel image, marking `event.target_reloaded`.
+pub fn apply_target_reload_if_needed(
+    client: &mut dyn DebugBackend,
+    debugger: &mut DebuggerContext,
+    breakpoints: &mut BreakpointManager,
+    caches: &ReplCaches,
+    event: &mut StopEvent,
+) -> TargetReloadStatus {
+    if !stop_event_requires_target_reload(debugger, event) {
+        return TargetReloadStatus::Unchanged;
+    }
+    event.target_reloaded = true;
+
+    let dropped_breakpoints = breakpoints.list().len();
+    *breakpoints = BreakpointManager::new();
+    *caches.breakpoints.write().unwrap() = Vec::new();
+
+    let kernel_base_hint = event
+        .target_kernel_base_hint
+        .or_else(|| client.target_kernel_base_hint().ok().flatten());
+    match debugger.reload_guest_with_kernel_base_hint(kernel_base_hint) {
+        Ok(report) => {
+            let loaded_module_list_available = reload_report_has_loaded_module_list(&report);
+            if loaded_module_list_available {
+                client.note_target_rediscovery_complete();
+            } else {
+                client.note_target_rediscovery_pending();
+            }
+            print_target_reload_report(&report);
+            caches.refresh_symbol_context(debugger);
+            *caches.vcpus.write().unwrap() = client.thread_list().unwrap_or_default();
+            if let Err(e) = caches.refresh_processes(debugger) {
+                *caches.processes.write().unwrap() = Vec::new();
+                error!("failed to refresh process cache after reload: {}", e);
+            }
+            caches.clear_threads();
+            *caches.drivers.write().unwrap() =
+                debugger.enumerate_driver_objects().unwrap_or_default();
+            if dropped_breakpoints > 0 {
+                println!(
+                    "{} dropped {} stale breakpoint(s)",
+                    "target:".bright_black(),
+                    dropped_breakpoints
+                );
+            }
+            println!();
+            TargetReloadStatus::Reloaded {
+                loaded_module_list_available,
+            }
+        }
+        Err(e) => {
+            match e {
+                Error::NtoskrnlNotFound => {
+                    client.note_target_rediscovery_pending();
+                    println!(
+                        "{} reboot observed; Windows kernel is not discoverable yet",
+                        "target:".bright_black()
+                    );
+                }
+                other => {
+                    error!("target reloaded, but guest rediscovery failed: {}", other);
+                }
+            }
+            *caches.processes.write().unwrap() = Vec::new();
+            *caches.vcpus.write().unwrap() = client.thread_list().unwrap_or_default();
+            *caches.drivers.write().unwrap() = Vec::new();
+            if dropped_breakpoints > 0 {
+                println!(
+                    "{} dropped {} stale breakpoint(s)",
+                    "target:".bright_black(),
+                    dropped_breakpoints
+                );
+            }
+            println!();
+            TargetReloadStatus::PendingRediscovery { kernel_base_hint }
+        }
+    }
+}
+
+pub const REPL_STOP_POLL: Duration = Duration::from_millis(100);
+
+pub const STATUS_BREAKPOINT: u32 = 0x8000_0003;
+
+pub fn processor_index_from_backend_thread_id(thread_id: &str) -> Option<u16> {
+    let stripped = thread_id.strip_prefix("p1.")?;
+    let one_based = u16::from_str_radix(stripped, 16).ok()?;
+    one_based.checked_sub(1)
+}
+
+pub fn refresh_windows_thread_context_for_backend_thread(
+    debugger: &mut DebuggerContext,
+    thread_id: &str,
+) -> Option<ThreadInfo> {
+    let thread = processor_index_from_backend_thread_id(thread_id).and_then(|processor| {
+        debugger
+            .current_windows_thread_for_processor(processor)
+            .ok()
+    });
+    if let Some(thread) = thread.clone() {
+        debugger.set_current_windows_thread_context(thread);
+    } else {
+        debugger.clear_current_windows_thread_context();
+    }
+    thread
+}
+
+fn format_windows_thread(thread: &ThreadInfo) -> String {
+    let process = thread.process_name.as_deref().unwrap_or("unknown");
+    let pid = thread
+        .pid
+        .map(|pid| format!(" pid={pid}"))
+        .unwrap_or_default();
+    let tid = thread
+        .tid
+        .map(|tid| format!(" tid={tid}"))
+        .unwrap_or_default();
+    let state = thread
+        .state
+        .map(|state| format!(" state={}", kthread_state_name(state)))
+        .unwrap_or_default();
+    format!(
+        "{} ethread={}{}{}{}",
+        process,
+        ui::addr(thread.ethread.0),
+        pid,
+        tid,
+        state
+    )
+}
+
+pub fn print_stop_notice_parts(exception_code: Option<u32>, program_counter: Option<u64>) {
+    match (exception_code, program_counter) {
+        (Some(code), Some(pc)) => println!(
+            "{} KD exception {:#x} at {}",
+            "stop:".bold(),
+            code,
+            ui::addr(pc)
+        ),
+        (Some(code), None) => println!("{} KD exception {:#x}", "stop:".bold(), code),
+        _ => {}
+    }
+}
+
+pub fn print_stop_notice(event: &StopEvent) {
+    print_stop_notice_parts(event.exception_code, event.program_counter);
+}
+
+pub fn stop_event_requires_target_reload(debugger: &DebuggerContext, event: &StopEvent) -> bool {
+    if event.target_reloaded {
+        return true;
+    }
+
+    let Some(pc) = event.program_counter else {
+        return false;
+    };
+    if !looks_like_kernel_pointer(pc) {
+        return false;
+    }
+
+    if !debugger.current_kernel_mapping_is_valid() {
+        return true;
+    }
+
+    let current_dtb = debugger.guest.ntoskrnl.dtb();
+    if debugger
+        .symbols
+        .find_module_for_address(current_dtb, VirtAddr(pc))
+        .is_some()
+    {
+        return false;
+    }
+
+    if !event.is_bugcheck
+        && pc.abs_diff(debugger.guest.ntoskrnl.base_address.0) < CURRENT_KERNEL_RELOAD_WINDOW
+    {
+        return false;
+    }
+
+    debugger
+        .rediscovered_kernel_identity_changed()
+        .unwrap_or(false)
+}
+
+pub fn set_current_thread_from_stop(
+    client: &mut dyn DebugBackend,
+    event: &StopEvent,
+    current: &mut String,
+) {
+    let stopped_tid = event
+        .thread_id
+        .clone()
+        .or_else(|| client.stopped_thread_id().ok());
+    if let Some(tid) = stopped_tid {
+        *current = tid;
+        let _ = client.set_current_thread(current);
+    }
+}
+
+/// Refresh the caches the stop output depends on (vcpus, kernel module symbols),
+/// done before any stop notice prints so it reflects the current kernel image.
+/// Returns whether the kernel module set changed (a driver/module loaded or
+/// unloaded), so the caller can refresh module-dependent caches. Both signals are
+/// consulted/cleared: the backend load event (KD) and the per-stop module-list
+/// diff (any backend).
+pub fn refresh_stop_caches_pre(
+    client: &mut dyn DebugBackend,
+    debugger: &DebuggerContext,
+    caches: &ReplCaches,
+) -> bool {
+    caches.refresh_vcpus(client);
+    let symbols_changed = refresh_kernel_module_symbols_on_stop(debugger, caches);
+    let event_changed = client.take_modules_changed();
+    symbols_changed || event_changed
+}
+
+/// Refresh the guest-state completion caches after a stop. Both the async and
+/// synchronous stop paths call this, so the set can't drift. Drivers are a
+/// near-static but expensive cache, so they re-enumerate only when the module set
+/// actually changed (`modules_changed`) rather than on every stop.
+pub fn refresh_stop_caches_post(
+    debugger: &DebuggerContext,
+    caches: &ReplCaches,
+    target_reloaded: bool,
+    modules_changed: bool,
+) {
+    // on reload the rediscovery path already refreshed processes
+    if !target_reloaded && let Err(e) = caches.refresh_processes(debugger) {
+        error!("failed to refresh process cache: {}", e);
+    }
+    if modules_changed {
+        caches.refresh_drivers(debugger);
+    }
+}
+
+/// A classified stop: the raw event plus the target-reload status derived from
+/// it. The two are produced together (`apply_target_reload_if_needed` sets the
+/// status while mutating the event) and consumed together by the async printer,
+/// so they travel as one.
+pub struct StopOutcome {
+    pub event: StopEvent,
+    pub reload_status: TargetReloadStatus,
+}
+
+pub fn print_async_stop_context(
+    client: &mut dyn DebugBackend,
+    register_map: &RegisterMap,
+    debugger: &mut DebuggerContext,
+    breakpoints: &BreakpointManager,
+    caches: &ReplCaches,
+    current_thread: &mut String,
+    outcome: StopOutcome,
+) {
+    let StopOutcome {
+        event,
+        reload_status,
+    } = outcome;
+    let target_reloaded = reload_status.target_reloaded();
+    let reload_load_symbols_stop = is_target_reload_load_symbols_stop(&event, reload_status);
+    set_current_thread_from_stop(client, &event, current_thread);
+    let modules_changed = refresh_stop_caches_pre(client, debugger, caches);
+    if event.is_bugcheck && !target_reloaded {
+        print_bugcheck_summary(debugger, event.bugcheck.as_ref());
+    } else if !target_reloaded {
+        print_stop_notice(&event);
+    }
+    refresh_stop_caches_post(debugger, caches, target_reloaded, modules_changed);
+    println!();
+    if reload_load_symbols_stop {
+        print_target_reload_notification_context(debugger, current_thread, &event, reload_status);
+        return;
+    }
+    if event.is_bugcheck && !target_reloaded {
+        print_break_context_for_bugcheck(
+            client,
+            register_map,
+            debugger,
+            breakpoints,
+            current_thread,
+            event.bugcheck.as_ref(),
+        );
+    } else {
+        print_break_context(client, register_map, debugger, breakpoints, current_thread);
+    }
+}
+
+pub fn is_target_reload_load_symbols_stop(
+    event: &StopEvent,
+    reload_status: TargetReloadStatus,
+) -> bool {
+    reload_status.target_reloaded()
+        && event.exception_code.is_none()
+        && event.target_kernel_base_hint.is_some()
+}
+
+pub fn print_target_reload_notification_context(
+    debugger: &DebuggerContext,
+    current_thread: &str,
+    event: &StopEvent,
+    reload_status: TargetReloadStatus,
+) {
+    let pending_status = TargetReloadStatus::PendingRediscovery {
+        kernel_base_hint: event.target_kernel_base_hint,
+    };
+    println!(
+        "{} {} early boot at {}",
+        "break:".bold(),
+        current_thread,
+        pending_reload_location(debugger, event, pending_status, None)
+    );
+    let message = if reload_status.loaded_module_list_available() {
+        "target: kernel reloaded; context is limited, continue to resume boot"
+    } else {
+        "target: kernel reloaded; module list is not available yet, continue to retry full reload"
+    };
+    println!("{}", message.bright_black());
+    println!();
+}
+
+pub fn rebase_kernel_symbol_for_pending_reload(
+    debugger: &DebuggerContext,
+    pc: u64,
+    kernel_base_hint: Option<VirtAddr>,
+) -> Option<String> {
+    let new_base = kernel_base_hint?;
+    let rva = pc.checked_sub(new_base.0)?;
+    let old_addr = debugger.guest.ntoskrnl.base_address.0.checked_add(rva)?;
+    let (module, symbol, offset) = debugger
+        .symbols
+        .find_closest_symbol_for_address(debugger.guest.ntoskrnl.dtb(), VirtAddr(old_addr))?;
+    if offset > 0x1000 {
+        return None;
+    }
+    Some(if offset == 0 {
+        format!("{module}!{symbol}")
+    } else {
+        format!("{module}!{symbol}+{offset:#x}")
+    })
+}
+
+pub fn pending_reload_location(
+    debugger: &DebuggerContext,
+    event: &StopEvent,
+    reload_status: TargetReloadStatus,
+    register_kernel_base_hint: Option<VirtAddr>,
+) -> String {
+    let Some(pc) = event.program_counter else {
+        return "unknown".bright_black().to_string();
+    };
+    let kernel_base_hint = reload_status
+        .kernel_base_hint()
+        .or(register_kernel_base_hint);
+    rebase_kernel_symbol_for_pending_reload(debugger, pc, kernel_base_hint)
+        .map(|symbol| ui::symbol(&symbol))
+        .unwrap_or_else(|| ui::addr(pc))
+}
+
+pub fn pending_reload_register_kernel_base_hint(
+    register_map: &RegisterMap,
+    regs: &[u8],
+    pc: u64,
+) -> Option<VirtAddr> {
+    let base = register_map.read_u64("r9", regs).ok()?;
+    if !looks_like_kernel_pointer(base) {
+        return None;
+    }
+    let rva = pc.checked_sub(base)?;
+    (rva < CURRENT_KERNEL_RELOAD_WINDOW).then_some(VirtAddr(base))
+}
+
+pub fn print_pending_rediscovery_stop_context(
+    client: &mut dyn DebugBackend,
+    register_map: &RegisterMap,
+    debugger: &DebuggerContext,
+    current_thread: &mut String,
+    event: &StopEvent,
+    reload_status: TargetReloadStatus,
+) {
+    set_current_thread_from_stop(client, event, current_thread);
+    let regs = client.read_registers();
+    let register_kernel_base_hint = match (&regs, event.program_counter) {
+        (Ok(regs), Some(pc)) => pending_reload_register_kernel_base_hint(register_map, regs, pc),
+        _ => None,
+    };
+    println!(
+        "{} {} early boot at {}",
+        "break:".bold(),
+        current_thread,
+        pending_reload_location(debugger, event, reload_status, register_kernel_base_hint)
+    );
+    println!(
+        "{}",
+        "target: kernel is not discoverable yet; context is limited, continue to retry"
+            .bright_black()
+    );
+    println!();
+
+    match regs {
+        Ok(regs) => print_registers(register_map, &regs, true),
+        Err(e) => println!("{} {}", "registers unavailable:".bold(), e),
+    }
+    println!();
+}
+
+pub fn should_resume_assisted_refresh_stop(
+    event: &StopEvent,
+    reload_status: TargetReloadStatus,
+) -> bool {
+    matches!(reload_status, TargetReloadStatus::Unchanged)
+        && event.assisted_breakin
+        && event.bugcheck.is_none()
+        && event.exception_code == Some(STATUS_BREAKPOINT)
+}
+
+pub fn resume_assisted_refresh_stop(client: &mut dyn DebugBackend) -> Result<()> {
+    client.continue_execution()
+}
+
+pub fn surface_pending_stop(
+    client: &mut dyn DebugBackend,
+    register_map: &RegisterMap,
+    debugger: &mut DebuggerContext,
+    breakpoints: &mut BreakpointManager,
+    caches: &ReplCaches,
+    current_thread: &mut String,
+    reload_module_list_pending: &mut bool,
+) -> Result<bool> {
+    match client.try_wait_for_stop(REPL_STOP_POLL)? {
+        Some(mut event) => {
+            let reload_status =
+                apply_target_reload_if_needed(client, debugger, breakpoints, caches, &mut event);
+            update_reload_module_list_pending(reload_module_list_pending, reload_status);
+            if reload_status.pending_rediscovery() {
+                print_pending_rediscovery_stop_context(
+                    client,
+                    register_map,
+                    debugger,
+                    current_thread,
+                    &event,
+                    reload_status,
+                );
+                return Ok(true);
+            }
+            caches.refresh_vcpus(client);
+            let completed_pending_module_list = try_complete_pending_module_list_reload(
+                client,
+                debugger,
+                caches,
+                reload_module_list_pending,
+            );
+            if !completed_pending_module_list
+                && !*reload_module_list_pending
+                && should_resume_assisted_refresh_stop(&event, reload_status)
+            {
+                resume_assisted_refresh_stop(client)?;
+                return Ok(true);
+            }
+            print_async_stop_context(
+                client,
+                register_map,
+                debugger,
+                breakpoints,
+                caches,
+                current_thread,
+                StopOutcome {
+                    event,
+                    reload_status,
+                },
+            );
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+pub fn surface_interrupt_stop(
+    client: &mut dyn DebugBackend,
+    register_map: &RegisterMap,
+    debugger: &mut DebuggerContext,
+    breakpoints: &mut BreakpointManager,
+    caches: &ReplCaches,
+    current_thread: &mut String,
+    reload_module_list_pending: &mut bool,
+) -> Result<()> {
+    let mut event = client.interrupt()?;
+    let reload_status =
+        apply_target_reload_if_needed(client, debugger, breakpoints, caches, &mut event);
+    update_reload_module_list_pending(reload_module_list_pending, reload_status);
+    if reload_status.pending_rediscovery() {
+        print_pending_rediscovery_stop_context(
+            client,
+            register_map,
+            debugger,
+            current_thread,
+            &event,
+            reload_status,
+        );
+        return Ok(());
+    }
+    caches.refresh_vcpus(client);
+    let completed_pending_module_list = try_complete_pending_module_list_reload(
+        client,
+        debugger,
+        caches,
+        reload_module_list_pending,
+    );
+    if !completed_pending_module_list
+        && !*reload_module_list_pending
+        && should_resume_assisted_refresh_stop(&event, reload_status)
+    {
+        resume_assisted_refresh_stop(client)?;
+        return Ok(());
+    }
+    print_async_stop_context(
+        client,
+        register_map,
+        debugger,
+        breakpoints,
+        caches,
+        current_thread,
+        StopOutcome {
+            event,
+            reload_status,
+        },
+    );
+    Ok(())
+}
+
+/// Single-step the current thread and clear `TF` from its RFLAGS afterwards.
+/// KVM sets `TF` when enabling `KVM_GUESTDBG_SINGLESTEP` but doesn't clear it
+/// when SINGLESTEP is removed; without this clear, the stepped thread keeps
+/// trapping after every instruction on resume
+pub fn step_one_and_clear_tf(
+    client: &mut dyn DebugBackend,
+    register_map: &RegisterMap,
+) -> Result<()> {
+    client.step()?;
+    client.wait_for_stop()?;
+
+    if let Ok(mut regs) = client.read_registers()
+        && let Ok(eflags) = register_map.read_u64("eflags", &regs)
+    {
+        let cleared = eflags & !(1u64 << 8);
+        if cleared != eflags && register_map.write_u64("eflags", &mut regs, cleared).is_ok() {
+            client.write_registers(&regs)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// If the current thread's RIP sits on one of our enabled breakpoints,
+/// disable it, step the underlying instruction, then re-enable. Returns
+/// whether a step was performed. Caller must have set the gdb stub's
+/// control thread first
+pub fn step_over_current_breakpoint(
+    client: &mut dyn DebugBackend,
+    register_map: &RegisterMap,
+    debugger: &DebuggerContext,
+    breakpoints: &mut BreakpointManager,
+) -> Result<bool> {
+    let regs = client.read_registers()?;
+    let rip = register_map.read_u64("rip", &regs)?;
+    let cr3 = register_map.read_u64("cr3", &regs)?;
+
+    // Scope-agnostic: a wrong-process hit on a shared-page BP still needs the
+    // disable/step/enable dance so the wrong process can make forward progress
+    let Some(bp_id) = breakpoints.breakpoint_id_at_address(rip) else {
+        return Ok(false);
+    };
+
+    if let Err(err) = breakpoints.disable(client, debugger, bp_id) {
+        if matches!(err, Error::BadVirtualAddress(_)) {
+            breakpoints
+                .disable_guest_memory_patch_in_address_space(client, debugger, bp_id, cr3)?;
+        } else {
+            return Err(err);
+        }
+    }
+
+    step_one_and_clear_tf(client, register_map)?;
+
+    if let Err(err) = breakpoints.enable(client, debugger, bp_id) {
+        if matches!(err, Error::BadVirtualAddress(_)) {
+            let removed = breakpoints.discard(bp_id)?;
+            println!(
+                "{}",
+                format!(
+                    "breakpoint #{} removed: {} address space no longer exists",
+                    removed.id,
+                    removed.scope.label()
+                )
+                .yellow()
+            );
+        } else {
+            return Err(err);
+        }
+    }
+    Ok(true)
+}
+
+/// For every gdb thread whose RIP sits one byte past one of our breakpoints,
+/// rewind it back to the breakpoint address. The stub doesn't always adjust
+/// RIP back to the int3 when multiple vCPUs hit the same BP simultaneously;
+/// resuming an un-adjusted vCPU would decode the remainder of the original
+/// instruction's bytes as a different instruction and corrupt guest state.
+/// Restores Hg/Hc to `restore_thread` before returning
+pub fn rewind_threads_off_breakpoints(
+    client: &mut dyn DebugBackend,
+    register_map: &RegisterMap,
+    breakpoints: &BreakpointManager,
+    restore_thread: &str,
+) {
+    let threads = match client.thread_list() {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+
+    for tid in &threads {
+        if client.set_current_thread(tid).is_err() {
+            continue;
+        }
+        let Ok(regs) = client.read_registers() else {
+            continue;
+        };
+        let rip = register_map.read_u64("rip", &regs).unwrap_or(0);
+        let cr3 = register_map.read_u64("cr3", &regs).unwrap_or(0);
+        let Some(prev) = rip.checked_sub(1) else {
+            continue;
+        };
+        if !matches!(
+            breakpoints.check_breakpoint_hit(prev, cr3),
+            BreakpointHitResult::Hit(_)
+        ) {
+            continue;
+        }
+        let mut adjusted = regs.clone();
+        if register_map.write_u64("rip", &mut adjusted, prev).is_err() {
+            continue;
+        }
+        let _ = client.write_registers(&adjusted);
+    }
+
+    let _ = client.set_current_thread(restore_thread);
+}
+
+pub fn print_break_context(
+    client: &mut dyn DebugBackend,
+    register_map: &RegisterMap,
+    debugger: &mut DebuggerContext,
+    breakpoints: &BreakpointManager,
+    thread_id: &str,
+) {
+    print_break_context_at(client, register_map, debugger, breakpoints, thread_id, None);
+}
+
+pub fn print_break_context_for_bugcheck(
+    client: &mut dyn DebugBackend,
+    register_map: &RegisterMap,
+    debugger: &mut DebuggerContext,
+    breakpoints: &BreakpointManager,
+    thread_id: &str,
+    info: Option<&BugcheckInfo>,
+) {
+    print_break_context_at(
+        client,
+        register_map,
+        debugger,
+        breakpoints,
+        thread_id,
+        info.and_then(bugcheck_fault_ip),
+    );
+}
+
+pub fn print_break_context_at(
+    client: &mut dyn DebugBackend,
+    register_map: &RegisterMap,
+    debugger: &mut DebuggerContext,
+    breakpoints: &BreakpointManager,
+    thread_id: &str,
+    display_rip: Option<u64>,
+) {
+    let _ = client.set_current_thread(thread_id);
+
+    let regs = match client.read_registers() {
+        Ok(r) => r,
+        Err(e) => {
+            debugger.registers = None;
+            println!(
+                "{} {} (read_registers failed: {})\n",
+                "break:".bold(),
+                thread_id,
+                e
+            );
+            return;
+        }
+    };
+
+    debugger.registers = Some(register_map.to_hashmap(&regs));
+
+    let cr3 = register_map.read_u64("cr3", &regs).unwrap_or(0);
+    let rip = register_map.read_u64("rip", &regs).unwrap_or(0);
+    let windows_thread = refresh_windows_thread_context_for_backend_thread(debugger, thread_id);
+    let trace = resolve_thread_trace_context(debugger, cr3);
+    let context_rip = display_rip.unwrap_or(rip);
+    let symbol = format_symbol(debugger, &trace, context_rip);
+
+    if display_rip.is_some_and(|display_rip| display_rip != rip) {
+        let stop_symbol = format_symbol(debugger, &trace, rip);
+        println!(
+            "{} {} {} at {}",
+            "break:".bold(),
+            thread_id,
+            trace.description,
+            ui::symbol(&symbol)
+        );
+        println!("{} bugcheck, {}", "stop:".bold(), ui::symbol(&stop_symbol));
+    } else {
+        println!(
+            "{} {} {} at {}",
+            "break:".bold(),
+            thread_id,
+            trace.description,
+            ui::symbol(&symbol)
+        );
+    }
+    if let Some(thread) = windows_thread {
+        println!("  {}", format_windows_thread(&thread));
+    }
+
+    print_registers(register_map, &regs, true);
+    print_disasm_context(debugger, breakpoints, &trace, context_rip);
+    print_stacktrace(
+        debugger,
+        register_map,
+        &regs,
+        BREAK_STACKTRACE_PROBE_LIMIT,
+        BREAK_STACKTRACE_DISPLAY_LIMIT,
+        true,
+    );
+    println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::processor_index_from_backend_thread_id;
+
+    #[test]
+    fn backend_thread_ids_parse_as_zero_based_processors() {
+        assert_eq!(processor_index_from_backend_thread_id("p1.1"), Some(0));
+        assert_eq!(processor_index_from_backend_thread_id("p1.a"), Some(9));
+        assert_eq!(processor_index_from_backend_thread_id("p1.0"), None);
+        assert_eq!(processor_index_from_backend_thread_id("bad"), None);
+    }
+}

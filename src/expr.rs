@@ -257,26 +257,66 @@ impl Expr {
             Expr::Literal(addr) => Ok(*addr),
 
             Expr::Symbol(name) => {
-                let addr = context
+                if let Some(addr) = context
                     .symbols
                     .find_symbol_across_modules(context.current_dtb(), name)
-                    .ok_or_else(|| Error::SymbolNotFound(name.clone()))?;
-                Ok(addr)
+                {
+                    return Ok(addr);
+                }
+                if let Some(value) = Self::parse_bare_hex_literal(name) {
+                    return Ok(VirtAddr(value));
+                }
+                Err(Error::SymbolNotFound(name.clone()))
             }
 
             Expr::Register(name) => {
-                let regs = context.registers.as_ref().ok_or_else(|| {
-                    Error::InvalidExpression("registers unavailable while VM is running".into())
-                })?;
-                let value = regs
-                    .get(name)
-                    .ok_or_else(|| Error::RegisterNotFound(name.clone()))?;
-                Ok(VirtAddr(*value))
+                // $<digits> -> a volatile result slot ($0..$N) from the most
+                // recent result-producing command (search, ev, ...)
+                if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+                    let idx: usize = name.parse().map_err(|_| {
+                        Error::InvalidExpression(format!("invalid result index ${name}"))
+                    })?;
+                    return context
+                        .results
+                        .get(idx)
+                        .copied()
+                        .map(VirtAddr)
+                        .ok_or_else(|| {
+                            Error::InvalidExpression(format!(
+                                "no result ${name} ({} available)",
+                                context.results.len()
+                            ))
+                        });
+                }
+
+                // a register (predefined) wins over a user variable of the same name
+                if let Some(value) = context.registers.as_ref().and_then(|r| r.get(name)) {
+                    return Ok(VirtAddr(*value));
+                }
+
+                // a user-defined convenience variable ($name = ...); explicit
+                // assignment wins over a builtin of the same name
+                if let Some(var) = context.user_vars.get(name) {
+                    return Ok(VirtAddr(var.value));
+                }
+
+                if let Some(value) = context.builtin_variable_value(name) {
+                    return Ok(VirtAddr(value));
+                }
+
+                // unknown: if registers are simply unavailable (VM running) the
+                // name may well be a register, so surface that hint
+                if context.registers.is_none() {
+                    return Err(Error::InvalidExpression(
+                        "registers unavailable while VM is running".into(),
+                    ));
+                }
+                Err(Error::RegisterNotFound(name.clone()))
             }
 
             Expr::Deref(inner) => {
                 let addr = inner.resolve(context)?;
-                let mem = context.get_current_process().memory(&context.kvm);
+                let mem = context.current_process().memory();
                 let val: u64 = mem.read(addr)?;
                 Ok(VirtAddr(val))
             }
@@ -298,7 +338,7 @@ impl Expr {
                     .ok_or_else(|| Error::StructNotFound(base_type_name))?;
 
                 let offset = type_info
-                    .try_get_field_offset(field_name)
+                    .field_offset(field_name)
                     .map_err(|_| Error::FieldNotFound(field_name.clone()))?;
                 Ok(base_addr + offset)
             }
@@ -330,7 +370,7 @@ impl Expr {
                 let base_type_name = base.resolve_type(symbols, dtb)?;
                 let type_info = symbols.find_type_across_modules(dtb, &base_type_name)?;
                 let field_info = type_info.fields.get(field_name)?;
-                Self::get_struct_type_name(&field_info.type_data)
+                Self::struct_type_name(&field_info.type_data)
             }
             _ => None,
         }
@@ -405,13 +445,24 @@ impl Expr {
         }
     }
 
-    fn get_struct_type_name(type_data: &ParsedType) -> Option<String> {
+    fn struct_type_name(type_data: &ParsedType) -> Option<String> {
         match type_data {
             ParsedType::Struct(name) | ParsedType::Union(name) => Some(name.clone()),
-            ParsedType::Pointer(inner) => Self::get_struct_type_name(inner),
-            ParsedType::Array(inner, _) => Self::get_struct_type_name(inner),
+            ParsedType::Pointer(inner) => Self::struct_type_name(inner),
+            ParsedType::Array(inner, _) => Self::struct_type_name(inner),
             _ => None,
         }
+    }
+
+    fn parse_bare_hex_literal(s: &str) -> Option<u64> {
+        let s = s.trim();
+        let has_hex_letter = s
+            .chars()
+            .any(|ch| ch.is_ascii_hexdigit() && ch.is_ascii_alphabetic());
+        if !has_hex_letter || !s.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return None;
+        }
+        u64::from_str_radix(s, 16).ok()
     }
 }
 
@@ -429,6 +480,29 @@ mod tests {
     fn test_parse_literal() {
         let expr = Expr::parse("0xfffff80123456789").unwrap();
         assert_eq!(expr, Expr::Literal(VirtAddr(0xfffff80123456789)));
+    }
+
+    #[test]
+    fn test_parse_bare_hex_stays_symbol_until_resolution() {
+        let expr = Expr::parse("fffff80123456789").unwrap();
+        assert_eq!(expr, Expr::Symbol("fffff80123456789".to_string()));
+    }
+
+    #[test]
+    fn test_parse_bare_decimal_stays_decimal_literal() {
+        let expr = Expr::parse("1000").unwrap();
+        assert_eq!(expr, Expr::Literal(VirtAddr(1000)));
+    }
+
+    #[test]
+    fn test_bare_hex_literal_fallback_requires_hex_letter() {
+        assert_eq!(
+            Expr::parse_bare_hex_literal("fffff80123456789"),
+            Some(0xfffff80123456789)
+        );
+        assert_eq!(Expr::parse_bare_hex_literal("DEADBEEF"), Some(0xdeadbeef));
+        assert_eq!(Expr::parse_bare_hex_literal("1000"), None);
+        assert_eq!(Expr::parse_bare_hex_literal("nt!KeBugCheck"), None);
     }
 
     #[test]

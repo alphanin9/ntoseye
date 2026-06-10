@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes};
 
 use crate::error::Result;
@@ -21,5 +23,18 @@ pub trait MemoryOps<A> {
     fn write<T: Copy + IntoBytes + Immutable>(&self, addr: A, val: &T) -> Result<()> {
         let slice = val.as_bytes();
         self.write_bytes(addr, slice)
+    }
+}
+
+/// Lets a shared `Arc<B>` stand in anywhere a memory backend `B` is expected, so
+/// owners (e.g. `WinObject`) can hold an `Arc<KvmHandle>` without every reader
+/// signature changing.
+impl<A, B: MemoryOps<A>> MemoryOps<A> for Arc<B> {
+    fn read_bytes(&self, addr: A, buf: &mut [u8]) -> Result<()> {
+        (**self).read_bytes(addr, buf)
+    }
+
+    fn write_bytes(&self, addr: A, buf: &[u8]) -> Result<()> {
+        (**self).write_bytes(addr, buf)
     }
 }

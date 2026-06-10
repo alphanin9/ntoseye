@@ -1,4 +1,7 @@
-<img align="right" width="28%" src="media/ntoseye.png">
+<picture>
+  <source media="(prefers-color-scheme: light)" srcset="media/logo_light.svg">
+  <img align="right" width="24%" src="media/logo_dark.svg" alt="logo">
+</picture>
 
 # ntoseye ![license](https://img.shields.io/badge/license-MIT-blue) [![crates.io](https://img.shields.io/crates/v/ntoseye.svg)](https://crates.io/crates/ntoseye)
 
@@ -11,7 +14,8 @@ Windows kernel debugger for Linux hosts running Windows under KVM/QEMU. Essentia
 - Kernel debugging
 - PDB fetching & parsing for offsets
 - Breakpointing (kernel, usermode)
-- Two debug backends: QEMU's `gdbstub` (default) and Windows KD over a serial pipe (KDCOM, see [Choosing a backend](#choosing-a-backend))
+- Bugcheck analysis (decodes the bug check code, parameters, and faulting site on a guest crash)
+- Three backends: Windows KD over a serial pipe (KDCOM, default), QEMU's `gdbstub`, and passive memory introspection (see [Choosing a backend](#choosing-a-backend))
 
 ### Supported Windows
 
@@ -28,7 +32,13 @@ Windows kernel debugger for Linux hosts running Windows under KVM/QEMU. Essentia
 
 ![ntos](media/preview.png)
 
-# Getting started
+# Installation
+
+## Install via shell script
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dmaivel/ntoseye/releases/latest/download/ntoseye-installer.sh | sh
+```
 
 ## Install via cargo
 
@@ -46,43 +56,53 @@ cargo build --release
 
 # Usage
 
-It is recommended that you run the following command before running `ntoseye` or a VM:
-```bash
-echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
-```
+## Quickstart
 
-Note that you may need to run `ntoseye` with `sudo` aswell (last resort, try command above first).
+The default and recommended backend is `kd` (KDCOM), which runs Windows KD over a QEMU serial socket. For a libvirt/virt-manager guest, the fastest path is:
 
-To view command line arguments, run `ntoseye --help`. The debugger is self documented, so pressing tab will display completions and descriptions for commands, symbols, and types.
+1. Configure the VM transport with `ntoseye virsh`: pick the domain, choose *configure debug transports*, then `kd`. (Prefer editing the XML yourself? See [VM configuration](#vm-configuration).)
+2. In the guest, enable kernel debugging and reboot (Administrator PowerShell):
+   ```
+   bcdedit /debug on
+   bcdedit /dbgsettings serial debugport:1 baudrate:115200
+   Restart-Computer
+   ```
+3. On the host, relax ptrace scope so `ntoseye` can attach to QEMU (resets on reboot):
+   ```bash
+   echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
+   ```
+4. Start the VM, then run `ntoseye`.
 
-For examples, refer [here](#usage-examples).
+For guests that aren't configured for KD, see [Choosing a backend](#choosing-a-backend) for the `gdb` and `memory` alternatives.
+
+The debugger is self-documented: run `ntoseye --help` for command-line arguments, and press tab in the REPL for completions and descriptions of commands, symbols, and types.
 
 ## Choosing a backend
 
-`ntoseye` can talk to the guest two ways. Pick with `--backend gdb` (default) or `--backend kd`.
+`ntoseye` can talk to the guest three ways. Pick with `--backend kd` (default), `--backend gdb`, or `--backend memory`.
 
-| | `gdb` (default) | `kd` |
-|---|---|---|
-| Transport | QEMU's `gdbstub` | Windows KD over a serial pipe (KDCOM) |
-| Requires in-guest configuration | No (guest is unaware it's being debugged) | Yes (`bcdedit /debug on`; anti-debug code, PatchGuard, and some Windows behaviour change once enabled) |
-| Supports usermode breakpoints | No | Yes |
-| Native breakpoints | gdb `Z0` packets | `DbgKdWriteBreakPointApi` |
+| | `kd` (default) | `gdb` | `memory` |
+|---|---|---|---|
+| Transport | Windows KD over a serial pipe (KDCOM) | QEMU's `gdbstub` | None; `/dev/kvm` memory introspection only |
+| Requires in-guest configuration | Yes (`bcdedit /debug on`; anti-debug code, PatchGuard, and some Windows behaviour change once enabled) | No (guest is unaware it's being debugged) | No |
+| Requires host VM configuration | Yes (serial socket) | Yes (`-s -S`) | No |
+| Execution control | Yes | Yes | No |
+| Kernel breakpoints | Yes | Yes | No |
+| Usermode breakpoints | Yes | No | No |
+| Kernel breakpoint mechanism | `DbgKdWriteBreakPointApi` | gdb `Z0` packets | No |
 
 See [VM configuration](#vm-configuration) for the host-side setup of each backend.
 
 ## VM configuration
 
-It is recommended to disable memory paging and memory compression within the guest operating system to avoid memory-related issues. This only needs to be done once per Windows installation. Run the following commands in PowerShell (Run as Administrator):
-```
-Get-CimInstance Win32_ComputerSystem | Set-CimInstance -Property @{ AutomaticManagedPagefile = $false }
-Get-CimInstance Win32_PageFileSetting | Remove-CimInstance
-Disable-MMAgent -MemoryCompression
-Restart-Computer
-```
+Manual host-side setup for each backend. libvirt/virt-manager users can do most of this automatically with `ntoseye virsh` (see [Quickstart](#quickstart)); `ntoseye virsh` can also remove ntoseye-managed debug transports later.
 
 ### GDBSTUB
 
-Default backend. Expose QEMU's gdbstub on `127.0.0.1:1234` by passing `-s -S`.
+Fallback backend for guests that are not configured for Windows KD. Expose QEMU's gdbstub on `127.0.0.1:1234` by passing `-s -S`, then run with `--backend gdb`.
+
+> [!NOTE]
+> Do not enable kernel debug mode (`bcdedit /debug on`) in the guest when using the `gdb` backend. That setting is only for the `kd` backend, and the `gdb` backend's whole advantage is that the guest is unaware it's being debugged. With debug mode on, the kernel changes behaviour (anti-debug code, PatchGuard) and expects a KD debugger to service breaks, while nothing on the `gdb` side answers the KD transport, so the guest can hang on `DbgBreakPoint`/exceptions. Leave debug mode off.
 
 #### QEMU
 
@@ -103,7 +123,7 @@ Add the following to the XML configuration:
 
 ### KDCOM
 
-Run with `--backend kd`. In the guest, enable kernel debugging (run as Administrator, then reboot):
+Default backend. In the guest, enable kernel debugging (run as Administrator, then reboot):
 ```
 bcdedit /debug on
 bcdedit /dbgsettings serial debugport:1 baudrate:115200
@@ -116,7 +136,9 @@ Add a Unix-socket chardev and route a serial port to it:
 ```
 -chardev socket,id=kd,path=/tmp/ntoseye-kd.sock,server=on,wait=off -serial chardev:kd
 ```
-Then connect: `ntoseye --backend kd`.
+Then connect: `ntoseye`.
+
+The initial KD handshake timeout is 8 seconds by default. For unusually slow guests, override it with `NTOSEYE_KD_TIMEOUT=<seconds>`.
 
 #### virt-manager
 
@@ -134,7 +156,7 @@ Then connect: `ntoseye --backend kd`.
 </serial>
 ```
 
-**Option B:** keep the auto-added serial and append the KD chardev via `qemu:commandline`. KD is COM2, use `debugport:2`.
+**Option B:** keep the auto-added serial and append the KD chardev via `qemu:commandline`. If KD is COM2, use `debugport:2`.
 ```xml
 <domain xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0" type="kvm">
   ...
@@ -145,6 +167,26 @@ Then connect: `ntoseye --backend kd`.
     <qemu:arg value="chardev:kd"/>
   </qemu:commandline>
 </domain>
+```
+
+### Memory
+
+Passive backend for guests where you only want `/dev/kvm` memory introspection. It requires no guest or VM debug transport configuration:
+
+```bash
+ntoseye --backend memory
+```
+
+Execution control, registers, execution-context selection, breakpoints, debug output, bugcheck stops, and reload detection are unavailable in this mode. Run `capabilities` in the REPL for the exact backend feature matrix.
+
+### Recommended guest tweaks
+
+Although not required, disabling memory paging and compression in the guest avoids memory-related issues. This only needs to be done once per Windows installation (Administrator PowerShell):
+```
+Get-CimInstance Win32_ComputerSystem | Set-CimInstance -Property @{ AutomaticManagedPagefile = $false }
+Get-CimInstance Win32_PageFileSetting | Remove-CimInstance
+Disable-MMAgent -MemoryCompression
+Restart-Computer
 ```
 
 ## Scripting
@@ -172,7 +214,7 @@ register_command("name", "help text", function(arg1, arg2) ... end)
 register_command("name", "help text", {"process", "symbol"}, function(a, b) ... end)
 ```
 
-Completion strategies: `"none"`, `"symbol"`, `"type"`, `"process"`, `"thread"`, `"breakpoint"`, `"driver"`. The strategies table is positional; arg 1 uses the first entry, arg 2 the second, etc. Missing positions fall back to `"none"`. Pass `{}` for an empty table if you want completion turned off explicitly.
+Completion strategies: `"none"`, `"symbol"`, `"type"`, `"process"`, `"vcpu"`, `"breakpoint"`, `"driver"`. The strategies table is positional; arg 1 uses the first entry, arg 2 the second, etc. Missing positions fall back to `"none"`. Pass `{}` for an empty table if you want completion turned off explicitly.
 
 Scripts run with a constrained Lua standard library: base globals plus `table`, `string`, `math`, and `utf8`. Host filesystem/process/module access through Lua's `io`, `os`, and `package` libraries is not available; debugger interaction should go through `ntos`.
 
@@ -209,7 +251,7 @@ Host API is exposed under a global `ntos` table:
 
 Addresses are an opaque userdata supporting `+ - & | ^ << >> < ==` and `tostring` (renders as hex). 
 
-## Credits
+# Credits
 
 Functionality regarding initialization of guest information was written with the help of the following sources:
 

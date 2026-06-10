@@ -2,26 +2,26 @@ use crate::{
     backend::MemoryOps,
     error::{Error, Result},
     guest::{ModuleInfo, WinObject},
-    host::KvmHandle,
     memory,
     types::{Dtb, PhysAddr, VirtAddr},
 };
 use dashmap::DashMap;
-use fst::{Automaton, IntoStreamer, Set, SetBuilder, Streamer, automaton::Str};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use memmap2::Mmap;
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
 use pdb2::{FallibleIterator, PrimitiveKind, TypeData, TypeFinder, TypeIndex};
 use pelite::{
     image::{
         GUID, IMAGE_DEBUG_CV_INFO_PDB70, IMAGE_DEBUG_DIRECTORY, IMAGE_DEBUG_TYPE_CODEVIEW,
         IMAGE_DIRECTORY_ENTRY_DEBUG,
     },
-    pe64::{Pe, debug::CodeView},
+    pe64::{Pe, PeFile, PeView, debug::CodeView},
 };
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use spin::Mutex;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     mem::size_of,
     path::{Path, PathBuf},
@@ -35,7 +35,8 @@ pub static FORCE_DOWNLOADS: OnceLock<bool> = OnceLock::new();
 
 #[derive(Default, Clone)]
 pub struct SymbolIndex {
-    set: Set<Vec<u8>>,
+    /// Symbol/type names, sorted and deduped. Matched fuzzily by `search`
+    names: Vec<String>,
 }
 
 pub struct SymbolStore {
@@ -44,6 +45,15 @@ pub struct SymbolStore {
     mmaps: DashMap<u128, Arc<Mmap>>,
     index: DashMap<u128, SymbolIndex>,
     index_types: DashMap<u128, SymbolIndex>,
+    /// guid -> (public symbol name -> RVA). Built alongside `index` so symbol
+    /// address resolution is an O(1) lookup instead of a per-call PDB scan
+    symbol_rvas: DashMap<u128, HashMap<String, u32>>,
+
+    /// (guid, struct name) -> parsed layout. `dump_struct_with_types`
+    /// otherwise rescans the entire PDB type stream on every call; keying on
+    /// guid makes this self-coherent (a reloaded module gets a new guid, so a
+    /// stale entry can never be returned).
+    type_cache: DashMap<(u128, String), Arc<TypeInfo>>,
 
     modules: DashMap<(Dtb, u64), LoadedModule>,
     module_status: DashMap<(Dtb, u64), ModuleSymbolStatus>,
@@ -59,7 +69,15 @@ fn guid_to_u128(guid: GUID) -> u128 {
     u128::from_be_bytes(bytes)
 }
 
-pub fn get_cache_root() -> Option<PathBuf> {
+pub fn format_symbol_with_offset(module: &str, name: &str, offset: u32) -> String {
+    if offset == 0 {
+        format!("{module}!{name}")
+    } else {
+        format!("{module}!{name}+{offset:#x}")
+    }
+}
+
+pub fn cache_root() -> Option<PathBuf> {
     let config_dir = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| {
@@ -80,14 +98,14 @@ pub fn get_cache_root() -> Option<PathBuf> {
     Some(cache_root)
 }
 
-fn get_symbols_directory() -> Option<PathBuf> {
-    let symbols_path = get_cache_root()?.join("symbols");
+fn symbols_directory() -> Option<PathBuf> {
+    let symbols_path = cache_root()?.join("symbols");
     std::fs::create_dir_all(&symbols_path).ok()?;
     Some(symbols_path)
 }
 
-fn get_images_directory() -> Option<PathBuf> {
-    let images_path = get_cache_root()?.join("images");
+fn images_directory() -> Option<PathBuf> {
+    let images_path = cache_root()?.join("images");
     std::fs::create_dir_all(&images_path).ok()?;
     Some(images_path)
 }
@@ -323,7 +341,7 @@ pub struct TypeInfo {
 }
 
 impl TypeInfo {
-    pub fn try_get_field_offset<S>(&self, field_name: S) -> Result<u64>
+    pub fn field_offset<S>(&self, field_name: S) -> Result<u64>
     where
         S: Into<String> + AsRef<str>,
     {
@@ -366,9 +384,83 @@ impl SymbolStore {
             mmaps: DashMap::new(),
             index: DashMap::new(),
             index_types: DashMap::new(),
+            symbol_rvas: DashMap::new(),
+            type_cache: DashMap::new(),
             modules: DashMap::new(),
             module_status: DashMap::new(),
             module_source: DashMap::new(),
+        }
+    }
+
+    pub fn clear_modules_for_dtb(&self, dtb: Dtb) {
+        let module_keys: Vec<_> = self
+            .modules
+            .iter()
+            .filter_map(|module| (module.dtb == dtb).then_some(*module.key()))
+            .collect();
+        for key in module_keys {
+            self.modules.remove(&key);
+        }
+
+        let status_keys: Vec<_> = self
+            .module_status
+            .iter()
+            .filter_map(|status| (status.key().0 == dtb).then_some(*status.key()))
+            .collect();
+        for key in status_keys {
+            self.module_status.remove(&key);
+        }
+
+        let source_keys: Vec<_> = self
+            .module_source
+            .iter()
+            .filter_map(|source| (source.key().0 == dtb).then_some(*source.key()))
+            .collect();
+        for key in source_keys {
+            self.module_source.remove(&key);
+        }
+    }
+
+    pub fn retain_modules_for_dtb(&self, dtb: Dtb, live_modules: &[ModuleInfo]) {
+        let live_bases = live_modules
+            .iter()
+            .map(|module| module.base_address.0)
+            .collect::<HashSet<_>>();
+
+        let module_keys: Vec<_> = self
+            .modules
+            .iter()
+            .filter_map(|module| {
+                (module.dtb == dtb && !live_bases.contains(&module.base_address.0))
+                    .then_some(*module.key())
+            })
+            .collect();
+        for key in module_keys {
+            self.modules.remove(&key);
+        }
+
+        let status_keys: Vec<_> = self
+            .module_status
+            .iter()
+            .filter_map(|status| {
+                let (status_dtb, base) = *status.key();
+                (status_dtb == dtb && !live_bases.contains(&base)).then_some(*status.key())
+            })
+            .collect();
+        for key in status_keys {
+            self.module_status.remove(&key);
+        }
+
+        let source_keys: Vec<_> = self
+            .module_source
+            .iter()
+            .filter_map(|source| {
+                let (source_dtb, base) = *source.key();
+                (source_dtb == dtb && !live_bases.contains(&base)).then_some(*source.key())
+            })
+            .collect();
+        for key in source_keys {
+            self.module_source.remove(&key);
         }
     }
 
@@ -421,7 +513,7 @@ impl SymbolStore {
     ) -> Result<Option<(u32, u32)>> {
         let mut header_buf = [0u8; 0x1000];
         memory.read_bytes(base_address, &mut header_buf)?;
-        let view = pelite::pe64::PeView::from_bytes(&header_buf)?;
+        let view = PeView::from_bytes(&header_buf)?;
         Ok(view
             .data_directory()
             .get(IMAGE_DIRECTORY_ENTRY_DEBUG)
@@ -543,7 +635,7 @@ impl SymbolStore {
             .unwrap_or(server_name);
 
         let filename = format!("{}.{}{:X}.pdb", stem, guid_str, age);
-        let storage_dir = get_symbols_directory().ok_or(Error::StorageNotFound)?;
+        let storage_dir = symbols_directory().ok_or(Error::StorageNotFound)?;
         let path = storage_dir.join(&filename);
 
         let guid = guid_to_u128(guid);
@@ -554,6 +646,21 @@ impl SymbolStore {
         };
 
         Ok((job, guid))
+    }
+
+    /// Ensure the module's on-disk PE image (matched by TimeDateStamp +
+    /// SizeOfImage, the symbol-server image key) is in the image cache,
+    /// downloading it if absent, and return its path. Lets the unwinder recover
+    /// read-only data (unwind tables) when the in-memory `.pdata` is paged out.
+    pub fn ensure_module_image_on_disk(
+        &self,
+        image_file_name: &str,
+        time_date_stamp: u32,
+        size_of_image: u32,
+    ) -> Result<PathBuf> {
+        let job = Self::build_image_download_job(image_file_name, time_date_stamp, size_of_image)?;
+        download_job(&job, ProgressBar::new(0))?;
+        Ok(job.path)
     }
 
     fn build_image_download_job(
@@ -567,7 +674,7 @@ impl SymbolStore {
             "https://msdl.microsoft.com/download/symbols/{}/{}/{}",
             server_name, image_id, server_name
         );
-        let storage_dir = get_images_directory().ok_or(Error::StorageNotFound)?;
+        let storage_dir = images_directory().ok_or(Error::StorageNotFound)?;
         let path = storage_dir.join(format!("{}.{}", image_id, server_name));
 
         Ok(DownloadJob {
@@ -584,12 +691,8 @@ impl SymbolStore {
     // TODO (everywhere) use MemoryOps, not KvmHandle...
     // TODO (everywhere) propagate errors with format!
     // NOTE dont check for more than 1 CV entry, there shouldn't be more than 1
-    pub fn load_from_binary(
-        &self,
-        kvm: &KvmHandle,
-        object: &mut WinObject,
-    ) -> Result<Option<u128>> {
-        let view = object.view(kvm).ok_or(Error::ViewFailed)?;
+    pub fn load_from_binary(&self, object: &mut WinObject) -> Result<Option<u128>> {
+        let view = object.view().ok_or(Error::ViewFailed)?;
         let debug = view.debug()?;
 
         if let Some((job, guid)) = Self::download_job_from_debug(&debug)? {
@@ -658,7 +761,7 @@ impl SymbolStore {
         debug: &pelite::pe64::debug::Debug<'a, P>,
     ) -> Result<Option<(DownloadJob, u128)>>
     where
-        P: pelite::pe64::Pe<'a>,
+        P: Pe<'a>,
     {
         let mut first_error = None;
 
@@ -729,11 +832,11 @@ impl SymbolStore {
     }
 
     pub fn extract_download_job_from_image_file(
-        image_path: &std::path::Path,
+        image_path: &Path,
     ) -> Result<Option<(DownloadJob, u128)>> {
         let file = File::open(image_path)?;
         let mmap = unsafe { Mmap::map(&file)? };
-        let pe = pelite::pe64::PeFile::from_bytes(&mmap[..])?;
+        let pe = PeFile::from_bytes(&mmap[..])?;
         let debug = pe.debug()?;
         Self::download_job_from_debug(&debug)
     }
@@ -744,7 +847,7 @@ impl SymbolStore {
     ) -> Result<(u32, u32)> {
         let mut header_buf = [0u8; 0x1000];
         memory.read_bytes(base_address, &mut header_buf)?;
-        let view = pelite::pe64::PeView::from_bytes(&header_buf)?;
+        let view = PeView::from_bytes(&header_buf)?;
         Ok((
             view.file_header().TimeDateStamp,
             view.optional_header().SizeOfImage,
@@ -796,12 +899,7 @@ impl SymbolStore {
             }
 
             if let Some(index) = self.index.get(&module.guid) {
-                let mut stream = index.set.stream();
-                while let Some(key) = stream.next() {
-                    if let Ok(s) = String::from_utf8(key.to_vec()) {
-                        all_strings.push(s);
-                    }
-                }
+                all_strings.extend(index.names.iter().cloned());
             }
 
             progress.inc(1);
@@ -810,17 +908,10 @@ impl SymbolStore {
         all_strings.sort();
         all_strings.dedup();
 
-        let mut build = SetBuilder::memory();
-        for symbol in all_strings {
-            let _ = build.insert(&symbol);
-        }
-
-        let bytes = build.into_inner().unwrap_or_default();
-        let set = Set::new(bytes).unwrap_or_default();
         progress.inc(1);
         progress.finish_and_clear();
 
-        SymbolIndex { set }
+        SymbolIndex { names: all_strings }
     }
 
     pub fn merged_types_index(&self, dtb: Option<Dtb>) -> SymbolIndex {
@@ -843,12 +934,7 @@ impl SymbolStore {
             }
 
             if let Some(index) = self.index_types.get(&module.guid) {
-                let mut stream = index.set.stream();
-                while let Some(key) = stream.next() {
-                    if let Ok(s) = String::from_utf8(key.to_vec()) {
-                        all_strings.push(s);
-                    }
-                }
+                all_strings.extend(index.names.iter().cloned());
             }
 
             progress.inc(1);
@@ -857,17 +943,10 @@ impl SymbolStore {
         all_strings.sort();
         all_strings.dedup();
 
-        let mut build = SetBuilder::memory();
-        for symbol in all_strings {
-            let _ = build.insert(&symbol);
-        }
-
-        let bytes = build.into_inner().unwrap_or_default();
-        let set = Set::new(bytes).unwrap_or_default();
         progress.inc(1);
         progress.finish_and_clear();
 
-        SymbolIndex { set }
+        SymbolIndex { names: all_strings }
     }
 
     pub fn find_type_across_modules(&self, dtb: Dtb, type_name: &str) -> Option<TypeInfo> {
@@ -883,15 +962,61 @@ impl SymbolStore {
     }
 
     pub fn find_symbol_across_modules(&self, dtb: Dtb, symbol_name: &str) -> Option<VirtAddr> {
+        self.find_symbol_with_module(dtb, symbol_name)
+            .map(|(addr, _)| addr)
+    }
+
+    /// Like `find_symbol_across_modules`, but also returns the resolving
+    /// module's short name (for namespaced display, e.g. `nt!KiSwapThread`).
+    pub fn find_symbol_with_module(
+        &self,
+        dtb: Dtb,
+        symbol_name: &str,
+    ) -> Option<(VirtAddr, String)> {
+        // `module!symbol` restricts the lookup to the named module (by short
+        // name, e.g. `nt!KiSwapThread`); a bare name matches in any module
+        let (module_filter, name) = match symbol_name.split_once('!') {
+            Some((module, name)) => (Some(module), name),
+            None => (None, symbol_name),
+        };
         for module in self.modules.iter() {
             if module.dtb != dtb {
                 continue;
             }
-            if let Some(rva) = self.get_rva_of_symbol(module.guid, symbol_name) {
-                return Some(module.base_address + rva as u64);
+            let short = ModuleInfo::derive_short_name(&module.name);
+            if let Some(filter) = module_filter
+                && !short.eq_ignore_ascii_case(filter)
+            {
+                continue;
+            }
+            if let Some(rva) = self.symbol_rva(module.guid, name) {
+                return Some((module.base_address + rva as u64, short));
             }
         }
         None
+    }
+
+    /// Fuzzy-search symbol names within a single module (by short name, e.g.
+    /// `nt`). Backs `module!<prefix>` completion.
+    pub fn search_symbols_in_module(
+        &self,
+        dtb: Dtb,
+        module_short: &str,
+        query: &str,
+        limit: usize,
+    ) -> Vec<String> {
+        for module in self.modules.iter() {
+            if module.dtb != dtb {
+                continue;
+            }
+            if !ModuleInfo::derive_short_name(&module.name).eq_ignore_ascii_case(module_short) {
+                continue;
+            }
+            if let Some(index) = self.index.get(&module.guid) {
+                return index.search(query, limit);
+            }
+        }
+        Vec::new()
     }
 
     pub fn find_closest_symbol_for_address(
@@ -906,13 +1031,18 @@ impl SymbolStore {
 
             if module.contains_address(address)
                 && let Some((sym_name, offset)) =
-                    self.get_address_of_closest_symbol(module.guid, module.base_address, address)
+                    self.closest_symbol(module.guid, module.base_address, address)
             {
                 let short_name = ModuleInfo::derive_short_name(&module.name);
                 return Some((short_name, sym_name, offset));
             }
         }
         None
+    }
+
+    pub fn format_closest_symbol_for_address(&self, dtb: Dtb, address: VirtAddr) -> Option<String> {
+        self.find_closest_symbol_for_address(dtb, address)
+            .map(|(module, name, offset)| format_symbol_with_offset(&module, &name, offset))
     }
 
     pub fn find_module_for_address(&self, dtb: Dtb, address: VirtAddr) -> Option<LoadedModule> {
@@ -926,28 +1056,27 @@ impl SymbolStore {
         let pdb = self.pdbs.get_mut(&guid)?;
         let mut pdb_lock = pdb.lock();
         let symbol_table = pdb_lock.global_symbols().ok()?;
+        let address_map = pdb_lock.address_map().ok()?;
         let mut symbols = symbol_table.iter();
 
         let mut strings: Vec<String> = Vec::new();
+        let mut rvas: HashMap<String, u32> = HashMap::new();
 
         while let Some(symbol) = symbols.next().ok()? {
             if let Ok(pdb2::SymbolData::Public(data)) = symbol.parse() {
-                strings.push(data.name.to_string().into());
+                let name: String = data.name.to_string().into();
+                if let Some(rva) = data.offset.to_rva(&address_map) {
+                    rvas.insert(name.clone(), rva.0);
+                }
+                strings.push(name);
             }
         }
 
         strings.sort();
         strings.dedup();
 
-        let mut build = SetBuilder::memory();
-        for symbol in strings {
-            let _ = build.insert(&symbol);
-        }
-
-        let bytes = build.into_inner().unwrap();
-        let set = Set::new(bytes).unwrap();
-
-        self.index.insert(guid, SymbolIndex { set });
+        self.index.insert(guid, SymbolIndex { names: strings });
+        self.symbol_rvas.insert(guid, rvas);
 
         // NOW FOR TYPES!
         let mut strings: Vec<String> = Vec::new();
@@ -970,15 +1099,8 @@ impl SymbolStore {
         strings.sort();
         strings.dedup();
 
-        let mut build = SetBuilder::memory();
-        for symbol in strings {
-            let _ = build.insert(&symbol);
-        }
-
-        let bytes = build.into_inner().unwrap();
-        let set = Set::new(bytes).unwrap();
-
-        self.index_types.insert(guid, SymbolIndex { set });
+        self.index_types
+            .insert(guid, SymbolIndex { names: strings });
 
         Some(())
     }
@@ -991,12 +1113,20 @@ impl SymbolStore {
     //     self.index_types.get(&guid).map(|v| Arc::new(v.clone()))
     // }
 
-    pub fn get_rva_of_symbol<S>(&self, guid: u128, symbol_name: S) -> Option<u32>
+    pub fn symbol_rva<S>(&self, guid: u128, symbol_name: S) -> Option<u32>
     where
         S: AsRef<str>,
     {
         let symbol_name = symbol_name.as_ref();
 
+        // fast path: the prebuilt name->rva map (built by build_index). It covers
+        // every public the scan below would find, minus those whose offset has no
+        // RVA (the scan returns 0 for those; here they're simply absent -> None)
+        if let Some(map) = self.symbol_rvas.get(&guid) {
+            return map.get(symbol_name).copied();
+        }
+
+        // fallback: scan the PDB when the index hasn't been built for this module
         let pdb = self.pdbs.get_mut(&guid)?;
         let mut pdb_lock = pdb.lock();
         let symbol_table = pdb_lock.global_symbols().ok()?;
@@ -1004,23 +1134,17 @@ impl SymbolStore {
         let mut symbols = symbol_table.iter();
 
         while let Some(symbol) = symbols.next().ok()? {
-            match symbol.parse() {
-                Ok(pdb2::SymbolData::Public(data)) => {
-                    if data.name.to_string() == symbol_name {
-                        return Some(data.offset.to_rva(&address_map).unwrap_or_default().0);
-                    }
-                }
-                Ok(pdb2::SymbolData::Data(_data)) => {
-                    // TODO does this need to also be checked?
-                }
-                _ => {}
+            if let Ok(pdb2::SymbolData::Public(data)) = symbol.parse()
+                && data.name.to_string() == symbol_name
+            {
+                return Some(data.offset.to_rva(&address_map).unwrap_or_default().0);
             }
         }
 
         None
     }
 
-    pub fn get_address_of_closest_symbol(
+    pub fn closest_symbol(
         &self,
         guid: u128,
         base_address: VirtAddr,
@@ -1058,7 +1182,7 @@ impl SymbolStore {
         closest
     }
 
-    fn get_type_size<'p>(
+    fn type_size<'p>(
         &self,
         finder: &pdb2::TypeFinder<'p>,
         index: pdb2::TypeIndex,
@@ -1111,16 +1235,16 @@ impl SymbolStore {
             pdb2::TypeData::Union(data) => Ok(data.size), // FIXME possibly? ^^
             pdb2::TypeData::Pointer(_) => Ok(ptr_size),
             pdb2::TypeData::Modifier(data) => {
-                self.get_type_size(finder, data.underlying_type, ptr_size)
+                self.type_size(finder, data.underlying_type, ptr_size)
             }
             pdb2::TypeData::Enumeration(data) => {
-                self.get_type_size(finder, data.underlying_type, ptr_size)
+                self.type_size(finder, data.underlying_type, ptr_size)
             }
             pdb2::TypeData::Array(data) => {
                 Ok(data.dimensions.iter().fold(0, |acc, &x| acc + x as u64))
             }
             pdb2::TypeData::Bitfield(data) => {
-                self.get_type_size(finder, data.underlying_type, ptr_size)
+                self.type_size(finder, data.underlying_type, ptr_size)
             }
             pdb2::TypeData::Procedure(_) => Ok(ptr_size),
             _ => Ok(0),
@@ -1178,7 +1302,7 @@ impl SymbolStore {
             TypeData::Array(data) => {
                 let inner = self.resolve_type(finder, data.element_type)?;
                 let count = data.dimensions.first().unwrap_or(&0);
-                let mut sizeof_type = self.get_type_size(finder, data.element_type, 8)? as u32;
+                let mut sizeof_type = self.type_size(finder, data.element_type, 8)? as u32;
                 if sizeof_type == 0 {
                     sizeof_type = 1;
                 }
@@ -1241,7 +1365,7 @@ impl SymbolStore {
                         name,
                         FieldInfo {
                             offset: offset as u32,
-                            size: self.get_type_size(type_finder, member.field_type, 8)?,
+                            size: self.type_size(type_finder, member.field_type, 8)?,
                             type_data: type_info,
                         },
                     );
@@ -1259,6 +1383,13 @@ impl SymbolStore {
     where
         S: Into<String> + AsRef<str>,
     {
+        // A hit skips the full PDB type-stream scan below. Cloning the cached
+        // layout is cheap next to that scan, so callers keep their owned return
+        let cache_key = (guid, struct_name.as_ref().to_string());
+        if let Some(cached) = self.type_cache.get(&cache_key) {
+            return Some((**cached).clone());
+        }
+
         let pdb = self.pdbs.get_mut(&guid)?;
         let mut pdb_lock = pdb.lock();
         let type_information = pdb_lock.type_information().ok()?;
@@ -1278,11 +1409,14 @@ impl SymbolStore {
                         .ok()?;
                 }
 
-                return Some(TypeInfo {
+                let type_info = TypeInfo {
                     name: struct_name.into(),
                     size: class.size as usize,
                     fields: fields_map,
-                });
+                };
+                self.type_cache
+                    .insert(cache_key, Arc::new(type_info.clone()));
+                return Some(type_info);
             }
         }
 
@@ -1291,21 +1425,47 @@ impl SymbolStore {
 }
 
 impl SymbolIndex {
-    pub fn search(&self, prefix: &str, limit: usize) -> Vec<String> {
-        let matcher = Str::new(prefix).starts_with();
-        let mut stream = self.set.search(matcher).into_stream();
-        let mut results = Vec::new();
-
-        while let Some(key) = stream.next() {
-            if let Ok(s) = String::from_utf8(key.to_vec()) {
-                results.push(s);
-            }
-
-            if results.len() >= limit {
-                break;
-            }
+    /// Fuzzy substring search over the names, ranked best-first. Smart-case
+    /// (case-insensitive unless the query has uppercase), so `process` matches
+    /// `PsGetProcessId`. Empty query returns the first `limit` names.
+    pub fn search(&self, query: &str, limit: usize) -> Vec<String> {
+        if query.is_empty() || limit == 0 {
+            return self.names.iter().take(limit).cloned().collect();
         }
 
-        results
+        let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+
+        // Fuzzy-scoring every name is the per-keystroke hot path: an attached
+        // GUI process can pull in hundreds of thousands of publics across its
+        // loaded modules, and `Pattern::match_list` scores them on a single
+        // thread. Spread the scan across cores instead; each rayon job keeps
+        // its own matcher and utf32 scratch buffer (both reused across the items
+        // that job sees, like the original thread-local matcher did).
+        let mut scored: Vec<(u32, &String)> = self
+            .names
+            .par_iter()
+            .map_init(
+                || (Matcher::new(Config::DEFAULT), Vec::new()),
+                |(matcher, buf), name| {
+                    pattern
+                        .score(Utf32Str::new(name, buf), matcher)
+                        .map(|score| (score, name))
+                },
+            )
+            .filter_map(|scored| scored)
+            .collect();
+
+        // Only the top `limit` matches are shown, so partial-select them instead
+        // of fully sorting every match; a short, broad query can match most of
+        // the list, and the full O(n log n) sort there is what stings. Ties break
+        // alphabetically (names are unique) for a stable, predictable ordering.
+        let by_rank =
+            |a: &(u32, &String), b: &(u32, &String)| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1));
+        if scored.len() > limit {
+            scored.select_nth_unstable_by(limit - 1, by_rank);
+            scored.truncate(limit);
+        }
+        scored.sort_unstable_by(by_rank);
+        scored.into_iter().map(|(_, name)| name.clone()).collect()
     }
 }

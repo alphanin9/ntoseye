@@ -1,11 +1,31 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
+
+/// Per-frame unwinder diagnostics, gated on `NTOSEYE_UNWIND_TRACE`. Prints which
+/// branch each `unwind_once` takes so early bail-outs (no function entry, bad
+/// codes, failed reads) can be told apart from a genuine leaf pop.
+fn unwind_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NTOSEYE_UNWIND_TRACE").is_some())
+}
+
+macro_rules! unwind_trace {
+    ($($arg:tt)*) => {
+        if unwind_trace_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+use std::cmp::Ordering;
 
 use pelite::pe64::{
     Pe, PeView,
     image::{
-        IMAGE_SCN_MEM_EXECUTE, UNW_FLAG_CHAININFO, UWOP_ALLOC_LARGE, UWOP_ALLOC_SMALL,
-        UWOP_PUSH_MACHFRAME, UWOP_PUSH_NONVOL, UWOP_SAVE_NONVOL, UWOP_SAVE_NONVOL_FAR,
-        UWOP_SAVE_XMM128, UWOP_SAVE_XMM128_FAR, UWOP_SET_FPREG,
+        IMAGE_DIRECTORY_ENTRY_EXCEPTION, IMAGE_SCN_MEM_EXECUTE, RUNTIME_FUNCTION,
+        UNW_FLAG_CHAININFO, UWOP_ALLOC_LARGE, UWOP_ALLOC_SMALL, UWOP_PUSH_MACHFRAME,
+        UWOP_PUSH_NONVOL, UWOP_SAVE_NONVOL, UWOP_SAVE_NONVOL_FAR, UWOP_SAVE_XMM128,
+        UWOP_SAVE_XMM128_FAR, UWOP_SET_FPREG,
     },
 };
 
@@ -13,14 +33,27 @@ use crate::{
     backend::MemoryOps,
     debugger::DebuggerContext,
     gdb::RegisterMap,
-    guest::{ModuleInfo, ProcessInfo, read_pe_image},
+    guest::{ModuleInfo, PeImage, ProcessInfo, read_pe_image, read_pe_image_from_file},
     host::KvmHandle,
     memory::AddressSpace,
+    symbols::SymbolStore,
     types::{Dtb, VirtAddr},
 };
 
 const CR3_PAGE_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 const STACK_SCAN_BYTES: usize = 0x1000;
+// cap on chained unwind entries followed per frame, guarding against cyclic or
+// corrupt unwind data
+const MAX_CHAIN_DEPTH: usize = 32;
+// hard cap on frames walked, so a stack switch (which relaxes the rsp-advances
+// guard) can't let a cyclic/corrupt stack spin forever
+const MAX_UNWIND_FRAMES: usize = 1024;
+
+// version-2 unwind opcodes that pelite 0.10 doesn't define. They describe epilog
+// locations and don't affect prolog-based unwinding, but must be counted so the
+// code iterator stays aligned with the slot stream
+const UWOP_EPILOG: u8 = 6;
+const UWOP_SPARE_CODE: u8 = 7;
 const UNWIND_REG_NAMES: [&str; 16] = [
     "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13",
     "r14", "r15",
@@ -67,7 +100,9 @@ struct RegisterContext {
 #[derive(Debug, Clone)]
 struct CachedModule {
     info: ModuleInfo,
-    image: Vec<u8>,
+    // Arc so a frame walk can cheaply take its own handle to the image and
+    // release the borrow on the cache while parsing unwind data
+    image: Arc<PeImage>,
     executable_ranges: Vec<(u32, u32)>,
 }
 
@@ -91,12 +126,33 @@ struct ParsedUnwindInfo {
     frame_register: u8,
     frame_offset: u8,
     codes: Vec<UnwindCodeSlot>,
-    chain_info: bool,
+    /// Present when this is a chained entry (`UNW_FLAG_CHAININFO`): the parent
+    /// RUNTIME_FUNCTION's unwind-data RVA, so the walk can follow the chain
+    chained_unwind_data: Option<u32>,
+}
+
+/// Outcome of applying one frame's unwind codes
+enum UnwindStep {
+    /// Codes applied; keep going (pop the return address or follow a chain)
+    Continue,
+    /// A hardware trap/interrupt frame set rip+rsp directly; the frame is complete
+    MachineFrame,
+}
+
+/// Outcome of unwinding one frame to its caller
+enum Unwound {
+    /// Could not unwind further; the caller falls back to a stack scan
+    Stop,
+    /// Advanced to the caller. `stack_switch` is set when we crossed a hardware
+    /// trap/interrupt frame, where rsp may move to a different stack (e.g. an IST
+    /// or the idle stack) and so need not be greater than the previous rsp.
+    Frame { stack_switch: bool },
 }
 
 struct StackTracer<'a> {
     trace: &'a ThreadTraceContext,
     kvm: &'a KvmHandle,
+    symbols: &'a SymbolStore,
     memory: AddressSpace<'a, KvmHandle>,
     modules: HashMap<(Dtb, u64), CachedModule>,
 }
@@ -112,10 +168,7 @@ pub fn resolve_thread_trace_context(debugger: &DebuggerContext, cr3: u64) -> Thr
             active_dtb: kernel_dtb,
             kernel_dtb,
             process_dtb: None,
-            kernel_modules: debugger
-                .guest
-                .get_kernel_modules(&debugger.kvm, &debugger.symbols)
-                .unwrap_or_default(),
+            kernel_modules: debugger.guest.kernel_modules().unwrap_or_default(),
             process_modules: Vec::new(),
         };
     }
@@ -123,17 +176,14 @@ pub fn resolve_thread_trace_context(debugger: &DebuggerContext, cr3: u64) -> Thr
     if let Some(proc_info) = find_process_by_cr3(debugger, cr3_masked) {
         let process_modules = debugger
             .guest
-            .get_process_modules(&debugger.kvm, &debugger.symbols, &proc_info)
+            .process_modules(&proc_info)
             .unwrap_or_default();
         return ThreadTraceContext {
             description: format!("{} ({})", proc_info.name, proc_info.pid),
             active_dtb: cr3_masked,
             kernel_dtb,
             process_dtb: Some(proc_info.dtb),
-            kernel_modules: debugger
-                .guest
-                .get_kernel_modules(&debugger.kvm, &debugger.symbols)
-                .unwrap_or_default(),
+            kernel_modules: debugger.guest.kernel_modules().unwrap_or_default(),
             process_modules,
         };
     }
@@ -143,10 +193,7 @@ pub fn resolve_thread_trace_context(debugger: &DebuggerContext, cr3: u64) -> Thr
         active_dtb: cr3_masked,
         kernel_dtb,
         process_dtb: None,
-        kernel_modules: debugger
-            .guest
-            .get_kernel_modules(&debugger.kvm, &debugger.symbols)
-            .unwrap_or_default(),
+        kernel_modules: debugger.guest.kernel_modules().unwrap_or_default(),
         process_modules: Vec::new(),
     }
 }
@@ -155,14 +202,7 @@ pub fn format_symbol(debugger: &DebuggerContext, trace: &ThreadTraceContext, add
     let try_format = |dtb| {
         debugger
             .symbols
-            .find_closest_symbol_for_address(dtb, VirtAddr(addr))
-            .map(|(module, symbol, offset)| {
-                if offset == 0 {
-                    format!("{}!{}", module, symbol)
-                } else {
-                    format!("{}!{}+{:#x}", module, symbol, offset)
-                }
-            })
+            .format_closest_symbol_for_address(dtb, VirtAddr(addr))
     };
 
     if let Some(module) = trace.module_for_address(addr) {
@@ -205,48 +245,51 @@ pub fn build_stacktrace(
     let cr3 = register_map.read_u64("cr3", regs).unwrap_or(0);
 
     let trace = resolve_thread_trace_context(debugger, cr3);
-    let mut stacktrace = StackTrace::default();
-    record_stack_frame(
-        &mut stacktrace,
-        limit,
-        StackFrame {
-            sp: rsp,
-            ip: rip,
-            symbol: format_symbol(debugger, &trace, rip),
-            source: FrameSource::Current,
-        },
-    );
 
+    // phase 1: walk the stack collecting raw frames (sp, ip, source). Symbols are
+    // formatted afterwards so we can first lazily load the modules they land in.
+    let mut raw: Vec<(u64, u64, FrameSource)> = vec![(rsp, rip, FrameSource::Current)];
     let mut tracer = StackTracer::new(debugger, &trace);
     let mut context = RegisterContext::from_registers(register_map, regs);
     let mut seen = HashSet::from([rip]);
 
-    loop {
+    // bound on unwind iterations: rsp normally advances every step, but a stack
+    // switch across a trap frame relaxes that guard, so cap the walk to stay safe
+    // against cyclic/corrupt data
+    for _ in 0..MAX_UNWIND_FRAMES {
         let previous_rip = context.rip;
         let previous_rsp = context.rsp;
 
-        if !tracer.unwind_once(&mut context) {
+        let stack_switch = match tracer.unwind_once(&mut context) {
+            Unwound::Stop => break,
+            Unwound::Frame { stack_switch } => stack_switch,
+        };
+
+        if context.rip == 0 || context.rip == previous_rip {
             break;
         }
-
-        if context.rip == 0 || context.rip == previous_rip || context.rsp <= previous_rsp {
+        // rsp must advance within a stack; a trap/interrupt frame can switch to
+        // another stack, where the new rsp is unrelated to the previous one
+        if !stack_switch && context.rsp <= previous_rsp {
             break;
         }
 
         seen.insert(context.rip);
-        record_stack_frame(
-            &mut stacktrace,
-            limit,
-            StackFrame {
-                sp: context.rsp,
-                ip: context.rip,
-                symbol: format_symbol(debugger, &trace, context.rip),
-                source: FrameSource::Unwind,
-            },
-        );
+        raw.push((context.rsp, context.rip, FrameSource::Unwind));
     }
 
     for (sp, ip) in tracer.scan_stack(context.rsp, &seen) {
+        raw.push((sp, ip, FrameSource::Scan));
+    }
+
+    // phase 2: lazily load symbols for the modules these frames land in, so
+    // user-mode frames (e.g. ntdll in a process we never attached to) resolve to
+    // `module!symbol` instead of `module+offset`
+    ensure_frame_module_symbols(debugger, &trace, raw.iter().map(|(_, ip, _)| *ip));
+
+    // phase 3: format each frame, honouring the display limit
+    let mut stacktrace = StackTrace::default();
+    for (sp, ip, source) in raw {
         record_stack_frame(
             &mut stacktrace,
             limit,
@@ -254,12 +297,45 @@ pub fn build_stacktrace(
                 sp,
                 ip,
                 symbol: format_symbol(debugger, &trace, ip),
-                source: FrameSource::Scan,
+                source,
             },
         );
     }
 
     stacktrace
+}
+
+/// Lazily load symbols for the modules a backtrace touches. Only modules with no
+/// prior load attempt are fetched (so kernel modules, loaded on stop, and an
+/// attached process's modules are skipped), and each is loaded once per session.
+fn ensure_frame_module_symbols(
+    debugger: &DebuggerContext,
+    trace: &ThreadTraceContext,
+    ips: impl Iterator<Item = u64>,
+) {
+    let mut by_dtb: HashMap<Dtb, Vec<ModuleInfo>> = HashMap::new();
+    let mut seen: HashSet<(Dtb, u64)> = HashSet::new();
+    for ip in ips {
+        let Some(module) = trace.module_for_address(ip) else {
+            continue;
+        };
+        let key = (module.dtb, module.info.base_address.0);
+        if seen.insert(key)
+            && debugger
+                .symbols
+                .module_symbol_status(module.dtb, module.info.base_address)
+                .is_none()
+        {
+            by_dtb.entry(module.dtb).or_default().push(module.info);
+        }
+    }
+
+    for (dtb, modules) in by_dtb {
+        let _ =
+            debugger
+                .guest
+                .load_symbols_for_modules(&debugger.kvm, &debugger.symbols, modules, dtb);
+    }
 }
 
 fn record_stack_frame(stacktrace: &mut StackTrace, limit: usize, frame: StackFrame) {
@@ -273,7 +349,7 @@ fn record_stack_frame(stacktrace: &mut StackTrace, limit: usize, frame: StackFra
 fn find_process_by_cr3(debugger: &DebuggerContext, cr3_masked: u64) -> Option<ProcessInfo> {
     debugger
         .guest
-        .enumerate_processes(&debugger.kvm, &debugger.symbols)
+        .enumerate_processes()
         .ok()?
         .into_iter()
         .find(|proc| (proc.dtb & CR3_PAGE_MASK) == cr3_masked)
@@ -339,80 +415,168 @@ impl<'a> StackTracer<'a> {
         Self {
             trace,
             kvm: &debugger.kvm,
+            symbols: &debugger.symbols,
             memory: AddressSpace::new(&debugger.kvm, trace.active_dtb),
             modules: HashMap::new(),
         }
     }
 
-    fn unwind_once(&mut self, context: &mut RegisterContext) -> bool {
-        let Some(module) = self.module_containing(context.rip) else {
-            return self.unwind_leaf(context);
-        };
-
-        let Ok(view) = PeView::from_bytes(&module.image) else {
-            return false;
-        };
-
-        let Ok(exception) = view.exception() else {
-            return self.unwind_leaf(context);
-        };
-
-        let rva = (context.rip - module.info.base_address.0) as u32;
-        let Some(function) = exception.lookup_function_entry(rva) else {
-            return self.unwind_leaf(context);
-        };
-
-        let runtime_function = function.image();
-        let rip_offset = rva.saturating_sub(runtime_function.BeginAddress);
-        let Some(unwind_info) = parse_unwind_info(&module.image, runtime_function.UnwindData)
+    fn unwind_once(&mut self, context: &mut RegisterContext) -> Unwound {
+        unwind_trace!("unwind: rip={:#x} rsp={:#x}", context.rip, context.rsp);
+        let Some(base_address) = self
+            .module_containing(context.rip)
+            .map(|module| module.info.base_address.0)
         else {
-            return false;
+            unwind_trace!("unwind: no module for rip -> leaf");
+            return self.unwind_leaf(context);
+        };
+        let Some(mut image) = self.module_image(context.rip) else {
+            return Unwound::Stop;
         };
 
-        if unwind_info.chain_info {
-            // TODO support chained unwind entries instead of falling back to a stack scan here.
-            return false;
+        // Resolve the function entry. If the lookup or its unwind data lands in a
+        // paged-out hole, upgrade to the complete on-disk image and re-resolve so
+        // we can unwind through a module whose `.pdata`/`.xdata` isn't resident.
+        let mut resolved = resolve_function(&image, base_address, context.rip);
+        if matches!(resolved, Resolve::Holed)
+            && !image.is_complete()
+            && self.upgrade_module_image(context.rip)
+        {
+            let Some(upgraded) = self.module_image(context.rip) else {
+                return Unwound::Stop;
+            };
+            image = upgraded;
+            resolved = resolve_function(&image, base_address, context.rip);
         }
 
+        let (mut unwind_data, begin) = match resolved {
+            Resolve::Function { unwind_data, begin } => (unwind_data, begin),
+            Resolve::Leaf => {
+                unwind_trace!("unwind: no unwind info for rip -> leaf (true leaf)");
+                return self.unwind_leaf(context);
+            }
+            Resolve::Holed => {
+                unwind_trace!("unwind: unwind data paged out and unrecoverable -> stop");
+                return Unwound::Stop;
+            }
+        };
+
+        // Walk the function and any chained parents. Only the primary function's
+        // codes are gated on the prolog progress at `rip`; chained parents already
+        // ran their prologs in full, so all of their codes apply.
+        let rva = (context.rip - base_address) as u32;
+        let rip_offset = rva.saturating_sub(begin);
+        let mut primary = true;
+
+        for _ in 0..MAX_CHAIN_DEPTH {
+            let Some(unwind_info) = parse_unwind_info(&image, unwind_data) else {
+                unwind_trace!(
+                    "unwind: parse_unwind_info failed/holed at unwind_data={unwind_data:#x} -> stop"
+                );
+                return Unwound::Stop;
+            };
+
+            unwind_trace!(
+                "unwind: rva={:#x} begin={:#x} prolog={:#x} codes={} chained={} in_prolog={}",
+                rva,
+                begin,
+                unwind_info.size_of_prolog,
+                unwind_info.codes.len(),
+                unwind_info.chained_unwind_data.is_some(),
+                primary && rip_offset < unwind_info.size_of_prolog as u32,
+            );
+
+            let in_prolog = primary && rip_offset < unwind_info.size_of_prolog as u32;
+            match self.apply_unwind_codes(context, &unwind_info, in_prolog, rip_offset) {
+                Some(UnwindStep::Continue) => {}
+                Some(UnwindStep::MachineFrame) => {
+                    unwind_trace!(
+                        "unwind: machine frame -> rip={:#x} rsp={:#x}",
+                        context.rip,
+                        context.rsp
+                    );
+                    return Unwound::Frame { stack_switch: true };
+                }
+                None => {
+                    unwind_trace!("unwind: malformed unwind codes -> stop");
+                    return Unwound::Stop;
+                }
+            }
+
+            match unwind_info.chained_unwind_data {
+                Some(next) => {
+                    unwind_data = next;
+                    primary = false;
+                }
+                None => {
+                    let Ok(return_address) = self.memory.read::<u64>(VirtAddr(context.rsp)) else {
+                        unwind_trace!(
+                            "unwind: return-address read failed at rsp={:#x} -> stop",
+                            context.rsp
+                        );
+                        return Unwound::Stop;
+                    };
+                    unwind_trace!(
+                        "unwind: pop return -> rip={return_address:#x} rsp={:#x}",
+                        context.rsp.saturating_add(8)
+                    );
+                    context.rip = return_address;
+                    context.rsp = context.rsp.saturating_add(8);
+                    return Unwound::Frame {
+                        stack_switch: false,
+                    };
+                }
+            }
+        }
+
+        // chain too deep or cyclic (corrupt unwind data); let the scan take over
+        Unwound::Stop
+    }
+
+    /// Apply one frame's unwind codes to `context`, undoing the prolog. Returns
+    /// `MachineFrame` if a trap/interrupt frame redirected rip+rsp (frame done),
+    /// `Continue` otherwise, or `None` on malformed codes.
+    fn apply_unwind_codes(
+        &self,
+        context: &mut RegisterContext,
+        unwind_info: &ParsedUnwindInfo,
+        in_prolog: bool,
+        rip_offset: u32,
+    ) -> Option<UnwindStep> {
         let original_context = context.clone();
-        let in_prolog = rip_offset < unwind_info.size_of_prolog as u32;
         let mut index = 0usize;
 
         while index < unwind_info.codes.len() {
             let slot = unwind_info.codes[index];
             let slots_used = unwind_slot_count(slot.unwind_op, slot.op_info);
             if slots_used == 0 || index + slots_used > unwind_info.codes.len() {
-                return false;
+                return None;
             }
 
             let executed = !in_prolog || u32::from(slot.code_offset) <= rip_offset;
             if executed
-                && self
-                    .apply_unwind_code(context, &original_context, &unwind_info, index)
-                    .is_none()
+                && let UnwindStep::MachineFrame =
+                    self.apply_unwind_code(context, &original_context, unwind_info, index)?
             {
-                return false;
+                return Some(UnwindStep::MachineFrame);
             }
 
             index += slots_used;
         }
 
-        let Ok(return_address) = self.memory.read::<u64>(VirtAddr(context.rsp)) else {
-            return false;
-        };
-        context.rip = return_address;
-        context.rsp = context.rsp.saturating_add(8);
-        true
+        Some(UnwindStep::Continue)
     }
 
-    fn unwind_leaf(&self, context: &mut RegisterContext) -> bool {
+    fn unwind_leaf(&self, context: &mut RegisterContext) -> Unwound {
         let Ok(return_address) = self.memory.read::<u64>(VirtAddr(context.rsp)) else {
-            return false;
+            return Unwound::Stop;
         };
 
         context.rip = return_address;
         context.rsp = context.rsp.saturating_add(8);
-        true
+        Unwound::Frame {
+            stack_switch: false,
+        }
     }
 
     fn apply_unwind_code(
@@ -421,7 +585,7 @@ impl<'a> StackTracer<'a> {
         original_context: &RegisterContext,
         unwind_info: &ParsedUnwindInfo,
         index: usize,
-    ) -> Option<()> {
+    ) -> Option<UnwindStep> {
         let slot = unwind_info.codes[index];
         match slot.unwind_op {
             UWOP_PUSH_NONVOL => {
@@ -445,7 +609,19 @@ impl<'a> StackTracer<'a> {
                 };
                 context.rsp = context.rsp.saturating_add(allocation);
             }
-            UWOP_SET_FPREG => {}
+            UWOP_SET_FPREG => {
+                // re-derive RSP from the established frame pointer: the prolog
+                // set `fpreg = rsp + frame_offset*16`, so unwinding restores
+                // RSP = fpreg - frame_offset*16. This supersedes any earlier
+                // ALLOC adjustment, which is the whole point of a frame pointer
+                // (the fixed allocation size need not be known to unwind)
+                context.rsp = frame_base(context, unwind_info)?;
+            }
+            UWOP_EPILOG | UWOP_SPARE_CODE => {
+                // version-2 epilog descriptors: they locate epilogs for the case
+                // where the PC is mid-epilog. We unwind from the prolog/body, so
+                // there's nothing to apply (their slots are skipped by the caller)
+            }
             UWOP_SAVE_NONVOL | UWOP_SAVE_XMM128 => {
                 let offset = if slot.unwind_op == UWOP_SAVE_NONVOL {
                     u64::from(slot_u16(&unwind_info.codes, index + 1)?) * 8
@@ -472,12 +648,28 @@ impl<'a> StackTracer<'a> {
                     context.set(slot.op_info, saved);
                 }
             }
-            // TODO unwind interrupt/trap frames explicitly instead of treating them as scan-only boundaries.
-            UWOP_PUSH_MACHFRAME => return None,
+            UWOP_PUSH_MACHFRAME => {
+                // a hardware-pushed trap/interrupt frame in iretq layout. op_info
+                // == 1 means a CPU error code sits below it, so step over that to
+                // reach the record: [+0]=rip [+8]=cs [+16]=eflags [+24]=rsp [+32]=ss
+                let base = if slot.op_info == 1 {
+                    context.rsp.saturating_add(8)
+                } else {
+                    context.rsp
+                };
+                let return_rip = self.memory.read::<u64>(VirtAddr(base)).ok()?;
+                let return_rsp = self
+                    .memory
+                    .read::<u64>(VirtAddr(base.saturating_add(24)))
+                    .ok()?;
+                context.rip = return_rip;
+                context.rsp = return_rsp;
+                return Some(UnwindStep::MachineFrame);
+            }
             _ => return None,
         }
 
-        Some(())
+        Some(UnwindStep::Continue)
     }
 
     fn scan_stack(&mut self, start_rsp: u64, seen: &HashSet<u64>) -> Vec<(u64, u64)> {
@@ -530,6 +722,55 @@ impl<'a> StackTracer<'a> {
         self.modules.get(&(module.dtb, module.info.base_address.0))
     }
 
+    /// A cheap clone of the cached image handle for the module containing
+    /// `address` (the module must already be loaded).
+    fn module_image(&self, address: u64) -> Option<Arc<PeImage>> {
+        let module = self.trace.module_for_address(address)?;
+        self.modules
+            .get(&(module.dtb, module.info.base_address.0))
+            .map(|cached| cached.image.clone())
+    }
+
+    /// Replace a module's holed in-memory image with the complete on-disk one,
+    /// downloading it if needed. Returns whether the cache now holds a complete
+    /// image. No-op (false) when the image is already complete or the on-disk
+    /// fetch fails (non-Microsoft module, offline); the caller then degrades to
+    /// a stack scan.
+    fn upgrade_module_image(&mut self, address: u64) -> bool {
+        let Some(module) = self.trace.module_for_address(address) else {
+            return false;
+        };
+        let key = (module.dtb, module.info.base_address.0);
+
+        let disk = {
+            let Some(cached) = self.modules.get(&key) else {
+                return false;
+            };
+            if cached.image.is_complete() {
+                return false;
+            }
+            self.load_on_disk_image(&cached.image, &module.info)
+        };
+        let Some(disk) = disk else {
+            return false;
+        };
+
+        unwind_trace!(
+            "unwind: recovered on-disk image for {} (in-memory unwind data paged out)",
+            module.info.short_name
+        );
+        let executable_ranges = executable_ranges(&disk);
+        self.modules.insert(
+            key,
+            CachedModule {
+                info: module.info.clone(),
+                image: Arc::new(disk),
+                executable_ranges,
+            },
+        );
+        true
+    }
+
     fn ensure_module_loaded(&mut self, module: &OwnedModule) -> Option<()> {
         let key = (module.dtb, module.info.base_address.0);
         if self.modules.contains_key(&key) {
@@ -538,57 +779,151 @@ impl<'a> StackTracer<'a> {
 
         let image_memory = AddressSpace::new(self.kvm, module.dtb);
         let image = read_pe_image(module.info.base_address, &image_memory).ok()?;
-        let view = PeView::from_bytes(&image).ok()?;
-        let executable_ranges = view
-            .section_headers()
-            .iter()
-            .filter_map(|section| {
-                if section.Characteristics & IMAGE_SCN_MEM_EXECUTE == 0 {
-                    return None;
-                }
-
-                let size = section.VirtualSize.max(section.SizeOfRawData);
-                if size == 0 {
-                    return None;
-                }
-
-                Some((
-                    section.VirtualAddress,
-                    section.VirtualAddress.saturating_add(size),
-                ))
-            })
-            .collect();
+        let executable_ranges = executable_ranges(&image);
 
         self.modules.insert(
             key,
             CachedModule {
                 info: module.info.clone(),
-                image,
+                image: Arc::new(image),
                 executable_ranges,
             },
         );
 
         Some(())
     }
+
+    /// Download (if needed) and load the module's complete on-disk PE image,
+    /// matched by the in-memory header's TimeDateStamp + SizeOfImage. The caller
+    /// re-resolves against it to decide whether it actually recovered anything.
+    fn load_on_disk_image(&self, image: &PeImage, info: &ModuleInfo) -> Option<PeImage> {
+        let view = PeView::from_bytes(image.as_slice()).ok()?;
+        let time_date_stamp = view.file_header().TimeDateStamp;
+        let size_of_image = view.optional_header().SizeOfImage;
+
+        let path = self
+            .symbols
+            .ensure_module_image_on_disk(&info.name, time_date_stamp, size_of_image)
+            .ok()?;
+        read_pe_image_from_file(&path).ok()
+    }
 }
 
-fn parse_unwind_info(image: &[u8], unwind_rva: u32) -> Option<ParsedUnwindInfo> {
+/// The `[start, end)` RVA ranges of a module's executable sections (used to
+/// validate scan candidates).
+fn executable_ranges(image: &PeImage) -> Vec<(u32, u32)> {
+    let Ok(view) = PeView::from_bytes(image.as_slice()) else {
+        return Vec::new();
+    };
+    view.section_headers()
+        .iter()
+        .filter_map(|section| {
+            if section.Characteristics & IMAGE_SCN_MEM_EXECUTE == 0 {
+                return None;
+            }
+            let size = section.VirtualSize.max(section.SizeOfRawData);
+            if size == 0 {
+                return None;
+            }
+            Some((
+                section.VirtualAddress,
+                section.VirtualAddress.saturating_add(size),
+            ))
+        })
+        .collect()
+}
+
+/// Resolution of an rip against a module's unwind tables.
+enum Resolve {
+    /// A genuine leaf: the `.pdata` table is readable but has no entry covering
+    /// the rip (a function with no prologue to undo).
+    Leaf,
+    /// An entry was found and its unwind data is resident.
+    Function { unwind_data: u32, begin: u32 },
+    /// The lookup was blocked by a paged-out hole in `.pdata` or `.xdata`; an
+    /// on-disk image could recover it.
+    Holed,
+}
+
+/// Resolve `rip` against the image's unwind tables, distinguishing a true leaf
+/// from a paged-out hole so the caller knows whether an on-disk image would help.
+fn resolve_function(image: &PeImage, base_address: u64, rip: u64) -> Resolve {
+    let Ok(view) = PeView::from_bytes(image.as_slice()) else {
+        return Resolve::Leaf;
+    };
+    let Ok(exception) = view.exception() else {
+        return Resolve::Leaf;
+    };
+
+    let rva = (rip - base_address) as u32;
+    match lookup_runtime_function(exception.image(), rva) {
+        // an entry is only usable if its unwind info (`.xdata`) is resident too
+        Some(function) if image.is_present(function.UnwindData as usize, 4) => Resolve::Function {
+            unwind_data: function.UnwindData,
+            begin: function.BeginAddress,
+        },
+        Some(_) => Resolve::Holed,
+        None => {
+            // no entry: a true leaf if the table is resident, otherwise the table
+            // itself is holed
+            let pdata_present = view
+                .data_directory()
+                .get(IMAGE_DIRECTORY_ENTRY_EXCEPTION)
+                .map(|d| {
+                    d.Size == 0 || image.is_present(d.VirtualAddress as usize, d.Size as usize)
+                })
+                .unwrap_or(true);
+            if pdata_present {
+                Resolve::Leaf
+            } else {
+                Resolve::Holed
+            }
+        }
+    }
+}
+
+/// Find the runtime function whose `[BeginAddress, EndAddress)` range covers
+/// `rva`, by binary search over the (sorted) `.pdata` table. Replaces pelite
+/// 0.10's `lookup_function_entry`, whose comparator is inverted and misses.
+fn lookup_runtime_function(functions: &[RUNTIME_FUNCTION], rva: u32) -> Option<&RUNTIME_FUNCTION> {
+    functions
+        .binary_search_by(|rf| {
+            if rva < rf.BeginAddress {
+                Ordering::Greater
+            } else if rva >= rf.EndAddress {
+                Ordering::Less
+            } else {
+                Ordering::Equal
+            }
+        })
+        .ok()
+        .map(|index| &functions[index])
+}
+
+fn parse_unwind_info(image: &PeImage, unwind_rva: u32) -> Option<ParsedUnwindInfo> {
+    // every read goes through `present_slice`, so unwind data that lands in a
+    // paged-out hole returns None (fall back to scan) rather than being parsed as
+    // zeros and fabricating a frame
     let offset = unwind_rva as usize;
-    let header = image.get(offset..offset + 4)?;
+    let header = image.present_slice(offset, 4)?;
     let version_flags = header[0];
     let count_of_codes = header[2] as usize;
     let frame_register_offset = header[3];
 
     let codes_offset = offset + 4;
-    let codes_end = codes_offset.checked_add(count_of_codes.checked_mul(2)?)?;
-    let codes_bytes = image.get(codes_offset..codes_end)?;
+    let codes_bytes = image.present_slice(codes_offset, count_of_codes.checked_mul(2)?)?;
 
     let aligned_code_count = (count_of_codes + 1) & !1;
     let tail_offset = offset + 4 + aligned_code_count * 2;
-    let chain_info = (version_flags >> 3) & UNW_FLAG_CHAININFO != 0;
-    if chain_info && image.get(tail_offset..tail_offset + 12).is_none() {
-        return None;
-    }
+    let chained_unwind_data = if (version_flags >> 3) & UNW_FLAG_CHAININFO != 0 {
+        // a chained entry is followed by the parent RUNTIME_FUNCTION
+        // (BeginAddress, EndAddress, UnwindInfoAddress); only the parent's
+        // unwind-data RVA is needed to keep walking the chain
+        let tail = image.present_slice(tail_offset, 12)?;
+        Some(u32::from_le_bytes([tail[8], tail[9], tail[10], tail[11]]))
+    } else {
+        None
+    };
 
     let mut codes = Vec::with_capacity(count_of_codes);
     for raw in codes_bytes.chunks_exact(2) {
@@ -605,7 +940,7 @@ fn parse_unwind_info(image: &[u8], unwind_rva: u32) -> Option<ParsedUnwindInfo> 
         frame_register: frame_register_offset & 0x0f,
         frame_offset: frame_register_offset >> 4,
         codes,
-        chain_info,
+        chained_unwind_data,
     })
 }
 
@@ -620,7 +955,8 @@ fn frame_base(context: &RegisterContext, unwind_info: &ParsedUnwindInfo) -> Opti
 
 fn unwind_slot_count(unwind_op: u8, op_info: u8) -> usize {
     match unwind_op {
-        UWOP_PUSH_NONVOL | UWOP_ALLOC_SMALL | UWOP_SET_FPREG | UWOP_PUSH_MACHFRAME => 1,
+        UWOP_PUSH_NONVOL | UWOP_ALLOC_SMALL | UWOP_SET_FPREG | UWOP_PUSH_MACHFRAME
+        | UWOP_EPILOG => 1,
         UWOP_ALLOC_LARGE => {
             if op_info == 0 {
                 2
@@ -629,7 +965,7 @@ fn unwind_slot_count(unwind_op: u8, op_info: u8) -> usize {
             }
         }
         UWOP_SAVE_NONVOL | UWOP_SAVE_XMM128 => 2,
-        UWOP_SAVE_NONVOL_FAR | UWOP_SAVE_XMM128_FAR => 3,
+        UWOP_SAVE_NONVOL_FAR | UWOP_SAVE_XMM128_FAR | UWOP_SPARE_CODE => 3,
         _ => 0,
     }
 }
@@ -642,9 +978,66 @@ fn slot_u16(codes: &[UnwindCodeSlot], index: usize) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FrameSource, ParsedUnwindInfo, RegisterContext, StackFrame, StackTrace, UnwindCodeSlot,
-        frame_base, record_stack_frame, slot_u16, unwind_slot_count,
+        FrameSource, ParsedUnwindInfo, PeImage, RUNTIME_FUNCTION, RegisterContext, StackFrame,
+        StackTrace, UnwindCodeSlot, frame_base, lookup_runtime_function, parse_unwind_info,
+        record_stack_frame, slot_u16, unwind_slot_count,
     };
+
+    #[test]
+    fn lookup_runtime_function_resolves_across_a_large_sorted_table() {
+        // entries [i*0x100, i*0x100+0x40) with a gap before the next; the
+        // lower-half hits are exactly what pelite's inverted comparator missed
+        let funcs: Vec<RUNTIME_FUNCTION> = (0..64u32)
+            .map(|i| RUNTIME_FUNCTION {
+                BeginAddress: i * 0x100,
+                EndAddress: i * 0x100 + 0x40,
+                UnwindData: i,
+            })
+            .collect();
+
+        assert_eq!(
+            lookup_runtime_function(&funcs, 0x0).unwrap().BeginAddress,
+            0x0
+        );
+        assert_eq!(
+            lookup_runtime_function(&funcs, 0x310).unwrap().BeginAddress,
+            0x300
+        );
+        assert_eq!(
+            lookup_runtime_function(&funcs, 0x3f00)
+                .unwrap()
+                .BeginAddress,
+            0x3f00
+        );
+        // an address in the gap between two functions resolves to nothing
+        assert!(lookup_runtime_function(&funcs, 0x350).is_none());
+        // past the end of the table
+        assert!(lookup_runtime_function(&funcs, 0x10000).is_none());
+    }
+
+    #[test]
+    fn parse_unwind_info_reads_chained_parent() {
+        // version 1 with UNW_FLAG_CHAININFO (0x4), no prolog, zero codes; the
+        // parent RUNTIME_FUNCTION (begin, end, unwind-data) follows the header
+        let blob = [
+            0x21, 0x00, 0x00, 0x00, // ver/flags=chaininfo, prolog, count, frame
+            0x00, 0x10, 0x00, 0x00, // BeginAddress = 0x1000
+            0x00, 0x11, 0x00, 0x00, // EndAddress   = 0x1100
+            0x00, 0x20, 0x00, 0x00, // UnwindData   = 0x2000
+        ];
+        let info =
+            parse_unwind_info(&PeImage::complete(blob.to_vec()), 0).expect("unwind info parses");
+        assert_eq!(info.chained_unwind_data, Some(0x2000));
+    }
+
+    #[test]
+    fn parse_unwind_info_without_chain_flag_has_no_parent() {
+        // version 1, no flags, no codes
+        let blob = [0x01, 0x00, 0x00, 0x00];
+        let info =
+            parse_unwind_info(&PeImage::complete(blob.to_vec()), 0).expect("unwind info parses");
+        assert_eq!(info.chained_unwind_data, None);
+    }
 
     #[test]
     fn slot_count_matches_opcode_encoding() {
@@ -653,6 +1046,8 @@ mod tests {
         assert_eq!(unwind_slot_count(1, 1), 3);
         assert_eq!(unwind_slot_count(4, 0), 2);
         assert_eq!(unwind_slot_count(5, 0), 3);
+        assert_eq!(unwind_slot_count(6, 0), 1); // UWOP_EPILOG
+        assert_eq!(unwind_slot_count(7, 0), 3); // UWOP_SPARE_CODE
     }
 
     #[test]
@@ -690,7 +1085,7 @@ mod tests {
             frame_register: 5,
             frame_offset: 2,
             codes: Vec::new(),
-            chain_info: false,
+            chained_unwind_data: None,
         };
 
         assert_eq!(frame_base(&context, &unwind), Some(0x1fe0));

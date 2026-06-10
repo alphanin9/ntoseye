@@ -3,6 +3,7 @@ use crate::memory::{
 };
 use owo_colors::OwoColorize;
 use std::fmt;
+use std::ops::{Add, AddAssign, Sub, SubAssign};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 #[derive(
@@ -36,19 +37,19 @@ impl From<u32> for VirtAddr {
     }
 }
 
-impl std::ops::AddAssign<u64> for VirtAddr {
+impl AddAssign<u64> for VirtAddr {
     fn add_assign(&mut self, rhs: u64) {
         *self += VirtAddr(rhs);
     }
 }
 
-impl std::ops::SubAssign<u64> for VirtAddr {
+impl SubAssign<u64> for VirtAddr {
     fn sub_assign(&mut self, rhs: u64) {
         *self -= VirtAddr(rhs);
     }
 }
 
-impl std::ops::Add<u64> for VirtAddr {
+impl Add<u64> for VirtAddr {
     type Output = Self;
 
     fn add(self, rhs: u64) -> Self::Output {
@@ -56,7 +57,7 @@ impl std::ops::Add<u64> for VirtAddr {
     }
 }
 
-impl std::ops::Sub<u64> for VirtAddr {
+impl Sub<u64> for VirtAddr {
     type Output = Self;
 
     fn sub(self, rhs: u64) -> Self::Output {
@@ -64,7 +65,7 @@ impl std::ops::Sub<u64> for VirtAddr {
     }
 }
 
-impl std::ops::Add<u32> for VirtAddr {
+impl Add<u32> for VirtAddr {
     type Output = Self;
 
     fn add(self, rhs: u32) -> Self::Output {
@@ -72,7 +73,7 @@ impl std::ops::Add<u32> for VirtAddr {
     }
 }
 
-impl std::ops::Sub<u32> for VirtAddr {
+impl Sub<u32> for VirtAddr {
     type Output = Self;
 
     fn sub(self, rhs: u32) -> Self::Output {
@@ -217,9 +218,23 @@ macro_rules! impl_colored_fmt {
     };
 }
 
-impl_colored_fmt!(
+/// Plain forwarding to the inner value's formatting; no styling. Domain types
+/// stay presentation-free; all address coloring lives in the `ui` module
+/// (`ui::addr`), so a `VirtAddr` formatted with `{:#x}` is just plain hex
+macro_rules! impl_plain_fmt {
+    ($t:ty, $($trait:path),+) => {
+        $(
+            impl $trait for $t {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    <_ as $trait>::fmt(&self.0, f)
+                }
+            }
+        )*
+    };
+}
+
+impl_plain_fmt!(
     VirtAddr,
-    yellow,
     fmt::Display,
     fmt::LowerHex,
     fmt::UpperHex,

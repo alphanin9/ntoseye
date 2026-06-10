@@ -1,5 +1,8 @@
+use std::num::ParseIntError;
 use std::path::PathBuf;
 
+use hex::FromHexError;
+use indicatif::style::TemplateError;
 use thiserror::Error;
 
 use crate::types::{PhysAddr, VirtAddr};
@@ -23,13 +26,13 @@ pub enum Error {
     PeLite(#[from] pelite::Error),
 
     #[error(transparent)]
-    ParseInt(#[from] core::num::ParseIntError),
+    ParseInt(#[from] ParseIntError),
 
     #[error(transparent)]
-    Hex(#[from] hex::FromHexError),
+    Hex(#[from] FromHexError),
 
     #[error(transparent)]
-    Indicatif(#[from] indicatif::style::TemplateError),
+    Indicatif(#[from] TemplateError),
 
     #[error(transparent)]
     CtrlC(#[from] ctrlc::Error),
@@ -39,6 +42,9 @@ pub enum Error {
 
     #[error("KD protocol failure: {0}")]
     Kd(String),
+
+    #[error("KD protocol failure: kernel returned NTSTATUS {ntstatus:#x} for api {api:#x}")]
+    KdStatus { ntstatus: u32, api: u32 },
 
     #[error("Register '{0}' not found")]
     RegisterNotFound(String),
@@ -80,6 +86,9 @@ pub enum Error {
     #[error("Field '{0}' not found")]
     FieldNotFound(String),
 
+    #[error("Field '{0}' is not a {1}")]
+    FieldTypeMismatch(String, String),
+
     #[error("Invalid expression: {0}")]
     InvalidExpression(String),
 
@@ -88,9 +97,6 @@ pub enum Error {
 
     #[error("Process missing PEB (kernel process?)")]
     MissingPEB,
-
-    #[error("Process missing LDR")]
-    MissingLDR,
 
     #[error("Process missing ImageBase")]
     MissingImageBase,
@@ -115,7 +121,7 @@ pub enum Error {
     #[error("Another instance of ntoseye is running")]
     AlreadyRunning,
 
-    #[error("Data doesn't find in buffer")]
+    #[error("Data doesn't fit in buffer")]
     BufferNotEnough,
 
     #[error("Invalid range")]
