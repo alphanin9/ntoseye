@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -7,11 +7,15 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::backend::MemoryOps;
-use crate::dbg_backend::DebugBackend;
-use crate::debugger::{AttachReport, DebuggerContext, DriverObjectInfo};
+use crate::bugchecks::{GENERIC_BUGCHECK_ARGS, bugcheck_descriptor};
+use crate::dbg_backend::{DebugBackend, StopEvent};
+use crate::debugger::{
+    AttachReport, DebuggerContext, DriverObjectInfo, MemoryRegionInfo, ThreadInfo, UserVar,
+    kthread_state_name, wait_reason_name,
+};
 use crate::error::{Error, Result};
 use crate::expr::Expr;
-use crate::gdb::{Breakpoint, BreakpointKind};
+use crate::gdb::{Breakpoint, BreakpointKind, BreakpointManager};
 use crate::guest::{ModuleInfo, ModuleSymbolLoadReport};
 use crate::inspect::descriptors::{
     GdtEntry, gdt_type_label, parse_gdtr_from_qemu_registers, parse_idtr_from_qemu_registers,
@@ -23,14 +27,21 @@ use crate::inspect::pool::{
     BigPoolEntry, PoolHeader, annotate_near_symbol, classify_pool_region, find_big_pool,
     locate_pool_block_in_page, pool_block_state, pool_layout, segment_heap_hint, tag_string,
 };
+use crate::repl::{
+    processor_index_from_backend_thread_id, refresh_windows_thread_context_for_backend_thread,
+    stop_event_requires_target_reload,
+};
 use crate::script::{LoadReport, ScriptHost, ScriptOutput};
 use crate::session::{DebuggerSession, StopOutcome};
 use crate::symbols::{ParsedType, TypeInfo};
 use crate::types::VirtAddr;
-use crate::unwind::{FrameSource, build_stacktrace};
+use crate::unwind::{
+    FrameSource, build_stacktrace, preferred_code_dtb, resolve_thread_trace_context,
+};
 
 use iced_x86::{
-    Code, Decoder, DecoderOptions, Formatter, Instruction, MemorySizeOptions, NasmFormatter,
+    Code, Decoder, DecoderOptions, Formatter, Instruction, MemorySizeOptions, Mnemonic,
+    NasmFormatter,
 };
 
 #[derive(Debug, Deserialize)]
@@ -68,6 +79,12 @@ struct AgentRequest {
     selector: Option<String>,
     #[serde(default)]
     path: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 struct AgentSession<'a> {
@@ -147,9 +164,11 @@ impl AgentSession<'_> {
     fn handle(&mut self, request: AgentRequest) -> Result<Value> {
         match request.command.as_str() {
             "status" => Ok(self.status()),
+            "capabilities" => Ok(self.capabilities()),
             "eval" => {
                 let expr = required(request.expr, "expr")?;
                 let address = self.eval_address(expr)?;
+                self.debugger.set_results(vec![address.0], "eval");
                 Ok(json!({ "address": fmt_addr(address.0) }))
             }
             "registers" => self.registers(),
@@ -169,14 +188,22 @@ impl AgentSession<'_> {
             "drivers" => self.drivers(request.filter),
             "processes" | "ps" => self.processes(request.filter),
             "modules" | "lm" => self.modules(request.filter),
+            "vmmap" => self.vmmap(request),
+            "symbols.search" | "symbol.search" | "x" => self.search_symbols(request),
+            "symbols.nearest" | "symbol.nearest" | "ln" => self.nearest_symbol(request),
+            "variables" | "vars" => Ok(self.variables()),
+            "variable.set" | "set" => self.set_variable(request),
+            "variable.unset" | "unset" => self.unset_variable(request),
             "load-symbols" | "symbols.load" => self.load_symbols(request),
             "attach" => self.attach(request.pid),
             "detach" => {
                 self.debugger.detach();
                 Ok(self.status())
             }
-            "thread" | "thread.set" => self.set_thread(required(request.thread, "thread")?),
-            "threads" => self.threads(),
+            "vcpus" => self.vcpus(),
+            "vcpu" | "vcpu.set" => self.set_vcpu(required(request.thread, "thread")?),
+            "threads" => self.windows_threads(request.filter),
+            "thread" | "thread.set" => self.set_windows_thread(required(request.thread, "thread")?),
             "breakpoint.set" | "bp.set" => self.set_breakpoint(request),
             "breakpoint.clear" | "bp.clear" => self.clear_breakpoint(request.breakpoint),
             "breakpoint.disable" | "bp.disable" => self.disable_breakpoint(request.breakpoint),
@@ -185,6 +212,8 @@ impl AgentSession<'_> {
             "continue" | "go" => self.continue_execution(request.timeout_ms),
             "interrupt" | "break" => self.interrupt(),
             "step" | "si" => self.step(),
+            "step.over" | "p" | "ni" => self.step_over(request.timeout_ms),
+            "step.out" | "gu" | "finish" => self.step_out(request.timeout_ms),
             "qcmd" => {
                 let command = required(request.expr, "expr")?;
                 self.client
@@ -248,9 +277,22 @@ impl AgentSession<'_> {
 
         json!({
             "running": self.client.is_running(),
+            "current_vcpu": self.session.current_thread,
             "current_thread": self.session.current_thread,
             "current_dtb": fmt_addr(self.debugger.current_dtb()),
             "current_process": process,
+            "current_windows_thread": self.debugger.current_windows_thread.as_ref().map(
+                |thread| thread_json(thread, Some(&self.session.current_thread))
+            ),
+        })
+    }
+
+    fn capabilities(&self) -> Value {
+        json!({
+            "capabilities": self.client.capabilities().into_iter().map(|entry| json!({
+                "name": entry.capability.label(),
+                "supported": entry.supported,
+            })).collect::<Vec<_>>()
         })
     }
 
@@ -750,6 +792,190 @@ impl AgentSession<'_> {
         }))
     }
 
+    fn vmmap(&mut self, request: AgentRequest) -> Result<Value> {
+        if self.client.is_running() {
+            return Err(Error::InvalidExpression("VM is running".into()));
+        }
+
+        let filter = request.filter.or(request.expr);
+        let filter_address = filter
+            .as_ref()
+            .and_then(|value| self.eval_address(value.clone()).ok());
+        if let Some(process) = self.debugger.current_process_info.clone() {
+            let regions = self
+                .debugger
+                .enumerate_vad_regions_for_process_info(&process)?
+                .into_iter()
+                .filter(|region| region_matches_filter(region, filter.as_deref(), filter_address))
+                .map(memory_region_json)
+                .collect::<Vec<_>>();
+            return Ok(json!({
+                "context": "process",
+                "pid": process.pid,
+                "name": process.name,
+                "regions": regions,
+            }));
+        }
+
+        let filter_lower = filter.as_deref().map(str::to_ascii_lowercase);
+        let regions = self
+            .debugger
+            .guest
+            .kernel_modules()?
+            .into_iter()
+            .filter(|module| {
+                filter_lower.as_ref().is_none_or(|filter| {
+                    module.short_name.to_ascii_lowercase().contains(filter)
+                        || module.name.to_ascii_lowercase().contains(filter)
+                        || filter_address.is_some_and(|address| module.contains_address(address))
+                })
+            })
+            .map(|module| {
+                json!({
+                    "start": fmt_addr(module.base_address.0),
+                    "end": fmt_addr(module.end_address().0),
+                    "size": module.size,
+                    "module": module.short_name,
+                    "image": module.name,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({ "context": "kernel", "regions": regions }))
+    }
+
+    fn search_symbols(&mut self, request: AgentRequest) -> Result<Value> {
+        let query = required(request.query.or(request.expr), "query")?;
+        let limit = request.limit.unwrap_or(4096).max(1);
+        let dtb = self.debugger.current_dtb();
+        let (module_filter, names) = match query.split_once('!') {
+            Some((module, query)) => (
+                Some(module.to_string()),
+                self.debugger
+                    .symbols
+                    .search_symbols_in_module(dtb, module, query, limit),
+            ),
+            None => (
+                None,
+                self.debugger.current_symbol_index().search(&query, limit),
+            ),
+        };
+
+        let mut results = Vec::new();
+        let mut addresses = Vec::new();
+        for name in names {
+            let lookup = module_filter
+                .as_ref()
+                .map(|module| format!("{module}!{name}"))
+                .unwrap_or_else(|| name.clone());
+            if let Some((address, module)) =
+                self.debugger.symbols.find_symbol_with_module(dtb, &lookup)
+            {
+                addresses.push(address.0);
+                results.push(json!({
+                    "address": fmt_addr(address.0),
+                    "module": module,
+                    "name": name,
+                    "symbol": format!("{module}!{name}"),
+                }));
+            }
+        }
+        self.debugger
+            .set_results(addresses, format!("symbol.search {query}"));
+        Ok(json!({
+            "query": query,
+            "limit": limit,
+            "truncated": results.len() >= limit,
+            "symbols": results,
+        }))
+    }
+
+    fn nearest_symbol(&mut self, request: AgentRequest) -> Result<Value> {
+        let expression = required(request.address.or(request.expr), "address")?;
+        let address = self.eval_address(expression)?;
+        let result = self
+            .debugger
+            .symbols
+            .find_closest_symbol_for_address(self.debugger.current_dtb(), address)
+            .map(|(module, name, offset)| {
+                let base = address.0.saturating_sub(offset as u64);
+                self.debugger.set_results(vec![base], "symbol.nearest");
+                json!({
+                    "address": fmt_addr(address.0),
+                    "base": fmt_addr(base),
+                    "module": module,
+                    "name": name,
+                    "offset": offset,
+                    "symbol": if offset == 0 {
+                        format!("{module}!{name}")
+                    } else {
+                        format!("{module}!{name}+0x{offset:x}")
+                    },
+                })
+            });
+        Ok(json!({ "result": result }))
+    }
+
+    fn variables(&self) -> Value {
+        let mut user = self
+            .debugger
+            .user_vars
+            .iter()
+            .map(|(name, variable)| {
+                json!({
+                    "name": name,
+                    "value": fmt_addr(variable.value),
+                    "source": variable.source,
+                })
+            })
+            .collect::<Vec<_>>();
+        user.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        json!({
+            "user": user,
+            "results": self.debugger.results.iter().enumerate().map(|(index, value)| json!({
+                "name": format!("${index}"),
+                "value": fmt_addr(*value),
+            })).collect::<Vec<_>>(),
+            "results_origin": self.debugger.results_origin,
+            "builtins": self.debugger.builtin_variables().into_iter().map(|variable| json!({
+                "name": variable.name,
+                "value": fmt_addr(variable.value),
+                "source": variable.source,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    fn set_variable(&mut self, request: AgentRequest) -> Result<Value> {
+        let raw_name = required(request.name, "name")?;
+        let name = raw_name.trim().trim_start_matches('$');
+        let valid = name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid {
+            return Err(Error::InvalidExpression(format!(
+                "invalid variable name '${name}'"
+            )));
+        }
+        let source = required(request.expr, "expr")?;
+        let value = self.eval_address(source.clone())?;
+        self.debugger.user_vars.insert(
+            name.to_string(),
+            UserVar {
+                value: value.0,
+                source,
+            },
+        );
+        Ok(json!({ "name": format!("${name}"), "value": fmt_addr(value.0) }))
+    }
+
+    fn unset_variable(&mut self, request: AgentRequest) -> Result<Value> {
+        let raw_name = required(request.name.or(request.expr), "name")?;
+        let name = raw_name.trim().trim_start_matches('$');
+        let removed = self.debugger.user_vars.remove(name).is_some();
+        Ok(json!({ "name": format!("${name}"), "removed": removed }))
+    }
+
     fn load_symbols(&mut self, request: AgentRequest) -> Result<Value> {
         let path = required(request.path.or(request.expr), "path")?;
         let report = load_symbols_from_directory(
@@ -780,14 +1006,158 @@ impl AgentSession<'_> {
         }))
     }
 
-    fn threads(&mut self) -> Result<Value> {
-        Ok(json!({ "threads": self.client.get_thread_list()? }))
+    fn active_windows_threads(&mut self) -> HashMap<u64, (String, ThreadInfo)> {
+        let Ok(original_vcpu) = self.client.get_stopped_thread_id() else {
+            return HashMap::new();
+        };
+        let Ok(vcpus) = self.client.get_thread_list() else {
+            return HashMap::new();
+        };
+        let mut active = HashMap::new();
+        for vcpu in &vcpus {
+            if self.client.set_current_thread(vcpu).is_err() {
+                continue;
+            }
+            let Some(processor) = backend_processor_index(vcpu) else {
+                continue;
+            };
+            if let Ok(thread) = self
+                .debugger
+                .current_windows_thread_for_processor(processor)
+            {
+                active.insert(thread.ethread.0, (vcpu.clone(), thread));
+            }
+        }
+        let _ = self.client.set_current_thread(&original_vcpu);
+        active
     }
 
-    fn set_thread(&mut self, thread: String) -> Result<Value> {
-        self.client.set_current_thread(&thread)?;
-        self.session.current_thread = thread;
+    fn vcpus(&mut self) -> Result<Value> {
+        if self.client.is_running() {
+            return Err(Error::InvalidExpression("VM is running".into()));
+        }
+        let original_vcpu = self.client.get_stopped_thread_id().ok();
+        let mut rows = Vec::new();
+        for vcpu in self.client.get_thread_list()? {
+            let mut row = json!({ "id": vcpu });
+            if self.client.set_current_thread(&vcpu).is_ok()
+                && let Ok(regs) = self.client.read_registers()
+            {
+                let rip = self.session.register_map.read_u64("rip", &regs).ok();
+                let cr3 = self.session.register_map.read_u64("cr3", &regs).ok();
+                row["rip"] = json!(rip.map(fmt_addr));
+                row["cr3"] = json!(cr3.map(fmt_addr));
+                row["symbol"] = json!(rip.and_then(|rip| self.format_symbol(VirtAddr(rip))));
+                if let Some(processor) = backend_processor_index(&vcpu)
+                    && let Ok(thread) = self
+                        .debugger
+                        .current_windows_thread_for_processor(processor)
+                {
+                    row["windows_thread"] = thread_json(&thread, Some(&vcpu));
+                }
+            }
+            rows.push(row);
+        }
+        if let Some(vcpu) = original_vcpu {
+            let _ = self.client.set_current_thread(&vcpu);
+        }
+        Ok(json!({ "vcpus": rows }))
+    }
+
+    fn set_vcpu(&mut self, vcpu: String) -> Result<Value> {
+        let vcpus = self.client.get_thread_list()?;
+        if !vcpus.iter().any(|candidate| candidate == &vcpu) {
+            return Err(Error::InvalidExpression(format!("vCPU '{vcpu}' not found")));
+        }
+        self.client.set_current_thread(&vcpu)?;
+        self.session.current_thread = vcpu;
+        refresh_windows_thread_context_for_backend_thread(
+            self.debugger,
+            &self.session.current_thread,
+        );
         Ok(self.status())
+    }
+
+    fn windows_threads(&mut self, filter: Option<String>) -> Result<Value> {
+        if self.client.is_running() {
+            return Err(Error::InvalidExpression("VM is running".into()));
+        }
+        let active = self.active_windows_threads();
+        let mut threads = self.debugger.enumerate_threads()?;
+        for (_, thread) in active.values() {
+            if !threads.iter().any(|known| known.ethread == thread.ethread) {
+                threads.push(thread.clone());
+            }
+        }
+        if let Some(filter) = filter.as_deref() {
+            threads.retain(|thread| windows_thread_matches(thread, filter));
+        }
+        threads.sort_by_key(|thread| (thread.pid.unwrap_or(u64::MAX), thread.tid));
+        Ok(json!({
+            "threads": threads.into_iter().map(|thread| {
+                let active_vcpu = active.get(&thread.ethread.0).map(|(vcpu, _)| vcpu.as_str());
+                thread_json(&thread, active_vcpu)
+            }).collect::<Vec<_>>()
+        }))
+    }
+
+    fn set_windows_thread(&mut self, target: String) -> Result<Value> {
+        if self.client.is_running() {
+            return Err(Error::InvalidExpression("VM is running".into()));
+        }
+        let active = self.active_windows_threads();
+        let mut threads = self.debugger.enumerate_threads()?;
+        for (_, thread) in active.values() {
+            if !threads.iter().any(|known| known.ethread == thread.ethread) {
+                threads.push(thread.clone());
+            }
+        }
+        let target_address = if target == "." {
+            self.debugger
+                .current_windows_thread
+                .as_ref()
+                .map(|thread| thread.ethread)
+        } else {
+            self.eval_address(target.clone()).ok()
+        };
+        let matches = threads
+            .into_iter()
+            .filter(|thread| {
+                thread
+                    .tid
+                    .is_some_and(|tid| tid.to_string() == target || format!("{tid:#x}") == target)
+                    || target_address.is_some_and(|address| address == thread.ethread)
+                    || format!("{:#x}", thread.ethread.0) == target
+                    || format!("{:x}", thread.ethread.0) == target.trim_start_matches("0x")
+            })
+            .collect::<Vec<_>>();
+        let thread = match matches.as_slice() {
+            [thread] => thread.clone(),
+            [] => {
+                return Err(Error::InvalidExpression(format!(
+                    "no Windows thread matches '{target}'"
+                )));
+            }
+            _ => {
+                return Err(Error::InvalidExpression(format!(
+                    "ambiguous Windows thread '{target}': {} matches",
+                    matches.len()
+                )));
+            }
+        };
+        let active_vcpu = active.get(&thread.ethread.0).map(|(vcpu, _)| vcpu.clone());
+        if let Some(vcpu) = &active_vcpu {
+            self.client.set_current_thread(vcpu)?;
+            self.session.current_thread = vcpu.clone();
+            self.debugger.clear_context_dtb_override();
+            self.debugger
+                .set_current_windows_thread_context(thread.clone());
+        }
+        Ok(json!({
+            "selected": active_vcpu.is_some(),
+            "vcpu": active_vcpu,
+            "thread": thread_json(&thread, active_vcpu.as_deref()),
+        }))
     }
 
     fn set_breakpoint(&mut self, request: AgentRequest) -> Result<Value> {
@@ -893,39 +1263,116 @@ impl AgentSession<'_> {
             return Ok(json!({ "running": true }));
         };
 
-        // Poll for a stop within the timeout budget, silently stepping over
-        // wrong-process int3 hits and resuming until a real stop or the
-        // deadline.
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        self.wait_for_stop(Some(Duration::from_millis(timeout_ms)))
+    }
+
+    fn wait_for_stop(&mut self, timeout: Option<Duration>) -> Result<Value> {
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let Some(event) = self.client.try_wait_for_stop(remaining)? else {
-                return Ok(json!({ "running": true, "stopped": false }));
+            let event = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let Some(event) = self.client.try_wait_for_stop(remaining)? else {
+                        return Ok(json!({ "running": true, "stopped": false }));
+                    };
+                    event
+                }
+                None => self.client.wait_for_stop()?,
             };
 
-            let summary = event.summary.clone();
-            match self
-                .session
-                .process_stop(self.client, self.debugger, &event)?
-            {
-                StopOutcome::Resumed(_) => {
-                    if Instant::now() >= deadline {
-                        return Ok(json!({ "running": true, "stopped": false }));
-                    }
+            match self.process_stop_event(event)? {
+                Some(result) => return Ok(result),
+                None if deadline.is_some_and(|deadline| Instant::now() >= deadline) => {
+                    return Ok(json!({ "running": true, "stopped": false }));
                 }
-                StopOutcome::TargetExited => return self.stop_json(summary, true, None),
-                StopOutcome::Stopped => return self.stop_json(summary, false, None),
-                StopOutcome::Breakpoint(bp) => return self.stop_json(summary, false, Some(&bp)),
+                None => {}
             }
         }
     }
 
-    fn interrupt(&mut self) -> Result<Value> {
-        self.client.interrupt()?;
-        if let Ok(thread) = self.client.get_stopped_thread_id() {
-            self.session.current_thread = thread;
+    fn process_stop_event(&mut self, mut event: StopEvent) -> Result<Option<Value>> {
+        if stop_event_requires_target_reload(self.debugger, &event) {
+            event.target_reloaded = true;
+            if let Some(thread) = event.thread_id.clone() {
+                self.session.current_thread = thread;
+            }
+            let dropped_breakpoints = self.session.breakpoints.list().len();
+            self.session.breakpoints = BreakpointManager::new();
+            let kernel_base_hint = event
+                .target_kernel_base_hint
+                .or_else(|| self.client.target_kernel_base_hint().ok().flatten());
+            let reload = match self
+                .debugger
+                .reload_guest_with_kernel_base_hint(kernel_base_hint)
+            {
+                Ok(report) => {
+                    let rediscovery_complete = report
+                        .startup
+                        .as_ref()
+                        .is_some_and(|startup| !startup.loaded_module_list.is_zero());
+                    if rediscovery_complete {
+                        self.client.note_target_rediscovery_complete();
+                    } else {
+                        self.client.note_target_rediscovery_pending();
+                    }
+                    json!({
+                        "status": if rediscovery_complete { "reloaded" } else { "pending_module_list" },
+                        "previous_kernel_base": fmt_addr(report.previous_base_address.0),
+                        "kernel_base": report.startup.as_ref().map(|startup| fmt_addr(startup.base_address.0)),
+                        "loaded_module_list": report.startup.as_ref().map(|startup| fmt_addr(startup.loaded_module_list.0)),
+                        "symbols": report.symbol_report.map(module_symbol_report_json),
+                        "symbol_error": report.symbol_error,
+                        "dropped_breakpoints": dropped_breakpoints,
+                    })
+                }
+                Err(error) => {
+                    self.client.note_target_rediscovery_pending();
+                    json!({
+                        "status": "pending",
+                        "kernel_base_hint": kernel_base_hint.map(|address| fmt_addr(address.0)),
+                        "error": error.to_string(),
+                        "dropped_breakpoints": dropped_breakpoints,
+                    })
+                }
+            };
+            return Ok(Some(self.stop_json(&event, None, Some(reload))?));
         }
-        Ok(self.status())
+
+        match self
+            .session
+            .process_stop(self.client, self.debugger, &event)?
+        {
+            StopOutcome::Resumed(_) => Ok(None),
+            StopOutcome::TargetExited | StopOutcome::Stopped => {
+                self.refresh_context_after_stop();
+                Ok(Some(self.stop_json(&event, None, None)?))
+            }
+            StopOutcome::Breakpoint(bp) => {
+                self.refresh_context_after_stop();
+                Ok(Some(self.stop_json(&event, Some(&bp), None)?))
+            }
+        }
+    }
+
+    fn refresh_context_after_stop(&mut self) {
+        if let Ok(regs) = self.client.read_registers()
+            && let Ok(cr3) = self.session.register_map.read_u64("cr3", &regs)
+            && cr3 != 0
+        {
+            self.debugger.set_context_dtb_override(cr3);
+        }
+        refresh_windows_thread_context_for_backend_thread(
+            self.debugger,
+            &self.session.current_thread,
+        );
+        let _ = self.debugger.refresh_kernel_module_symbols();
+        let _ = self.client.take_modules_changed();
+    }
+
+    fn interrupt(&mut self) -> Result<Value> {
+        let event = self.client.interrupt()?;
+        self.process_stop_event(event)?
+            .ok_or_else(|| Error::DebugInfo("interrupt stop was automatically resumed".into()))
     }
 
     fn step(&mut self) -> Result<Value> {
@@ -935,7 +1382,101 @@ impl AgentSession<'_> {
 
         // Shared step-over/single-step path (handles sitting on a breakpoint).
         let result = self.session.step(self.client, self.debugger)?;
-        self.stop_json(result.event.summary, result.event.target_exited, None)
+        self.process_stop_event(result.event)?
+            .ok_or_else(|| Error::DebugInfo("step stop was automatically resumed".into()))
+    }
+
+    fn step_over(&mut self, timeout_ms: Option<u64>) -> Result<Value> {
+        let regs = self.current_regs()?;
+        let rip = self.session.register_map.read_u64("rip", &regs)?;
+        let instruction = self.decode_instruction_at_current_rip(&regs)?;
+        if instruction.mnemonic() != Mnemonic::Call {
+            return self.step();
+        }
+        let next_ip = rip.saturating_add(instruction.len() as u64);
+        self.run_to_temporary_breakpoint(VirtAddr(next_ip), timeout_ms)
+    }
+
+    fn step_out(&mut self, timeout_ms: Option<u64>) -> Result<Value> {
+        let regs = self.current_regs()?;
+        let trace = build_stacktrace(self.debugger, &self.session.register_map, &regs, 4);
+        let caller = trace
+            .frames
+            .get(1)
+            .ok_or_else(|| Error::DebugInfo("could not find caller return address".into()))?;
+        if caller.ip == 0 {
+            return Err(Error::DebugInfo("caller return address is null".into()));
+        }
+        self.run_to_temporary_breakpoint(VirtAddr(caller.ip), timeout_ms)
+    }
+
+    fn decode_instruction_at_current_rip(&self, regs: &[u8]) -> Result<Instruction> {
+        let rip = self.session.register_map.read_u64("rip", regs)?;
+        let cr3 = self.session.register_map.read_u64("cr3", regs).unwrap_or(0);
+        let trace = resolve_thread_trace_context(self.debugger, cr3);
+        let code_dtb = preferred_code_dtb(&trace, rip);
+        let mut bytes = [0u8; 16];
+        crate::memory::AddressSpace::new(&self.debugger.kvm, code_dtb)
+            .read_bytes(VirtAddr(rip), &mut bytes)?;
+        self.session
+            .breakpoints
+            .mask_breakpoint_bytes(VirtAddr(rip), &mut bytes, trace.active_dtb);
+        let mut decoder = Decoder::with_ip(64, &bytes, rip, DecoderOptions::NONE);
+        let instruction = decoder.decode();
+        if instruction.code() == Code::INVALID {
+            return Err(Error::DebugInfo(format!(
+                "failed to decode instruction at {rip:#x}"
+            )));
+        }
+        Ok(instruction)
+    }
+
+    fn run_to_temporary_breakpoint(
+        &mut self,
+        address: VirtAddr,
+        timeout_ms: Option<u64>,
+    ) -> Result<Value> {
+        if self
+            .session
+            .breakpoints
+            .enabled_breakpoint_id_for_current_context(self.debugger, address)
+            .is_none()
+        {
+            let temporary =
+                self.session
+                    .breakpoints
+                    .add_temporary_code(self.client, self.debugger, address)?;
+            self.session.prepare_resume(self.client, self.debugger)?;
+            self.client.continue_execution()?;
+            self.debugger.registers = None;
+            let mut result = self.wait_for_stop(timeout_ms.map(Duration::from_millis));
+            if result
+                .as_ref()
+                .ok()
+                .and_then(|value| value.get("running"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                let event = self.client.interrupt()?;
+                result = self.process_stop_event(event)?.map_or_else(
+                    || Err(Error::DebugInfo("timeout interrupt was resumed".into())),
+                    |mut value| {
+                        value["timed_out"] = json!(true);
+                        Ok(value)
+                    },
+                );
+            }
+            let _ = self
+                .session
+                .breakpoints
+                .remove(self.client, self.debugger, temporary);
+            return result;
+        }
+
+        self.session.prepare_resume(self.client, self.debugger)?;
+        self.client.continue_execution()?;
+        self.debugger.registers = None;
+        self.wait_for_stop(timeout_ms.map(Duration::from_millis))
     }
 
     fn qlog(&mut self, request: AgentRequest) -> Result<Value> {
@@ -958,16 +1499,24 @@ impl AgentSession<'_> {
     /// the current thread's registers for RIP/CR3/symbol context.
     fn stop_json(
         &mut self,
-        summary: Option<String>,
-        target_exited: bool,
+        event: &StopEvent,
         breakpoint: Option<&Breakpoint>,
+        reload: Option<Value>,
     ) -> Result<Value> {
         let mut out = json!({
             "running": false,
             "stopped": true,
             "thread": self.session.current_thread,
-            "summary": summary,
-            "target_exited": target_exited,
+            "summary": event.summary,
+            "target_exited": event.target_exited,
+            "exception_code": event.exception_code.map(|code| format!("0x{code:08x}")),
+            "program_counter": event.program_counter.map(fmt_addr),
+            "is_bugcheck": event.is_bugcheck,
+            "bugcheck": event.bugcheck.as_ref().map(bugcheck_json),
+            "target_reloaded": event.target_reloaded,
+            "target_kernel_base_hint": event.target_kernel_base_hint.map(|address| fmt_addr(address.0)),
+            "assisted_breakin": event.assisted_breakin,
+            "reload": reload,
         });
 
         if let Some(bp) = breakpoint {
@@ -978,7 +1527,9 @@ impl AgentSession<'_> {
             });
         }
 
-        if !target_exited && let Ok(regs) = self.client.read_registers() {
+        if !event.target_exited
+            && let Ok(regs) = self.client.read_registers()
+        {
             let rip = self
                 .session
                 .register_map
@@ -1017,8 +1568,13 @@ impl AgentSession<'_> {
         if self.debugger.registers.is_some() || self.client.is_running() {
             return Ok(());
         }
-        self.session
-            .refresh_register_cache(self.client, self.debugger)?;
+        if self.client.capabilities().iter().any(|entry| {
+            entry.capability == crate::dbg_backend::DebugCapability::ReadRegisters
+                && entry.supported
+        }) {
+            self.session
+                .refresh_register_cache(self.client, self.debugger)?;
+        }
         Ok(())
     }
 
@@ -1166,6 +1722,152 @@ fn big_pool_json(entry: BigPoolEntry) -> Value {
     })
 }
 
+fn bugcheck_json(info: &crate::dbg_backend::BugcheckInfo) -> Value {
+    let descriptor = bugcheck_descriptor(info.code);
+    let arguments = descriptor
+        .as_ref()
+        .map(|descriptor| descriptor.arguments)
+        .unwrap_or(GENERIC_BUGCHECK_ARGS);
+    json!({
+        "code": format!("0x{:08x}", info.code),
+        "name": descriptor.as_ref().map(|descriptor| descriptor.name),
+        "description": descriptor.as_ref().and_then(|descriptor| descriptor.description),
+        "driver": info.driver,
+        "parameters": info.parameters.iter().zip(arguments).enumerate().map(
+            |(index, (value, description))| json!({
+                "index": index + 1,
+                "value": fmt_addr(*value),
+                "description": description,
+            })
+        ).collect::<Vec<_>>(),
+    })
+}
+
+fn thread_json(thread: &ThreadInfo, active_vcpu: Option<&str>) -> Value {
+    json!({
+        "active_vcpu": active_vcpu,
+        "ethread": fmt_addr(thread.ethread.0),
+        "kthread": fmt_addr(thread.kthread.0),
+        "tid": thread.tid,
+        "pid": thread.pid,
+        "process": thread.process_name,
+        "eprocess": thread.eprocess.map(|address| fmt_addr(address.0)),
+        "state": thread.state.map(|state| json!({
+            "value": state,
+            "name": kthread_state_name(state),
+        })),
+        "wait_reason": thread.wait_reason.map(|reason| json!({
+            "value": reason,
+            "name": wait_reason_name(reason),
+        })),
+        "priority": thread.priority,
+        "base_priority": thread.base_priority,
+        "wait_irql": thread.wait_irql,
+        "kernel_stack_resident": thread.kernel_stack_resident,
+        "start_address": thread.start_address.map(|address| fmt_addr(address.0)),
+        "win32_start_address": thread.win32_start_address.map(|address| fmt_addr(address.0)),
+        "teb": thread.teb.map(|address| fmt_addr(address.0)),
+        "kernel_stack": thread.kernel_stack.map(|address| fmt_addr(address.0)),
+        "stack_base": thread.stack_base.map(|address| fmt_addr(address.0)),
+        "stack_limit": thread.stack_limit.map(|address| fmt_addr(address.0)),
+        "trap_frame": thread.trap_frame.map(|address| fmt_addr(address.0)),
+        "pending_irps": thread.pending_irps.as_ref().map(|irps| {
+            irps.iter().map(|address| fmt_addr(address.0)).collect::<Vec<_>>()
+        }),
+    })
+}
+
+fn windows_thread_matches(thread: &ThreadInfo, filter: &str) -> bool {
+    let filter_lower = filter.to_ascii_lowercase();
+    thread
+        .process_name
+        .as_deref()
+        .is_some_and(|name| name.to_ascii_lowercase().contains(&filter_lower))
+        || thread
+            .pid
+            .is_some_and(|pid| pid.to_string() == filter || format!("{pid:#x}") == filter_lower)
+        || thread
+            .tid
+            .is_some_and(|tid| tid.to_string() == filter || format!("{tid:#x}") == filter_lower)
+        || format!("{:#x}", thread.ethread.0) == filter_lower
+        || format!("{:x}", thread.ethread.0) == filter_lower.trim_start_matches("0x")
+}
+
+fn backend_processor_index(thread_id: &str) -> Option<u16> {
+    processor_index_from_backend_thread_id(thread_id).or_else(|| {
+        let raw = thread_id.trim_start_matches("0x");
+        u16::from_str_radix(raw, 16)
+            .ok()
+            .and_then(|one_based| one_based.checked_sub(1))
+    })
+}
+
+fn vad_protection_label(protection: Option<u64>) -> String {
+    match protection {
+        Some(0) => "none".to_string(),
+        Some(1) => "r".to_string(),
+        Some(2) => "x".to_string(),
+        Some(3) => "x/r".to_string(),
+        Some(4) => "rw".to_string(),
+        Some(5) => "cow".to_string(),
+        Some(6) => "x/rw".to_string(),
+        Some(7) => "x/cow".to_string(),
+        Some(value) => format!("prot:{value}"),
+        None => "-".to_string(),
+    }
+}
+
+fn vad_type_label(region: &MemoryRegionInfo) -> String {
+    match region.vad_type {
+        Some(2) => "mapped".to_string(),
+        Some(3) => "image".to_string(),
+        Some(_) if region.private_memory == Some(true) => "private".to_string(),
+        Some(value) => format!("vad:{value}"),
+        None => "vad".to_string(),
+    }
+}
+
+fn region_matches_filter(
+    region: &MemoryRegionInfo,
+    filter: Option<&str>,
+    address: Option<VirtAddr>,
+) -> bool {
+    if let Some(address) = address
+        && address >= region.start
+        && address < region.end
+    {
+        return true;
+    }
+    let Some(filter) = filter.map(str::to_ascii_lowercase) else {
+        return true;
+    };
+    format!("{:#x}", region.start.0).contains(&filter)
+        || format!("{:#x}", region.end.0).contains(&filter)
+        || region
+            .details
+            .as_deref()
+            .is_some_and(|details| details.to_ascii_lowercase().contains(&filter))
+        || vad_type_label(region).contains(&filter)
+        || vad_protection_label(region.protection)
+            .to_ascii_lowercase()
+            .contains(&filter)
+}
+
+fn memory_region_json(region: MemoryRegionInfo) -> Value {
+    json!({
+        "start": fmt_addr(region.start.0),
+        "end": fmt_addr(region.end.0),
+        "size": region.size(),
+        "protection": vad_protection_label(region.protection),
+        "protection_value": region.protection,
+        "type": vad_type_label(&region),
+        "vad_type": region.vad_type,
+        "private": region.private_memory,
+        "commit_charge": region.commit_charge,
+        "details": region.details,
+    })
+}
+
 fn module_symbol_report_json(report: ModuleSymbolLoadReport) -> Value {
     json!({
         "total": report.total,
@@ -1189,6 +1891,7 @@ fn script_load_report_json(report: LoadReport) -> Value {
 fn agent_builtin_names() -> HashSet<String> {
     [
         "status",
+        "capabilities",
         "eval",
         "registers",
         "read-memory",
@@ -1210,9 +1913,17 @@ fn agent_builtin_names() -> HashSet<String> {
         "drivers",
         "ps",
         "lm",
+        "vmmap",
+        "symbol.search",
+        "symbol.nearest",
+        "vars",
+        "variable.set",
+        "variable.unset",
         "load-symbols",
         "attach",
         "detach",
+        "vcpus",
+        "vcpu.set",
         "threads",
         "thread.set",
         "bp.set",
@@ -1223,6 +1934,8 @@ fn agent_builtin_names() -> HashSet<String> {
         "continue",
         "interrupt",
         "step",
+        "step.over",
+        "step.out",
         "qcmd",
         "qlog",
         "scripts",
@@ -1247,5 +1960,71 @@ fn completion_strategy_name(strategy: crate::repl::CompletionStrategy) -> &'stat
         crate::repl::CompletionStrategy::Vcpu => "vcpu",
         crate::repl::CompletionStrategy::Breakpoint => "breakpoint",
         crate::repl::CompletionStrategy::Driver => "driver",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        agent_builtin_names, backend_processor_index, bugcheck_json, region_matches_filter,
+    };
+    use crate::dbg_backend::BugcheckInfo;
+    use crate::debugger::MemoryRegionInfo;
+    use crate::types::VirtAddr;
+
+    #[test]
+    fn backend_processor_index_accepts_kd_and_gdb_ids() {
+        assert_eq!(backend_processor_index("p1.1"), Some(0));
+        assert_eq!(backend_processor_index("p1.10"), Some(15));
+        assert_eq!(backend_processor_index("1"), Some(0));
+        assert_eq!(backend_processor_index("2"), Some(1));
+        assert_eq!(backend_processor_index("0"), None);
+    }
+
+    #[test]
+    fn agent_builtin_names_cover_v012_command_families() {
+        let names = agent_builtin_names();
+        for command in [
+            "capabilities",
+            "vmmap",
+            "symbol.search",
+            "symbol.nearest",
+            "variable.set",
+            "vcpus",
+            "threads",
+            "step.over",
+            "step.out",
+        ] {
+            assert!(names.contains(command), "missing agent command {command}");
+        }
+    }
+
+    #[test]
+    fn bugcheck_json_includes_descriptor_and_arguments() {
+        let value = bugcheck_json(&BugcheckInfo {
+            code: 0x0a,
+            parameters: [1, 2, 3, 4],
+            driver: Some("driver.sys".to_string()),
+        });
+        assert_eq!(value["name"], "IRQL_NOT_LESS_OR_EQUAL");
+        assert_eq!(value["driver"], "driver.sys");
+        assert_eq!(value["parameters"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn vmmap_filter_matches_containing_address_and_metadata() {
+        let region = MemoryRegionInfo {
+            start: VirtAddr(0x1000),
+            end: VirtAddr(0x3000),
+            protection: Some(6),
+            vad_type: Some(3),
+            private_memory: Some(false),
+            commit_charge: Some(2),
+            details: Some("example.dll".to_string()),
+        };
+        assert!(region_matches_filter(&region, None, Some(VirtAddr(0x2000))));
+        assert!(region_matches_filter(&region, Some("example"), None));
+        assert!(region_matches_filter(&region, Some("x/rw"), None));
+        assert!(!region_matches_filter(&region, Some("missing"), None));
     }
 }

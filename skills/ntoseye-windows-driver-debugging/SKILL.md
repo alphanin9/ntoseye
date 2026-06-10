@@ -38,6 +38,23 @@ Use this split:
 
 Do not load a driver directly from the shared folder unless that path has been tested. Copying to NTFS avoids path visibility, filesystem semantics, locking, and policy edge cases.
 
+## Local NTOSEYE Launch
+
+On the current machine, launch NTOSEYE with `sudo` when using the KVM/QEMU-backed debugger path:
+
+```bash
+sudo /usr/local/bin/ntoseye
+```
+
+`/usr/local/bin/ntoseye` is a symlink to `/home/user/dev/ntoseye/target/debug/ntoseye`, so rebuilding the debug binary updates the command automatically. Preserve any backend and agent arguments after the executable, for example:
+
+```bash
+sudo /usr/local/bin/ntoseye --backend gdb --connect 127.0.0.1:1234 --agent-stdio
+sudo /usr/local/bin/ntoseye --backend memory
+```
+
+Treat this as a requirement of this host's KVM/QEMU access setup, not a universal NTOSEYE requirement.
+
 Example guest deploy script shape:
 
 ```powershell
@@ -89,7 +106,7 @@ python3 ~/.codex/skills/ntoseye-windows-driver-debugging/scripts/qga-exec.py \
 When the task involves controlling NTOSEYE programmatically, read `references/agent-stdio.md` for the command reference. The protocol is newline-delimited JSON over stdin/stdout:
 
 ```bash
-ntoseye --backend gdb --connect 127.0.0.1:1234 --agent-stdio
+sudo /usr/local/bin/ntoseye --backend gdb --connect 127.0.0.1:1234 --agent-stdio
 ```
 
 Use the agent interface for structured inspection and automation. Use the interactive REPL for exploratory manual sessions.

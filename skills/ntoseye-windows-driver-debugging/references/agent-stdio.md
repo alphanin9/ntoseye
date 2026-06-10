@@ -3,7 +3,7 @@
 Use `--agent-stdio` to run NTOSEYE as a newline-delimited JSON control process instead of the interactive REPL:
 
 ```bash
-ntoseye --backend gdb --connect 127.0.0.1:1234 --agent-stdio
+sudo /usr/local/bin/ntoseye --backend gdb --connect 127.0.0.1:1234 --agent-stdio
 ```
 
 The first stdout line is a `ready` event. Each request is one JSON object on one line. Each response is one JSON object on one line.
@@ -32,8 +32,9 @@ Addresses are expression strings and use the same parser as the REPL: symbols, `
 
 | Command | Fields | Notes |
 | --- | --- | --- |
-| `status` | none | Returns running state, current thread, current DTB, and attached process info. |
-| `eval` | `expr` | Evaluates an expression and returns `address`. |
+| `status` | none | Returns running state, current vCPU (`current_vcpu`; legacy alias `current_thread`), current Windows thread, DTB, and attached process info. |
+| `capabilities` | none | Returns the selected backend's supported and unsupported debugger capabilities. |
+| `eval` | `expr` | Evaluates an expression, returns `address`, and stores it in `$0`. |
 | `registers` | none | Reads registers for the current stopped thread. Fails if the VM is running. |
 | `disasm` / `u` | `address`, optional `length` | Disassembles bytes at `address`; default length is 32 bytes. |
 | `dt` / `type.dump` | `type`, optional `address`, optional `field` | Dumps type layout and, when `address` is present, field values. Leading underscore on the type is optional. |
@@ -58,6 +59,17 @@ Addresses are expression strings and use the same parser as the REPL: symbols, `
 | `gdt` | optional `length` | Reads GDT entries using stopped CPU register state plus QEMU monitor register descriptors. |
 | `tss` | optional `selector` | Dumps the TSS descriptor and stack bases. If omitted, selector comes from QEMU monitor TR output. |
 | `pool` | `address` or `expr` | Classifies nearby pool metadata and big-pool state for a target address. |
+| `vmmap` | optional `filter` or `expr` | Lists VAD regions for the attached process, or kernel module ranges when detached. A resolvable expression filters by containing address. |
+
+## Symbols and Variables
+
+| Command | Fields | Notes |
+| --- | --- | --- |
+| `symbol.search` / `symbols.search` / `x` | `query` or `expr`, optional `limit` | Fuzzy-searches symbols. `module!query` restricts the search to one module. Addresses populate `$0..$N`. |
+| `symbol.nearest` / `symbols.nearest` / `ln` | `address` or `expr` | Returns the nearest symbol, base, and offset. The symbol base is stored in `$0`. |
+| `variable.set` / `set` | `name`, `expr` | Defines a convenience variable usable as `$name`. |
+| `variables` / `vars` | none | Lists user variables, result slots, their origin, and built-in variables. |
+| `variable.unset` / `unset` | `name` or `expr` | Removes a user convenience variable. |
 
 ## Processes, Modules, Drivers
 
@@ -70,17 +82,21 @@ Addresses are expression strings and use the same parser as the REPL: symbols, `
 | `attach` | `pid` | Attaches debugger context to a process and loads available symbols. |
 | `detach` | none | Returns to kernel context. |
 
-## Threads and Execution
+## vCPUs, Windows Threads, and Execution
 
 | Command | Fields | Notes |
 | --- | --- | --- |
-| `threads` | none | Returns backend thread IDs. |
-| `thread.set` / `thread` | `thread` | Sets the current backend thread. |
+| `vcpus` | none | Lists backend execution contexts with RIP, CR3, nearest symbol, and active Windows thread when resolvable. |
+| `vcpu.set` / `vcpu` | `thread` | Selects a backend vCPU/execution context. |
+| `threads` | optional `filter` | Lists Windows threads with ETHREAD/KTHREAD, PID/TID, state, wait reason, stack metadata, pending IRPs, and active vCPU. |
+| `thread.set` / `thread` | `thread` | Resolves a Windows thread by TID or ETHREAD. If it is active, selects its vCPU and installs its pseudo-register context. |
 | `continue` / `go` | optional `timeout_ms` | Continues execution. If `timeout_ms` is present, waits that long for a stop and returns stop details or `{running:true, stopped:false}`. |
 | `interrupt` / `break` | none | Interrupts the target and refreshes current stopped thread when possible. |
 | `step` / `si` | none | Single-steps the current thread and returns stop details. Fails if already running. |
+| `step.over` / `p` / `ni` | optional `timeout_ms` | Steps over calls using a temporary breakpoint; non-call instructions single-step. |
+| `step.out` / `gu` / `finish` | optional `timeout_ms` | Runs to the caller found by the stack unwinder using a temporary breakpoint. |
 
-Stop responses can include `running:false`, `stopped:true`, `thread`, `summary`, `target_exited`, `rip`, `cr3`, and nearest `symbol`.
+Stop responses can include `running`, `stopped`, `thread`, `summary`, `target_exited`, `rip`, `cr3`, nearest `symbol`, `exception_code`, `program_counter`, `is_bugcheck`, structured `bugcheck`, `target_reloaded`, `target_kernel_base_hint`, `assisted_breakin`, and a `reload` rediscovery report. Reload processing drops stale breakpoints and rebuilds guest state.
 
 ## Breakpoints
 
@@ -108,13 +124,14 @@ Prefer `kind:"hardware"` for PatchGuard-sensitive driver debugging when QEMU gdb
 
 ```json
 {"id":1,"command":"status"}
-{"id":2,"command":"eval","expr":"nt!MmAccessFault"}
-{"id":3,"command":"memory.read","address":"nt!MmAccessFault","length":16}
-{"id":4,"command":"disasm","address":"nt!MmAccessFault","length":64}
-{"id":5,"command":"dt","type":"KTRAP_FRAME","address":"$rsp","field":"Rip"}
-{"id":6,"command":"drivers","filter":"mydrv"}
-{"id":7,"command":"bp.set","address":"mydrv!DriverEntry","kind":"hardware"}
-{"id":8,"command":"continue","timeout_ms":1000}
-{"id":9,"command":"interrupt"}
-{"id":10,"command":"qlog","expr":"int,cpu_reset,guest_errors","path":"/tmp/ntoseye-qemu.log"}
+{"id":2,"command":"capabilities"}
+{"id":3,"command":"eval","expr":"nt!MmAccessFault"}
+{"id":4,"command":"symbol.search","query":"MmAccess"}
+{"id":5,"command":"vmmap","filter":"ntdll"}
+{"id":6,"command":"vcpus"}
+{"id":7,"command":"threads","filter":"System"}
+{"id":8,"command":"memory.read","address":"nt!MmAccessFault","length":16}
+{"id":9,"command":"bp.set","address":"mydrv!DriverEntry","kind":"hardware"}
+{"id":10,"command":"continue","timeout_ms":1000}
+{"id":11,"command":"qlog","expr":"int,cpu_reset,guest_errors","path":"/tmp/ntoseye-qemu.log"}
 ```
