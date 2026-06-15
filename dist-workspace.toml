@@ -9,6 +9,11 @@ cargo-dist-version = "0.30.3"
 ci = "github"
 # The installers to generate for each app
 installers = ["shell"]
+# Build each package with `-p <pkg>` instead of `--workspace`. Required here:
+# the workspace mixes pyo3 `auto-initialize` (binary, links libpython) with
+# `extension-module` (ntoseye-py wheel, no libpython). A --workspace build
+# unifies those features and the binary fails to link (undefined PyExc_* etc).
+precise-builds = true
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["x86_64-unknown-linux-gnu"]
 # Path that installers should place binaries in
