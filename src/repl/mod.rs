@@ -1,28 +1,36 @@
+#[cfg(feature = "cli")]
 use nu_ansi_term::{Color, Style};
+#[cfg(feature = "cli")]
 use reedline::{
     DescriptionMode, Emacs, IdeMenu, KeyCode, KeyModifiers, MenuBuilder, ReedlineEvent,
     ReedlineMenu, default_emacs_keybindings,
 };
+#[cfg(feature = "cli")]
 use reedline::{Reedline, Signal};
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+#[cfg(feature = "cli")]
+use std::sync::atomic::Ordering;
 
-use strum::IntoEnumIterator;
 use strum_macros::{Display, EnumIter, EnumMessage, EnumString};
 use tabled::builder::Builder;
 use tabled::settings::Padding;
 
 use owo_colors::OwoColorize;
 
-use crate::dbg_backend::{BackendCapability, DebugBackend, DebugCapability};
-use crate::debugger::DebuggerContext;
+#[cfg(feature = "cli")]
+use crate::dbg_backend::DebugBackend;
+use crate::dbg_backend::{BackendCapability, DebugCapability};
 use crate::diagnostics;
 use crate::error::Result;
-use crate::gdb::{BreakpointManager, RegisterMap};
 use crate::guest::ModuleSymbolLoadReport;
-use crate::script::{LoadReport, ScriptHost};
+#[cfg(feature = "python")]
+use crate::python::embed;
+use crate::session::Session;
+#[cfg(feature = "cli")]
+use crate::target::Target;
+#[cfg(feature = "cli")]
 use crate::ui;
 
 pub static INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -178,6 +186,38 @@ pub enum ReplCommand {
     Status,
     #[strum(message = "Display backend capabilities.\n(usage: capabilities)")]
     Capabilities,
+    #[strum(message = "Show captured guest debug output (DbgPrint).\n(usage: dbgprint [count])")]
+    Dbgprint,
+    #[strum(
+        message = "Inspect an IRP and its current IO_STACK_LOCATION.\n(usage: irp <address-expression>)"
+    )]
+    Irp,
+    #[strum(
+        message = "Discover in-flight IRPs from thread IrpLists and device CurrentIrp.\n(usage: irps [process-filter|driver-filter])"
+    )]
+    Irps,
+    #[strum(
+        message = "Inspect a DRIVER_OBJECT, its device chain and dispatch table.\n(usage: drvobj <driver-object-expression-or-name>)"
+    )]
+    Drvobj,
+    #[strum(
+        message = "Inspect a DEVICE_OBJECT and its attached stack.\n(usage: devobj <device-object-expression>)"
+    )]
+    Devobj,
+    #[strum(
+        message = "Inspect an executive object header and body.\n(usage: object <object-expression>)"
+    )]
+    Object,
+    #[strum(
+        message = "Enumerate process/thread/image notification callbacks.\n(usage: callbacks [symbol-filter])"
+    )]
+    Callbacks,
+    #[strum(message = "Dump the SSDT and shadow SSDT.\n(usage: ssdt)")]
+    Ssdt,
+    #[strum(
+        message = "Describe what an address belongs to (module+section, or VAD region).\n(usage: address <address-expression>)"
+    )]
+    Address,
 
     // execution contexts / processes / modules
     #[strum(message = "List vCPU contexts and their RIP values.\n(usage: vcpus)")]
@@ -206,7 +246,7 @@ pub enum ReplCommand {
     Detach,
 
     #[strum(
-        message = "Reload Lua command scripts from $XDG_CONFIG_HOME/ntoseye/commands.\n(usage: reload)"
+        message = "Reload custom commands from $XDG_CONFIG_HOME/ntoseye/commands.\n(usage: reload)"
     )]
     Reload,
 
@@ -233,9 +273,15 @@ impl ReplCommand {
             | Self::Pte
             | Self::Pool
             | Self::Vmmap
+            | Self::Irp
+            | Self::Devobj
+            | Self::Object
+            | Self::Callbacks
+            | Self::Address
             | Self::Bp => CompletionStrategy::Symbol,
             Self::Dt => CompletionStrategy::Type,
-            Self::Attach | Self::Threads => CompletionStrategy::Process,
+            Self::Drvobj => CompletionStrategy::Driver,
+            Self::Attach | Self::Threads | Self::Irps => CompletionStrategy::Process,
             Self::Thread => CompletionStrategy::Thread,
             Self::Vcpu => CompletionStrategy::Vcpu,
             Self::Bc | Self::Bd | Self::Be => CompletionStrategy::Breakpoint,
@@ -258,6 +304,8 @@ mod bugcheck;
 mod commands;
 mod completion;
 mod disasm;
+#[cfg(feature = "cli")]
+mod line_editor;
 mod memory_view;
 mod pool;
 mod stop;
@@ -266,6 +314,8 @@ pub use bugcheck::*;
 pub use completion::CompletionStrategy;
 pub use completion::*;
 pub use disasm::*;
+#[cfg(feature = "cli")]
+pub use line_editor::*;
 pub use memory_view::*;
 pub use pool::*;
 pub use stop::*;
@@ -342,25 +392,6 @@ pub fn print_backend_capability_warning(capabilities: &[BackendCapability]) {
     println!();
 }
 
-pub fn print_script_load_report(report: &LoadReport, startup_hint: bool) {
-    if report.loaded.is_empty() && report.failed.is_empty() {
-        if startup_hint {
-            println!("scripts: 0 installed (run `ntoseye scripts install` to add bundled scripts)");
-        } else {
-            println!("scripts: 0 loaded");
-        }
-    } else {
-        let mut summary = format!("scripts: {} loaded", report.loaded.len());
-        if !report.failed.is_empty() {
-            summary.push_str(&format!(", {} failed", report.failed.len()));
-        }
-        println!("{}", summary);
-        for (path, err) in &report.failed {
-            diagnostics::print_error(format!("{}: {}", path.display(), err));
-        }
-    }
-}
-
 pub fn print_plain_table(builder: Builder) {
     let mut table = builder.build();
     table
@@ -375,19 +406,57 @@ pub enum Flow {
 }
 
 pub struct ReplState<'a> {
-    pub debugger: &'a mut DebuggerContext,
-    pub client: &'a mut dyn DebugBackend,
-    pub breakpoints: BreakpointManager,
-    pub current_thread: String,
-    pub reload_module_list_pending: bool,
-    pub register_map: RegisterMap,
+    pub ctx: &'a mut Session,
     pub caches: ReplCaches,
-    pub script_host: ScriptHost,
-    pub builtin_names: HashSet<String>,
     pub line: String,
 }
 
-pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend) -> Result<()> {
+/// The user-command completion set: the registered Python commands when the
+/// binary embeds Python (`python-embed`), else empty.
+pub(crate) fn initial_user_commands() -> Vec<(String, String, Vec<CompletionStrategy>)> {
+    #[allow(unused_mut)]
+    let mut cmds: Vec<(String, String, Vec<CompletionStrategy>)> = Vec::new();
+    #[cfg(feature = "python")]
+    for (name, help, strategies) in embed::command_list() {
+        cmds.push((name, help, strategies));
+    }
+    cmds
+}
+
+impl<'a> ReplState<'a> {
+    /// Build a transient REPL state around an existing context for one-off
+    /// command dispatch (e.g. the Python SDK's `run_command`). Completion caches
+    /// start empty (no live REPL to populate them). Output goes to stdout, as in
+    /// the REPL.
+    pub fn for_oneshot(ctx: &'a mut Session) -> Self {
+        let caches = ReplCaches {
+            symbols: Arc::new(RwLock::new(ctx.target.current_symbol_index())),
+            types: Arc::new(RwLock::new(ctx.target.current_types_index())),
+            symbol_store: Arc::clone(&ctx.target.symbols),
+            dtb: Arc::new(RwLock::new(ctx.target.current_dtb())),
+            processes: Arc::new(RwLock::new(Vec::new())),
+            threads: Arc::new(RwLock::new(Vec::new())),
+            vcpus: Arc::new(RwLock::new(Vec::new())),
+            breakpoints: Arc::new(RwLock::new(Vec::new())),
+            drivers: Arc::new(RwLock::new(Vec::new())),
+            user_commands: Arc::new(RwLock::new(initial_user_commands())),
+        };
+
+        ReplState {
+            ctx,
+            caches,
+            line: String::new(),
+        }
+    }
+}
+
+#[cfg(feature = "cli")]
+pub fn start_repl(ctx: &mut Session) -> Result<()> {
+    // Borrow the two owned fields disjointly; the rest of this function (and
+    // ReplState) consumes them exactly as before.
+    let debugger: &mut Target = &mut ctx.target;
+    let client: &mut dyn DebugBackend = ctx.backend.as_mut();
+
     ctrlc::set_handler(move || {
         INTERRUPT_REQUESTED.store(true, Ordering::SeqCst);
     })?;
@@ -405,27 +474,17 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
     let capabilities = client.capabilities();
     print_backend_capability_warning(&capabilities);
 
-    let register_map = client.register_map().clone();
-
     let has_register_context = supports_capability(&capabilities, DebugCapability::ReadRegisters);
-    let current_thread = if has_register_context {
-        client
-            .stopped_thread_id()
-            .unwrap_or_else(|_| "1".to_string())
-    } else {
-        "1".to_string()
-    };
 
-    let breakpoints = BreakpointManager::new();
     let reload_module_list_pending = message_data.loaded_module_list.is_zero();
 
     if has_register_context {
         print_break_context(
             &mut *client,
-            &register_map,
+            &ctx.register_map,
             debugger,
-            &breakpoints,
-            &current_thread,
+            &ctx.breakpoints,
+            &ctx.current_thread,
         );
     }
 
@@ -479,6 +538,19 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
             ReedlineEvent::MenuPrevious,
         ]),
     );
+    // The default Left/Right bindings route through MenuLeft/MenuRight first,
+    // which the open completion menu swallows so the cursor never moves. The
+    // IdeMenu is a single column (Up/Down navigate it), so drop the menu nav and
+    // let the arrows always move the cursor; keep history-hint accept on Right.
+    keybindings.add_binding(KeyModifiers::NONE, KeyCode::Left, ReedlineEvent::Left);
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Right,
+        ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::HistoryHintComplete,
+            ReedlineEvent::Right,
+        ]),
+    );
 
     let edit_mode = Box::new(Emacs::new(keybindings));
 
@@ -494,10 +566,13 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
     };
     let initial_drivers = debugger.enumerate_driver_objects().unwrap_or_default();
 
-    let mut script_host = ScriptHost::new();
-    let builtin_names: HashSet<String> = ReplCommand::iter().map(|c| c.to_string()).collect();
-    let load_report = script_host.load_all(&builtin_names, Some(debugger));
-    print_script_load_report(&load_report, true);
+    // In-REPL Python commands (the embedded-interpreter build). Loaded here so
+    // they're in the completion set below.
+    #[cfg(feature = "python")]
+    {
+        let py_report = embed::load_commands_dir();
+        embed::print_script_load_report(&py_report, true);
+    }
 
     let caches = ReplCaches {
         symbols: Arc::new(RwLock::new(debugger.current_symbol_index())),
@@ -510,7 +585,7 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
         vcpus: Arc::new(RwLock::new(initial_vcpus)),
         breakpoints: Arc::new(RwLock::new(Vec::new())),
         drivers: Arc::new(RwLock::new(initial_drivers)),
-        user_commands: Arc::new(RwLock::new(script_host.command_names())),
+        user_commands: Arc::new(RwLock::new(initial_user_commands())),
     };
 
     let completor = Box::new(MyCompleter {
@@ -530,17 +605,14 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
     let prompt = CustomPrompt {};
 
     let mut state = ReplState {
-        debugger,
-        client,
-        breakpoints,
-        current_thread,
-        reload_module_list_pending,
-        register_map,
+        ctx,
         caches,
-        script_host,
-        builtin_names,
         line: String::new(),
     };
+    // The reload state machine lives on the Session now; seed it from the
+    // startup message (an empty module list means we attached very early in
+    // boot, before rediscovery completed).
+    state.ctx.reload_module_list_pending = reload_module_list_pending;
 
     loop {
         let sig = line_editor.read_line(&prompt)?;
@@ -566,7 +638,7 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
                     continue;
                 }
 
-                if state.client.is_running() {
+                if state.ctx.backend.is_running() {
                     state.interrupt_running_vm()?;
                 } else {
                     error!("VM is already paused");
@@ -575,49 +647,49 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
         }
     }
 
-    let was_running_on_exit = state.client.is_running();
+    let was_running_on_exit = state.ctx.backend.is_running();
     let mut resume_on_exit = !was_running_on_exit;
-    if was_running_on_exit && !state.breakpoints.list().is_empty() {
-        match state.client.try_wait_for_stop(REPL_STOP_POLL) {
+    if was_running_on_exit && !state.ctx.breakpoints.list().is_empty() {
+        match state.ctx.backend.try_wait_for_stop(REPL_STOP_POLL) {
             Ok(Some(mut event)) => {
                 let reload_status = apply_target_reload_if_needed(
-                    &mut *state.client,
-                    state.debugger,
-                    &mut state.breakpoints,
+                    &mut *state.ctx.backend,
+                    &mut state.ctx.target,
+                    &mut state.ctx.breakpoints,
                     &state.caches,
                     &mut event,
                 );
                 update_reload_module_list_pending(
-                    &mut state.reload_module_list_pending,
+                    &mut state.ctx.reload_module_list_pending,
                     reload_status,
                 );
                 if !reload_status.pending_rediscovery() {
                     set_current_thread_from_stop(
-                        &mut *state.client,
+                        &mut *state.ctx.backend,
                         &event,
-                        &mut state.current_thread,
+                        &mut state.ctx.current_thread,
                     );
                 }
                 resume_on_exit = true;
             }
-            Ok(None) => match state.client.interrupt() {
+            Ok(None) => match state.ctx.backend.interrupt() {
                 Ok(mut event) => {
                     let reload_status = apply_target_reload_if_needed(
-                        &mut *state.client,
-                        state.debugger,
-                        &mut state.breakpoints,
+                        &mut *state.ctx.backend,
+                        &mut state.ctx.target,
+                        &mut state.ctx.breakpoints,
                         &state.caches,
                         &mut event,
                     );
                     update_reload_module_list_pending(
-                        &mut state.reload_module_list_pending,
+                        &mut state.ctx.reload_module_list_pending,
                         reload_status,
                     );
                     if !reload_status.pending_rediscovery() {
                         set_current_thread_from_stop(
-                            &mut *state.client,
+                            &mut *state.ctx.backend,
                             &event,
-                            &mut state.current_thread,
+                            &mut state.ctx.current_thread,
                         );
                     }
                     resume_on_exit = true;
@@ -636,18 +708,25 @@ pub fn start_repl(debugger: &mut DebuggerContext, client: &mut dyn DebugBackend)
 
     // Best effort even if the interrupt above failed: a leftover int3 in guest
     // code with no debugger attached is worse than a failed removal
-    let bp_ids: Vec<u32> = state.breakpoints.list().iter().map(|bp| bp.id).collect();
+    let bp_ids: Vec<u32> = state
+        .ctx
+        .breakpoints
+        .list()
+        .iter()
+        .map(|bp| bp.id)
+        .collect();
     for id in bp_ids {
         if let Err(e) = state
+            .ctx
             .breakpoints
-            .remove(&mut *state.client, state.debugger, id)
+            .remove(&mut *state.ctx.backend, &state.ctx.target, id)
         {
             error!("failed to uninstall breakpoint #{} on exit: {}", id, e);
         }
     }
 
-    let leave_running_on_exit = resume_on_exit || state.client.is_running();
-    if let Err(e) = state.client.prepare_for_exit(leave_running_on_exit) {
+    let leave_running_on_exit = resume_on_exit || state.ctx.backend.is_running();
+    if let Err(e) = state.ctx.backend.prepare_for_exit(leave_running_on_exit) {
         error!("failed to prepare backend for exit: {:?}", e);
     }
 

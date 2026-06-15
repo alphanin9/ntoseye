@@ -1,12 +1,9 @@
-use iced_x86::{
-    Code, Decoder, DecoderOptions, Formatter, Instruction, MemorySizeOptions, NasmFormatter,
-};
 use owo_colors::OwoColorize;
 
 use crate::backend::MemoryOps;
-use crate::debugger::DebuggerContext;
 use crate::gdb::{BreakpointManager, RegisterMap};
 use crate::memory::AddressSpace;
+use crate::target::Target;
 use crate::types::VirtAddr;
 use crate::ui;
 use crate::unwind::{
@@ -114,20 +111,9 @@ pub fn print_registers(register_map: &RegisterMap, regs: &[u8], embedded: bool) 
     );
 }
 
-/// NASM formatter configured for ntoseye's disassembly. Shared by the break/
-/// status view and the `disasm` command so they decode identically.
-pub fn disasm_formatter() -> NasmFormatter {
-    let mut formatter = NasmFormatter::new();
-    let options = formatter.options_mut();
-    options.set_space_after_operand_separator(true);
-    options.set_hex_prefix("0x");
-    options.set_hex_suffix("");
-    options.set_first_operand_char_index(5);
-    options.set_memory_size_options(MemorySizeOptions::Always);
-    options.set_show_branch_size(false);
-    options.set_rip_relative_addresses(true);
-    formatter
-}
+// Decoding lives in core (`crate::disasm`); the REPL owns the *rendering*
+// (`format_disasm_line`/`render_rows` below).
+pub use crate::disasm::{DisasmRow, decode_rows, disasm_formatter};
 
 /// Width of the byte column for a listing: the longest hex string among the
 /// rows about to be printed, so the asm column always aligns and never gets
@@ -165,74 +151,6 @@ pub fn format_disasm_line(
     format!("{}{}  {}  {}{}", prefix, ui::addr(ip), bytes, asm, comment)
 }
 
-/// One decoded instruction, ready to render: address, space-joined hex bytes,
-/// NASM asm text, and an optional symbol comment for a branch / rip-relative
-/// target.
-pub struct DisasmRow {
-    pub ip: u64,
-    pub hex: String,
-    pub asm: String,
-    pub comment: Option<String>,
-}
-
-/// Decode `bytes` (loaded at `start_addr`) into rendered rows, stopping after
-/// `limit` instructions when `Some`. `resolve` turns a branch / rip-relative
-/// target into a symbol comment; both disasm call sites pass a `format_symbol`
-/// backed closure so comments read identically. The single place instructions
-/// get turned into rows: the decode loop, hex byte string, and comment
-/// attachment all live here. The caller owns `formatter` (build it once with
-/// [`disasm_formatter`]) so it's reused across decode passes.
-pub fn decode_rows(
-    bytes: &[u8],
-    start_addr: u64,
-    limit: Option<usize>,
-    formatter: &mut NasmFormatter,
-    resolve: impl Fn(u64) -> String,
-) -> Vec<DisasmRow> {
-    let mut decoder = Decoder::with_ip(64, bytes, start_addr, DecoderOptions::NONE);
-    let mut instruction = Instruction::default();
-    let mut output = String::new();
-    let mut rows = Vec::new();
-
-    while decoder.can_decode() && limit.is_none_or(|n| rows.len() < n) {
-        decoder.decode_out(&mut instruction);
-        if instruction.code() == Code::INVALID {
-            continue;
-        }
-        output.clear();
-        formatter.format(&instruction, &mut output);
-
-        let ip = instruction.ip();
-        let start_index = (ip - start_addr) as usize;
-        let instr_bytes = &bytes[start_index..start_index + instruction.len()];
-        let hex = instr_bytes
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let comment = if instruction.is_ip_rel_memory_operand() {
-            Some(resolve(instruction.ip_rel_memory_address()))
-        } else if instruction.is_call_near()
-            || instruction.is_jmp_near()
-            || instruction.is_jcc_near()
-        {
-            Some(resolve(instruction.near_branch_target()))
-        } else {
-            None
-        };
-
-        rows.push(DisasmRow {
-            ip,
-            hex,
-            asm: output.clone(),
-            comment,
-        });
-    }
-
-    rows
-}
-
 /// Print decoded rows in the house style, sizing the byte column once across
 /// all rows so the asm column aligns. `marker_for` gives each row its cursor
 /// state: `None` for a plain listing (`disasm`), `Some(current)` for the
@@ -255,7 +173,7 @@ pub fn render_rows(rows: &[DisasmRow], marker_for: impl Fn(u64) -> Option<bool>)
 }
 
 pub fn print_disasm_context(
-    debugger: &DebuggerContext,
+    debugger: &Target,
     breakpoints: &BreakpointManager,
     trace: &ThreadTraceContext,
     rip: u64,
@@ -320,7 +238,7 @@ pub fn print_disasm_context(
 /// (bold `stack` header, 2-space indent); standalone `k` passes false so it
 /// reads flush-left with no header, matching `disasm`.
 pub fn print_stacktrace(
-    debugger: &DebuggerContext,
+    debugger: &Target,
     register_map: &RegisterMap,
     regs: &[u8],
     build_limit: usize,

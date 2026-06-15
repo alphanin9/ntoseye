@@ -4,10 +4,10 @@ use pelite::pe64::{Pe, PeView, image::IMAGE_SCN_MEM_EXECUTE};
 
 use crate::backend::MemoryOps;
 use crate::dbg_backend::DebugBackend;
-use crate::debugger::DebuggerContext;
 use crate::error::{Error, Result};
 use crate::guest::{ModuleInfo, ProcessInfo, read_pe_image};
 use crate::memory::AddressSpace;
+use crate::target::Target;
 use crate::types::{Dtb, VirtAddr};
 
 #[derive(Debug, Clone)]
@@ -95,7 +95,7 @@ impl BreakpointManager {
     pub fn add(
         &mut self,
         client: &mut dyn DebugBackend,
-        debugger: &DebuggerContext,
+        debugger: &Target,
         address: VirtAddr,
         symbol: Option<String>,
         condition: Option<String>,
@@ -106,7 +106,7 @@ impl BreakpointManager {
     pub fn add_temporary_code(
         &mut self,
         client: &mut dyn DebugBackend,
-        debugger: &DebuggerContext,
+        debugger: &Target,
         address: VirtAddr,
     ) -> Result<u32> {
         self.add_code(client, debugger, address, None, None, true)
@@ -115,7 +115,7 @@ impl BreakpointManager {
     fn add_code(
         &mut self,
         client: &mut dyn DebugBackend,
-        debugger: &DebuggerContext,
+        debugger: &Target,
         address: VirtAddr,
         symbol: Option<String>,
         condition: Option<String>,
@@ -128,11 +128,10 @@ impl BreakpointManager {
             return Err(Error::NotSupported);
         }
 
-        let id = self.next_id;
-        self.next_id += 1;
-
         Self::validate_breakpoint_target(debugger, address)?;
         let backend = Self::install_breakpoint(client, debugger, address, &scope)?;
+        let id = self.next_id;
+        self.next_id += 1;
 
         let bp = Breakpoint {
             id,
@@ -152,7 +151,7 @@ impl BreakpointManager {
     pub fn remove(
         &mut self,
         client: &mut dyn DebugBackend,
-        debugger: &DebuggerContext,
+        debugger: &Target,
         id: u32,
     ) -> Result<()> {
         let bp = self.breakpoints.remove(&id).ok_or(Error::BPNotFound(id))?;
@@ -179,7 +178,7 @@ impl BreakpointManager {
     pub fn enable(
         &mut self,
         client: &mut dyn DebugBackend,
-        debugger: &DebuggerContext,
+        debugger: &Target,
         id: u32,
     ) -> Result<()> {
         let bp = self.breakpoints.get_mut(&id).ok_or(Error::BPNotFound(id))?;
@@ -196,7 +195,7 @@ impl BreakpointManager {
     pub fn disable(
         &mut self,
         client: &mut dyn DebugBackend,
-        debugger: &DebuggerContext,
+        debugger: &Target,
         id: u32,
     ) -> Result<()> {
         let bp = self.breakpoints.get_mut(&id).ok_or(Error::BPNotFound(id))?;
@@ -213,7 +212,7 @@ impl BreakpointManager {
     pub fn disable_guest_memory_patch_in_address_space(
         &mut self,
         client: &mut dyn DebugBackend,
-        debugger: &DebuggerContext,
+        debugger: &Target,
         id: u32,
         dtb: Dtb,
     ) -> Result<()> {
@@ -249,11 +248,7 @@ impl BreakpointManager {
 
     // NOTE refreshing ensures local breakpoint state matches target state in case they were cleared,
     // this should fix single stepping breaking every breakpoint proceeding the step..
-    pub fn refresh_enabled(
-        &self,
-        client: &mut dyn DebugBackend,
-        debugger: &DebuggerContext,
-    ) -> Result<()> {
+    pub fn refresh_enabled(&self, client: &mut dyn DebugBackend, debugger: &Target) -> Result<()> {
         let mut enabled: Vec<_> = self.breakpoints.values().filter(|bp| bp.enabled).collect();
         enabled.sort_by_key(|bp| bp.id);
 
@@ -277,7 +272,7 @@ impl BreakpointManager {
 
     pub fn enabled_breakpoint_id_for_current_context(
         &self,
-        debugger: &DebuggerContext,
+        debugger: &Target,
         address: VirtAddr,
     ) -> Option<u32> {
         let scope = Self::scope_for_current_context(debugger);
@@ -312,7 +307,7 @@ impl BreakpointManager {
             .map(|bp| bp.id)
     }
 
-    fn scope_for_current_context(debugger: &DebuggerContext) -> BreakpointScope {
+    fn scope_for_current_context(debugger: &Target) -> BreakpointScope {
         match &debugger.current_process_info {
             Some(ProcessInfo { pid, name, dtb, .. }) => BreakpointScope::Process {
                 pid: *pid,
@@ -325,7 +320,7 @@ impl BreakpointManager {
 
     fn install_breakpoint(
         client: &mut dyn DebugBackend,
-        debugger: &DebuggerContext,
+        debugger: &Target,
         address: VirtAddr,
         scope: &BreakpointScope,
     ) -> Result<BreakpointBackend> {
@@ -360,7 +355,7 @@ impl BreakpointManager {
 
     fn install_existing_breakpoint(
         client: &mut dyn DebugBackend,
-        debugger: &DebuggerContext,
+        debugger: &Target,
         bp: &Breakpoint,
     ) -> Result<()> {
         match (&bp.scope, &bp.backend) {
@@ -379,7 +374,7 @@ impl BreakpointManager {
 
     fn uninstall_breakpoint(
         client: &mut dyn DebugBackend,
-        debugger: &DebuggerContext,
+        debugger: &Target,
         bp: &Breakpoint,
     ) -> Result<()> {
         match (&bp.scope, &bp.backend) {
@@ -399,7 +394,7 @@ impl BreakpointManager {
         }
     }
 
-    fn validate_breakpoint_target(debugger: &DebuggerContext, address: VirtAddr) -> Result<()> {
+    fn validate_breakpoint_target(debugger: &Target, address: VirtAddr) -> Result<()> {
         let module = Self::find_kernel_module_containing_address(debugger, address);
         let memory = AddressSpace::new(&debugger.kvm, debugger.current_dtb());
         let translation = memory
@@ -441,7 +436,7 @@ impl BreakpointManager {
     }
 
     fn find_kernel_module_containing_address(
-        debugger: &DebuggerContext,
+        debugger: &Target,
         address: VirtAddr,
     ) -> Option<ModuleInfo> {
         debugger

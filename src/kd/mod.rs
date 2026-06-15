@@ -1,17 +1,16 @@
-//! Windows KD backend over QEMU serial
-
 use std::collections::{HashMap, HashSet};
 use std::io::{ErrorKind, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use owo_colors::OwoColorize;
 
 use crate::dbg_backend::{
-    BackendCapability, BugcheckInfo, DebugBackend, DebugCapability, StopEvent,
+    BackendCapability, BugcheckInfo, DebugBackend, DebugCapability, DebugLog, DebugOutputPage,
+    StopEvent,
 };
 use crate::error::{Error, Result};
 use crate::gdb::RegisterMap;
@@ -67,6 +66,17 @@ pub struct StateChange {
     target_reloaded: bool,
     assisted_breakin: bool,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct PendingWriteBreakpoint {
+    addr: u64,
+    processor: u16,
+}
+
+/// Retained guest debug-output lines (DbgPrint ring). Bounded so a chatty guest
+/// can't grow memory without limit; older lines are evicted and a reader that
+/// falls behind sees `dropped`.
+const DEBUG_LOG_CAPACITY: usize = 4096;
 
 const DBG_KD_EXCEPTION_STATE_CHANGE: u32 = 0x0000_3030;
 /// Symbol load/unload notification. The kernel emits these (including during
@@ -207,8 +217,14 @@ pub struct KdBackend {
     reconnect_assist_after_continue: Option<Duration>,
     bp_handles: HashMap<u64, u32>,
     managed_bp_addresses: HashSet<u64>,
+    breakin_addresses: HashSet<u64>,
+    pending_write_breakpoint: Option<PendingWriteBreakpoint>,
     special_register_cache: HashMap<u16, Vec<u8>>,
     is_running: bool,
+    /// Captured guest debug output (DbgPrint). Shared with the background pump,
+    /// which is the sole socket reader (and so the primary capture point) while
+    /// the VM runs.
+    debug_log: DebugLog,
 }
 
 impl KdBackend {
@@ -258,6 +274,12 @@ impl KdBackend {
         // A second handle on the same socket lets the foreground send an
         // unframed break-in byte while the pump owns `framing` for reading
         let breakin_clone = framing.transport_mut().try_clone()?;
+        let mut breakin_addresses = HashSet::new();
+        if initial_stop.new_state == DBG_KD_EXCEPTION_STATE_CHANGE
+            && initial_stop.exception_code == STATUS_BREAKPOINT
+        {
+            breakin_addresses.insert(initial_stop.program_counter);
+        }
 
         Ok(Self {
             framing: Some(framing),
@@ -273,16 +295,29 @@ impl KdBackend {
             pending_stop: None,
             bp_handles: HashMap::new(),
             managed_bp_addresses: HashSet::new(),
+            breakin_addresses,
+            pending_write_breakpoint: None,
             last_stop_was_managed_breakpoint: false,
             reconnect_assist_after_continue: None,
             special_register_cache: HashMap::new(),
             is_running: false,
+            debug_log: DebugLog::new(DEBUG_LOG_CAPACITY),
         })
     }
 
     /// Foreground access to the framing. Errors if the pump currently owns it
-    /// (i.e. the VM is running) - request/reply only happens while stopped
+    /// (i.e. the VM is running) or if a WriteBreakpoint reply is still pending;
+    /// issuing another request in either state would steal the outstanding reply
+    /// and desync the packet stream. Request/reply only happens while stopped
     fn framing(&mut self) -> Result<&mut KdFraming<UnixStream>> {
+        self.require_no_pending_write_breakpoint()?;
+        self.framing_unchecked()
+    }
+
+    /// Framing access without the pending-write-breakpoint guard. Only the
+    /// breakpoint completion path may use this, since it exists precisely to
+    /// drain that outstanding reply
+    fn framing_unchecked(&mut self) -> Result<&mut KdFraming<UnixStream>> {
         self.framing
             .as_mut()
             .ok_or_else(|| Error::Kd("KD transport is busy: VM is running".into()))
@@ -301,14 +336,25 @@ impl KdBackend {
         let (stop_tx, stop_rx) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let pump_shutdown = Arc::clone(&shutdown);
+        let reported_stop = Arc::new(AtomicBool::new(false));
+        let pump_reported_stop = Arc::clone(&reported_stop);
+        let pump_debug_log = self.debug_log.clone();
         let join = std::thread::spawn(move || {
-            run_pump(framing, stop_tx, pump_shutdown, reconnect_assist_delay)
+            run_pump(
+                framing,
+                stop_tx,
+                pump_shutdown,
+                pump_reported_stop,
+                reconnect_assist_delay,
+                pump_debug_log,
+            )
         });
         kd_trace!("kd: pump: spawned background servicing thread");
         self.pump = Some(PumpHandle {
             join,
             stop_rx,
             shutdown,
+            reported_stop,
         });
         Ok(())
     }
@@ -379,6 +425,7 @@ impl KdBackend {
             join,
             stop_rx,
             shutdown,
+            reported_stop: _,
         } = pump;
         shutdown.store(true, Ordering::SeqCst);
         let stop = Self::try_recv_pump_stop(&stop_rx)?;
@@ -405,16 +452,92 @@ impl KdBackend {
         Ok(())
     }
 
+    fn known_breakin_stop(&self, stop: &StateChange) -> bool {
+        stop.new_state == DBG_KD_EXCEPTION_STATE_CHANGE
+            && stop.exception_code == STATUS_BREAKPOINT
+            && self.breakin_addresses.contains(&stop.program_counter)
+            && !self.managed_bp_addresses.contains(&stop.program_counter)
+    }
+
+    fn mark_known_breakin_stop(&self, mut stop: StateChange) -> StateChange {
+        if self.known_breakin_stop(&stop) {
+            stop.assisted_breakin = true;
+        }
+        stop
+    }
+
+    fn pending_write_breakpoint_error(pending: PendingWriteBreakpoint) -> Error {
+        Error::Kd(format!(
+            "breakpoint install at {:#x} is pending; retry the same bp command before issuing other KD commands",
+            pending.addr
+        ))
+    }
+
+    fn require_no_pending_write_breakpoint(&self) -> Result<()> {
+        match self.pending_write_breakpoint {
+            Some(pending) => Err(Self::pending_write_breakpoint_error(pending)),
+            None => Ok(()),
+        }
+    }
+
+    fn complete_pending_write_breakpoint(&mut self, addr: u64) -> Result<bool> {
+        let Some(pending) = self.pending_write_breakpoint else {
+            return Ok(false);
+        };
+        if pending.addr != addr {
+            return Err(Self::pending_write_breakpoint_error(pending));
+        }
+
+        kd_trace!(
+            "kd: breakpoint: waiting for late WriteBreakPoint reply at {:#x}",
+            pending.addr
+        );
+        let result = with_framing_read_timeout_raw(
+            self.framing_unchecked()?,
+            KD_REQUEST_TIMEOUT,
+            |framing| api::recv_write_breakpoint_reply(framing, pending.processor),
+        );
+        match result {
+            Ok(handle) => {
+                kd_trace!(
+                    "kd: breakpoint: completed late WriteBreakPoint at {:#x} handle={}",
+                    pending.addr,
+                    handle
+                );
+                self.pending_write_breakpoint = None;
+                self.bp_handles.insert(pending.addr, handle);
+                self.managed_bp_addresses.insert(pending.addr);
+                Ok(true)
+            }
+            Err(Error::Io(e)) if is_temporary_io_error(e.kind()) => Err(Error::Kd(format!(
+                "KD request timed out after {}s; breakpoint install is still pending",
+                KD_REQUEST_TIMEOUT.as_secs()
+            ))),
+            Err(err) => {
+                self.pending_write_breakpoint = None;
+                Err(err)
+            }
+        }
+    }
+
     fn record_stop(&mut self, stop: &StateChange) {
         if stop.target_reloaded {
             kd_trace!("kd: target reload detected; clearing target-owned breakpoint state");
             self.bp_handles.clear();
             self.managed_bp_addresses.clear();
+            self.breakin_addresses.clear();
+            self.pending_write_breakpoint = None;
         } else if stop.is_bugcheck {
             self.reconnect_assist_after_continue = Some(POST_BUGCHECK_RECONNECT_ASSIST_DELAY);
         }
         let managed_breakpoint_stop = stop.exception_code == STATUS_BREAKPOINT
             && self.managed_bp_addresses.contains(&stop.program_counter);
+        if stop.assisted_breakin
+            && stop.exception_code == STATUS_BREAKPOINT
+            && !managed_breakpoint_stop
+        {
+            self.breakin_addresses.insert(stop.program_counter);
+        }
         kd_trace!(
             "kd: stop on p{}, new_state={:#x}, exception_code={:#x}, rip={:#x}, managed_bp={}",
             stop.processor + 1,
@@ -570,10 +693,26 @@ impl DebugBackend for KdBackend {
     }
 
     fn set_breakpoint(&mut self, addr: u64) -> Result<()> {
+        if self.complete_pending_write_breakpoint(addr)? {
+            return Ok(());
+        }
+
         let processor = self.current_processor;
-        let handle = with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
-            api::write_breakpoint(framing, processor, addr)
-        })?;
+        let result =
+            with_framing_read_timeout_raw(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
+                api::write_breakpoint(framing, processor, addr)
+            });
+        let handle = match result {
+            Ok(handle) => handle,
+            Err(Error::Io(e)) if is_temporary_io_error(e.kind()) => {
+                self.pending_write_breakpoint = Some(PendingWriteBreakpoint { addr, processor });
+                return Err(Error::Kd(format!(
+                    "KD request timed out after {}s; breakpoint install is pending, retry the same bp command to complete it",
+                    KD_REQUEST_TIMEOUT.as_secs()
+                )));
+            }
+            Err(err) => return Err(err),
+        };
         self.bp_handles.insert(addr, handle);
         self.managed_bp_addresses.insert(addr);
         Ok(())
@@ -618,6 +757,10 @@ impl DebugBackend for KdBackend {
         ]
     }
 
+    fn read_debug_output(&self, since_seq: u64) -> DebugOutputPage {
+        self.debug_log.read_since(since_seq)
+    }
+
     fn note_breakpoint_installed(&mut self, addr: u64) {
         self.managed_bp_addresses.insert(addr);
     }
@@ -645,7 +788,13 @@ impl DebugBackend for KdBackend {
         // Drain stale break-in bytes consumed by KdPollBreakIn after resume
         const MAX_DRAIN_ITERATIONS: u32 = 64;
         const DRAIN_POLL: Duration = Duration::from_millis(1000);
+        // Cap on total time spent draining before handing the socket to the
+        // pump. Spurious re-breaks land within the first second; this only
+        // matters when boot traffic streams in continuously (no idle gap to
+        // end the drain), which otherwise pins this thread for minutes.
+        const DRAIN_BUDGET: Duration = Duration::from_secs(2);
 
+        let drain_deadline = Instant::now() + DRAIN_BUDGET;
         let mut drained = 0u32;
         loop {
             let resume_processor = self.last_stop_processor;
@@ -683,12 +832,15 @@ impl DebugBackend for KdBackend {
                 .transport_mut()
                 .set_read_timeout(Some(DRAIN_POLL))?;
             let mut saw_kd_refresh = false;
+            let debug_log = self.debug_log.clone();
             let result = await_state_change(
                 self.framing()?,
                 Some(&mut saw_kd_refresh),
                 false,
                 None,
                 None,
+                Some(drain_deadline),
+                Some(&debug_log),
             );
             let _ = self.framing()?.transport_mut().set_read_timeout(None);
 
@@ -775,6 +927,7 @@ impl DebugBackend for KdBackend {
 
     fn wait_for_stop(&mut self) -> Result<StopEvent> {
         if let Some(stop) = self.pending_stop.take() {
+            let stop = self.mark_known_breakin_stop(stop);
             self.record_stop(&stop);
             return Ok(stop_event(stop));
         }
@@ -782,16 +935,28 @@ impl DebugBackend for KdBackend {
             let stop = self
                 .take_pump_stop(None)?
                 .ok_or_else(|| Error::Kd("KD pump returned no stop".into()))?;
+            let stop = self.mark_known_breakin_stop(stop);
             self.record_stop(&stop);
             return Ok(stop_event(stop));
         }
-        let stop = await_state_change(self.framing()?, None, false, None, None)?;
+        let debug_log = self.debug_log.clone();
+        let stop = await_state_change(
+            self.framing()?,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some(&debug_log),
+        )?;
+        let stop = self.mark_known_breakin_stop(stop);
         self.record_stop(&stop);
         Ok(stop_event(stop))
     }
 
     fn try_wait_for_stop(&mut self, timeout: Duration) -> Result<Option<StopEvent>> {
         if let Some(stop) = self.pending_stop.take() {
+            let stop = self.mark_known_breakin_stop(stop);
             kd_trace!(
                 "kd: try_wait: surfacing pending_stop rip={:#x} (bypassing spurious check)",
                 stop.program_counter
@@ -804,6 +969,7 @@ impl DebugBackend for KdBackend {
         if self.pump.is_some() {
             return match self.take_pump_stop(Some(timeout))? {
                 Some(stop) => {
+                    let stop = self.mark_known_breakin_stop(stop);
                     kd_trace!(
                         "kd: try_wait: pump reported stop rip={:#x} exc={:#x}",
                         stop.program_counter,
@@ -815,17 +981,20 @@ impl DebugBackend for KdBackend {
                 None => Ok(None),
             };
         }
-        // Synchronous fallback (no pump - e.g. polling after a bare step)
+        // Synchronous fallback (no pump, e.g. polling after a bare step)
         self.framing()?
             .transport_mut()
             .set_read_timeout(Some(timeout))?;
         let mut saw_kd_refresh = false;
+        let debug_log = self.debug_log.clone();
         let result = await_state_change(
             self.framing()?,
             Some(&mut saw_kd_refresh),
             false,
             None,
             None,
+            Some(Instant::now() + timeout),
+            Some(&debug_log),
         );
         // Restore blocking mode regardless of how the wait turned out
         let _ = self.framing()?.transport_mut().set_read_timeout(None);
@@ -843,6 +1012,7 @@ impl DebugBackend for KdBackend {
             Err(e) => return Err(e),
         };
 
+        let stop = self.mark_known_breakin_stop(stop);
         kd_trace!(
             "kd: try_wait: stop rip={:#x} exc={:#x} in_managed={}",
             stop.program_counter,
@@ -871,6 +1041,19 @@ impl DebugBackend for KdBackend {
 
     fn is_running(&self) -> bool {
         self.is_running
+    }
+
+    fn has_pending_stop(&self) -> bool {
+        // The background pump caught a state-change, reported it into its
+        // channel, and exited, but no foreground drain has consumed it yet, so
+        // `is_running` still holds its stale post-continue `true`. A locally
+        // queued `pending_stop` (set when a continue observed a KD refresh) is
+        // the same situation. Either way the VM is actually halted.
+        self.pending_stop.is_some()
+            || self
+                .pump
+                .as_ref()
+                .is_some_and(|pump| pump.reported_stop.load(Ordering::SeqCst))
     }
 
     fn prepare_for_exit(&mut self, leave_running: bool) -> Result<()> {
@@ -1124,6 +1307,7 @@ mod tests {
         let mut framing = KdFraming::new(Loopback::new());
         let mut capture = BugcheckCapture::default();
         let mut output = Vec::new();
+        let debug_log = DebugLog::new(DEBUG_LOG_CAPACITY);
 
         let saw_refresh = handle_debug_io_with_output(
             &mut framing,
@@ -1131,6 +1315,7 @@ mod tests {
             true,
             Some(&mut capture),
             true,
+            Some(&debug_log),
             &mut output,
         )
         .unwrap();
@@ -1138,6 +1323,14 @@ mod tests {
         assert!(!saw_refresh);
         assert!(output.is_empty());
         assert_eq!(capture.finish().unwrap().code, 0xd1);
+        // The terminal stream is suppressed during a bugcheck, but the ring is
+        // the complete record and still captures the crash text.
+        let page = debug_log.read_since(0);
+        assert!(
+            page.lines
+                .iter()
+                .any(|line| line.text.contains("Fatal System Error"))
+        );
     }
 
     #[test]
@@ -1156,9 +1349,16 @@ mod tests {
         let mut framing = KdFraming::new(Loopback::new());
         let mut output = Vec::new();
 
-        let saw_refresh =
-            handle_debug_io_with_output(&mut framing, &payload, true, None, false, &mut output)
-                .unwrap();
+        let saw_refresh = handle_debug_io_with_output(
+            &mut framing,
+            &payload,
+            true,
+            None,
+            false,
+            None,
+            &mut output,
+        )
+        .unwrap();
 
         assert!(saw_refresh);
         assert_eq!(output, b"KDTARGET: Refreshing KD connection\n");
@@ -1171,9 +1371,16 @@ mod tests {
         let mut framing = KdFraming::new(Loopback::new());
         let mut output = Vec::new();
 
-        let saw_refresh =
-            handle_debug_io_with_output(&mut framing, &payload, false, None, false, &mut output)
-                .unwrap();
+        let saw_refresh = handle_debug_io_with_output(
+            &mut framing,
+            &payload,
+            false,
+            None,
+            false,
+            None,
+            &mut output,
+        )
+        .unwrap();
 
         assert!(!saw_refresh);
         assert_eq!(output, b"KDTARGET: Refreshing KD connection\n");
@@ -1468,9 +1675,157 @@ mod tests {
             reconnect_assist_after_continue: None,
             bp_handles: HashMap::new(),
             managed_bp_addresses: HashSet::new(),
+            breakin_addresses: HashSet::new(),
+            pending_write_breakpoint: None,
             special_register_cache: HashMap::new(),
             is_running: true,
+            debug_log: DebugLog::new(DEBUG_LOG_CAPACITY),
         }
+    }
+
+    fn kd_backend_with_framing(host: UnixStream) -> KdBackend {
+        let breakin_clone = host.try_clone().unwrap();
+        KdBackend {
+            framing: Some(KdFraming::new(host)),
+            breakin_clone,
+            pump: None,
+            register_map: context::build_register_map(),
+            processor_count: 1,
+            current_processor: 0,
+            pending_stop: None,
+            last_stop_processor: 0,
+            last_exception_code: 0,
+            last_rip: 0,
+            last_stop_was_managed_breakpoint: false,
+            reconnect_assist_after_continue: None,
+            bp_handles: HashMap::new(),
+            managed_bp_addresses: HashSet::new(),
+            breakin_addresses: HashSet::new(),
+            pending_write_breakpoint: None,
+            special_register_cache: HashMap::new(),
+            is_running: true,
+            debug_log: DebugLog::new(DEBUG_LOG_CAPACITY),
+        }
+    }
+
+    fn write_breakpoint_reply_payload(processor: u16, addr: u64, handle: u32) -> Vec<u8> {
+        const MANIPULATE_UNION_OFFSET: usize = 16;
+
+        let mut payload = vec![0u8; api::MANIPULATE_HEADER_SIZE];
+        payload[0..4].copy_from_slice(&api::DBGKD_WRITE_BREAKPOINT.to_le_bytes());
+        payload[6..8].copy_from_slice(&processor.to_le_bytes());
+        payload[MANIPULATE_UNION_OFFSET..MANIPULATE_UNION_OFFSET + 8]
+            .copy_from_slice(&addr.to_le_bytes());
+        payload[MANIPULATE_UNION_OFFSET + 8..MANIPULATE_UNION_OFFSET + 12]
+            .copy_from_slice(&handle.to_le_bytes());
+        payload
+    }
+
+    #[test]
+    fn known_breakin_stop_is_marked_assisted_unless_managed() {
+        let (_kernel, host) = UnixStream::pair().unwrap();
+        let breakin_clone = host.try_clone().unwrap();
+        let pump_host = host.try_clone().unwrap();
+        let pump = PumpHandle {
+            join: std::thread::spawn(move || KdFraming::new(pump_host)),
+            stop_rx: mpsc::channel().1,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            reported_stop: Arc::new(AtomicBool::new(false)),
+        };
+        let mut backend = kd_backend_with_pump(pump, breakin_clone);
+        let pc = 0xfffff800_deadbeef;
+        backend.breakin_addresses.insert(pc);
+
+        let stop = StateChange {
+            processor: 0,
+            number_processors: 1,
+            new_state: DBG_KD_EXCEPTION_STATE_CHANGE,
+            exception_code: STATUS_BREAKPOINT,
+            program_counter: pc,
+            kernel_base_hint: None,
+            is_bugcheck: false,
+            bugcheck: None,
+            target_reloaded: false,
+            assisted_breakin: false,
+        };
+
+        assert!(
+            backend
+                .mark_known_breakin_stop(stop.clone())
+                .assisted_breakin
+        );
+        backend.managed_bp_addresses.insert(pc);
+        assert!(!backend.mark_known_breakin_stop(stop).assisted_breakin);
+    }
+
+    #[test]
+    fn pending_write_breakpoint_retry_completes_late_reply_without_resend() {
+        let (mut kernel, host) = UnixStream::pair().unwrap();
+        kernel
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let mut backend = kd_backend_with_framing(host);
+        let addr = 0xfffff800_12345678;
+        let handle = 7;
+        backend.pending_write_breakpoint = Some(PendingWriteBreakpoint { addr, processor: 0 });
+
+        let payload = write_breakpoint_reply_payload(0, addr, handle);
+        kernel
+            .write_all(&wire_data_packet(
+                PACKET_TYPE_KD_STATE_MANIPULATE,
+                WIRE_FIRST_PACKET_ID,
+                &payload,
+            ))
+            .unwrap();
+        kernel.flush().unwrap();
+
+        backend.set_breakpoint(addr).unwrap();
+
+        assert_eq!(backend.bp_handles.get(&addr), Some(&handle));
+        assert!(backend.managed_bp_addresses.contains(&addr));
+        assert!(backend.pending_write_breakpoint.is_none());
+
+        let ack = read_wire_packet(&mut kernel);
+        assert_eq!(
+            u32::from_le_bytes(ack[0..4].try_into().unwrap()),
+            WIRE_CONTROL_LEADER
+        );
+        assert_eq!(
+            u16::from_le_bytes(ack[4..6].try_into().unwrap()),
+            PACKET_TYPE_KD_ACKNOWLEDGE
+        );
+        assert_eq!(
+            u32::from_le_bytes(ack[8..12].try_into().unwrap()),
+            WIRE_FIRST_PACKET_ID
+        );
+
+        let mut extra = [0u8; 1];
+        match kernel.read(&mut extra) {
+            Err(e) if is_temporary_io_error(e.kind()) => {}
+            Ok(0) => {}
+            Ok(n) => panic!("unexpected duplicate KD request: read {n} byte(s)"),
+            Err(e) => panic!("unexpected socket read error: {e}"),
+        }
+    }
+
+    #[test]
+    fn pending_write_breakpoint_blocks_unrelated_kd_requests() {
+        let (_kernel, host) = UnixStream::pair().unwrap();
+        let mut backend = kd_backend_with_framing(host);
+        let addr = 0xfffff800_12345678;
+        backend.pending_write_breakpoint = Some(PendingWriteBreakpoint { addr, processor: 0 });
+
+        let err = backend
+            .set_breakpoint(addr + 1)
+            .expect_err("different breakpoint should be rejected while install is pending");
+        let message = err.to_string();
+        assert!(message.contains("breakpoint install at 0xfffff80012345678 is pending"));
+        assert!(message.contains("retry the same bp command"));
+
+        let err = backend
+            .target_kernel_base_hint()
+            .expect_err("other KD requests should be rejected while install is pending");
+        assert!(err.to_string().contains("retry the same bp command"));
     }
 
     #[test]
@@ -1481,7 +1836,16 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let handle = {
             let shutdown = Arc::clone(&shutdown);
-            std::thread::spawn(move || run_pump(framing, tx, shutdown, None))
+            std::thread::spawn(move || {
+                run_pump(
+                    framing,
+                    tx,
+                    shutdown,
+                    Arc::new(AtomicBool::new(false)),
+                    None,
+                    DebugLog::new(DEBUG_LOG_CAPACITY),
+                )
+            })
         };
 
         let pc = 0xfffff800_deadbeef;
@@ -1514,12 +1878,22 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let join = {
             let shutdown = Arc::clone(&shutdown);
-            std::thread::spawn(move || run_pump(framing, tx, shutdown, None))
+            std::thread::spawn(move || {
+                run_pump(
+                    framing,
+                    tx,
+                    shutdown,
+                    Arc::new(AtomicBool::new(false)),
+                    None,
+                    DebugLog::new(DEBUG_LOG_CAPACITY),
+                )
+            })
         };
         let pump = PumpHandle {
             join,
             stop_rx: rx,
             shutdown,
+            reported_stop: Arc::new(AtomicBool::new(false)),
         };
         let mut backend = kd_backend_with_pump(pump, breakin_clone);
         let (continue_tx, continue_rx) = mpsc::channel();
@@ -1590,6 +1964,78 @@ mod tests {
     }
 
     #[test]
+    fn has_pending_stop_flags_undrained_pump_stop_until_consumed() {
+        let (mut kernel, host) = UnixStream::pair().unwrap();
+        let breakin_clone = host.try_clone().unwrap();
+        let framing = KdFraming::new(host);
+        let (tx, rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let reported_stop = Arc::new(AtomicBool::new(false));
+        let join = {
+            let shutdown = Arc::clone(&shutdown);
+            let reported_stop = Arc::clone(&reported_stop);
+            std::thread::spawn(move || {
+                run_pump(
+                    framing,
+                    tx,
+                    shutdown,
+                    reported_stop,
+                    None,
+                    DebugLog::new(DEBUG_LOG_CAPACITY),
+                )
+            })
+        };
+        let pump = PumpHandle {
+            join,
+            stop_rx: rx,
+            shutdown,
+            reported_stop,
+        };
+        let mut backend = kd_backend_with_pump(pump, breakin_clone);
+
+        // Running, with the pump servicing the socket: nothing caught yet.
+        assert!(backend.is_running());
+        assert!(!backend.has_pending_stop());
+
+        // Kernel emits a state-change; the pump catches it, flags reported_stop,
+        // and exits with the stop sitting undrained in its channel.
+        let pc = 0xfffff800_deadbeef;
+        let mut payload = exception_state_change_payload(pc);
+        payload[32..36].copy_from_slice(&STATUS_BREAKPOINT.to_le_bytes());
+        kernel
+            .write_all(&wire_data_packet(
+                PACKET_TYPE_KD_STATE_CHANGE64,
+                WIRE_FIRST_PACKET_ID,
+                &payload,
+            ))
+            .unwrap();
+        kernel.flush().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !backend.has_pending_stop() {
+            assert!(
+                Instant::now() < deadline,
+                "pump never flagged the reported stop"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // The undrained-stop window: is_running() is still its stale post-continue
+        // true, but has_pending_stop() reports the truth: the VM is halted.
+        assert!(backend.is_running());
+        assert!(backend.has_pending_stop());
+
+        // Draining the stop reclaims the framing and clears the condition.
+        let stop = backend
+            .take_pump_stop(Some(Duration::from_secs(5)))
+            .unwrap()
+            .expect("pump reported no stop");
+        assert_eq!(stop.program_counter, pc);
+        assert!(backend.pump.is_none());
+        assert!(!backend.has_pending_stop());
+    }
+
+    #[test]
     fn pump_sends_breakin_after_peer_reset_while_waiting_for_reconnect() {
         let (mut kernel, host) = UnixStream::pair().unwrap();
         kernel
@@ -1600,7 +2046,16 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let handle = {
             let shutdown = Arc::clone(&shutdown);
-            std::thread::spawn(move || run_pump(framing, tx, shutdown, None))
+            std::thread::spawn(move || {
+                run_pump(
+                    framing,
+                    tx,
+                    shutdown,
+                    Arc::new(AtomicBool::new(false)),
+                    None,
+                    DebugLog::new(DEBUG_LOG_CAPACITY),
+                )
+            })
         };
 
         kernel
@@ -1642,7 +2097,16 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let handle = {
             let shutdown = Arc::clone(&shutdown);
-            std::thread::spawn(move || run_pump(framing, tx, shutdown, None))
+            std::thread::spawn(move || {
+                run_pump(
+                    framing,
+                    tx,
+                    shutdown,
+                    Arc::new(AtomicBool::new(false)),
+                    None,
+                    DebugLog::new(DEBUG_LOG_CAPACITY),
+                )
+            })
         };
 
         kernel
@@ -1695,7 +2159,16 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let handle = {
             let shutdown = Arc::clone(&shutdown);
-            std::thread::spawn(move || run_pump(framing, tx, shutdown, None))
+            std::thread::spawn(move || {
+                run_pump(
+                    framing,
+                    tx,
+                    shutdown,
+                    Arc::new(AtomicBool::new(false)),
+                    None,
+                    DebugLog::new(DEBUG_LOG_CAPACITY),
+                )
+            })
         };
 
         kernel
@@ -1734,7 +2207,16 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let handle = {
             let shutdown = Arc::clone(&shutdown);
-            std::thread::spawn(move || run_pump(framing, tx, shutdown, Some(Duration::ZERO)))
+            std::thread::spawn(move || {
+                run_pump(
+                    framing,
+                    tx,
+                    shutdown,
+                    Arc::new(AtomicBool::new(false)),
+                    Some(Duration::ZERO),
+                    DebugLog::new(DEBUG_LOG_CAPACITY),
+                )
+            })
         };
 
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -1775,7 +2257,14 @@ mod tests {
         let handle = {
             let shutdown = Arc::clone(&shutdown);
             std::thread::spawn(move || {
-                run_pump(framing, tx, shutdown, Some(Duration::from_secs(60)))
+                run_pump(
+                    framing,
+                    tx,
+                    shutdown,
+                    Arc::new(AtomicBool::new(false)),
+                    Some(Duration::from_secs(60)),
+                    DebugLog::new(DEBUG_LOG_CAPACITY),
+                )
             })
         };
 
@@ -1813,8 +2302,16 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let mut framing = KdFraming::new(host);
             let mut saw_refresh = false;
-            let stop = await_state_change(&mut framing, Some(&mut saw_refresh), false, None, None)
-                .expect("await_state_change failed");
+            let stop = await_state_change(
+                &mut framing,
+                Some(&mut saw_refresh),
+                false,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("await_state_change failed");
             (saw_refresh, stop)
         });
 
@@ -1892,7 +2389,16 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let handle = {
             let shutdown = Arc::clone(&shutdown);
-            std::thread::spawn(move || run_pump(framing, tx, shutdown, None))
+            std::thread::spawn(move || {
+                run_pump(
+                    framing,
+                    tx,
+                    shutdown,
+                    Arc::new(AtomicBool::new(false)),
+                    None,
+                    DebugLog::new(DEBUG_LOG_CAPACITY),
+                )
+            })
         };
 
         let refresh = debug_io_print_payload(KD_REFRESH_MESSAGE);
@@ -1959,7 +2465,16 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let handle = {
             let shutdown = Arc::clone(&shutdown);
-            std::thread::spawn(move || run_pump(framing, tx, shutdown, None))
+            std::thread::spawn(move || {
+                run_pump(
+                    framing,
+                    tx,
+                    shutdown,
+                    Arc::new(AtomicBool::new(false)),
+                    None,
+                    DebugLog::new(DEBUG_LOG_CAPACITY),
+                )
+            })
         };
 
         let refresh = debug_io_print_payload(KD_REFRESH_MESSAGE);
@@ -2030,7 +2545,16 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let handle = {
             let shutdown = Arc::clone(&shutdown);
-            std::thread::spawn(move || run_pump(framing, tx, shutdown, None))
+            std::thread::spawn(move || {
+                run_pump(
+                    framing,
+                    tx,
+                    shutdown,
+                    Arc::new(AtomicBool::new(false)),
+                    None,
+                    DebugLog::new(DEBUG_LOG_CAPACITY),
+                )
+            })
         };
 
         // No traffic: the pump should be parked on its read-timeout loop

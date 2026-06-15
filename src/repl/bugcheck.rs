@@ -1,36 +1,17 @@
 use owo_colors::OwoColorize;
 
-use crate::backend::MemoryOps;
-use crate::bugchecks::{GENERIC_BUGCHECK_ARGS, bugcheck_descriptor};
 use crate::dbg_backend::BugcheckInfo;
-use crate::debugger::DebuggerContext;
-use crate::error::Result;
+use crate::target::Target;
 use crate::types::VirtAddr;
 use crate::ui;
-use crate::unwind::{ThreadTraceContext, format_symbol, resolve_thread_trace_context};
 
-pub const BUGCHECK_DATA_SLOTS: usize = 5;
-
-pub const CURRENT_KERNEL_RELOAD_WINDOW: u64 = 0x1000_0000;
-
-pub fn plausible_bugcheck_code(code: u64) -> bool {
-    code != 0 && code <= u32::MAX as u64
-}
-
-pub fn looks_like_kernel_pointer(value: u64) -> bool {
-    value >= 0xffff_8000_0000_0000
-}
-
-pub fn read_bugcheck_data<M: MemoryOps<VirtAddr>>(
-    mem: &M,
-    addr: VirtAddr,
-) -> Result<[u64; BUGCHECK_DATA_SLOTS]> {
-    let mut data = [0u64; BUGCHECK_DATA_SLOTS];
-    for (i, slot) in data.iter_mut().enumerate() {
-        *slot = mem.read::<u64>(addr + (i * 8) as u64)?;
-    }
-    Ok(data)
-}
+// Bugcheck *analysis* (descriptor lookup, fault site, KiBugCheckData decode) lives
+// in core (`crate::bugchecks`), shared with the SDK/MCP; the REPL adds presentation.
+pub use crate::bugchecks::{
+    BUGCHECK_DATA_SLOTS, CURRENT_KERNEL_RELOAD_WINDOW, analyze_bugcheck, bugcheck_fault_ip,
+    bugcheck_site, current_bugcheck, looks_like_kernel_pointer, plausible_bugcheck_code,
+    read_bugcheck_data,
+};
 
 pub fn print_unresolved_bugcheck_data(
     addr: VirtAddr,
@@ -58,103 +39,42 @@ pub fn format_arg_value(value: u64) -> String {
     ui::addr(value)
 }
 
-pub fn module_filename(name: &str) -> String {
-    name.rsplit(['\\', '/']).next().unwrap_or(name).to_string()
-}
-
-pub fn driver_filename_for_address(
-    debugger: &DebuggerContext,
-    trace: &ThreadTraceContext,
-    address: u64,
-) -> Option<String> {
-    trace
-        .kernel_modules
-        .iter()
-        .chain(trace.process_modules.iter())
-        .find(|module| module.contains_address(VirtAddr(address)))
-        .map(|module| module_filename(&module.name))
-        .filter(|name| name.to_ascii_lowercase().ends_with(".sys"))
-        .or_else(|| {
-            debugger
-                .symbols
-                .find_module_for_address(trace.kernel_dtb, VirtAddr(address))
-                .map(|module| module_filename(&module.name))
-                .filter(|name| name.to_ascii_lowercase().ends_with(".sys"))
-        })
-}
-
-pub fn bugcheck_fault_ip(info: &BugcheckInfo) -> Option<u64> {
-    let ip = match info.code {
-        // IRQL_NOT_LESS_OR_EQUAL / DRIVER_IRQL_NOT_LESS_OR_EQUAL:
-        // parameter 4 is the instruction address that referenced memory.
-        0x0000_000a | 0x0000_00d1 => info.parameters[3],
-        // PAGE_FAULT_IN_NONPAGED_AREA: parameter 3 is the instruction address
-        // when non-zero.
-        0x0000_0050 => info.parameters[2],
-        // Other bugchecks may carry addresses, but not necessarily a faulting
-        // instruction. For example, 0x4a arg1 is the system-call routine and
-        // often resolves to an ntdll syscall stub, not the responsible driver.
-        _ => 0,
-    };
-    (ip != 0).then_some(ip)
-}
-
-pub fn bugcheck_site(
-    debugger: &DebuggerContext,
-    trace: &ThreadTraceContext,
-    info: &BugcheckInfo,
-) -> Option<(u64, String, Option<String>)> {
-    let ip = bugcheck_fault_ip(info)?;
-    let symbol = format_symbol(debugger, trace, ip);
-    let driver = driver_filename_for_address(debugger, trace, ip);
-    Some((ip, symbol, driver))
-}
-
-pub fn print_bugcheck_info(debugger: &DebuggerContext, info: &BugcheckInfo) {
-    let trace = resolve_thread_trace_context(debugger, debugger.guest.ntoskrnl.dtb());
-    let site = bugcheck_site(debugger, &trace, info);
-    let descriptor = bugcheck_descriptor(info.code);
-    let name = descriptor
-        .as_ref()
-        .map(|descriptor| descriptor.name)
-        .unwrap_or("UNKNOWN_BUGCHECK");
-    let driver = info
-        .driver
-        .as_deref()
-        .or_else(|| site.as_ref().and_then(|(_, _, driver)| driver.as_deref()));
+/// Render a [`BugcheckInfo`] using the shared core analysis
+/// ([`analyze_bugcheck`]), so the REPL and the SDK/MCP never disagree on the
+/// name/arguments/responsible driver of a bugcheck.
+pub fn print_bugcheck_info(debugger: &Target, info: &BugcheckInfo) {
+    let analysis = analyze_bugcheck(debugger, info);
 
     println!();
-    println!("{}", format!("{name} ({:#010x})", info.code).red().bold());
-    if let Some(driver) = driver {
+    println!(
+        "{}",
+        format!("{} ({:#010x})", analysis.name, analysis.code)
+            .red()
+            .bold()
+    );
+    if let Some(driver) = &analysis.driver {
         println!("  module: {}", driver.green());
     }
-    if let Some(description) = descriptor
-        .as_ref()
-        .and_then(|descriptor| descriptor.description)
-    {
+    if let Some(description) = &analysis.description {
         println!("  reason: {description}");
     }
     println!();
     println!("{}", "args".bold());
-    let arg_descriptions = descriptor
-        .as_ref()
-        .map(|descriptor| descriptor.arguments)
-        .unwrap_or(GENERIC_BUGCHECK_ARGS);
-    for (idx, (value, description)) in info.parameters.iter().zip(arg_descriptions).enumerate() {
-        if description.is_empty() {
-            println!("  arg{} {}", idx + 1, format_arg_value(*value));
+    for (idx, arg) in analysis.args.iter().enumerate() {
+        if arg.description.is_empty() {
+            println!("  arg{} {}", idx + 1, format_arg_value(arg.value));
         } else {
             println!(
                 "  arg{} {}  {}",
                 idx + 1,
-                format_arg_value(*value),
-                description
+                format_arg_value(arg.value),
+                arg.description
             );
         }
     }
 }
 
-pub fn print_bugcheck_summary(debugger: &DebuggerContext, info: Option<&BugcheckInfo>) {
+pub fn print_bugcheck_summary(debugger: &Target, info: Option<&BugcheckInfo>) {
     if let Some(info) = info {
         print_bugcheck_info(debugger, info);
         return;
@@ -168,7 +88,7 @@ pub fn print_bugcheck_summary(debugger: &DebuggerContext, info: Option<&Bugcheck
 
 /// Read and display `nt!KiBugCheckData` (BugCheckCode + 4 parameters). The
 /// guest is frozen mid-bugcheck, so this is readable over `/dev/kvm`.
-pub fn print_bugcheck_summary_from_memory(debugger: &DebuggerContext) {
+pub fn print_bugcheck_summary_from_memory(debugger: &Target) {
     let kernel_dtb = debugger.guest.ntoskrnl.dtb();
     let Some(addr) = debugger
         .symbols

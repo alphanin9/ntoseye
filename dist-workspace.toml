@@ -15,3 +15,9 @@ targets = ["x86_64-unknown-linux-gnu"]
 install-path = "~/.local/bin/"
 # Whether to install an updater program
 install-updater = false
+# The binary defaults to in-REPL Python scripting (python-embed, like distro
+# gdb/lldb), so it links libpython: the build needs the python dev lib (apt dep
+# below) and the released binary needs a libpython3 at runtime (near-universal on
+# Linux; abi3 -> any Python 3.x).
+[dist.dependencies.apt]
+python3-dev = '*'

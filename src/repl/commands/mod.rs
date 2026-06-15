@@ -58,6 +58,15 @@ impl ReplState<'_> {
             Ok(ReplCommand::K) => self.cmd_k(parts)?,
             Ok(ReplCommand::Status) => self.cmd_status(parts)?,
             Ok(ReplCommand::Capabilities) => self.cmd_capabilities(parts)?,
+            Ok(ReplCommand::Dbgprint) => self.cmd_dbgprint(parts)?,
+            Ok(ReplCommand::Irp) => self.cmd_irp(parts)?,
+            Ok(ReplCommand::Irps) => self.cmd_irps(parts)?,
+            Ok(ReplCommand::Drvobj) => self.cmd_drvobj(parts)?,
+            Ok(ReplCommand::Devobj) => self.cmd_devobj(parts)?,
+            Ok(ReplCommand::Object) => self.cmd_object(parts)?,
+            Ok(ReplCommand::Callbacks) => self.cmd_callbacks(parts)?,
+            Ok(ReplCommand::Ssdt) => self.cmd_ssdt(parts)?,
+            Ok(ReplCommand::Address) => self.cmd_address(parts)?,
             Err(_) => self.cmd_user(cmd_str, parts)?,
         }
         Ok(Flow::Continue)

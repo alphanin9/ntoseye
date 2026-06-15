@@ -1,0 +1,20 @@
+[package]
+name = "ntoseye-py"
+version.workspace = true
+edition = "2024"
+authors = [ "dmaivel" ]
+description = "Python SDK for the ntoseye Windows kernel debugger"
+license = "MIT"
+publish = false
+
+[lib]
+# Extension module; the `_` name avoids clashing with the core `ntoseye` crate.
+name = "_ntoseye"
+crate-type = ["cdylib"]
+
+[dependencies]
+# The SDK itself lives in core's `python` module; this crate is a thin shim that
+# owns the `PyInit__ntoseye` symbol. `python-extension` resolves libpython at
+# load (wheel), `default-features = false` drops the cli/mcp deps.
+ntoseye_core = { package = "ntoseye", path = "..", default-features = false, features = ["python-extension"] }
+pyo3 = { version = "0.28.3", features = ["extension-module", "abi3-py39"] }

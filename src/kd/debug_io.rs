@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 
-use crate::dbg_backend::BugcheckInfo;
+use crate::dbg_backend::{BugcheckInfo, DebugLog};
 use crate::error::{Error, Result};
 use crate::kd::framing::{KdFraming, PACKET_TYPE_KD_DEBUG_IO, PACKET_TYPE_KD_FILE_IO};
 use crate::kd::wire::{read_u16, read_u32, write_u16, write_u32};
@@ -144,6 +144,7 @@ pub fn handle_debug_io<T: Read + Write>(
         detect_kd_refresh,
         None,
         false,
+        None,
         &mut stderr,
     )
 }
@@ -154,11 +155,18 @@ pub fn handle_debug_io_with_output<T: Read + Write, W: Write>(
     detect_kd_refresh: bool,
     bugcheck_capture: Option<&mut BugcheckCapture>,
     suppress_bugcheck_text: bool,
+    debug_log: Option<&DebugLog>,
     output: &mut W,
 ) -> Result<bool> {
     let mut kd_refresh_seen = false;
     match parse_debug_io(payload) {
         Some(DebugIo::PrintString { text }) => {
+            // Capture into the log regardless of terminal suppression: the ring
+            // is the complete record, while `suppress_bugcheck_text` only keeps
+            // the raw crash spam off stderr next to the structured analysis.
+            if let Some(log) = debug_log {
+                log.record(text);
+            }
             let mut suppress_output = false;
             if let Some(capture) = bugcheck_capture {
                 capture.observe_debug_text(text);

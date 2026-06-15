@@ -31,12 +31,12 @@ use pelite::pe64::{
 
 use crate::{
     backend::MemoryOps,
-    debugger::DebuggerContext,
     gdb::RegisterMap,
     guest::{ModuleInfo, PeImage, ProcessInfo, read_pe_image, read_pe_image_from_file},
     host::KvmHandle,
     memory::AddressSpace,
     symbols::SymbolStore,
+    target::Target,
     types::{Dtb, VirtAddr},
 };
 
@@ -74,6 +74,19 @@ pub enum FrameSource {
     Current,
     Unwind,
     Scan,
+}
+
+impl FrameSource {
+    /// Stable lowercase tag for how a frame was recovered, surfaced by every
+    /// host. Explicit rather than derived from `Debug`, which would drift if a
+    /// variant were renamed.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FrameSource::Current => "current",
+            FrameSource::Unwind => "unwind",
+            FrameSource::Scan => "scan",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -157,7 +170,7 @@ struct StackTracer<'a> {
     modules: HashMap<(Dtb, u64), CachedModule>,
 }
 
-pub fn resolve_thread_trace_context(debugger: &DebuggerContext, cr3: u64) -> ThreadTraceContext {
+pub fn resolve_thread_trace_context(debugger: &Target, cr3: u64) -> ThreadTraceContext {
     let cr3_masked = cr3 & CR3_PAGE_MASK;
     let kernel_dtb = debugger.guest.ntoskrnl.dtb();
     let kernel_dtb_masked = kernel_dtb & CR3_PAGE_MASK;
@@ -198,7 +211,7 @@ pub fn resolve_thread_trace_context(debugger: &DebuggerContext, cr3: u64) -> Thr
     }
 }
 
-pub fn format_symbol(debugger: &DebuggerContext, trace: &ThreadTraceContext, addr: u64) -> String {
+pub fn format_symbol(debugger: &Target, trace: &ThreadTraceContext, addr: u64) -> String {
     let try_format = |dtb| {
         debugger
             .symbols
@@ -234,7 +247,7 @@ pub fn preferred_code_dtb(trace: &ThreadTraceContext, addr: u64) -> Dtb {
 }
 
 pub fn build_stacktrace(
-    debugger: &DebuggerContext,
+    debugger: &Target,
     register_map: &RegisterMap,
     regs: &[u8],
     limit: usize,
@@ -309,7 +322,7 @@ pub fn build_stacktrace(
 /// prior load attempt are fetched (so kernel modules, loaded on stop, and an
 /// attached process's modules are skipped), and each is loaded once per session.
 fn ensure_frame_module_symbols(
-    debugger: &DebuggerContext,
+    debugger: &Target,
     trace: &ThreadTraceContext,
     ips: impl Iterator<Item = u64>,
 ) {
@@ -346,7 +359,7 @@ fn record_stack_frame(stacktrace: &mut StackTrace, limit: usize, frame: StackFra
     }
 }
 
-fn find_process_by_cr3(debugger: &DebuggerContext, cr3_masked: u64) -> Option<ProcessInfo> {
+fn find_process_by_cr3(debugger: &Target, cr3_masked: u64) -> Option<ProcessInfo> {
     debugger
         .guest
         .enumerate_processes()
@@ -411,7 +424,7 @@ impl ThreadTraceContext {
 }
 
 impl<'a> StackTracer<'a> {
-    fn new(debugger: &'a DebuggerContext, trace: &'a ThreadTraceContext) -> Self {
+    fn new(debugger: &'a Target, trace: &'a ThreadTraceContext) -> Self {
         Self {
             trace,
             kvm: &debugger.kvm,

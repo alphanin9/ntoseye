@@ -1,6 +1,8 @@
 build/*
 .cache/
-
+__pycache__/
+dist/
+.venv/
 
 # Added by cargo
 

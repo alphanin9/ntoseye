@@ -45,6 +45,7 @@ pub struct SymbolStore {
     mmaps: DashMap<u128, Arc<Mmap>>,
     index: DashMap<u128, SymbolIndex>,
     index_types: DashMap<u128, SymbolIndex>,
+    index_enums: DashMap<u128, SymbolIndex>,
     /// guid -> (public symbol name -> RVA). Built alongside `index` so symbol
     /// address resolution is an O(1) lookup instead of a per-call PDB scan
     symbol_rvas: DashMap<u128, HashMap<String, u32>>,
@@ -58,6 +59,14 @@ pub struct SymbolStore {
     modules: DashMap<(Dtb, u64), LoadedModule>,
     module_status: DashMap<(Dtb, u64), ModuleSymbolStatus>,
     module_source: DashMap<(Dtb, u64), ModuleSymbolSource>,
+
+    /// GUID of the kernel (`ntoskrnl`) module. Type/enum *layout* lookups are
+    /// address-space independent, so they must always prefer the kernel's
+    /// definitions over same-named user-mode types (e.g. ntdll's `_KPRCB`) and
+    /// over kernel-only types the attached process simply omits. Resolution
+    /// consults this guid first regardless of the attached DTB; updated whenever
+    /// the kernel module (re)loads.
+    kernel_guid: Mutex<Option<u128>>,
 }
 
 fn guid_to_u128(guid: GUID) -> u128 {
@@ -282,6 +291,24 @@ pub enum ParsedType {
     Unknown,
 }
 
+impl ParsedType {
+    /// The element count when this is a fixed array of single-byte char-like
+    /// primitives, i.e. an inline C string buffer such as
+    /// `_EPROCESS.ImageFileName` (`UCHAR[15]`). `None` for anything else. Lets a
+    /// host auto-decode such fields to text instead of handing back raw bytes.
+    pub fn c_string_len(&self) -> Option<u32> {
+        match self {
+            ParsedType::Array(inner, count) => match inner.as_ref() {
+                ParsedType::Primitive(name) if matches!(name.as_str(), "CHAR" | "UCHAR") => {
+                    Some(*count)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
 impl fmt::Display for ParsedType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -350,6 +377,70 @@ impl TypeInfo {
             .ok_or(Error::FieldNotFound(field_name.into()))
             .map(|f| f.offset as u64)
     }
+
+    /// Decode the scalar leaves of this struct out of a buffer covering the whole
+    /// type, returning `(field, value)` pairs sorted by offset. The field-decoding
+    /// rules shared by the pyo3 and MCP struct readers; each host packs the neutral
+    /// [`FieldValue`] into its own form. Nested struct/union fields (reported by
+    /// the PDB with size 0) and fields running past the buffer are skipped; read
+    /// those separately with their own type.
+    pub fn decode_fields(&self, buf: &[u8]) -> Vec<(String, FieldValue)> {
+        let mut out: Vec<(u32, String, FieldValue)> = Vec::new();
+        for (name, f) in self.fields.iter() {
+            let off = f.offset as usize;
+            let sz = f.size as usize;
+            if sz == 0 || off + sz > buf.len() {
+                continue;
+            }
+            let slice = &buf[off..off + sz];
+            let value = match &f.type_data {
+                ParsedType::Bitfield { pos, len, .. } => {
+                    let raw = le_uint(slice);
+                    let mask = if *len >= 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << len) - 1
+                    };
+                    FieldValue::Bitfield((raw >> pos) & mask)
+                }
+                ParsedType::Pointer(_) => FieldValue::Pointer(le_uint(slice)),
+                _ => match sz {
+                    1 | 2 | 4 | 8 => FieldValue::Int(le_uint(slice)),
+                    _ => FieldValue::Bytes(slice.to_vec()),
+                },
+            };
+            out.push((f.offset, name.clone(), value));
+        }
+        out.sort_by_key(|(off, _, _)| *off);
+        out.into_iter()
+            .map(|(_, name, value)| (name, value))
+            .collect()
+    }
+}
+
+/// A decoded scalar field leaf, the neutral result of [`TypeInfo::decode_fields`].
+/// Hosts render this into their own representation (Python objects / JSON).
+#[derive(Debug, Clone)]
+pub enum FieldValue {
+    /// A 1/2/4/8-byte integer.
+    Int(u64),
+    /// A pointer-sized address (semantically distinct so hosts can render it as
+    /// hex if they prefer).
+    Pointer(u64),
+    /// A bitfield already masked/shifted to its value.
+    Bitfield(u64),
+    /// A larger aggregate (array, embedded blob) returned verbatim.
+    Bytes(Vec<u8>),
+}
+
+/// Little-endian unsigned integer from up to 8 bytes, shared by the
+/// struct/bitfield decoders.
+pub fn le_uint(slice: &[u8]) -> u64 {
+    let mut v = 0u64;
+    for (i, b) in slice.iter().take(8).enumerate() {
+        v |= (*b as u64) << (8 * i);
+    }
+    v
 }
 
 /// A loaded module with its symbols and address range.
@@ -384,12 +475,24 @@ impl SymbolStore {
             mmaps: DashMap::new(),
             index: DashMap::new(),
             index_types: DashMap::new(),
+            index_enums: DashMap::new(),
             symbol_rvas: DashMap::new(),
             type_cache: DashMap::new(),
             modules: DashMap::new(),
             module_status: DashMap::new(),
             module_source: DashMap::new(),
+            kernel_guid: Mutex::new(None),
         }
+    }
+
+    /// Record the kernel module's guid so type/enum layout lookups can prefer it
+    /// regardless of the attached address space. Called when `ntoskrnl` loads.
+    pub fn set_kernel_guid(&self, guid: Option<u128>) {
+        *self.kernel_guid.lock() = guid;
+    }
+
+    pub fn kernel_guid(&self) -> Option<u128> {
+        *self.kernel_guid.lock()
     }
 
     pub fn clear_modules_for_dtb(&self, dtb: Dtb) {
@@ -949,9 +1052,59 @@ impl SymbolStore {
         SymbolIndex { names: all_strings }
     }
 
-    pub fn find_type_across_modules(&self, dtb: Dtb, type_name: &str) -> Option<TypeInfo> {
+    pub fn merged_enum_index(&self, dtb: Option<Dtb>) -> SymbolIndex {
+        let total_modules = self
+            .modules
+            .iter()
+            .filter(|module| dtb.is_none_or(|filter_dtb| module.dtb == filter_dtb))
+            .count();
+        let progress = ProgressBar::new((total_modules + 1) as u64);
+        progress.set_style(task_progress_style());
+        progress.set_message("Building enum completions");
+
+        let mut all_strings: Vec<String> = Vec::new();
+
         for module in self.modules.iter() {
-            if module.dtb != dtb {
+            if let Some(filter_dtb) = dtb
+                && module.dtb != filter_dtb
+            {
+                continue;
+            }
+
+            if let Some(index) = self.index_enums.get(&module.guid) {
+                all_strings.extend(index.names.iter().cloned());
+            }
+
+            progress.inc(1);
+        }
+
+        all_strings.sort();
+        all_strings.dedup();
+
+        progress.inc(1);
+        progress.finish_and_clear();
+
+        SymbolIndex { names: all_strings }
+    }
+
+    pub fn find_type_across_modules(&self, dtb: Dtb, type_name: &str) -> Option<TypeInfo> {
+        // Type layouts are address-space independent, so a kernel type must
+        // resolve to the kernel's definition even while attached to a user
+        // process whose modules (e.g. ntdll) define same-named-but-different
+        // types or omit kernel-only ones. Consult the kernel module first, then
+        // fall back to the current address space's modules for user-mode types.
+        //
+        // NOTE this hands a WOW64 (32-bit) process the kernel's 64-bit layout
+        // for a shared type name instead of its own 32-bit one; revisit with
+        // `module!type` qualification if that ever matters
+        let kernel_guid = self.kernel_guid();
+        if let Some(guid) = kernel_guid
+            && let Some(type_info) = self.dump_struct_with_types(guid, type_name)
+        {
+            return Some(type_info);
+        }
+        for module in self.modules.iter() {
+            if module.dtb != dtb || Some(module.guid) == kernel_guid {
                 continue;
             }
             if let Some(type_info) = self.dump_struct_with_types(module.guid, type_name) {
@@ -959,6 +1112,43 @@ impl SymbolStore {
             }
         }
         None
+    }
+
+    /// Variants `(name, value)` of an enum, searched across the modules in the
+    /// current address space (mirrors [`Self::find_type_across_modules`]).
+    pub fn find_enum_across_modules(
+        &self,
+        dtb: Dtb,
+        enum_name: &str,
+    ) -> Option<Vec<(String, i64)>> {
+        // Kernel-first for the same reason as `find_type_across_modules`: enum
+        // definitions don't depend on the attached address space.
+        let kernel_guid = self.kernel_guid();
+        if let Some(guid) = kernel_guid
+            && let Some(variants) = self.enum_variants(guid, enum_name)
+        {
+            return Some(variants);
+        }
+        for module in self.modules.iter() {
+            if module.dtb != dtb || Some(module.guid) == kernel_guid {
+                continue;
+            }
+            if let Some(variants) = self.enum_variants(module.guid, enum_name) {
+                return Some(variants);
+            }
+        }
+        None
+    }
+
+    /// Error text for a name that didn't resolve as a struct/union: point at the
+    /// enum tooling when it's actually an enum, else "unknown type". Keeps the
+    /// hint identical across the REPL, SDK, and MCP.
+    pub fn unresolved_type_message(&self, dtb: Dtb, name: &str) -> String {
+        if self.find_enum_across_modules(dtb, name).is_some() {
+            format!("{name} is an enum; use enum_values")
+        } else {
+            format!("unknown type: {name}")
+        }
     }
 
     pub fn find_symbol_across_modules(&self, dtb: Dtb, symbol_name: &str) -> Option<VirtAddr> {
@@ -1079,7 +1269,8 @@ impl SymbolStore {
         self.symbol_rvas.insert(guid, rvas);
 
         // NOW FOR TYPES!
-        let mut strings: Vec<String> = Vec::new();
+        let mut type_strings: Vec<String> = Vec::new();
+        let mut enum_strings: Vec<String> = Vec::new();
 
         let type_information = pdb_lock.type_information().ok()?;
         let mut type_finder = type_information.finder();
@@ -1088,19 +1279,42 @@ impl SymbolStore {
         while let Some(typ) = iter.next().ok()? {
             type_finder.update(&iter);
 
-            if let Ok(TypeData::Class(class)) = typ.parse()
-                && !class.properties.forward_reference()
-                && class.name.to_string() != "<anonymous-tag>"
-            {
-                strings.push(class.name.to_string().into());
+            if let Ok(type_data) = typ.parse() {
+                match type_data {
+                    TypeData::Class(class)
+                        if !class.properties.forward_reference()
+                            && class.name.to_string() != "<anonymous-tag>" =>
+                    {
+                        type_strings.push(class.name.to_string().into());
+                    }
+                    TypeData::Enumeration(en)
+                        if !en.properties.forward_reference()
+                            && en.name.to_string() != "<anonymous-tag>" =>
+                    {
+                        enum_strings.push(en.name.to_string().into());
+                    }
+                    _ => {}
+                }
             }
         }
 
-        strings.sort();
-        strings.dedup();
+        type_strings.sort();
+        type_strings.dedup();
+        enum_strings.sort();
+        enum_strings.dedup();
 
-        self.index_types
-            .insert(guid, SymbolIndex { names: strings });
+        self.index_types.insert(
+            guid,
+            SymbolIndex {
+                names: type_strings,
+            },
+        );
+        self.index_enums.insert(
+            guid,
+            SymbolIndex {
+                names: enum_strings,
+            },
+        );
 
         Some(())
     }
@@ -1421,6 +1635,70 @@ impl SymbolStore {
         }
 
         None
+    }
+
+    /// Variants `(name, value)` of a PDB enum, in declaration order. Enums live
+    /// in the type stream but aren't in the (class-only) type index, so this
+    /// scans like `dump_struct_with_types`. Lets callers map a raw enum value
+    /// (e.g. an `_MI_SYSTEM_VA_TYPE` region tag) back to its name.
+    pub fn enum_variants<S>(&self, guid: u128, enum_name: S) -> Option<Vec<(String, i64)>>
+    where
+        S: AsRef<str>,
+    {
+        let pdb = self.pdbs.get_mut(&guid)?;
+        let mut pdb_lock = pdb.lock();
+        let type_information = pdb_lock.type_information().ok()?;
+        let mut type_finder = type_information.finder();
+        let mut iter = type_information.iter();
+
+        while let Some(typ) = iter.next().ok()? {
+            type_finder.update(&iter);
+
+            if let Ok(TypeData::Enumeration(en)) = typ.parse()
+                && en.name.to_string() == enum_name.as_ref()
+                && !en.properties.forward_reference()
+            {
+                let mut out = Vec::new();
+                self.collect_enum_variants(&type_finder, en.fields, &mut out)
+                    .ok()?;
+                return Some(out);
+            }
+        }
+        None
+    }
+
+    fn collect_enum_variants<'p>(
+        &self,
+        type_finder: &pdb2::TypeFinder<'p>,
+        field_index: pdb2::TypeIndex,
+        out: &mut Vec<(String, i64)>,
+    ) -> pdb2::Result<()> {
+        let field_item = type_finder.find(field_index)?;
+        if let Ok(TypeData::FieldList(list)) = field_item.parse() {
+            for field in list.fields {
+                if let TypeData::Enumerate(e) = field {
+                    out.push((e.name.to_string().into_owned(), variant_to_i64(&e.value)));
+                }
+            }
+            if let Some(more) = list.continuation {
+                self.collect_enum_variants(type_finder, more, out)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A pdb2 enum-constant value, widened to `i64` (enum tags are small).
+fn variant_to_i64(v: &pdb2::Variant) -> i64 {
+    match *v {
+        pdb2::Variant::U8(x) => x as i64,
+        pdb2::Variant::U16(x) => x as i64,
+        pdb2::Variant::U32(x) => x as i64,
+        pdb2::Variant::U64(x) => x as i64,
+        pdb2::Variant::I8(x) => x as i64,
+        pdb2::Variant::I16(x) => x as i64,
+        pdb2::Variant::I32(x) => x as i64,
+        pdb2::Variant::I64(x) => x as i64,
     }
 }
 
