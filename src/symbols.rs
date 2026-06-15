@@ -150,6 +150,8 @@ impl ModuleSymbolStatus {
 pub enum ModuleSymbolSource {
     Memory,
     Image,
+    /// A PDB loaded from a host directory (the agent's `load-symbols` command).
+    Local,
 }
 
 impl ModuleSymbolSource {
@@ -157,6 +159,7 @@ impl ModuleSymbolSource {
         match self {
             Self::Memory => "memory",
             Self::Image => "image",
+            Self::Local => "local",
         }
     }
 }
@@ -858,6 +861,45 @@ impl SymbolStore {
         self.set_module_symbol_source(load.dtb, load.module.base_address, load.source.clone());
 
         Ok(())
+    }
+
+    /// Load a PDB sitting in a host directory (the agent's `load-symbols`), after
+    /// verifying its GUID matches the module the caller resolved. Mirrors
+    /// [`Self::load_downloaded_pdb`] but tags the source as
+    /// [`ModuleSymbolSource::Local`].
+    pub fn load_local_pdb_for_module(
+        &self,
+        dtb: Dtb,
+        module: ModuleInfo,
+        guid: u128,
+        pdb_path: &std::path::Path,
+    ) -> Result<()> {
+        let mut pdb = pdb2::PDB::open(std::fs::File::open(pdb_path)?)?;
+        let pdb_info = pdb.pdb_information()?;
+        if pdb_info.guid.as_u128() != guid {
+            return Err(Error::DebugInfo(format!(
+                "PDB GUID mismatch for {}: expected {:032x}, got {}",
+                pdb_path.display(),
+                guid,
+                pdb_info.guid
+            )));
+        }
+
+        let load = ModuleSymbolLoad::new(
+            DownloadJob {
+                url: String::new(),
+                path: pdb_path.to_path_buf(),
+                filename: pdb_path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| pdb_path.display().to_string()),
+            },
+            guid,
+            ModuleSymbolSource::Local,
+            module,
+            dtb,
+        );
+        self.load_downloaded_pdb(&load)
     }
 
     fn download_job_from_debug<'a, P>(

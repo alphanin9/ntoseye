@@ -1,6 +1,8 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("This application only runs on Linux hosts.");
 
+#[cfg(feature = "agent")]
+pub mod agent;
 pub mod backend;
 pub mod bugchecks;
 #[cfg(feature = "cli")]
@@ -13,6 +15,8 @@ pub mod expr;
 pub mod gdb;
 pub mod guest;
 pub mod host;
+#[cfg(feature = "agent")]
+pub mod inspect;
 pub mod kd;
 #[cfg(feature = "mcp")]
 pub mod mcp;
@@ -26,7 +30,7 @@ pub mod symbols;
 pub mod target;
 pub mod types;
 pub mod ui;
-#[cfg(any(feature = "mcp", feature = "python"))]
+#[cfg(any(feature = "mcp", feature = "python", feature = "agent"))]
 pub mod view;
 pub mod unwind;
 #[cfg(feature = "cli")]

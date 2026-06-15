@@ -300,6 +300,13 @@ pub trait DebugBackend {
     /// Return the currently stopped execution context
     fn stopped_thread_id(&mut self) -> Result<String>;
 
+    /// Run a QEMU monitor command (e.g. `info registers` for IDT/GDT/TR bases)
+    /// through the backend, if it supports a monitor channel. Default: not
+    /// supported; the gdbstub backend implements it over `qRcmd`.
+    fn monitor_command(&mut self, _command: &str) -> Result<String> {
+        Err(crate::error::Error::NotSupported)
+    }
+
     fn is_running(&self) -> bool;
 
     /// Whether a stop has been caught but not yet drained by the foreground (e.g.

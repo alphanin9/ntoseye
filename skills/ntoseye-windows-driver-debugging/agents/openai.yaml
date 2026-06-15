@@ -1,0 +1,4 @@
+interface:
+  display_name: "NTOSEYE Windows Driver Debugging"
+  short_description: "Debug Windows drivers through NTOSEYE and QGA"
+  default_prompt: "Use $ntoseye-windows-driver-debugging to deploy and debug a Windows kernel driver in the NTOSEYE VM."

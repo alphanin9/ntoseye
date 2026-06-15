@@ -296,6 +296,65 @@ pub fn dispatch(name: &str, args: &[&str], session: &mut Session) -> Result<(), 
     })
 }
 
+/// Like [`dispatch`], but redirects the interpreter's `sys.stdout`/`sys.stderr`
+/// to an in-memory buffer for the call and returns whatever the command printed.
+/// The agent stdio protocol multiplexes line-delimited JSON on the process's
+/// real stdout, so a script printing directly would corrupt that stream;
+/// capturing keeps script output inside the JSON response instead. The streams
+/// are restored before the buffer is read back, even if the command raised.
+#[cfg(feature = "agent")]
+pub fn dispatch_capture(name: &str, args: &[&str], session: &mut Session) -> Result<String, String> {
+    Python::attach(|py| -> Result<String, String> {
+        let callable = {
+            let reg = REGISTRY.lock().unwrap();
+            let entry = reg
+                .iter()
+                .find(|r| r.name == name)
+                .ok_or_else(|| format!("no such python command: {name}"))?;
+            entry.callable.clone_ref(py)
+        };
+
+        // Swap sys.stdout/sys.stderr for a StringIO for the duration of the call.
+        let sys = py.import("sys").map_err(|e| e.to_string())?;
+        let buffer = py
+            .import("io")
+            .and_then(|io| io.call_method0("StringIO"))
+            .map_err(|e| e.to_string())?;
+        let prev_stdout = sys.getattr("stdout").map_err(|e| e.to_string())?;
+        let prev_stderr = sys.getattr("stderr").map_err(|e| e.to_string())?;
+        sys.setattr("stdout", &buffer).map_err(|e| e.to_string())?;
+        sys.setattr("stderr", &buffer).map_err(|e| e.to_string())?;
+
+        let valid = Arc::new(AtomicBool::new(true));
+        let call_result = {
+            let _invalidate = Invalidate(valid.clone());
+            let dbg = Bound::new(py, Debugger::from_session_ref(session, valid.clone()))
+                .map_err(|e| e.to_string())?;
+            let mut items: Vec<Bound<'_, PyAny>> = Vec::with_capacity(args.len() + 1);
+            items.push(dbg.into_any());
+            for a in args {
+                items.push(PyString::new(py, a).into_any());
+            }
+            let call_args = PyTuple::new(py, items).map_err(|e| e.to_string())?;
+            callable.call1(py, call_args).map(|_| ())
+        };
+
+        // Restore the real streams before reading the buffer back.
+        let _ = sys.setattr("stdout", prev_stdout);
+        let _ = sys.setattr("stderr", prev_stderr);
+        let captured: String = buffer
+            .call_method0("getvalue")
+            .and_then(|v| v.extract())
+            .unwrap_or_default();
+
+        match call_result {
+            Ok(()) => Ok(captured),
+            Err(e) if captured.is_empty() => Err(e.to_string()),
+            Err(e) => Err(format!("{captured}\n{e}")),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

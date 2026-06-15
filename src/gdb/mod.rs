@@ -679,6 +679,38 @@ impl DebugBackend for GdbClient {
         GdbClient::read_registers(self)
     }
 
+    /// Run a QEMU monitor command over the gdbstub `qRcmd` channel, accumulating
+    /// the `O<hex>` output packets until `OK`.
+    fn monitor_command(&mut self, command: &str) -> Result<String> {
+        let encoded_command = hex::encode(command.as_bytes());
+        let packet = Self::encode_packet(&format!("qRcmd,{encoded_command}"));
+        self.send_raw_command(&packet)?;
+
+        let mut output = String::new();
+        loop {
+            let response = self.read_response_packet()?;
+            if response == "OK" {
+                return Ok(output);
+            }
+            if response.is_empty() {
+                return Err(Error::NotSupported);
+            }
+            if let Some(hex_output) = response.strip_prefix('O') {
+                let bytes = hex::decode(hex_output)?;
+                output.push_str(&String::from_utf8_lossy(&bytes));
+                continue;
+            }
+            if response.starts_with('E') {
+                return Err(Error::Rsp(format!(
+                    "monitor command failed for '{command}': {response}"
+                )));
+            }
+            return Err(Error::Rsp(format!(
+                "unexpected qRcmd response for '{command}': {response}"
+            )));
+        }
+    }
+
     fn write_registers(&mut self, data: &[u8]) -> Result<()> {
         GdbClient::write_registers(self, data)
     }

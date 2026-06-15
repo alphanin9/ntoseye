@@ -27,8 +27,9 @@ pub enum View {
     Object(Vec<(&'static str, View)>),
 }
 
-/// Render a [`View`] to JSON (MCP): addresses become `0x` hex strings.
-#[cfg(feature = "mcp")]
+/// Render a [`View`] to JSON (MCP and the agent stdio protocol): addresses
+/// become `0x` hex strings.
+#[cfg(any(feature = "mcp", feature = "agent"))]
 pub fn to_json(v: &View) -> serde_json::Value {
     use serde_json::Value;
     match v {

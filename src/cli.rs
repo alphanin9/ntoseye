@@ -10,6 +10,8 @@ use crate::{
     repl::start_repl,
     session, symbols, virsh,
 };
+#[cfg(feature = "agent")]
+use crate::agent;
 #[cfg(feature = "mcp")]
 use crate::mcp;
 
@@ -69,7 +71,18 @@ enum Command {
     Virsh(VirshCommand),
     #[cfg(feature = "mcp")]
     Mcp(McpCommand),
+    #[cfg(feature = "agent")]
+    Agent(AgentCommand),
 }
+
+#[cfg(feature = "agent")]
+#[derive(FromArgs)]
+#[argh(subcommand, name = "agent")]
+/// run as an AI-agent stdio server: line-delimited JSON requests on stdin,
+/// JSON responses on stdout (reads the top-level --backend/--connect to choose
+/// how to attach). Drives the same debugger core as the REPL; intended to be
+/// launched under `sudo` by an agent harness.
+struct AgentCommand {}
 
 #[cfg(feature = "mcp")]
 #[derive(FromArgs)]
@@ -190,7 +203,7 @@ pub fn main() {
 }
 
 fn run() -> Result<()> {
-    let args: Args = argh::from_env();
+    let mut args: Args = argh::from_env();
     if args.version {
         println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
         return Ok(());
@@ -212,7 +225,7 @@ fn run() -> Result<()> {
             Error::DebugInfo("symbol download flag was initialized before startup".into())
         })?;
 
-    if let Some(command) = args.command {
+    if let Some(command) = args.command.take() {
         return match command {
             Command::Virsh(_) => virsh::run_interactive(),
             #[cfg(feature = "mcp")]
@@ -230,12 +243,23 @@ fn run() -> Result<()> {
                 )
                 .map_err(|e| Error::DebugInfo(e.to_string()))
             }
+            #[cfg(feature = "agent")]
+            Command::Agent(_) => {
+                let mut ctx = connect_session(&args)?;
+                agent::run(&mut ctx)
+            }
         };
     }
 
-    // `connect` takes the single-instance lock before building the backend, so a
-    // second ntoseye fails fast instead of racing on the transport handshake.
-    let mut ctx = session::Session::connect(|| -> Result<Box<dyn DebugBackend>> {
+    let mut ctx = connect_session(&args)?;
+    start_repl(&mut ctx)
+}
+
+/// Acquire the single-instance lock and connect the selected backend. The lock
+/// is taken before the backend handshake, so a second ntoseye fails fast instead
+/// of racing on the transport. Backend selection stays a frontend concern.
+fn connect_session(args: &Args) -> Result<session::Session> {
+    session::Session::connect(|| -> Result<Box<dyn DebugBackend>> {
         Ok(match args.backend {
             BackendKind::Gdb => {
                 let addr = args.connect.as_deref().unwrap_or("127.0.0.1:1234");
@@ -254,6 +278,5 @@ fn run() -> Result<()> {
                 Box::new(MemoryBackend::new())
             }
         })
-    })?;
-    start_repl(&mut ctx)
+    })
 }

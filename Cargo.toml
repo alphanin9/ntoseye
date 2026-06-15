@@ -74,9 +74,14 @@ anyhow = { version = "1", optional = true }
 # build` gets in-REPL scripting out of the box (like distro gdb/lldb). It links
 # libpython, so the build needs the Python dev lib; to build without it, opt out:
 #   cargo build --no-default-features --features cli,mcp
-default = ["cli", "mcp", "python-embed"]
+default = ["cli", "mcp", "agent", "python-embed"]
 cli = ["dep:ctrlc", "dep:argh", "dep:dialoguer", "dep:nu-ansi-term", "dep:reedline"]
 mcp = ["dep:rmcp", "dep:schemars", "dep:serde", "dep:serde_json", "dep:tokio", "dep:tokio-util", "dep:axum", "dep:tower-http", "dep:anyhow"]
+# `agent` exposes the line-delimited JSON stdio debugger protocol (the
+# `ntoseye agent` subcommand) used by AI agent workflows that need `sudo`. Pulls
+# Python for in-protocol scripting (the `script.*` commands) via the embedded
+# interpreter, and shares the neutral `view` renderer with MCP.
+agent = ["dep:serde", "dep:serde_json", "python"]
 # `python` compiles the SDK. `python-embed` (binary) links libpython and
 # auto-starts the interpreter. `python-extension` is for the ntoseye-py wheel
 # shim (libpython resolved at load). The two libpython modes are mutually
