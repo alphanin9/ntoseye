@@ -1,8 +1,133 @@
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::Result;
 use crate::gdb::RegisterMap;
 use crate::types::VirtAddr;
+
+/// One captured line of guest debug output (DbgPrint / kernel printf), with the
+/// host wall-clock time it completed and a monotonic sequence number used as the
+/// read cursor.
+#[derive(Clone, Debug)]
+pub struct DebugLine {
+    pub seq: u64,
+    pub timestamp_ms: u64,
+    pub text: String,
+}
+
+/// A window of debug lines returned by [`DebugBackend::read_debug_output`].
+/// `next_seq` is the cursor to pass on the next call to resume after the last
+/// returned line; `dropped` is set when `since_seq` predated the retained window
+/// (the bounded ring evicted lines the caller had not yet read).
+#[derive(Clone, Debug, Default)]
+pub struct DebugOutputPage {
+    pub lines: Vec<DebugLine>,
+    pub next_seq: u64,
+    pub dropped: bool,
+}
+
+/// Thread-safe, bounded, line-oriented ring buffer of guest debug output.
+///
+/// Guest DbgPrint arrives as arbitrary byte chunks serviced from two threads
+/// (the foreground KD loop and the background pump that owns the socket while
+/// the VM runs), so this is a cheap cloneable shared handle. Text is accumulated
+/// and split on `\n`; each completed line is timestamped and assigned a
+/// monotonic `seq`. Reads are snapshot+cursor and never drain, so independent
+/// consumers (the REPL's live terminal stream, an MCP poller, a Python script)
+/// can each track their own position.
+#[derive(Clone)]
+pub struct DebugLog {
+    inner: Arc<Mutex<DebugLogInner>>,
+}
+
+struct DebugLogInner {
+    lines: VecDeque<DebugLine>,
+    /// Bytes received since the last newline; a line is emitted only once
+    /// terminated, mirroring how a terminal line-buffers the same stream.
+    partial: String,
+    next_seq: u64,
+    capacity: usize,
+}
+
+impl DebugLog {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(DebugLogInner {
+                lines: VecDeque::new(),
+                partial: String::new(),
+                next_seq: 0,
+                capacity: capacity.max(1),
+            })),
+        }
+    }
+
+    /// Append a raw chunk of debug output, splitting it into timestamped lines.
+    /// Invalid UTF-8 is replaced lossily so the ring always holds valid text.
+    pub fn record(&self, bytes: &[u8]) {
+        let text = String::from_utf8_lossy(bytes);
+        let now = now_ms();
+        let mut inner = self.inner.lock().unwrap();
+        inner.push_text(&text, now);
+    }
+
+    /// Lines with `seq >= since_seq`, plus the cursor to resume after them.
+    pub fn read_since(&self, since_seq: u64) -> DebugOutputPage {
+        let inner = self.inner.lock().unwrap();
+        let dropped = inner
+            .lines
+            .front()
+            .is_some_and(|first| since_seq < first.seq);
+        let lines = inner
+            .lines
+            .iter()
+            .filter(|line| line.seq >= since_seq)
+            .cloned()
+            .collect();
+        DebugOutputPage {
+            lines,
+            next_seq: inner.next_seq,
+            dropped,
+        }
+    }
+}
+
+impl DebugLogInner {
+    fn push_text(&mut self, text: &str, now_ms: u64) {
+        for ch in text.chars() {
+            if ch == '\n' {
+                let mut line = std::mem::take(&mut self.partial);
+                // Normalize CRLF so Windows prints don't leave a trailing CR
+                if line.ends_with('\r') {
+                    line.pop();
+                }
+                self.push_line(line, now_ms);
+            } else {
+                self.partial.push(ch);
+            }
+        }
+    }
+
+    fn push_line(&mut self, text: String, now_ms: u64) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.lines.push_back(DebugLine {
+            seq,
+            timestamp_ms: now_ms,
+            text,
+        });
+        while self.lines.len() > self.capacity {
+            self.lines.pop_front();
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BugcheckInfo {
@@ -15,10 +140,6 @@ pub struct BugcheckInfo {
 pub struct StopEvent {
     /// Backend execution-context id, if the stop packet provided one
     pub thread_id: Option<String>,
-    /// Human-readable stop/exit reason, if the backend provided one
-    pub summary: Option<String>,
-    /// True if the debug target exited, was terminated, or reports no resumed threads
-    pub target_exited: bool,
     /// Backend exception/status code, when the stop packet carries one
     pub exception_code: Option<u32>,
     /// Program counter reported by the stop packet, when available
@@ -113,18 +234,6 @@ pub trait DebugBackend {
     fn set_breakpoint(&mut self, addr: u64) -> Result<()>;
     fn remove_breakpoint(&mut self, addr: u64) -> Result<()>;
 
-    fn set_hardware_breakpoint(&mut self, _addr: u64) -> Result<()> {
-        Err(crate::error::Error::NotSupported)
-    }
-
-    fn remove_hardware_breakpoint(&mut self, _addr: u64) -> Result<()> {
-        Err(crate::error::Error::NotSupported)
-    }
-
-    fn supports_process_breakpoints(&self) -> bool {
-        self.supports_user_mode_breakpoints()
-    }
-
     fn supports_user_mode_breakpoints(&self) -> bool {
         false
     }
@@ -186,26 +295,30 @@ pub trait DebugBackend {
     fn try_wait_for_stop(&mut self, timeout: Duration) -> Result<Option<StopEvent>>;
 
     fn thread_list(&mut self) -> Result<Vec<String>>;
-
-    fn get_thread_list(&mut self) -> Result<Vec<String>> {
-        self.thread_list()
-    }
-
     fn set_current_thread(&mut self, thread_id: &str) -> Result<()>;
 
     /// Return the currently stopped execution context
     fn stopped_thread_id(&mut self) -> Result<String>;
 
-    fn get_stopped_thread_id(&mut self) -> Result<String> {
-        self.stopped_thread_id()
-    }
-
-    /// Run a QEMU monitor command through the gdbstub, if this backend supports it.
+    /// Run a QEMU monitor command (e.g. `info registers` for IDT/GDT/TR bases)
+    /// through the backend, if it supports a monitor channel. Default: not
+    /// supported; the gdbstub backend implements it over `qRcmd`.
     fn monitor_command(&mut self, _command: &str) -> Result<String> {
         Err(crate::error::Error::NotSupported)
     }
 
     fn is_running(&self) -> bool;
+
+    /// Whether a stop has been caught but not yet drained by the foreground (e.g.
+    /// the background servicer reported a stop into its channel and exited, but no
+    /// `wait_for_stop`/`interrupt` has consumed it). In that window `is_running()`
+    /// is still its last `continue` value, stale, so the VM is actually halted
+    /// even though `is_running()` says true. A read-only "where am I" surface uses
+    /// this to report the truth without consuming the stop. Default `false`:
+    /// backends that stop synchronously have no such window.
+    fn has_pending_stop(&self) -> bool {
+        false
+    }
 
     /// Best-effort target cleanup before the frontend exits.
     ///
@@ -219,6 +332,13 @@ pub trait DebugBackend {
         Ok(())
     }
 
+    /// Read captured guest debug output (DbgPrint) at or after `since_seq`.
+    /// Default empty: only transports with a native debug-print stream (KD)
+    /// capture anything; see [`DebugCapability::DebugOutput`].
+    fn read_debug_output(&self, _since_seq: u64) -> DebugOutputPage {
+        DebugOutputPage::default()
+    }
+
     /// Return (and clear) whether a kernel module/driver loaded or unloaded since
     /// the last call, used to invalidate module-dependent caches (driver
     /// completions). Default `false`: backends without a load event rely instead
@@ -229,275 +349,55 @@ pub trait DebugBackend {
 }
 
 #[cfg(test)]
-pub mod fake {
-    //! A deterministic in-memory [`DebugBackend`] for tests. It records
-    //! breakpoint and continue/step activity and serves a scripted queue of
-    //! stop events, so backend-neutral logic can be exercised without a guest.
-
-    use std::collections::{BTreeSet, VecDeque};
-    use std::time::Duration;
-
-    use super::{DebugBackend, StopEvent};
-    use crate::error::Result;
-    use crate::gdb::{RegisterInfo, RegisterMap};
-
-    pub struct FakeBackend {
-        register_map: RegisterMap,
-        registers: Vec<u8>,
-        pub software_breakpoints: BTreeSet<u64>,
-        pub hardware_breakpoints: BTreeSet<u64>,
-        running: bool,
-        current_thread: String,
-        threads: Vec<String>,
-        stop_queue: VecDeque<StopEvent>,
-        pub continue_count: usize,
-        pub step_count: usize,
-        pub interrupt_count: usize,
-    }
-
-    impl FakeBackend {
-        /// Backend with `rsp`/`rip`/`cr3` registers laid out contiguously.
-        pub fn new() -> Self {
-            let register_map = RegisterMap::from_registers(vec![
-                RegisterInfo {
-                    name: "rsp".into(),
-                    offset: 0,
-                    size: 8,
-                    regnum: 0,
-                },
-                RegisterInfo {
-                    name: "rip".into(),
-                    offset: 8,
-                    size: 8,
-                    regnum: 1,
-                },
-                RegisterInfo {
-                    name: "cr3".into(),
-                    offset: 16,
-                    size: 8,
-                    regnum: 2,
-                },
-            ]);
-            Self {
-                register_map,
-                registers: vec![0u8; 24],
-                software_breakpoints: BTreeSet::new(),
-                hardware_breakpoints: BTreeSet::new(),
-                running: false,
-                current_thread: "1".into(),
-                threads: vec!["1".into()],
-                stop_queue: VecDeque::new(),
-                continue_count: 0,
-                step_count: 0,
-                interrupt_count: 0,
-            }
-        }
-
-        pub fn set_register(&mut self, name: &str, value: u64) {
-            self.register_map
-                .write_u64(name, &mut self.registers, value)
-                .unwrap();
-        }
-
-        pub fn queue_stop(&mut self, event: StopEvent) {
-            self.stop_queue.push_back(event);
-        }
-    }
-
-    impl DebugBackend for FakeBackend {
-        fn register_map(&self) -> &RegisterMap {
-            &self.register_map
-        }
-
-        fn read_registers(&mut self) -> Result<Vec<u8>> {
-            Ok(self.registers.clone())
-        }
-
-        fn write_registers(&mut self, data: &[u8]) -> Result<()> {
-            self.registers = data.to_vec();
-            Ok(())
-        }
-
-        fn set_breakpoint(&mut self, addr: u64) -> Result<()> {
-            self.software_breakpoints.insert(addr);
-            Ok(())
-        }
-
-        fn remove_breakpoint(&mut self, addr: u64) -> Result<()> {
-            self.software_breakpoints.remove(&addr);
-            Ok(())
-        }
-
-        fn set_hardware_breakpoint(&mut self, addr: u64) -> Result<()> {
-            self.hardware_breakpoints.insert(addr);
-            Ok(())
-        }
-
-        fn remove_hardware_breakpoint(&mut self, addr: u64) -> Result<()> {
-            self.hardware_breakpoints.remove(&addr);
-            Ok(())
-        }
-
-        fn continue_execution(&mut self) -> Result<()> {
-            self.continue_count += 1;
-            self.running = true;
-            Ok(())
-        }
-
-        fn step(&mut self) -> Result<()> {
-            self.step_count += 1;
-            Ok(())
-        }
-
-        fn interrupt(&mut self) -> Result<StopEvent> {
-            self.interrupt_count += 1;
-            self.running = false;
-            Ok(self.stop_queue.pop_front().unwrap_or(StopEvent {
-                thread_id: Some(self.current_thread.clone()),
-                summary: None,
-                target_exited: false,
-                exception_code: None,
-                program_counter: None,
-                is_bugcheck: false,
-                bugcheck: None,
-                target_reloaded: false,
-                target_kernel_base_hint: None,
-                assisted_breakin: false,
-            }))
-        }
-
-        fn wait_for_stop(&mut self) -> Result<StopEvent> {
-            self.running = false;
-            Ok(self.stop_queue.pop_front().unwrap_or(StopEvent {
-                thread_id: Some(self.current_thread.clone()),
-                summary: None,
-                target_exited: false,
-                exception_code: None,
-                program_counter: None,
-                is_bugcheck: false,
-                bugcheck: None,
-                target_reloaded: false,
-                target_kernel_base_hint: None,
-                assisted_breakin: false,
-            }))
-        }
-
-        fn try_wait_for_stop(&mut self, _timeout: Duration) -> Result<Option<StopEvent>> {
-            match self.stop_queue.pop_front() {
-                Some(event) => {
-                    self.running = false;
-                    Ok(Some(event))
-                }
-                None => Ok(None),
-            }
-        }
-
-        fn thread_list(&mut self) -> Result<Vec<String>> {
-            Ok(self.threads.clone())
-        }
-
-        fn set_current_thread(&mut self, thread_id: &str) -> Result<()> {
-            self.current_thread = thread_id.to_string();
-            Ok(())
-        }
-
-        fn stopped_thread_id(&mut self) -> Result<String> {
-            Ok(self.current_thread.clone())
-        }
-
-        fn is_running(&self) -> bool {
-            self.running
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
-    use super::fake::FakeBackend;
-    use super::{DebugBackend, StopEvent};
-    use std::time::Duration;
+    use super::*;
 
     #[test]
-    fn tracks_software_breakpoint_lifecycle() {
-        let mut backend = FakeBackend::new();
-        backend.set_breakpoint(0x1000).unwrap();
-        backend.set_breakpoint(0x2000).unwrap();
-        assert_eq!(backend.software_breakpoints.len(), 2);
-
-        backend.remove_breakpoint(0x1000).unwrap();
-        assert!(!backend.software_breakpoints.contains(&0x1000));
-        assert!(backend.software_breakpoints.contains(&0x2000));
+    fn debug_log_splits_lines_and_strips_crlf() {
+        let log = DebugLog::new(16);
+        // Arrives in two chunks, the second completing a line split across them
+        log.record(b"DriverEntry failed\r\nhello ");
+        log.record(b"world\n");
+        let page = log.read_since(0);
+        let texts: Vec<&str> = page.lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["DriverEntry failed", "hello world"]);
+        assert_eq!(page.next_seq, 2);
+        assert!(!page.dropped);
     }
 
     #[test]
-    fn hardware_breakpoints_are_tracked_separately() {
-        let mut backend = FakeBackend::new();
-        backend.set_hardware_breakpoint(0x4000).unwrap();
-        backend.set_breakpoint(0x5000).unwrap();
-        assert!(backend.hardware_breakpoints.contains(&0x4000));
-        assert!(!backend.software_breakpoints.contains(&0x4000));
-        backend.remove_hardware_breakpoint(0x4000).unwrap();
-        assert!(backend.hardware_breakpoints.is_empty());
+    fn debug_log_buffers_unterminated_partial() {
+        let log = DebugLog::new(16);
+        log.record(b"no newline yet");
+        assert!(log.read_since(0).lines.is_empty());
+        log.record(b"\n");
+        assert_eq!(log.read_since(0).lines.len(), 1);
     }
 
     #[test]
-    fn continue_then_wait_delivers_queued_stop_and_clears_running() {
-        let mut backend = FakeBackend::new();
-        backend.queue_stop(StopEvent {
-            thread_id: Some("3".into()),
-            summary: Some("breakpoint".into()),
-            target_exited: false,
-            exception_code: None,
-            program_counter: None,
-            is_bugcheck: false,
-            bugcheck: None,
-            target_reloaded: false,
-            target_kernel_base_hint: None,
-            assisted_breakin: false,
-        });
-
-        backend.continue_execution().unwrap();
-        assert!(backend.is_running());
-        assert_eq!(backend.continue_count, 1);
-
-        let event = backend.wait_for_stop().unwrap();
-        assert_eq!(event.thread_id.as_deref(), Some("3"));
-        assert!(!backend.is_running());
+    fn debug_log_cursor_returns_only_new_lines() {
+        let log = DebugLog::new(16);
+        log.record(b"one\ntwo\n");
+        let first = log.read_since(0);
+        assert_eq!(first.lines.len(), 2);
+        log.record(b"three\n");
+        let next = log.read_since(first.next_seq);
+        let texts: Vec<&str> = next.lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["three"]);
+        assert_eq!(next.next_seq, 3);
     }
 
     #[test]
-    fn try_wait_returns_none_until_a_stop_is_queued() {
-        let mut backend = FakeBackend::new();
-        backend.continue_execution().unwrap();
-        assert!(backend.try_wait_for_stop(Duration::ZERO).unwrap().is_none());
-        assert!(backend.is_running());
-
-        backend.queue_stop(StopEvent {
-            thread_id: None,
-            summary: None,
-            target_exited: true,
-            exception_code: None,
-            program_counter: None,
-            is_bugcheck: false,
-            bugcheck: None,
-            target_reloaded: false,
-            target_kernel_base_hint: None,
-            assisted_breakin: false,
-        });
-        let event = backend.try_wait_for_stop(Duration::ZERO).unwrap().unwrap();
-        assert!(event.target_exited);
-        assert!(!backend.is_running());
-    }
-
-    #[test]
-    fn registers_round_trip_through_register_map() {
-        let mut backend = FakeBackend::new();
-        backend.set_register("rsp", 0xdead_beef);
-        backend.set_register("rip", 0xfeed_face);
-
-        let regs = backend.read_registers().unwrap();
-        let map = backend.register_map();
-        assert_eq!(map.read_u64("rsp", &regs).unwrap(), 0xdead_beef);
-        assert_eq!(map.read_u64("rip", &regs).unwrap(), 0xfeed_face);
+    fn debug_log_evicts_oldest_and_flags_dropped() {
+        let log = DebugLog::new(2);
+        log.record(b"a\nb\nc\n");
+        let page = log.read_since(0);
+        // Only the last two retained; seq 0 ("a") was evicted
+        let texts: Vec<&str> = page.lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["b", "c"]);
+        // A reader still holding the evicted cursor learns it fell behind
+        assert!(page.dropped);
+        // A reader caught up to the retained window does not
+        assert!(!log.read_since(1).dropped);
     }
 }

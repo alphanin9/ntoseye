@@ -1,0 +1,36 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "ntoseye"
+dynamic = ["version"]
+description = "Python SDK for the ntoseye Windows kernel debugger (Linux/KVM/QEMU)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "dmaivel" }]
+keywords = ["debugger", "windows", "kernel", "kvm", "qemu", "introspection", "windbg"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Software Development :: Debuggers",
+    "Topic :: Security",
+]
+
+[project.urls]
+Homepage = "https://github.com/dmaivel/ntoseye"
+Repository = "https://github.com/dmaivel/ntoseye"
+Issues = "https://github.com/dmaivel/ntoseye/issues"
+
+[tool.maturin]
+# the `ntoseye` package (python/ntoseye/) wraps the private `_ntoseye`
+# rust extension and carries the PEP 561 stub + py.typed marker.
+features = ["pyo3/extension-module"]
+module-name = "ntoseye._ntoseye"
+python-source = "python"

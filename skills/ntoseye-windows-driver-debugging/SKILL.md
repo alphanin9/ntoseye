@@ -49,7 +49,7 @@ sudo /usr/local/bin/ntoseye
 `/usr/local/bin/ntoseye` is a symlink to `/home/user/dev/ntoseye/target/debug/ntoseye`, so rebuilding the debug binary updates the command automatically. Preserve any backend and agent arguments after the executable, for example:
 
 ```bash
-sudo /usr/local/bin/ntoseye --backend gdb --connect 127.0.0.1:1234 --agent-stdio
+sudo /usr/local/bin/ntoseye --backend gdb --connect 127.0.0.1:1234 agent
 sudo /usr/local/bin/ntoseye --backend memory
 ```
 
@@ -106,7 +106,7 @@ python3 ~/.codex/skills/ntoseye-windows-driver-debugging/scripts/qga-exec.py \
 When the task involves controlling NTOSEYE programmatically, read `references/agent-stdio.md` for the command reference. The protocol is newline-delimited JSON over stdin/stdout:
 
 ```bash
-sudo /usr/local/bin/ntoseye --backend gdb --connect 127.0.0.1:1234 --agent-stdio
+sudo /usr/local/bin/ntoseye --backend gdb --connect 127.0.0.1:1234 agent
 ```
 
 Use the agent interface for structured inspection and automation. Use the interactive REPL for exploratory manual sessions.
@@ -116,12 +116,9 @@ Use the agent interface for structured inspection and automation. Use the intera
 Before changing debugger code, inspect the local checkout and current branch. Existing useful behavior in this repo includes:
 
 - KD and QEMU gdbstub are separate debugger paths.
-- Software breakpoints use GDB remote `Z0` / `z0` and guest `0xCC` patching.
-- QEMU gdbstub hardware execution breakpoints use `Z1` / `z1`.
-- The repo advertises `hwbreak+` and exposes `hbp <address>` for hardware breakpoints.
-- `bp` should remain the software-breakpoint path.
-- Exact-RIP hardware breakpoint hits must not go through RIP-minus-one `int3` rewind logic.
-- `cregs` / `control-registers` and `trap-frame` / `tf` exist for architectural inspection when available in the checkout.
+- Software breakpoints use GDB remote `Z0` / `z0` and guest `0xCC` patching; `bp` is the software-breakpoint path.
+- Hardware execution breakpoints (`Z1` / `z1`, `hwbreak+`, `hbp <address>`) are NOT present on the current shared-core base — re-porting the fork's gdbstub hardware-breakpoint path is a tracked follow-up. If you re-add it, exact-RIP hardware hits must not go through RIP-minus-one `int3` rewind logic.
+- `trap-frame` / `tf` exists for architectural inspection when available in the checkout.
 
 For VMM-layer breakpoint ideas, keep the boundary clear: nested page table behavior belongs below Windows in QEMU/KVM/VMM behavior, not in the guest kernel. Host memory access in this repo goes through `/dev/kvm` plus QEMU process memory mechanisms.
 

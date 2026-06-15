@@ -1,9 +1,9 @@
 use strum::EnumMessage;
 
-use crate::debugger::UserVar;
 use crate::error::Result;
 use crate::expr::Expr;
 use crate::symbols::format_symbol_with_offset;
+use crate::target::UserVar;
 use crate::ui;
 
 use crate::repl::*;
@@ -17,13 +17,14 @@ impl ReplState<'_> {
         // bounded purely for terminal-output sanity (resolution
         // is O(1) now); a huge match set just floods the screen
         const X_LIMIT: usize = 4096;
-        let dtb = self.debugger.current_dtb();
+        let dtb = self.ctx.target.current_dtb();
         // `module!query` scopes the search to one module; a bare
         // query fuzzy-matches across the cached merged index
         let (module_filter, names) = match query.split_once('!') {
             Some((module, q)) => (
                 Some(module),
-                self.debugger
+                self.ctx
+                    .target
                     .symbols
                     .search_symbols_in_module(dtb, module, q, X_LIMIT),
             ),
@@ -41,8 +42,11 @@ impl ReplState<'_> {
                 Some(m) => format!("{}!{}", m, name),
                 None => name.clone(),
             };
-            if let Some((addr, module)) =
-                self.debugger.symbols.find_symbol_with_module(dtb, &lookup)
+            if let Some((addr, module)) = self
+                .ctx
+                .target
+                .symbols
+                .find_symbol_with_module(dtb, &lookup)
             {
                 println!(
                     "{}  {}",
@@ -67,7 +71,7 @@ impl ReplState<'_> {
                 hits.len() - 1
             );
         }
-        self.debugger.set_results(hits, self.line.clone());
+        self.ctx.target.set_results(hits, self.line.clone());
         println!();
 
         Ok(())
@@ -78,7 +82,7 @@ impl ReplState<'_> {
             error!("usage: ln <address>");
             return Ok(());
         };
-        let addr = match Expr::eval(arg, self.debugger) {
+        let addr = match Expr::eval(arg, &self.ctx.target) {
             Ok(a) => a,
             Err(e) => {
                 error!("{}", e);
@@ -86,15 +90,17 @@ impl ReplState<'_> {
             }
         };
         match self
-            .debugger
+            .ctx
+            .target
             .symbols
-            .find_closest_symbol_for_address(self.debugger.current_dtb(), addr)
+            .find_closest_symbol_for_address(self.ctx.target.current_dtb(), addr)
         {
             Some((module, sym, offset)) => {
                 let label = format_symbol_with_offset(&module, &sym, offset);
                 println!("{}  {}\n", ui::addr(addr.0), ui::symbol(&label));
                 // $0 = the symbol's base address (the resolved target)
-                self.debugger
+                self.ctx
+                    .target
                     .set_results(vec![(addr - offset as u64).0], self.line.clone());
             }
             None => {
@@ -120,9 +126,9 @@ impl ReplState<'_> {
             parts[1].to_string()
         };
 
-        match Expr::eval(&expr_str, self.debugger) {
+        match Expr::eval(&expr_str, &self.ctx.target) {
             Ok(addr) => {
-                self.debugger.set_results(vec![addr.0], self.line.clone());
+                self.ctx.target.set_results(vec![addr.0], self.line.clone());
                 println!("{}", ui::addr(addr.0));
             }
             Err(e) => error!("{}", e),
@@ -155,9 +161,10 @@ impl ReplState<'_> {
             return Ok(());
         }
         let source = rhs.trim().to_string();
-        match Expr::eval(&source, self.debugger) {
+        match Expr::eval(&source, &self.ctx.target) {
             Ok(v) => {
-                self.debugger
+                self.ctx
+                    .target
                     .user_vars
                     .insert(name.to_string(), UserVar { value: v.0, source });
                 println!("${} = {}\n", name, ui::addr(v.0));
@@ -169,20 +176,20 @@ impl ReplState<'_> {
     }
 
     pub fn cmd_vars(&mut self, _parts: &[&str]) -> Result<()> {
-        let builtins = self.debugger.builtin_variables();
-        if self.debugger.user_vars.is_empty()
-            && self.debugger.results.is_empty()
+        let builtins = self.ctx.target.builtin_variables();
+        if self.ctx.target.user_vars.is_empty()
+            && self.ctx.target.results.is_empty()
             && builtins.is_empty()
         {
             println!("no variables defined\n");
             return Ok(());
         }
-        let mut names: Vec<&String> = self.debugger.user_vars.keys().collect();
+        let mut names: Vec<&String> = self.ctx.target.user_vars.keys().collect();
         names.sort();
         if !names.is_empty() {
             println!("{}", ui::label("user:"));
             for name in names {
-                let var = &self.debugger.user_vars[name];
+                let var = &self.ctx.target.user_vars[name];
                 println!(
                     "  ${:<16} {}   {}",
                     name,
@@ -191,24 +198,25 @@ impl ReplState<'_> {
                 );
             }
         }
-        if !self.debugger.results.is_empty() {
-            if !self.debugger.user_vars.is_empty() {
+        if !self.ctx.target.results.is_empty() {
+            if !self.ctx.target.user_vars.is_empty() {
                 println!();
             }
             let origin = self
-                .debugger
+                .ctx
+                .target
                 .results_origin
                 .as_deref()
                 .map(|cmd| format!("from: {}", cmd))
                 .unwrap_or_default();
             println!(
                 "  {}   {}",
-                ui::muted(&format!("$0..${}", self.debugger.results.len() - 1)),
+                ui::muted(&format!("$0..${}", self.ctx.target.results.len() - 1)),
                 ui::muted(&origin)
             );
         }
         if !builtins.is_empty() {
-            if !self.debugger.user_vars.is_empty() || !self.debugger.results.is_empty() {
+            if !self.ctx.target.user_vars.is_empty() || !self.ctx.target.results.is_empty() {
                 println!();
             }
             println!("{}", ui::label("builtins:"));
@@ -232,7 +240,7 @@ impl ReplState<'_> {
             return Ok(());
         };
         let name = arg.strip_prefix('$').unwrap_or(arg);
-        if self.debugger.user_vars.remove(name).is_some() {
+        if self.ctx.target.user_vars.remove(name).is_some() {
             println!("unset ${}\n", name);
         } else {
             error!("no such variable: ${}", name);

@@ -1,8 +1,8 @@
 use owo_colors::OwoColorize;
 
-use crate::debugger::DebuggerContext;
 use crate::error::{Error, Result};
 use crate::expr::Expr;
+use crate::target::Target;
 use crate::types::VirtAddr;
 use crate::ui;
 
@@ -14,7 +14,7 @@ pub struct AddressRange {
 impl AddressRange {
     pub fn parse(
         parts: &[&str],
-        debugger: &DebuggerContext,
+        debugger: &Target,
         default_count: u64,
         item_size: u64,
     ) -> Result<Self> {

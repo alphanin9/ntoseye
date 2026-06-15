@@ -1,8 +1,7 @@
 #![allow(dead_code)]
-//! KD manipulate-state requests
-//!
-//! `DBGKD_MANIPULATE_STATE64` is 56 bytes: 12-byte prefix, 4 bytes padding,
-//! then a 40-byte per-API union
+
+// `DBGKD_MANIPULATE_STATE64` is 56 bytes: 12-byte prefix, 4 bytes padding,
+// then a 40-byte per-API union.
 
 use std::io::{Read, Write};
 
@@ -70,18 +69,10 @@ impl ManipulateHeader {
     }
 }
 
-/// Send a manipulate-state request and wait for the matching reply
-fn send_manipulate(
+fn recv_manipulate_reply(
     framing: &mut KdFraming<impl Read + Write>,
-    header: &[u8; MANIPULATE_HEADER_SIZE],
-    data: &[u8],
+    requested_processor: u16,
 ) -> Result<(ManipulateHeader, Vec<u8>, Vec<u8>)> {
-    let requested_processor = read_u16(header, 6);
-    let mut payload = Vec::with_capacity(MANIPULATE_HEADER_SIZE + data.len());
-    payload.extend_from_slice(header);
-    payload.extend_from_slice(data);
-    framing.send_data(PACKET_TYPE_KD_STATE_MANIPULATE, &payload)?;
-
     loop {
         let pkt = framing.recv_data()?;
         match pkt.packet_type {
@@ -120,6 +111,20 @@ fn send_manipulate(
             }
         }
     }
+}
+
+/// Send a manipulate-state request and wait for the matching reply
+fn send_manipulate(
+    framing: &mut KdFraming<impl Read + Write>,
+    header: &[u8; MANIPULATE_HEADER_SIZE],
+    data: &[u8],
+) -> Result<(ManipulateHeader, Vec<u8>, Vec<u8>)> {
+    let requested_processor = read_u16(header, 6);
+    let mut payload = Vec::with_capacity(MANIPULATE_HEADER_SIZE + data.len());
+    payload.extend_from_slice(header);
+    payload.extend_from_slice(data);
+    framing.send_data(PACKET_TYPE_KD_STATE_MANIPULATE, &payload)?;
+    recv_manipulate_reply(framing, requested_processor)
 }
 
 fn check_status(header: &ManipulateHeader, api: u32) -> Result<()> {
@@ -262,6 +267,18 @@ pub fn write_breakpoint<T: Read + Write>(
     let mut header = make_header(DBGKD_WRITE_BREAKPOINT, processor);
     write_u64(&mut header, UNION_OFFSET, addr);
     let (parsed, reply_header, _) = send_manipulate(framing, &header, &[])?;
+    check_status(&parsed, DBGKD_WRITE_BREAKPOINT)?;
+    Ok(read_u32(&reply_header, UNION_OFFSET + 8))
+}
+
+/// Receive a late `DbgKdWriteBreakPointApi` reply after the original wait
+/// timed out. Used by the KD backend to complete an in-flight breakpoint install
+/// without sending a duplicate request.
+pub fn recv_write_breakpoint_reply<T: Read + Write>(
+    framing: &mut KdFraming<T>,
+    processor: u16,
+) -> Result<u32> {
+    let (parsed, reply_header, _) = recv_manipulate_reply(framing, processor)?;
     check_status(&parsed, DBGKD_WRITE_BREAKPOINT)?;
     Ok(read_u32(&reply_header, UNION_OFFSET + 8))
 }

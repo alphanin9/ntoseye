@@ -4,10 +4,10 @@ use pelite::pe64::{Pe, PeView, image::IMAGE_SCN_MEM_EXECUTE};
 
 use crate::backend::MemoryOps;
 use crate::dbg_backend::DebugBackend;
-use crate::debugger::DebuggerContext;
 use crate::error::{Error, Result};
 use crate::guest::{ModuleInfo, ProcessInfo, read_pe_image};
 use crate::memory::AddressSpace;
+use crate::target::Target;
 use crate::types::{Dtb, VirtAddr};
 
 #[derive(Debug, Clone)]
@@ -19,23 +19,7 @@ pub struct Breakpoint {
     pub scope: BreakpointScope,
     pub condition: Option<String>,
     pub temporary: bool,
-    pub kind: BreakpointKind,
     backend: BreakpointBackend,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BreakpointKind {
-    Software,
-    Hardware,
-}
-
-impl BreakpointKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Software => "software",
-            Self::Hardware => "hardware",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,19 +64,17 @@ impl BreakpointScope {
 #[derive(Debug, Clone)]
 enum BreakpointBackend {
     Kernel { original_byte: u8 },
-    Hardware,
     GuestMemoryPatch { original_byte: u8 },
 }
 
 impl BreakpointBackend {
     /// The instruction byte we displaced with the int3, so display paths can
     /// overlay it and never show our own breakpoint.
-    fn original_byte(&self) -> Option<u8> {
+    fn original_byte(&self) -> u8 {
         match self {
             Self::Kernel { original_byte } | Self::GuestMemoryPatch { original_byte } => {
-                Some(*original_byte)
+                *original_byte
             }
-            Self::Hardware => None,
         }
     }
 }
@@ -113,80 +95,43 @@ impl BreakpointManager {
     pub fn add(
         &mut self,
         client: &mut dyn DebugBackend,
-        debugger: &DebuggerContext,
+        debugger: &Target,
         address: VirtAddr,
         symbol: Option<String>,
         condition: Option<String>,
     ) -> Result<u32> {
-        self.add_code(
-            client,
-            debugger,
-            address,
-            symbol,
-            condition,
-            false,
-            BreakpointKind::Software,
-        )
-    }
-
-    pub fn add_hardware(
-        &mut self,
-        client: &mut dyn DebugBackend,
-        debugger: &DebuggerContext,
-        address: VirtAddr,
-        symbol: Option<String>,
-    ) -> Result<u32> {
-        self.add_code(
-            client,
-            debugger,
-            address,
-            symbol,
-            None,
-            false,
-            BreakpointKind::Hardware,
-        )
+        self.add_code(client, debugger, address, symbol, condition, false)
     }
 
     pub fn add_temporary_code(
         &mut self,
         client: &mut dyn DebugBackend,
-        debugger: &DebuggerContext,
+        debugger: &Target,
         address: VirtAddr,
     ) -> Result<u32> {
-        self.add_code(
-            client,
-            debugger,
-            address,
-            None,
-            None,
-            true,
-            BreakpointKind::Software,
-        )
+        self.add_code(client, debugger, address, None, None, true)
     }
 
     fn add_code(
         &mut self,
         client: &mut dyn DebugBackend,
-        debugger: &DebuggerContext,
+        debugger: &Target,
         address: VirtAddr,
         symbol: Option<String>,
         condition: Option<String>,
         temporary: bool,
-        kind: BreakpointKind,
     ) -> Result<u32> {
         let scope = Self::scope_for_current_context(debugger);
         if matches!(scope, BreakpointScope::Process { .. })
-            && matches!(kind, BreakpointKind::Software)
             && !client.supports_user_mode_breakpoints()
         {
             return Err(Error::NotSupported);
         }
 
+        Self::validate_breakpoint_target(debugger, address)?;
+        let backend = Self::install_breakpoint(client, debugger, address, &scope)?;
         let id = self.next_id;
         self.next_id += 1;
-
-        Self::validate_breakpoint_target(debugger, address)?;
-        let backend = Self::install_breakpoint(client, debugger, address, &scope, kind)?;
 
         let bp = Breakpoint {
             id,
@@ -196,7 +141,6 @@ impl BreakpointManager {
             scope,
             condition,
             temporary,
-            kind,
             backend,
         };
 
@@ -207,7 +151,7 @@ impl BreakpointManager {
     pub fn remove(
         &mut self,
         client: &mut dyn DebugBackend,
-        debugger: &DebuggerContext,
+        debugger: &Target,
         id: u32,
     ) -> Result<()> {
         let bp = self.breakpoints.remove(&id).ok_or(Error::BPNotFound(id))?;
@@ -234,7 +178,7 @@ impl BreakpointManager {
     pub fn enable(
         &mut self,
         client: &mut dyn DebugBackend,
-        debugger: &DebuggerContext,
+        debugger: &Target,
         id: u32,
     ) -> Result<()> {
         let bp = self.breakpoints.get_mut(&id).ok_or(Error::BPNotFound(id))?;
@@ -251,7 +195,7 @@ impl BreakpointManager {
     pub fn disable(
         &mut self,
         client: &mut dyn DebugBackend,
-        debugger: &DebuggerContext,
+        debugger: &Target,
         id: u32,
     ) -> Result<()> {
         let bp = self.breakpoints.get_mut(&id).ok_or(Error::BPNotFound(id))?;
@@ -268,7 +212,7 @@ impl BreakpointManager {
     pub fn disable_guest_memory_patch_in_address_space(
         &mut self,
         client: &mut dyn DebugBackend,
-        debugger: &DebuggerContext,
+        debugger: &Target,
         id: u32,
         dtb: Dtb,
     ) -> Result<()> {
@@ -286,8 +230,8 @@ impl BreakpointManager {
                 bp.enabled = false;
                 Ok(())
             }
-            BreakpointBackend::Kernel { .. } | BreakpointBackend::Hardware => Err(Error::Rsp(
-                "cannot address-space-disable a transport-managed breakpoint".into(),
+            BreakpointBackend::Kernel { .. } => Err(Error::Rsp(
+                "cannot address-space-disable a kernel breakpoint".into(),
             )),
         }
     }
@@ -304,11 +248,7 @@ impl BreakpointManager {
 
     // NOTE refreshing ensures local breakpoint state matches target state in case they were cleared,
     // this should fix single stepping breaking every breakpoint proceeding the step..
-    pub fn refresh_enabled(
-        &self,
-        client: &mut dyn DebugBackend,
-        debugger: &DebuggerContext,
-    ) -> Result<()> {
+    pub fn refresh_enabled(&self, client: &mut dyn DebugBackend, debugger: &Target) -> Result<()> {
         let mut enabled: Vec<_> = self.breakpoints.values().filter(|bp| bp.enabled).collect();
         enabled.sort_by_key(|bp| bp.id);
 
@@ -332,7 +272,7 @@ impl BreakpointManager {
 
     pub fn enabled_breakpoint_id_for_current_context(
         &self,
-        debugger: &DebuggerContext,
+        debugger: &Target,
         address: VirtAddr,
     ) -> Option<u32> {
         let scope = Self::scope_for_current_context(debugger);
@@ -355,9 +295,7 @@ impl BreakpointManager {
             if bp.address.0 < start.0 || bp.address.0 >= end {
                 continue;
             }
-            if let Some(original_byte) = bp.backend.original_byte() {
-                buf[(bp.address.0 - start.0) as usize] = original_byte;
-            }
+            buf[(bp.address.0 - start.0) as usize] = bp.backend.original_byte();
         }
     }
 
@@ -369,16 +307,7 @@ impl BreakpointManager {
             .map(|bp| bp.id)
     }
 
-    pub fn int3_breakpoint_hit_at(&self, rip: u64, cr3: u64) -> bool {
-        self.breakpoints.values().any(|bp| {
-            bp.enabled
-                && bp.address.0 == rip
-                && bp.scope.matches_cr3(cr3)
-                && !matches!(bp.backend, BreakpointBackend::Hardware)
-        })
-    }
-
-    fn scope_for_current_context(debugger: &DebuggerContext) -> BreakpointScope {
+    fn scope_for_current_context(debugger: &Target) -> BreakpointScope {
         match &debugger.current_process_info {
             Some(ProcessInfo { pid, name, dtb, .. }) => BreakpointScope::Process {
                 pid: *pid,
@@ -391,13 +320,12 @@ impl BreakpointManager {
 
     fn install_breakpoint(
         client: &mut dyn DebugBackend,
-        debugger: &DebuggerContext,
+        debugger: &Target,
         address: VirtAddr,
         scope: &BreakpointScope,
-        kind: BreakpointKind,
     ) -> Result<BreakpointBackend> {
-        match (kind, scope) {
-            (BreakpointKind::Software, BreakpointScope::Kernel) => {
+        match scope {
+            BreakpointScope::Kernel => {
                 // Capture the displaced byte before the kernel writes the int3,
                 // so display paths can mask it back out (the kernel owns the
                 // original byte but never hands it to us)
@@ -409,7 +337,7 @@ impl BreakpointManager {
                     original_byte: original[0],
                 })
             }
-            (BreakpointKind::Software, BreakpointScope::Process { dtb, .. }) => {
+            BreakpointScope::Process { dtb, .. } => {
                 let memory = AddressSpace::new(&debugger.kvm, *dtb);
                 let mut original = [0u8; 1];
                 memory.read_bytes(address, &mut original)?;
@@ -422,23 +350,18 @@ impl BreakpointManager {
                     original_byte: original[0],
                 })
             }
-            (BreakpointKind::Hardware, _) => {
-                client.set_hardware_breakpoint(address.0)?;
-                Ok(BreakpointBackend::Hardware)
-            }
         }
     }
 
     fn install_existing_breakpoint(
         client: &mut dyn DebugBackend,
-        debugger: &DebuggerContext,
+        debugger: &Target,
         bp: &Breakpoint,
     ) -> Result<()> {
         match (&bp.scope, &bp.backend) {
             (BreakpointScope::Kernel, BreakpointBackend::Kernel { .. }) => {
                 client.set_breakpoint(bp.address.0)
             }
-            (_, BreakpointBackend::Hardware) => client.set_hardware_breakpoint(bp.address.0),
             (BreakpointScope::Process { dtb, .. }, BreakpointBackend::GuestMemoryPatch { .. }) => {
                 let memory = AddressSpace::new(&debugger.kvm, *dtb);
                 memory.write_bytes(bp.address, &[0xcc])?;
@@ -451,14 +374,13 @@ impl BreakpointManager {
 
     fn uninstall_breakpoint(
         client: &mut dyn DebugBackend,
-        debugger: &DebuggerContext,
+        debugger: &Target,
         bp: &Breakpoint,
     ) -> Result<()> {
         match (&bp.scope, &bp.backend) {
             (BreakpointScope::Kernel, BreakpointBackend::Kernel { .. }) => {
                 client.remove_breakpoint(bp.address.0)
             }
-            (_, BreakpointBackend::Hardware) => client.remove_hardware_breakpoint(bp.address.0),
             (
                 BreakpointScope::Process { dtb, .. },
                 BreakpointBackend::GuestMemoryPatch { original_byte },
@@ -472,7 +394,7 @@ impl BreakpointManager {
         }
     }
 
-    fn validate_breakpoint_target(debugger: &DebuggerContext, address: VirtAddr) -> Result<()> {
+    fn validate_breakpoint_target(debugger: &Target, address: VirtAddr) -> Result<()> {
         let module = Self::find_kernel_module_containing_address(debugger, address);
         let memory = AddressSpace::new(&debugger.kvm, debugger.current_dtb());
         let translation = memory
@@ -514,7 +436,7 @@ impl BreakpointManager {
     }
 
     fn find_kernel_module_containing_address(
-        debugger: &DebuggerContext,
+        debugger: &Target,
         address: VirtAddr,
     ) -> Option<ModuleInfo> {
         debugger
@@ -537,8 +459,7 @@ pub enum BreakpointHitResult {
 #[cfg(test)]
 mod tests {
     use super::{
-        Breakpoint, BreakpointBackend, BreakpointHitResult, BreakpointKind, BreakpointManager,
-        BreakpointScope,
+        Breakpoint, BreakpointBackend, BreakpointHitResult, BreakpointManager, BreakpointScope,
     };
     use crate::types::VirtAddr;
 
@@ -555,7 +476,6 @@ mod tests {
                 scope: BreakpointScope::Kernel,
                 condition: None,
                 temporary: false,
-                kind: BreakpointKind::Software,
                 backend: BreakpointBackend::Kernel {
                     original_byte: 0x90,
                 },
@@ -585,7 +505,6 @@ mod tests {
                 },
                 condition: None,
                 temporary: false,
-                kind: BreakpointKind::Software,
                 backend: BreakpointBackend::GuestMemoryPatch {
                     original_byte: 0x90,
                 },

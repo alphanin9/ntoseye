@@ -1,6 +1,12 @@
+[workspace]
+members = ["ntoseye-py"]
+
+[workspace.package]
+version = "0.13.0"
+
 [package]
 name = "ntoseye"
-version = "0.12.0"
+version.workspace = true
 edition = "2024"
 authors = [ "dmaivel" ]
 description = "Windows kernel debugger for Linux hosts running Windows under KVM/QEMU"
@@ -10,20 +16,20 @@ readme = "README.md"
 keywords = [ "virtualization", "introspection", "memory", "windbg", "kvm" ]
 categories = [ "security", "os" ]
 
+[[bin]]
+name = "ntoseye"
+path = "src/main.rs"
+required-features = ["cli"]
+
 [dependencies]
-ctrlc = "3.4"
-argh = "0.1.13"
-dialoguer = { version = "0.12.0", default-features = false }
 iced-x86 = "1.21.0"
 indicatif = "0.18.3"
 memmap2 = "0.9.9"
 nix = { version = "0.30.1", features = [ "process", "uio" ] }
-nu-ansi-term = "0.50.3"
 owo-colors = "4.2.3"
 pelite = "0.10.0"
-reedline = "0.44.0"
-reqwest = { version = "0.12.28", features = [ "blocking" ] }
-single-instance = "0.3.3"
+# rustls, not the default native-tls, to avoid linking system OpenSSL (portable wheel)
+reqwest = { version = "0.12.28", default-features = false, features = [ "blocking", "rustls-tls", "charset", "http2" ] }
 strum = "0.27.2"
 strum_macros = "0.27.2"
 tabled = { version = "0.20.0", features = [ "ansi" ] }
@@ -35,13 +41,57 @@ derive_more = { version = "2.1.1", features = ["full"] }
 pdb2 = "0.10.1"
 spin = "0.10.0"
 dashmap = "6.1.0"
-sha2 = "0.10.9"
-mlua = { version = "0.11", features = ["lua54", "vendored"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 nucleo-matcher = "0.3.1"
+single-instance = "0.3.3"
 
-# The profile that 'dist' will build with
+# pyo3 SDK + embedded interpreter, gated behind the `python` features. abi3 so
+# the wheel works against any Python 3.9+; per build the embed/extension toggle
+# (auto-initialize vs extension-module) selects how libpython is linked.
+pyo3 = { version = "0.28.3", features = ["abi3-py39"], optional = true }
+
+# Interactive CLI deps, gated behind the `cli` feature; the wheel builds without it
+ctrlc = { version = "3.4", optional = true }
+argh = { version = "0.1.13", optional = true }
+dialoguer = { version = "0.12.0", default-features = false, optional = true }
+nu-ansi-term = { version = "0.50.3", optional = true }
+reedline = { version = "0.44.0", optional = true }
+
+# MCP server deps
+rmcp = { version = "0.16", features = ["server", "transport-io", "transport-streamable-http-server", "macros"], optional = true }
+schemars = { version = "1", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "io-std", "net", "signal", "time"], optional = true }
+# CancellationToken for per-request cancel of in-flight continue_until_break
+tokio-util = { version = "0.7", default-features = false, optional = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"], optional = true }
+# CORS for the HTTP transport so browser MCP clients arent blocked
+tower-http = { version = "0.6", default-features = false, features = ["cors"], optional = true }
+anyhow = { version = "1", optional = true }
+
+[features]
+# `python-embed` is on by default so a plain `cargo install ntoseye` / `cargo
+# build` gets in-REPL scripting out of the box (like distro gdb/lldb). It links
+# libpython, so the build needs the Python dev lib; to build without it, opt out:
+#   cargo build --no-default-features --features cli,mcp
+default = ["cli", "mcp", "agent", "python-embed"]
+cli = ["dep:ctrlc", "dep:argh", "dep:dialoguer", "dep:nu-ansi-term", "dep:reedline"]
+mcp = ["dep:rmcp", "dep:schemars", "dep:serde", "dep:serde_json", "dep:tokio", "dep:tokio-util", "dep:axum", "dep:tower-http", "dep:anyhow"]
+# `agent` exposes the line-delimited JSON stdio debugger protocol (the
+# `ntoseye agent` subcommand) used by AI agent workflows that need `sudo`. Pulls
+# `python-embed` (not just `python`) so the in-protocol `script.*` commands have
+# a live, auto-initialized interpreter even in a minimal `--features agent` build,
+# and shares the neutral `view` renderer with MCP.
+agent = ["dep:serde", "dep:serde_json", "python-embed"]
+# `python` compiles the SDK. `python-embed` (binary) links libpython and
+# auto-starts the interpreter. `python-extension` is for the ntoseye-py wheel
+# shim (libpython resolved at load). The two libpython modes are mutually
+# exclusive in one build, so don't build the binary and the wheel cdylib together
+# (`cargo build --workspace` fails; build per-package).
+python = ["dep:pyo3"]
+python-embed = ["python", "pyo3/auto-initialize"]
+python-extension = ["python", "pyo3/extension-module"]
+
 [profile.dist]
 inherits = "release"
 lto = "thin"

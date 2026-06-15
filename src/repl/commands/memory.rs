@@ -6,7 +6,7 @@ use owo_colors::OwoColorize;
 use crate::backend::MemoryOps;
 use crate::error::Result;
 use crate::expr::Expr;
-use crate::symbols::ParsedType;
+use crate::symbols::{FieldValue, ParsedType};
 use crate::types::{Value, VirtAddr};
 use crate::ui;
 use crate::unwind::{format_symbol, resolve_thread_trace_context};
@@ -17,9 +17,10 @@ impl ReplState<'_> {
     /// Read guest memory in the current process context for *display*, masking
     /// out our own breakpoint int3 bytes so listings never show them.
     fn read_for_display(&self, addr: VirtAddr, buf: &mut [u8]) -> Result<()> {
-        let process = self.debugger.current_process();
+        let process = self.ctx.target.current_process();
         process.memory().read_bytes(addr, buf)?;
-        self.breakpoints
+        self.ctx
+            .breakpoints
             .mask_breakpoint_bytes(addr, buf, process.dtb());
         Ok(())
     }
@@ -31,7 +32,7 @@ impl ReplState<'_> {
         item_size: u64,
         mode: MemoryDisplayMode,
     ) -> Result<()> {
-        let range = match AddressRange::parse(parts, self.debugger, default_count, item_size) {
+        let range = match AddressRange::parse(parts, &self.ctx.target, default_count, item_size) {
             Ok(r) => r,
             Err(e) => {
                 error!("{}", e);
@@ -63,7 +64,7 @@ impl ReplState<'_> {
             return Ok(());
         }
 
-        let address = match Expr::eval(parts[1], self.debugger) {
+        let address = match Expr::eval(parts[1], &self.ctx.target) {
             Ok(a) => a,
             Err(e) => {
                 error!("{}", e);
@@ -72,7 +73,7 @@ impl ReplState<'_> {
         };
 
         let expr_str = parts[2..].join(" ");
-        let value = match Expr::eval(&expr_str, self.debugger) {
+        let value = match Expr::eval(&expr_str, &self.ctx.target) {
             Ok(v) => v.0,
             Err(e) => {
                 error!("{}", e);
@@ -82,7 +83,7 @@ impl ReplState<'_> {
 
         let bytes = encode(value);
         let formatted_value = display_value(value);
-        let mem = self.debugger.current_process().memory();
+        let mem = self.ctx.target.current_process().memory();
         if let Err(e) = mem.write_bytes(address, &bytes) {
             error!("failed to write {}: {}", noun, e);
         } else {
@@ -110,7 +111,7 @@ impl ReplState<'_> {
     }
 
     pub fn cmd_disasm(&mut self, parts: &[&str]) -> Result<()> {
-        let range = match AddressRange::parse(parts, self.debugger, 32, 1) {
+        let range = match AddressRange::parse(parts, &self.ctx.target, 32, 1) {
             Ok(r) => r,
             Err(e) => {
                 error!("{}", e);
@@ -127,9 +128,9 @@ impl ReplState<'_> {
 
         // resolve branch / rip-relative targets the same way the break/status
         // view does, so the `disasm` command's comments read identically
-        let dtb = self.debugger.current_process().dtb();
-        let trace = resolve_thread_trace_context(self.debugger, dtb);
-        let resolve = |target: u64| format_symbol(self.debugger, &trace, target);
+        let dtb = self.ctx.target.current_process().dtb();
+        let trace = resolve_thread_trace_context(&self.ctx.target, dtb);
+        let resolve = |target: u64| format_symbol(&self.ctx.target, &trace, target);
 
         // TODO dont hardcode 64-bit for WOW64 process? / support other formats?
         let mut formatter = disasm_formatter();
@@ -179,7 +180,7 @@ impl ReplState<'_> {
             return Ok(());
         }
 
-        let address = match Expr::eval(parts[1], self.debugger) {
+        let address = match Expr::eval(parts[1], &self.ctx.target) {
             Ok(a) => a,
             Err(e) => {
                 error!("{}", e);
@@ -197,7 +198,7 @@ impl ReplState<'_> {
         };
 
         let length = match parts.get(3) {
-            Some(length_arg) => match Expr::eval(length_arg, self.debugger) {
+            Some(length_arg) => match Expr::eval(length_arg, &self.ctx.target) {
                 Ok(value) => match resolve_length_or_end(address, value) {
                     Some(length) => length,
                     None => {
@@ -214,7 +215,7 @@ impl ReplState<'_> {
         };
 
         let data = repeat_pattern(&pattern, length);
-        let mem = self.debugger.current_process().memory();
+        let mem = self.ctx.target.current_process().memory();
 
         if let Err(e) = mem.write_bytes(address, &data) {
             error!("failed to fill memory: {}", e);
@@ -242,7 +243,7 @@ impl ReplState<'_> {
 
         let pattern_str = parts[2];
 
-        let start_addr = match Expr::eval(parts[1], self.debugger) {
+        let start_addr = match Expr::eval(parts[1], &self.ctx.target) {
             Ok(a) => a,
             Err(e) => {
                 error!("{}", e);
@@ -259,7 +260,7 @@ impl ReplState<'_> {
         };
 
         let length = match parts.get(3) {
-            Some(length_arg) => match Expr::eval(length_arg, self.debugger) {
+            Some(length_arg) => match Expr::eval(length_arg, &self.ctx.target) {
                 Ok(value) => match usize::try_from(value.0) {
                     Ok(length) => length,
                     Err(_) => {
@@ -275,37 +276,33 @@ impl ReplState<'_> {
             None => 0x100,
         };
 
-        let mut data = vec![0u8; length];
-        let mem = self.debugger.current_process().memory();
-
-        if let Err(e) = mem.read_bytes(start_addr, &mut data) {
-            error!("failed to read memory: {}", e);
-            return Ok(());
-        }
-
-        let mut hits: Vec<u64> = Vec::new();
-        if pattern.len() <= data.len() {
-            for i in 0..=data.len() - pattern.len() {
-                if &data[i..i + pattern.len()] == pattern.as_slice() {
-                    let addr = start_addr + i as u64;
-                    let sym = self
-                        .debugger
-                        .guest
-                        .ntoskrnl
-                        .closest_symbol(addr)
-                        .map(|(s, o)| {
-                            if o == 0 {
-                                s.to_string()
-                            } else {
-                                format!("{}+{:#x}", s, o)
-                            }
-                        })
-                        .unwrap_or_default();
-
-                    println!("{}  {}", ui::addr(addr.0), ui::symbol(&sym));
-                    hits.push(addr.0);
-                }
+        // The scan itself is the shared core primitive (`Target::search`), the
+        // same one the SDK and MCP `search` use; the REPL only adds the
+        // per-hit symbol line and the $0..$N result slots.
+        let hits = match self.ctx.target.search(start_addr, &pattern, length) {
+            Ok(hits) => hits,
+            Err(e) => {
+                error!("failed to read memory: {}", e);
+                return Ok(());
             }
+        };
+        for &addr in &hits {
+            let sym = self
+                .ctx
+                .target
+                .guest
+                .ntoskrnl
+                .closest_symbol(VirtAddr(addr))
+                .map(|(s, o)| {
+                    if o == 0 {
+                        s.to_string()
+                    } else {
+                        format!("{}+{:#x}", s, o)
+                    }
+                })
+                .unwrap_or_default();
+
+            println!("{}  {}", ui::addr(addr), ui::symbol(&sym));
         }
 
         if hits.is_empty() {
@@ -323,11 +320,11 @@ impl ReplState<'_> {
                 hits.len() - 1
             );
         }
-        // TODO: expose search results to Lua as a table of
-        // {address, symbol} rows so scripts can iterate over
+        // TODO: expose search results to Python scripts as a list
+        // of {address, symbol} rows so scripts can iterate over
         // every match (e.g. nop/patch all hits, or filter by
         // symbol); the $0..$N slots only cover acting on one
-        self.debugger.set_results(hits, self.line.clone());
+        self.ctx.target.set_results(hits, self.line.clone());
         println!();
 
         Ok(())
@@ -336,7 +333,7 @@ impl ReplState<'_> {
     pub fn cmd_dt(&mut self, parts: &[&str]) -> Result<()> {
         let arg = require_arg!(parts, 1, ReplCommand::Dt);
 
-        let address = match Expr::eval(parts.get(2).copied().unwrap_or("0"), self.debugger) {
+        let address = match Expr::eval(parts.get(2).copied().unwrap_or("0"), &self.ctx.target) {
             Ok(a) => a,
             Err(e) => {
                 error!("{}", e);
@@ -347,9 +344,10 @@ impl ReplState<'_> {
         let field_name = parts.get(3);
 
         match self
-            .debugger
+            .ctx
+            .target
             .symbols
-            .find_type_across_modules(self.debugger.current_dtb(), arg)
+            .find_type_across_modules(self.ctx.target.current_dtb(), arg)
         {
             Some(type_info) => {
                 let mut builder = Builder::default();
@@ -358,6 +356,32 @@ impl ReplState<'_> {
                     type_info.name,
                     Value(type_info.size)
                 )]);
+
+                // Decode via the shared `decode_fields` (the path `read_struct`
+                // uses in the SDK/MCP) so `dt` and a struct read can't disagree.
+                // One whole-struct read, rendered from the decoded leaves; the
+                // offset/type columns and bitfield Y/N styling stay dt-specific.
+                let decoded: std::collections::HashMap<String, FieldValue> = if address.0 != 0 {
+                    // NOTE: one whole-struct read, not page-tolerant; fine for the
+                    // non-paged kernel structs dt targets, but a partially-resident
+                    // pageable struct with a paged-out tail would fail the read here
+                    let mut buf = vec![0u8; type_info.size];
+                    match self
+                        .ctx
+                        .target
+                        .current_process()
+                        .memory()
+                        .read_bytes(address, &mut buf)
+                    {
+                        Ok(()) => type_info.decode_fields(&buf).into_iter().collect(),
+                        Err(e) => {
+                            error!("failed to read struct memory: {}", e);
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    std::collections::HashMap::new()
+                };
 
                 let mut sorted_fields: Vec<_> = type_info.fields.iter().collect();
                 sorted_fields.sort_by_key(|(_, info)| {
@@ -369,48 +393,31 @@ impl ReplState<'_> {
                 });
 
                 for (name, info) in sorted_fields {
-                    let value = if address.0 != 0 {
-                        let mem = self.debugger.current_process().memory();
-                        match &info.type_data {
-                            ParsedType::Primitive(p) => {
-                                if p.contains("*") || p.contains("LONGLONG") {
-                                    let val: u64 = mem.read(address + info.offset)?;
-                                    format!(" = {:#x}", Value(val))
-                                } else if p.contains("LONG") {
-                                    let val: u32 = mem.read(address + info.offset)?;
-                                    format!(" = {:#x}", Value(val))
-                                } else if p.contains("SHORT") || p.contains("WCHAR") {
-                                    let val: u16 = mem.read(address + info.offset)?;
-                                    format!(" = {:#x}", Value(val))
-                                } else if p.contains("CHAR") {
-                                    let val: u8 = mem.read(address + info.offset)?;
-                                    format!(" = {:#x}", Value(val))
+                    let value = match decoded.get(name) {
+                        // A len-1 bitfield renders as a Y/N flag (the value is
+                        // already masked/shifted by decode_fields); wider
+                        // bitfields show the decimal value.
+                        Some(FieldValue::Bitfield(val)) => {
+                            let single_bit = matches!(
+                                &info.type_data,
+                                ParsedType::Bitfield { len, .. } if *len == 1
+                            );
+                            if single_bit {
+                                if *val == 1 {
+                                    format!(" = {}", "Y".green())
                                 } else {
-                                    "".into()
+                                    format!(" = {}", "N".red())
                                 }
+                            } else {
+                                format!(" = {}", Value(*val))
                             }
-                            ParsedType::Pointer(_) => {
-                                let val: u64 = mem.read(address + info.offset)?;
-                                format!(" = {:#x}", Value(val))
-                            }
-                            ParsedType::Bitfield { pos, len, .. } => {
-                                let val: u64 = mem.read(address + info.offset)?;
-                                let val = (val >> pos) & ((1u64 << len) - 1);
-
-                                if *len == 1 {
-                                    if val == 1 {
-                                        format!(" = {}", "Y".green())
-                                    } else {
-                                        format!(" = {}", "N".red())
-                                    }
-                                } else {
-                                    format!(" = {}", Value(val))
-                                }
-                            }
-                            _ => "".into(),
                         }
-                    } else {
-                        "".into()
+                        Some(FieldValue::Int(val)) | Some(FieldValue::Pointer(val)) => {
+                            format!(" = {:#x}", Value(*val))
+                        }
+                        // Aggregates (Bytes) and fields decode_fields skips
+                        // (nested structs / past the buffer) show no inline value.
+                        Some(FieldValue::Bytes(_)) | None => String::new(),
                     };
 
                     if field_name.is_none() || field_name.unwrap() == name {
@@ -429,7 +436,30 @@ impl ReplState<'_> {
                 print_plain_table(builder);
             }
             None => {
-                error!("failed to get type information: type `{}` not found\n", arg);
+                // Not a struct/union; it may be an enum (enums aren't in the
+                // struct type index, so find_type misses them).
+                match self
+                    .ctx
+                    .target
+                    .symbols
+                    .find_enum_across_modules(self.ctx.target.current_dtb(), arg)
+                {
+                    Some(variants) => {
+                        // Header as its own line; a one-cell header row in the
+                        // table would stretch the value column. The value/name
+                        // table then sizes both columns to content.
+                        println!("enum {} ({} values)", arg, variants.len());
+                        let mut builder = Builder::default();
+                        for (name, value) in &variants {
+                            builder.push_record(vec![format!("  {:#x}  ", value), name.clone()]);
+                        }
+                        print_plain_table(builder);
+                        println!();
+                    }
+                    None => {
+                        error!("failed to get type information: type `{}` not found\n", arg);
+                    }
+                }
             }
         }
 

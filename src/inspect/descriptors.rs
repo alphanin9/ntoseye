@@ -5,10 +5,10 @@
 //! them as tables and the agent serializes them as JSON.
 
 use crate::backend::MemoryOps;
-use crate::debugger::DebuggerContext;
 use crate::error::{Error, Result};
 use crate::gdb::RegisterMap;
 use crate::memory::AddressSpace;
+use crate::target::Target;
 use crate::types::VirtAddr;
 
 const CR3_PAGE_MASK: u64 = 0x000F_FFFF_FFFF_F000;
@@ -142,7 +142,7 @@ pub fn parse_idt_entry(vector: usize, bytes: &[u8]) -> IdtEntry {
 }
 
 pub fn read_idt_entries(
-    debugger: &DebuggerContext,
+    debugger: &Target,
     register_map: &RegisterMap,
     regs: &[u8],
     idtr: Idtr,
@@ -209,7 +209,7 @@ pub fn parse_gdt_entry(index: usize, data: &[u8]) -> GdtEntry {
 }
 
 pub fn read_gdt_entries(
-    debugger: &DebuggerContext,
+    debugger: &Target,
     register_map: &RegisterMap,
     regs: &[u8],
     gdtr: Gdtr,
@@ -246,7 +246,7 @@ pub fn read_gdt_entries(
 }
 
 pub fn read_gdt_entry(
-    debugger: &DebuggerContext,
+    debugger: &Target,
     register_map: &RegisterMap,
     regs: &[u8],
     gdtr: Gdtr,
@@ -284,7 +284,7 @@ pub fn parse_tss_stack_bases(data: &[u8]) -> Result<TssStackBases> {
 }
 
 pub fn read_tss_stack_bases(
-    debugger: &DebuggerContext,
+    debugger: &Target,
     register_map: &RegisterMap,
     regs: &[u8],
     gdtr: Gdtr,

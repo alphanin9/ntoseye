@@ -34,6 +34,7 @@ pub enum Error {
     #[error(transparent)]
     Indicatif(#[from] TemplateError),
 
+    #[cfg(feature = "cli")]
     #[error(transparent)]
     CtrlC(#[from] ctrlc::Error),
 

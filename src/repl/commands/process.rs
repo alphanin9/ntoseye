@@ -1,5 +1,4 @@
 use indicatif::{ProgressBar, ProgressStyle};
-use std::collections::HashMap;
 use std::time::Duration;
 
 use strum::EnumMessage;
@@ -7,11 +6,12 @@ use tabled::builder::Builder;
 
 use owo_colors::OwoColorize;
 
-use crate::debugger::{
-    AttachReport, MemoryRegionInfo, ThreadInfo, kthread_state_name, wait_reason_name,
-};
 use crate::error::Result;
 use crate::expr::Expr;
+use crate::target::{
+    AttachReport, MemoryRegionInfo, ThreadInfo, kthread_state_name, process_matches,
+    wait_reason_name,
+};
 use crate::types::{Value, VirtAddr};
 use crate::ui;
 
@@ -201,36 +201,8 @@ fn region_matches_filter(
 }
 
 impl ReplState<'_> {
-    fn active_windows_thread_map(&mut self) -> HashMap<u64, (String, ThreadInfo)> {
-        let Ok(original_thread) = self.client.stopped_thread_id() else {
-            return HashMap::new();
-        };
-        let Ok(vcpus) = self.client.thread_list() else {
-            return HashMap::new();
-        };
-
-        let mut active = HashMap::new();
-        for vcpu in &vcpus {
-            if self.client.set_current_thread(vcpu).is_err() {
-                continue;
-            }
-            let Some(processor) = processor_index_from_backend_thread_id(vcpu) else {
-                continue;
-            };
-            if let Ok(thread) = self
-                .debugger
-                .current_windows_thread_for_processor(processor)
-            {
-                active.insert(thread.ethread.0, (vcpu.clone(), thread));
-            }
-        }
-
-        let _ = self.client.set_current_thread(&original_thread);
-        active
-    }
-
     pub fn cmd_vcpus(&mut self, _parts: &[&str]) -> Result<()> {
-        if self.client.is_running() {
+        if self.ctx.backend.is_running() {
             error!("VM is running");
             return Ok(());
         }
@@ -245,108 +217,32 @@ impl ReplState<'_> {
         pb.set_message(format!("{}", "Waiting on GDB...".bright_black()));
         pb.enable_steady_tick(Duration::from_millis(100));
 
-        let original_thread = match self.client.stopped_thread_id() {
-            Ok(thread) => thread,
+        let vcpus = match self.ctx.vcpus() {
+            Ok(vcpus) => vcpus,
             Err(e) => {
                 pb.finish_and_clear();
                 error!("{}", e);
                 return Ok(());
             }
         };
-        let threads = match self.client.thread_list() {
-            Ok(threads) => threads,
-            Err(e) => {
-                pb.finish_and_clear();
-                error!("{}", e);
-                return Ok(());
-            }
-        };
-
-        let processes = self
-            .debugger
-            .guest
-            .enumerate_processes()
-            .unwrap_or_default();
-        let kernel_dtb = self.debugger.guest.ntoskrnl.dtb();
-
-        let mut vcpu_data: Vec<(String, String, String, String)> = Vec::new();
-
-        for thread in &threads {
-            let regs = self
-                .client
-                .set_current_thread(thread)
-                .and_then(|_| self.client.read_registers());
-            let regs = match regs {
-                Ok(regs) => regs,
-                Err(e) => {
-                    vcpu_data.push((
-                        thread.clone(),
-                        ui::muted("unavailable"),
-                        String::new(),
-                        format!("{e}"),
-                    ));
-                    continue;
-                }
-            };
-            let (Ok(rip), Ok(cr3)) = (
-                self.register_map.read_u64("rip", &regs),
-                self.register_map.read_u64("cr3", &regs),
-            ) else {
-                vcpu_data.push((
-                    thread.clone(),
-                    ui::muted("unavailable"),
-                    String::new(),
-                    String::new(),
-                ));
-                continue;
-            };
-
-            let cr3_masked = cr3 & 0x000F_FFFF_FFFF_F000;
-            let kernel_dtb_masked = kernel_dtb & 0x000F_FFFF_FFFF_F000;
-
-            let (context, symbol) = if cr3_masked == kernel_dtb_masked {
-                let sym = self
-                    .debugger
-                    .guest
-                    .ntoskrnl
-                    .closest_symbol(VirtAddr(rip))
-                    .map(|(s, o)| format!("{}+{:#x}", s, o))
-                    .unwrap_or_else(|_| format!("{:#x}", rip));
-                ("kernel".to_string(), sym)
-            } else {
-                match processes
-                    .iter()
-                    .find(|p| (p.dtb & 0x000F_FFFF_FFFF_F000) == cr3_masked)
-                {
-                    Some(proc) => {
-                        let sym = self
-                            .debugger
-                            .symbols
-                            .format_closest_symbol_for_address(proc.dtb, VirtAddr(rip))
-                            .unwrap_or_else(|| format!("{:#x}", rip));
-                        (proc.name.clone(), sym)
-                    }
-                    None => ("unknown".to_string(), format!("{:#x}", rip)),
-                }
-            };
-
-            vcpu_data.push((thread.clone(), ui::addr(rip), context, symbol));
-        }
 
         pb.finish_and_clear();
 
-        if let Err(e) = self.client.set_current_thread(&original_thread) {
-            error!("failed to restore vcpu context: {}", e);
-        }
-
         let mut builder = Builder::default();
         builder.push_record(vec!["vCPU", "RIP", "Context", "Symbol"]);
-        for (vcpu, rip, ctx, sym) in vcpu_data {
+        for vcpu in vcpus {
+            let (rip_cell, symbol_cell) = match vcpu.rip {
+                Some(rip) => (
+                    ui::addr(rip),
+                    vcpu.symbol.unwrap_or_else(|| format!("{rip:#x}")),
+                ),
+                None => (ui::muted("unavailable"), vcpu.error.unwrap_or_default()),
+            };
             builder.push_record(vec![
-                format!("{}  ", vcpu),
-                format!("{}  ", rip),
-                format!("{}  ", ctx),
-                sym,
+                format!("{}  ", vcpu.id),
+                format!("{}  ", rip_cell),
+                format!("{}  ", vcpu.context),
+                symbol_cell,
             ]);
         }
 
@@ -356,29 +252,22 @@ impl ReplState<'_> {
     }
 
     pub fn cmd_threads(&mut self, parts: &[&str]) -> Result<()> {
-        if self.client.is_running() {
+        if self.ctx.backend.is_running() {
             error!("VM is running");
             return Ok(());
         }
 
         let filter = parts.get(1).copied();
-        let active = self.active_windows_thread_map();
-        let mut threads = match self.debugger.enumerate_threads() {
-            Ok(threads) => threads,
+        let (mut threads, active) = match self.ctx.windows_threads() {
+            Ok(result) => result,
             Err(e) => {
                 error!("failed to enumerate threads: {}", e);
                 return Ok(());
             }
         };
-        for (_, thread) in active.values() {
-            if !threads.iter().any(|known| known.ethread == thread.ethread) {
-                threads.push(thread.clone());
-            }
-        }
         if let Some(filter) = filter {
             threads.retain(|thread| thread_matches_filter(thread, filter));
         }
-        threads.sort_by_key(|thread| (thread.pid.unwrap_or(u64::MAX), thread.tid));
         *self.caches.threads.write().unwrap() = threads.clone();
 
         if threads.is_empty() {
@@ -400,7 +289,7 @@ impl ReplState<'_> {
         for thread in &threads {
             let active_vcpu = active
                 .get(&thread.ethread.0)
-                .map(|(vcpu, _)| vcpu.as_str())
+                .map(|vcpu| vcpu.as_str())
                 .unwrap_or("-");
             let start = thread.start_address.or(thread.win32_start_address);
             builder.push_record(vec![
@@ -435,13 +324,13 @@ impl ReplState<'_> {
     }
 
     pub fn cmd_thread(&mut self, parts: &[&str]) -> Result<()> {
-        if self.client.is_running() {
+        if self.ctx.backend.is_running() {
             error!("VM is running");
             return Ok(());
         }
 
         let target = require_arg!(parts, 1, ReplCommand::Thread);
-        let mut threads = match self.debugger.enumerate_threads() {
+        let mut threads = match self.ctx.target.enumerate_threads() {
             Ok(threads) => threads,
             Err(e) => {
                 error!("failed to enumerate threads: {}", e);
@@ -449,7 +338,7 @@ impl ReplState<'_> {
             }
         };
 
-        let active = self.active_windows_thread_map();
+        let active = self.ctx.active_thread_map();
         for (_, thread) in active.values() {
             if !threads.iter().any(|known| known.ethread == thread.ethread) {
                 threads.push(thread.clone());
@@ -458,7 +347,8 @@ impl ReplState<'_> {
         *self.caches.threads.write().unwrap() = threads.clone();
 
         let current_alias_address = if target == "." {
-            self.debugger
+            self.ctx
+                .target
                 .current_windows_thread
                 .as_ref()
                 .map(|t| t.ethread)
@@ -466,7 +356,7 @@ impl ReplState<'_> {
             None
         };
         let target_address =
-            current_alias_address.or_else(|| Expr::eval(target, self.debugger).ok());
+            current_alias_address.or_else(|| Expr::eval(target, &self.ctx.target).ok());
         let matches = threads
             .iter()
             .filter(|thread| {
@@ -511,25 +401,28 @@ impl ReplState<'_> {
             return Ok(());
         };
 
-        if let Err(e) = self.client.set_current_thread(vcpu) {
+        // Route through Session::set_current_thread so the inspection context
+        // (registers + the thread's CR3 as the read/install DTB) is established
+        // uniformly with the SDK; the REPL layers the Windows-thread context and
+        // symbol-cache refresh on top.
+        if let Err(e) = self.ctx.set_current_thread(vcpu) {
             error!("failed to switch to vCPU {}: {:?}", vcpu, e);
             return Ok(());
         }
-        self.current_thread = vcpu.clone();
-        self.debugger.clear_context_dtb_override();
-        self.debugger
+        self.ctx
+            .target
             .set_current_windows_thread_context((*thread).clone());
-        self.caches.refresh_symbol_context(self.debugger);
+        self.caches.refresh_symbol_context(&self.ctx.target);
         println!(
             "switched to {} running ETHREAD {}\n",
-            self.current_thread,
+            self.ctx.current_thread,
             ui::addr(thread.ethread.0)
         );
         print_thread_detail(thread);
 
         match action {
             Some("k") => {
-                let regs = match self.client.read_registers() {
+                let regs = match self.ctx.backend.read_registers() {
                     Ok(regs) => regs,
                     Err(e) => {
                         error!("failed to read registers: {:?}", e);
@@ -537,8 +430,8 @@ impl ReplState<'_> {
                     }
                 };
                 print_stacktrace(
-                    self.debugger,
-                    &self.register_map,
+                    &self.ctx.target,
+                    &self.ctx.register_map,
                     &regs,
                     frame_limit,
                     frame_limit,
@@ -546,14 +439,14 @@ impl ReplState<'_> {
                 );
             }
             Some("r" | "registers") => {
-                let regs = match self.client.read_registers() {
+                let regs = match self.ctx.backend.read_registers() {
                     Ok(regs) => regs,
                     Err(e) => {
                         error!("failed to read registers: {:?}", e);
                         return Ok(());
                     }
                 };
-                print_registers(&self.register_map, &regs, false);
+                print_registers(&self.ctx.register_map, &regs, false);
             }
             Some(other) => error!("unknown thread action '{}': expected k or r", other),
             None => {}
@@ -563,17 +456,18 @@ impl ReplState<'_> {
     }
 
     pub fn cmd_vmmap(&mut self, parts: &[&str]) -> Result<()> {
-        if self.client.is_running() {
+        if self.ctx.backend.is_running() {
             error!("VM is running");
             return Ok(());
         }
 
         let filter = parts.get(1).copied();
-        let filter_address = filter.and_then(|filter| Expr::eval(filter, self.debugger).ok());
+        let filter_address = filter.and_then(|filter| Expr::eval(filter, &self.ctx.target).ok());
 
-        if let Some(process) = self.debugger.current_process_info.clone() {
+        if let Some(process) = self.ctx.target.current_process_info.clone() {
             let regions = match self
-                .debugger
+                .ctx
+                .target
                 .enumerate_vad_regions_for_process_info(&process)
             {
                 Ok(regions) => regions,
@@ -631,7 +525,7 @@ impl ReplState<'_> {
             return Ok(());
         }
 
-        let modules = match self.debugger.guest.kernel_modules() {
+        let modules = match self.ctx.target.guest.kernel_modules() {
             Ok(modules) => modules,
             Err(e) => {
                 error!("failed to enumerate kernel modules: {}", e);
@@ -682,9 +576,9 @@ impl ReplState<'_> {
     }
 
     pub fn cmd_ps(&mut self, parts: &[&str]) -> Result<()> {
-        let filter = parts.get(1).map(|s| s.to_lowercase());
+        let filter = parts.get(1).copied();
 
-        match self.debugger.guest.enumerate_processes() {
+        match self.ctx.target.guest.enumerate_processes() {
             Ok(processes) => {
                 *self.caches.processes.write().unwrap() =
                     processes.iter().map(|p| (p.name.clone(), p.pid)).collect();
@@ -699,8 +593,8 @@ impl ReplState<'_> {
 
                 let mut count = 0;
                 for proc in processes {
-                    if let Some(ref f) = filter
-                        && !proc.name.to_lowercase().contains(f)
+                    if let Some(f) = filter
+                        && !process_matches(&proc, f)
                     {
                         continue;
                     }
@@ -730,7 +624,7 @@ impl ReplState<'_> {
     pub fn cmd_drivers(&mut self, parts: &[&str]) -> Result<()> {
         let filter = parts.get(1).map(|s| s.to_lowercase());
 
-        match self.debugger.enumerate_driver_objects() {
+        match self.ctx.target.enumerate_driver_objects() {
             Ok(drivers) => {
                 let mut builder = Builder::default();
                 builder.push_record(vec![
@@ -753,10 +647,11 @@ impl ReplState<'_> {
                     }
                     count += 1;
                     let module = self
-                        .debugger
+                        .ctx
+                        .target
                         .symbols
                         .find_module_for_address(
-                            self.debugger.guest.ntoskrnl.dtb(),
+                            self.ctx.target.guest.ntoskrnl.dtb(),
                             driver.driver_start,
                         )
                         .map(|module| module.name)
@@ -790,19 +685,12 @@ impl ReplState<'_> {
     pub fn cmd_lm(&mut self, parts: &[&str]) -> Result<()> {
         let filter = parts.get(1).map(|s| s.to_lowercase());
 
-        let (result, dtb) = if let Some(process_info) = &self.debugger.current_process_info {
-            (
-                self.debugger.guest.process_modules(process_info),
-                process_info.dtb,
-            )
-        } else {
-            (
-                self.debugger.guest.kernel_modules(),
-                self.debugger.guest.ntoskrnl.dtb(),
-            )
+        let dtb = match &self.ctx.target.current_process_info {
+            Some(process_info) => process_info.dtb,
+            None => self.ctx.target.guest.ntoskrnl.dtb(),
         };
 
-        match result {
+        match self.ctx.target.modules() {
             Ok(modules) => {
                 let mut builder = Builder::default();
                 builder.push_record(vec![
@@ -829,7 +717,8 @@ impl ReplState<'_> {
                         format!("{}  ", module.short_name),
                         format!(
                             "{}  ",
-                            self.debugger
+                            self.ctx
+                                .target
                                 .symbols
                                 .module_symbol_status(dtb, module.base_address)
                                 .map(|status| status.label().to_string())
@@ -837,7 +726,8 @@ impl ReplState<'_> {
                         ),
                         format!(
                             "{}  ",
-                            self.debugger
+                            self.ctx
+                                .target
                                 .symbols
                                 .module_symbol_source(dtb, module.base_address)
                                 .map(|source| source.label().to_string())
@@ -864,13 +754,13 @@ impl ReplState<'_> {
     pub fn cmd_attach(&mut self, parts: &[&str]) -> Result<()> {
         let pid_str = require_arg!(parts, 1, ReplCommand::Attach);
         match pid_str.parse::<u64>() {
-            Ok(pid) => match self.debugger.attach(pid) {
+            Ok(pid) => match self.ctx.target.attach(pid) {
                 Ok(AttachReport {
                     name,
                     symbol_report,
                 }) => {
-                    self.caches.refresh_symbol_context(self.debugger);
-                    if let Err(e) = self.caches.refresh_processes(self.debugger) {
+                    self.caches.refresh_symbol_context(&self.ctx.target);
+                    if let Err(e) = self.caches.refresh_processes(&self.ctx.target) {
                         error!("failed to refresh process cache: {}", e);
                     }
                     println!("attached to {} (PID {})", name, pid);
@@ -890,12 +780,12 @@ impl ReplState<'_> {
     }
 
     pub fn cmd_detach(&mut self, _parts: &[&str]) -> Result<()> {
-        if self.debugger.current_process.is_none() {
+        if self.ctx.target.current_process.is_none() {
             error!("not attached to any process");
         } else {
-            self.debugger.detach();
-            self.caches.refresh_symbol_context(self.debugger);
-            if let Err(e) = self.caches.refresh_processes(self.debugger) {
+            self.ctx.target.detach();
+            self.caches.refresh_symbol_context(&self.ctx.target);
+            if let Err(e) = self.caches.refresh_processes(&self.ctx.target) {
                 error!("failed to refresh process cache: {}", e);
             }
             println!("detached, now in kernel context\n");
@@ -905,14 +795,14 @@ impl ReplState<'_> {
     }
 
     pub fn cmd_vcpu(&mut self, parts: &[&str]) -> Result<()> {
-        if self.client.is_running() {
+        if self.ctx.backend.is_running() {
             error!("VM is running");
             return Ok(());
         }
 
         let thread_id = require_arg!(parts, 1, ReplCommand::Vcpu);
 
-        let threads = match self.client.thread_list() {
+        let threads = match self.ctx.backend.thread_list() {
             Ok(t) => t,
             Err(e) => {
                 error!("failed to get vCPU list: {:?}", e);
@@ -925,15 +815,17 @@ impl ReplState<'_> {
             return Ok(());
         }
 
-        if let Err(e) = self.client.set_current_thread(thread_id) {
+        if let Err(e) = self.ctx.set_current_thread(thread_id) {
             error!("failed to switch vCPU: {:?}", e);
             return Ok(());
         }
 
-        self.current_thread = thread_id.to_string();
-        refresh_windows_thread_context_for_backend_thread(self.debugger, &self.current_thread);
-        self.caches.refresh_symbol_context(self.debugger);
-        println!("switched to vCPU {}\n", self.current_thread);
+        refresh_windows_thread_context_for_backend_thread(
+            &mut self.ctx.target,
+            &self.ctx.current_thread,
+        );
+        self.caches.refresh_symbol_context(&self.ctx.target);
+        println!("switched to vCPU {}\n", self.ctx.current_thread);
 
         Ok(())
     }

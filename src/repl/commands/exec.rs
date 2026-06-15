@@ -1,58 +1,24 @@
 use std::sync::atomic::Ordering;
 
-use iced_x86::{Code, Decoder, DecoderOptions, Instruction, Mnemonic};
 use owo_colors::OwoColorize;
 
-use crate::backend::MemoryOps;
-use crate::debugger::DebuggerContext;
 use crate::error::Result;
-use crate::expr::Expr;
-use crate::gdb::BreakpointHitResult;
-use crate::memory::AddressSpace;
+use crate::session::{BreakpointStopAction, StepKind};
 use crate::types::VirtAddr;
 use crate::ui;
-use crate::unwind::{build_stacktrace, preferred_code_dtb, resolve_thread_trace_context};
 
 use crate::repl::*;
-
-fn split_condition_operator(condition: &str) -> Option<(&str, &str, &str)> {
-    const OPS: [&str; 6] = ["==", "!=", "<=", ">=", "<", ">"];
-    for op in OPS {
-        if let Some((left, right)) = condition.split_once(op) {
-            return Some((left.trim(), op, right.trim()));
-        }
-    }
-    None
-}
-
-fn eval_breakpoint_condition(condition: &str, debugger: &DebuggerContext) -> Result<bool> {
-    if let Some((left, op, right)) = split_condition_operator(condition) {
-        let left = Expr::eval(left, debugger)?.0;
-        let right = Expr::eval(right, debugger)?.0;
-        return Ok(match op {
-            "==" => left == right,
-            "!=" => left != right,
-            "<=" => left <= right,
-            ">=" => left >= right,
-            "<" => left < right,
-            ">" => left > right,
-            _ => false,
-        });
-    }
-
-    Ok(Expr::eval(condition, debugger)?.0 != 0)
-}
 
 impl ReplState<'_> {
     pub fn interrupt_running_vm(&mut self) -> Result<()> {
         match surface_pending_stop(
-            &mut *self.client,
-            &self.register_map,
-            self.debugger,
-            &mut self.breakpoints,
+            &mut *self.ctx.backend,
+            &self.ctx.register_map,
+            &mut self.ctx.target,
+            &mut self.ctx.breakpoints,
             &self.caches,
-            &mut self.current_thread,
-            &mut self.reload_module_list_pending,
+            &mut self.ctx.current_thread,
+            &mut self.ctx.reload_module_list_pending,
         ) {
             Ok(true) => return Ok(()),
             Ok(false) => {}
@@ -63,13 +29,13 @@ impl ReplState<'_> {
         }
 
         if let Err(e) = surface_interrupt_stop(
-            &mut *self.client,
-            &self.register_map,
-            self.debugger,
-            &mut self.breakpoints,
+            &mut *self.ctx.backend,
+            &self.ctx.register_map,
+            &mut self.ctx.target,
+            &mut self.ctx.breakpoints,
             &self.caches,
-            &mut self.current_thread,
-            &mut self.reload_module_list_pending,
+            &mut self.ctx.current_thread,
+            &mut self.ctx.reload_module_list_pending,
         ) {
             error!("failed to interrupt: {:?}", e);
         }
@@ -78,15 +44,15 @@ impl ReplState<'_> {
     }
 
     pub fn cmd_continue(&mut self, _parts: &[&str]) -> Result<()> {
-        if self.client.is_running() {
+        if self.ctx.backend.is_running() {
             match surface_pending_stop(
-                &mut *self.client,
-                &self.register_map,
-                self.debugger,
-                &mut self.breakpoints,
+                &mut *self.ctx.backend,
+                &self.ctx.register_map,
+                &mut self.ctx.target,
+                &mut self.ctx.breakpoints,
                 &self.caches,
-                &mut self.current_thread,
-                &mut self.reload_module_list_pending,
+                &mut self.ctx.current_thread,
+                &mut self.ctx.reload_module_list_pending,
             ) {
                 Ok(true) => {}
                 Ok(false) => error!("VM is running"),
@@ -95,41 +61,12 @@ impl ReplState<'_> {
             return Ok(());
         }
 
-        // If we're sitting on one of our breakpoints, step past it
-        // before resuming; otherwise the int3 at RIP fires the BP
-        // again on the very next cycle
-        if self.breakpoints.has_enabled_breakpoints() {
-            if let Err(e) = self.client.set_current_thread(&self.current_thread) {
-                error!("failed to select execution context: {:?}", e);
-                return Ok(());
-            }
-            if let Err(e) = step_over_current_breakpoint(
-                &mut *self.client,
-                &self.register_map,
-                self.debugger,
-                &mut self.breakpoints,
-            ) {
-                error!("failed to step over current breakpoint: {:?}", e);
-                return Ok(());
-            }
-        }
-
-        if let Err(e) = self
-            .breakpoints
-            .refresh_enabled(&mut *self.client, self.debugger)
-        {
-            error!("failed to refresh breakpoints: {}", e);
-            return Ok(());
-        }
-
-        if let Err(e) = self.client.continue_execution() {
+        // Step past a breakpoint at RIP, re-arm breakpoints, continue, and drop
+        // stale inspection caches; the canonical resume prologue lives in core.
+        if let Err(e) = self.ctx.resume() {
             error!("failed to continue: {:?}", e);
             return Ok(());
         }
-
-        self.debugger.registers = None;
-        self.debugger.clear_context_dtb_override();
-        self.debugger.clear_current_windows_thread_context();
 
         println!(
             "{}",
@@ -139,53 +76,76 @@ impl ReplState<'_> {
         INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
 
         loop {
-            let stop_result = if INTERRUPT_REQUESTED.swap(false, Ordering::SeqCst) {
+            let interrupt_requested = INTERRUPT_REQUESTED.swap(false, Ordering::SeqCst);
+            let stop_result = if interrupt_requested {
                 println!();
-                match self.client.try_wait_for_stop(REPL_STOP_POLL) {
+                match self.ctx.backend.try_wait_for_stop(REPL_STOP_POLL) {
                     Ok(Some(event)) => Ok(Some(event)),
-                    Ok(None) => self.client.interrupt().map(Some),
+                    Ok(None) => self.ctx.backend.interrupt().map(Some),
                     Err(e) => Err(e),
                 }
             } else {
-                self.client.try_wait_for_stop(REPL_STOP_POLL)
+                self.ctx.backend.try_wait_for_stop(REPL_STOP_POLL)
             };
 
             match stop_result {
                 Ok(Some(mut event)) => {
                     let reload_status = apply_target_reload_if_needed(
-                        &mut *self.client,
-                        self.debugger,
-                        &mut self.breakpoints,
+                        &mut *self.ctx.backend,
+                        &mut self.ctx.target,
+                        &mut self.ctx.breakpoints,
                         &self.caches,
                         &mut event,
                     );
                     update_reload_module_list_pending(
-                        &mut self.reload_module_list_pending,
+                        &mut self.ctx.reload_module_list_pending,
                         reload_status,
                     );
                     if reload_status.pending_rediscovery() {
                         print_pending_rediscovery_stop_context(
-                            &mut *self.client,
-                            &self.register_map,
-                            self.debugger,
-                            &mut self.current_thread,
+                            &mut *self.ctx.backend,
+                            &self.ctx.register_map,
+                            &self.ctx.target,
+                            &mut self.ctx.current_thread,
                             &event,
                             reload_status,
                         );
                         break;
                     }
-                    let completed_pending_module_list = try_complete_pending_module_list_reload(
-                        &mut *self.client,
-                        self.debugger,
+                    let _ = try_complete_pending_module_list_reload(
+                        &mut *self.ctx.backend,
+                        &mut self.ctx.target,
                         &self.caches,
-                        &mut self.reload_module_list_pending,
+                        &mut self.ctx.reload_module_list_pending,
                     );
-                    if !completed_pending_module_list
-                        && !self.reload_module_list_pending
-                        && should_resume_assisted_refresh_stop(&event, reload_status)
+                    if !interrupt_requested
+                        && !self.ctx.reload_module_list_pending
+                        && should_resume_assisted_refresh_stop(
+                            &self.ctx.target,
+                            &self.ctx.breakpoints,
+                            &event,
+                            reload_status,
+                        )
                     {
-                        if let Err(e) = resume_assisted_refresh_stop(&mut *self.client) {
+                        if let Err(e) = resume_assisted_refresh_stop(&mut *self.ctx.backend) {
                             error!("failed to resume after assisted refresh break: {:?}", e);
+                            break;
+                        }
+                        continue;
+                    }
+                    // A stray single-step (STATUS_SINGLE_STEP, not at a user
+                    // breakpoint) is a debugger artifact from a managed step-over
+                    // on SMP KD, not a stop to surface; clear TF on its processor
+                    // and resume. Shared classification with continue_until_break.
+                    if stop_is_stray_single_step(&event, &self.ctx.breakpoints) {
+                        set_current_thread_from_stop(
+                            &mut *self.ctx.backend,
+                            &event,
+                            &mut self.ctx.current_thread,
+                        );
+                        let _ = clear_trap_flag(&mut *self.ctx.backend, &self.ctx.register_map);
+                        if let Err(e) = self.ctx.backend.continue_execution() {
+                            error!("failed to resume after stray single-step: {:?}", e);
                             break;
                         }
                         continue;
@@ -195,14 +155,17 @@ impl ReplState<'_> {
                         is_target_reload_load_symbols_stop(&event, reload_status);
                     let is_bugcheck = event.is_bugcheck && !target_reloaded;
                     set_current_thread_from_stop(
-                        &mut *self.client,
+                        &mut *self.ctx.backend,
                         &event,
-                        &mut self.current_thread,
+                        &mut self.ctx.current_thread,
                     );
-                    let modules_changed =
-                        refresh_stop_caches_pre(&mut *self.client, self.debugger, &self.caches);
+                    let modules_changed = refresh_stop_caches_pre(
+                        &mut *self.ctx.backend,
+                        &self.ctx.target,
+                        &self.caches,
+                    );
                     if is_bugcheck {
-                        print_bugcheck_summary(self.debugger, event.bugcheck.as_ref());
+                        print_bugcheck_summary(&self.ctx.target, event.bugcheck.as_ref());
                         println!();
                     }
                     let stop_exception_code = event.exception_code;
@@ -210,7 +173,7 @@ impl ReplState<'_> {
                     let early_non_breakpoint_stop = !target_reloaded
                         && !is_bugcheck
                         && stop_exception_code.zip(stop_pc).is_some_and(|(_, pc)| {
-                            self.breakpoints.breakpoint_id_at_address(pc).is_none()
+                            self.ctx.breakpoints.breakpoint_id_at_address(pc).is_none()
                         });
                     if early_non_breakpoint_stop {
                         print_stop_notice_parts(stop_exception_code, stop_pc);
@@ -218,173 +181,121 @@ impl ReplState<'_> {
                     }
 
                     refresh_stop_caches_post(
-                        self.debugger,
+                        &self.ctx.target,
                         &self.caches,
                         target_reloaded,
                         modules_changed,
                     );
 
-                    if self.breakpoints.has_enabled_breakpoints() && !is_bugcheck {
+                    if self.ctx.breakpoints.has_enabled_breakpoints() && !is_bugcheck {
                         // Done before reading the current thread's regs so
                         // the BP-hit check below sees the post-rewind RIP
                         rewind_threads_off_breakpoints(
-                            &mut *self.client,
-                            &self.register_map,
-                            &self.breakpoints,
-                            &self.current_thread,
+                            &mut *self.ctx.backend,
+                            &self.ctx.register_map,
+                            &self.ctx.breakpoints,
+                            &self.ctx.current_thread,
                         );
                     }
 
-                    let hit_result = if early_non_breakpoint_stop
-                        || is_bugcheck
-                        || reload_load_symbols_stop
-                    {
-                        BreakpointHitResult::NotBreakpoint
-                    } else {
-                        let regs = match self.client.read_registers() {
-                            Ok(r) => r,
-                            Err(e) => {
-                                error!("failed to read registers: {:?}", e);
-                                break;
+                    let hit_result =
+                        if early_non_breakpoint_stop || is_bugcheck || reload_load_symbols_stop {
+                            BreakpointStopAction::NotBreakpoint
+                        } else {
+                            let regs = match self.ctx.backend.read_registers() {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    error!("failed to read registers: {:?}", e);
+                                    break;
+                                }
+                            };
+
+                            self.ctx.target.registers =
+                                Some(self.ctx.register_map.to_hashmap(&regs));
+                            let rip = self.ctx.register_map.read_u64("rip", &regs).unwrap_or(0);
+                            let cr3 = self.ctx.register_map.read_u64("cr3", &regs).unwrap_or(0);
+                            if cr3 != 0 {
+                                self.ctx.target.set_context_dtb_override(cr3);
+                                self.caches.refresh_symbol_context(&self.ctx.target);
+                            }
+                            refresh_windows_thread_context_for_backend_thread(
+                                &mut self.ctx.target,
+                                &self.ctx.current_thread,
+                            );
+
+                            // Shared core resolver so the REPL and `continue_until_break`
+                            // can't drift on breakpoint-hit disposition; absorbed cases
+                            // (Resumed) step over and resume internally, so we keep waiting.
+                            match self.ctx.resolve_breakpoint_stop(rip, cr3) {
+                                Ok(BreakpointStopAction::Resumed) => continue,
+                                Ok(action) => action,
+                                Err(e) => {
+                                    error!("failed to handle breakpoint stop: {:?}", e);
+                                    break;
+                                }
                             }
                         };
 
-                        self.debugger.registers = Some(self.register_map.to_hashmap(&regs));
-                        let rip = self.register_map.read_u64("rip", &regs).unwrap_or(0);
-                        let cr3 = self.register_map.read_u64("cr3", &regs).unwrap_or(0);
-                        if cr3 != 0 {
-                            self.debugger.set_context_dtb_override(cr3);
-                            self.caches.refresh_symbol_context(self.debugger);
-                        }
-                        refresh_windows_thread_context_for_backend_thread(
-                            self.debugger,
-                            &self.current_thread,
-                        );
-
-                        let hit_result = self.breakpoints.check_breakpoint_hit(rip, cr3);
-
-                        // Wrong-process hit on a `GuestMemoryPatch` BP
-                        // (shared page, e.g. ntdll/user32): step past
-                        // the int3 silently so the wrong process keeps
-                        // running, then resume waiting for the right one.
-                        if matches!(hit_result, BreakpointHitResult::NotBreakpoint)
-                            && self.breakpoints.breakpoint_id_at_address(rip).is_some()
-                        {
-                            if let Err(e) = step_over_current_breakpoint(
-                                &mut *self.client,
-                                &self.register_map,
-                                self.debugger,
-                                &mut self.breakpoints,
-                            ) {
-                                error!("failed to silent-step over wrong-process int3: {:?}", e);
-                                break;
-                            }
-                            if let Err(e) = self.client.continue_execution() {
-                                error!(
-                                    "failed to resume after silent step over wrong-process int3: {:?}",
-                                    e
-                                );
-                                break;
-                            }
-                            continue;
-                        }
-
-                        hit_result
-                    };
-
                     match hit_result {
-                        BreakpointHitResult::Hit(bp) => {
-                            if let Some(condition) = &bp.condition {
-                                match eval_breakpoint_condition(condition, self.debugger) {
-                                    Ok(true) => {}
-                                    Ok(false) => {
-                                        if let Err(e) = step_over_current_breakpoint(
-                                            &mut *self.client,
-                                            &self.register_map,
-                                            self.debugger,
-                                            &mut self.breakpoints,
-                                        ) {
-                                            error!(
-                                                "failed to step over false conditional breakpoint: {:?}",
-                                                e
-                                            );
-                                            break;
-                                        }
-                                        if let Err(e) = self.client.continue_execution() {
-                                            error!(
-                                                "failed to resume after false conditional breakpoint: {:?}",
-                                                e
-                                            );
-                                            break;
-                                        }
-                                        continue;
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            "breakpoint {} condition failed: {}",
-                                            ui::bp_id(bp.id),
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-
+                        BreakpointStopAction::Hit {
+                            id,
+                            symbol,
+                            temporary,
+                            ..
+                        } => {
                             println!();
-                            if !bp.temporary {
+                            if !temporary {
                                 println!(
                                     "{} {} {}",
                                     ui::label("breakpoint:"),
-                                    ui::bp_id(bp.id),
-                                    bp.symbol
+                                    ui::bp_id(id),
+                                    symbol
                                         .as_ref()
                                         .map(|s| format!("({})", ui::symbol(s)))
                                         .unwrap_or_default()
                                 );
                             }
                             print_break_context(
-                                &mut *self.client,
-                                &self.register_map,
-                                self.debugger,
-                                &self.breakpoints,
-                                &self.current_thread,
+                                &mut *self.ctx.backend,
+                                &self.ctx.register_map,
+                                &mut self.ctx.target,
+                                &self.ctx.breakpoints,
+                                &self.ctx.current_thread,
                             );
-
-                            // refresh all breakpoints, the stub may have
-                            // lost non-hit breakpoints when the VM stopped
-                            let _ = self
-                                .breakpoints
-                                .refresh_enabled(&mut *self.client, self.debugger);
 
                             break;
                         }
-                        BreakpointHitResult::NotBreakpoint => {
+                        // Absorbed inline in the resolver above; defensively keep
+                        // waiting if one ever reaches here.
+                        BreakpointStopAction::Resumed => continue,
+                        BreakpointStopAction::NotBreakpoint => {
                             if !target_reloaded && !early_non_breakpoint_stop && !is_bugcheck {
                                 print_stop_notice_parts(stop_exception_code, stop_pc);
                                 println!();
                             }
                             if reload_load_symbols_stop {
                                 print_target_reload_notification_context(
-                                    self.debugger,
-                                    &self.current_thread,
+                                    &self.ctx.target,
+                                    &self.ctx.current_thread,
                                     &event,
                                     reload_status,
                                 );
                             } else if is_bugcheck {
                                 print_break_context_for_bugcheck(
-                                    &mut *self.client,
-                                    &self.register_map,
-                                    self.debugger,
-                                    &self.breakpoints,
-                                    &self.current_thread,
+                                    &mut *self.ctx.backend,
+                                    &self.ctx.register_map,
+                                    &mut self.ctx.target,
+                                    &self.ctx.breakpoints,
+                                    &self.ctx.current_thread,
                                     event.bugcheck.as_ref(),
                                 );
                             } else {
                                 print_break_context(
-                                    &mut *self.client,
-                                    &self.register_map,
-                                    self.debugger,
-                                    &self.breakpoints,
-                                    &self.current_thread,
+                                    &mut *self.ctx.backend,
+                                    &self.ctx.register_map,
+                                    &mut self.ctx.target,
+                                    &self.ctx.breakpoints,
+                                    &self.ctx.current_thread,
                                 );
                             }
                             break;
@@ -405,7 +316,7 @@ impl ReplState<'_> {
     }
 
     pub fn cmd_break(&mut self, _parts: &[&str]) -> Result<()> {
-        if !self.client.is_running() {
+        if !self.ctx.backend.is_running() {
             error!("VM is already paused");
             return Ok(());
         }
@@ -414,191 +325,107 @@ impl ReplState<'_> {
     }
 
     pub fn cmd_si(&mut self, _parts: &[&str]) -> Result<()> {
-        if self.client.is_running() {
+        if self.ctx.backend.is_running() {
             error!("VM is running");
             return Ok(());
         }
 
-        if let Err(e) = self.client.set_current_thread(&self.current_thread) {
-            error!("failed to select execution context: {:?}", e);
-            return Ok(());
-        }
-
-        let stepped = match step_over_current_breakpoint(
-            &mut *self.client,
-            &self.register_map,
-            self.debugger,
-            &mut self.breakpoints,
-        ) {
-            Ok(stepped) => stepped,
-            Err(e) => {
-                error!("failed to step over breakpoint: {:?}", e);
-                return Ok(());
-            }
-        };
-
-        if !stepped && let Err(e) = step_one_and_clear_tf(&mut *self.client, &self.register_map) {
+        // The step itself (over-breakpoint dance, trap-flag clear, breakpoint
+        // re-arm, thread re-select) is the canonical `Session::step`;
+        // the REPL only adds the break-context display.
+        if let Err(e) = self.ctx.step() {
             error!("failed to step: {:?}", e);
             return Ok(());
         }
 
-        if let Err(e) = self
-            .breakpoints
-            .refresh_enabled(&mut *self.client, self.debugger)
-        {
-            error!("failed to refresh breakpoints after step: {}", e);
-        }
-
-        if let Ok(tid) = self.client.stopped_thread_id() {
-            self.current_thread = tid;
-        }
-
         println!();
         print_break_context(
-            &mut *self.client,
-            &self.register_map,
-            self.debugger,
-            &self.breakpoints,
-            &self.current_thread,
+            &mut *self.ctx.backend,
+            &self.ctx.register_map,
+            &mut self.ctx.target,
+            &self.ctx.breakpoints,
+            &self.ctx.current_thread,
         );
 
         Ok(())
     }
 
-    fn read_current_registers_for_run_control(&mut self) -> Option<Vec<u8>> {
-        if self.client.is_running() {
-            error!("VM is running");
-            return None;
-        }
-
-        if let Err(e) = self.client.set_current_thread(&self.current_thread) {
-            error!("failed to select execution context: {:?}", e);
-            return None;
-        }
-
-        match self.client.read_registers() {
-            Ok(regs) => {
-                self.debugger.registers = Some(self.register_map.to_hashmap(&regs));
-                if let Ok(cr3) = self.register_map.read_u64("cr3", &regs)
-                    && cr3 != 0
-                {
-                    self.debugger.set_context_dtb_override(cr3);
-                    self.caches.refresh_symbol_context(self.debugger);
-                }
-                refresh_windows_thread_context_for_backend_thread(
-                    self.debugger,
-                    &self.current_thread,
-                );
-                Some(regs)
-            }
-            Err(e) => {
-                self.debugger.registers = None;
-                self.debugger.clear_current_windows_thread_context();
-                error!("failed to read registers: {:?}", e);
-                None
-            }
-        }
-    }
-
-    fn decode_current_instruction(&self, regs: &[u8]) -> Result<Instruction> {
-        let rip = self.register_map.read_u64("rip", regs)?;
-        let cr3 = self.register_map.read_u64("cr3", regs).unwrap_or(0);
-        let trace = resolve_thread_trace_context(self.debugger, cr3);
-        let code_dtb = preferred_code_dtb(&trace, rip);
-        let memory = AddressSpace::new(&self.debugger.kvm, code_dtb);
-        let mut bytes = [0u8; 16];
-        memory.read_bytes(VirtAddr(rip), &mut bytes)?;
-        self.breakpoints
-            .mask_breakpoint_bytes(VirtAddr(rip), &mut bytes, trace.active_dtb);
-
-        let mut decoder = Decoder::with_ip(64, &bytes, rip, DecoderOptions::NONE);
-        let instruction = decoder.decode();
-        if instruction.code() == Code::INVALID {
-            return Err(crate::error::Error::DebugInfo(format!(
-                "failed to decode instruction at {rip:#x}"
-            )));
-        }
-        Ok(instruction)
-    }
-
     fn run_to_temporary_code_breakpoint(&mut self, address: VirtAddr) -> Result<()> {
         if self
+            .ctx
             .breakpoints
-            .enabled_breakpoint_id_for_current_context(self.debugger, address)
+            .enabled_breakpoint_id_for_current_context(&self.ctx.target, address)
             .is_some()
         {
             return self.cmd_continue(&["continue"]);
         }
 
-        let temp_id =
-            match self
-                .breakpoints
-                .add_temporary_code(&mut *self.client, self.debugger, address)
-            {
-                Ok(id) => id,
-                Err(e) => {
-                    error!(
-                        "failed to set temporary breakpoint at {}: {}",
-                        ui::addr(address.0),
-                        e
-                    );
-                    return Ok(());
-                }
-            };
-        self.caches.refresh_breakpoints(&self.breakpoints);
+        let temp_id = match self.ctx.breakpoints.add_temporary_code(
+            &mut *self.ctx.backend,
+            &self.ctx.target,
+            address,
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                error!(
+                    "failed to set temporary breakpoint at {}: {}",
+                    ui::addr(address.0),
+                    e
+                );
+                return Ok(());
+            }
+        };
+        self.caches.refresh_breakpoints(&self.ctx.breakpoints);
 
         let result = self.cmd_continue(&["continue"]);
 
         let _ = self
+            .ctx
             .breakpoints
-            .remove(&mut *self.client, self.debugger, temp_id);
-        self.caches.refresh_breakpoints(&self.breakpoints);
+            .remove(&mut *self.ctx.backend, &self.ctx.target, temp_id);
+        self.caches.refresh_breakpoints(&self.ctx.breakpoints);
 
         result
     }
 
     pub fn cmd_p(&mut self, _parts: &[&str]) -> Result<()> {
-        let Some(regs) = self.read_current_registers_for_run_control() else {
+        if self.ctx.backend.is_running() {
+            error!("VM is running");
             return Ok(());
-        };
-        let rip = self.register_map.read_u64("rip", &regs).unwrap_or(0);
-        let instruction = match self.decode_current_instruction(&regs) {
-            Ok(instruction) => instruction,
-            Err(e) => {
-                error!("failed to decode current instruction: {}", e);
-                return Ok(());
-            }
-        };
-
-        if instruction.mnemonic() != Mnemonic::Call {
-            return self.cmd_si(&["si"]);
         }
 
-        let next_ip = rip.saturating_add(instruction.len() as u64);
-        self.run_to_temporary_code_breakpoint(VirtAddr(next_ip))
+        // The step-over decision (is the current insn a call? where does it
+        // return?) is shared with the SDKs; the REPL only differs in *how* it
+        // runs to the target, via its rich-display continue loop.
+        match self.ctx.step_over_target() {
+            Ok(StepKind::Single) => self.cmd_si(&["si"]),
+            Ok(StepKind::RunTo(target)) => self.run_to_temporary_code_breakpoint(target),
+            Err(e) => {
+                error!("failed to decode current instruction: {}", e);
+                Ok(())
+            }
+        }
     }
 
     pub fn cmd_gu(&mut self, _parts: &[&str]) -> Result<()> {
-        let Some(regs) = self.read_current_registers_for_run_control() else {
-            return Ok(());
-        };
-        let trace = build_stacktrace(self.debugger, &self.register_map, &regs, 4);
-        let Some(caller) = trace.frames.get(1) else {
-            error!("could not find caller return address");
-            return Ok(());
-        };
-        if caller.ip == 0 {
-            error!("caller return address is null");
+        if self.ctx.backend.is_running() {
+            error!("VM is running");
             return Ok(());
         }
 
-        self.run_to_temporary_code_breakpoint(VirtAddr(caller.ip))
+        match self.ctx.step_out_target() {
+            Ok(target) => self.run_to_temporary_code_breakpoint(target),
+            Err(e) => {
+                error!("{}", e);
+                Ok(())
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::split_condition_operator;
+    use crate::session::split_condition_operator;
 
     #[test]
     fn condition_operator_splitter_prefers_two_char_operators() {

@@ -1,21 +1,33 @@
-use std::collections::{HashMap, HashSet};
+//! Line-delimited JSON stdio debugger protocol for AI agent workflows.
+//!
+//! Each line on stdin is one [`AgentRequest`]; each line on stdout is one JSON
+//! response (`{ id, ok, result | error }`). The frontend drives the shared
+//! [`Session`] directly (it is single-threaded, so no actor is needed, unlike
+//! the MCP server) and renders guest state through [`crate::view`] where a
+//! neutral shape already exists, falling back to bespoke JSON for the agent-only
+//! surfaces (descriptor tables, pool blocks, QEMU monitor passthrough).
+//!
+//! Scripting is the embedded Python interpreter (`ntoseye.repl` commands); the
+//! `script.*` commands run a registered command with its stdout captured so it
+//! cannot corrupt the JSON-on-stdout protocol.
+
 use std::io::{self, BufRead, Write};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::backend::MemoryOps;
-use crate::bugchecks::{GENERIC_BUGCHECK_ARGS, bugcheck_descriptor};
-use crate::dbg_backend::{DebugBackend, StopEvent};
-use crate::debugger::{
-    AttachReport, DebuggerContext, DriverObjectInfo, MemoryRegionInfo, ThreadInfo, UserVar,
-    kthread_state_name, wait_reason_name,
+use iced_x86::{
+    Code, Decoder, DecoderOptions, Formatter, Instruction, MemorySizeOptions, NasmFormatter,
 };
+
+use crate::backend::MemoryOps;
+use crate::dbg_backend::DebugCapability;
 use crate::error::{Error, Result};
 use crate::expr::Expr;
-use crate::gdb::{Breakpoint, BreakpointKind, BreakpointManager};
 use crate::guest::{ModuleInfo, ModuleSymbolLoadReport};
 use crate::inspect::descriptors::{
     GdtEntry, gdt_type_label, parse_gdtr_from_qemu_registers, parse_idtr_from_qemu_registers,
@@ -27,22 +39,20 @@ use crate::inspect::pool::{
     BigPoolEntry, PoolHeader, annotate_near_symbol, classify_pool_region, find_big_pool,
     locate_pool_block_in_page, pool_block_state, pool_layout, segment_heap_hint, tag_string,
 };
+use crate::python::embed;
 use crate::repl::{
     processor_index_from_backend_thread_id, refresh_windows_thread_context_for_backend_thread,
-    stop_event_requires_target_reload,
 };
-use crate::script::{LoadReport, ScriptHost, ScriptOutput};
-use crate::session::{DebuggerSession, StopOutcome};
+use crate::session::{ContinueOutcome, Session};
 use crate::symbols::{ParsedType, TypeInfo};
+use crate::target::{
+    AttachReport, DriverObjectInfo, MemoryRegionInfo, ThreadInfo, UserVar, kthread_state_name,
+    wait_reason_name,
+};
 use crate::types::VirtAddr;
-use crate::unwind::{
-    FrameSource, build_stacktrace, preferred_code_dtb, resolve_thread_trace_context,
-};
-
-use iced_x86::{
-    Code, Decoder, DecoderOptions, Formatter, Instruction, MemorySizeOptions, Mnemonic,
-    NasmFormatter,
-};
+use crate::unwind::{FrameSource, build_stacktrace};
+use crate::view;
+use crate::bugchecks::{analyze_bugcheck, current_bugcheck};
 
 #[derive(Debug, Deserialize)]
 struct AgentRequest {
@@ -85,37 +95,71 @@ struct AgentRequest {
     query: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    condition: Option<String>,
 }
 
 struct AgentSession<'a> {
-    debugger: &'a mut DebuggerContext,
-    client: &'a mut dyn DebugBackend,
-    session: DebuggerSession,
-    script_host: ScriptHost,
+    session: &'a mut Session,
 }
 
-pub fn start_agent_stdio(
-    debugger: &mut DebuggerContext,
-    client: &mut dyn DebugBackend,
-) -> Result<()> {
-    let register_map = client.register_map().clone();
-    let current_thread = client
-        .get_stopped_thread_id()
-        .unwrap_or_else(|_| "1".to_string());
-    let mut script_host = ScriptHost::new();
-    let script_report = script_host.load_all(&agent_builtin_names(), Some(debugger));
-    let mut session = AgentSession {
-        debugger,
-        client,
-        session: DebuggerSession::new(register_map, current_thread),
-        script_host,
-    };
+/// A never-cancelled token for run-control calls whose `Session` method already
+/// enforces a timeout internally (`continue_until_break` / `wait_for_stop_bounded`).
+fn no_cancel() -> AtomicBool {
+    AtomicBool::new(false)
+}
+
+/// Sets a cancel flag after `timeout_ms` unless dropped first. Lets the agent
+/// bound `Session::step_over`/`step_out`, whose underlying `run_to` waits with no
+/// internal timeout (unlike `continue_until_break`); without this a step over a
+/// call that never returns would hang the single-threaded agent forever.
+struct TimeoutCanceller {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TimeoutCanceller {
+    fn start(timeout_ms: Option<u64>, cancel: Arc<AtomicBool>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = timeout_ms.map(|ms| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_millis(ms);
+                while Instant::now() < deadline {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                cancel.store(true, Ordering::Relaxed);
+            })
+        });
+        Self { stop, handle }
+    }
+}
+
+impl Drop for TimeoutCanceller {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Drive the agent stdio protocol against a live [`Session`] until EOF or `quit`.
+pub fn run(session: &mut Session) -> Result<()> {
+    // Load the embedded Python commands so `script.*` works out of the box, the
+    // same way the REPL does at startup.
+    let script_report = embed::load_commands_dir();
+
+    let mut session = AgentSession { session };
 
     write_json(json!({
         "ok": true,
         "event": "ready",
         "result": session.status(),
-        "scripts": script_load_report_json(script_report),
+        "scripts": script_load_report_json(&script_report),
     }))?;
 
     let stdin = io::stdin();
@@ -157,6 +201,10 @@ pub fn start_agent_stdio(
         }
     }
 
+    // Best-effort: uninstall breakpoints and leave the guest usable on exit,
+    // matching the REPL and MCP frontends (the agent shouldn't be the one
+    // frontend that leaves int3 patches behind).
+    let _ = session.session.cleanup_for_exit();
     Ok(())
 }
 
@@ -168,7 +216,7 @@ impl AgentSession<'_> {
             "eval" => {
                 let expr = required(request.expr, "expr")?;
                 let address = self.eval_address(expr)?;
-                self.debugger.set_results(vec![address.0], "eval");
+                self.session.target.set_results(vec![address.0], "eval");
                 Ok(json!({ "address": fmt_addr(address.0) }))
             }
             "registers" => self.registers(),
@@ -197,7 +245,7 @@ impl AgentSession<'_> {
             "load-symbols" | "symbols.load" => self.load_symbols(request),
             "attach" => self.attach(request.pid),
             "detach" => {
-                self.debugger.detach();
+                self.session.target.detach();
                 Ok(self.status())
             }
             "vcpus" => self.vcpus(),
@@ -210,30 +258,29 @@ impl AgentSession<'_> {
             "breakpoint.enable" | "bp.enable" => self.enable_breakpoint(request.breakpoint),
             "breakpoint.list" | "bp.list" => self.list_breakpoints(),
             "continue" | "go" => self.continue_execution(request.timeout_ms),
+            "wait" | "wait-for-stop" => self.wait_for_stop_cmd(request.timeout_ms),
             "interrupt" | "break" => self.interrupt(),
             "step" | "si" => self.step(),
             "step.over" | "p" | "ni" => self.step_over(request.timeout_ms),
             "step.out" | "gu" | "finish" => self.step_out(request.timeout_ms),
             "qcmd" => {
                 let command = required(request.expr, "expr")?;
-                self.client
+                self.session
+                    .backend
                     .monitor_command(&command)
                     .map(|output| json!({ "output": output }))
             }
             "qlog" => self.qlog(request),
             "scripts" | "script.list" => Ok(json!({
-                "commands": self.script_host.command_names().into_iter().map(|(name, help, strategies)| json!({
+                "commands": embed::command_list().into_iter().map(|(name, help, strategies)| json!({
                     "name": name,
                     "help": help,
                     "strategies": strategies.into_iter().map(completion_strategy_name).collect::<Vec<_>>(),
                 })).collect::<Vec<_>>()
             })),
             "script.reload" => {
-                self.script_host.reset();
-                let report = self
-                    .script_host
-                    .load_all(&agent_builtin_names(), Some(self.debugger));
-                Ok(script_load_report_json(report))
+                let report = embed::load_commands_dir();
+                Ok(script_load_report_json(&report))
             }
             "script.run" | "script.exec" => self.run_script(request),
             "quit" => Ok(json!({ "bye": true })),
@@ -249,39 +296,30 @@ impl AgentSession<'_> {
         let Some((name, args)) = parts.split_first() else {
             return Err(Error::InvalidExpression("empty script command".into()));
         };
-        if !self.script_host.has(name) {
+        if !embed::has_command(name) {
             return Err(Error::InvalidExpression(format!(
                 "no such script command: {name}"
             )));
         }
-        let output = self
-            .script_host
-            .dispatch(
-                name,
-                args,
-                self.debugger,
-                self.client,
-                &self.session.register_map,
-                ScriptOutput::Capture,
-            )
-            .map_err(|e| Error::InvalidExpression(e.to_string()))?;
+        let output = embed::dispatch_capture(name, args, self.session)
+            .map_err(Error::InvalidExpression)?;
         Ok(json!({ "command": name, "output": output }))
     }
 
     fn status(&self) -> Value {
-        let process = self
-            .debugger
+        let target = &self.session.target;
+        let process = target
             .current_process_info
             .as_ref()
             .map(|p| json!({ "pid": p.pid, "name": p.name, "dtb": fmt_addr(p.dtb) }));
 
         json!({
-            "running": self.client.is_running(),
+            "running": self.session.backend.is_running(),
             "current_vcpu": self.session.current_thread,
             "current_thread": self.session.current_thread,
-            "current_dtb": fmt_addr(self.debugger.current_dtb()),
+            "current_dtb": fmt_addr(target.current_dtb()),
             "current_process": process,
-            "current_windows_thread": self.debugger.current_windows_thread.as_ref().map(
+            "current_windows_thread": target.current_windows_thread.as_ref().map(
                 |thread| thread_json(thread, Some(&self.session.current_thread))
             ),
         })
@@ -289,7 +327,7 @@ impl AgentSession<'_> {
 
     fn capabilities(&self) -> Value {
         json!({
-            "capabilities": self.client.capabilities().into_iter().map(|entry| json!({
+            "capabilities": self.session.backend.capabilities().into_iter().map(|entry| json!({
                 "name": entry.capability.label(),
                 "supported": entry.supported,
             })).collect::<Vec<_>>()
@@ -297,13 +335,11 @@ impl AgentSession<'_> {
     }
 
     fn registers(&mut self) -> Result<Value> {
-        if self.client.is_running() {
+        if self.session.backend.is_running() {
             return Err(Error::InvalidExpression("VM is running".into()));
         }
 
-        let regs = self
-            .session
-            .refresh_register_cache(self.client, self.debugger)?;
+        let regs = self.current_regs()?;
         let map = self.session.register_map.to_hashmap(&regs);
         Ok(json!({
             "thread": self.session.current_thread,
@@ -317,7 +353,8 @@ impl AgentSession<'_> {
         let address = self.eval_address(required(request.address, "address")?)?;
         let length = request.length.unwrap_or(16);
         let mut bytes = vec![0u8; length];
-        self.debugger
+        self.session
+            .target
             .current_process()
             .memory()
             .read_bytes(address, &mut bytes)?;
@@ -330,7 +367,8 @@ impl AgentSession<'_> {
     fn write_memory(&mut self, request: AgentRequest) -> Result<Value> {
         let address = self.eval_address(required(request.address, "address")?)?;
         let data = hex::decode(required(request.data, "data")?)?;
-        self.debugger
+        self.session
+            .target
             .current_process()
             .memory()
             .write_bytes(address, &data)?;
@@ -349,7 +387,8 @@ impl AgentSession<'_> {
         }
 
         let mut bytes = vec![0u8; length];
-        self.debugger
+        self.session
+            .target
             .current_process()
             .memory()
             .read_bytes(address, &mut bytes)?;
@@ -392,7 +431,8 @@ impl AgentSession<'_> {
             bytes.extend_from_slice(&pattern[..remaining.min(pattern.len())]);
         }
 
-        self.debugger
+        self.session
+            .target
             .current_process()
             .memory()
             .write_bytes(address, &bytes)?;
@@ -407,7 +447,8 @@ impl AgentSession<'_> {
         let address = self.eval_address(required(request.address, "address")?)?;
         let length = request.length.unwrap_or(32);
         let mut bytes = vec![0u8; length];
-        self.debugger
+        self.session
+            .target
             .current_process()
             .memory()
             .read_bytes(address, &mut bytes)?;
@@ -463,14 +504,17 @@ impl AgentSession<'_> {
         } else {
             format!("_{type_name}")
         };
+        let dtb = self.session.target.current_dtb();
         let type_info = self
-            .debugger
+            .session
+            .target
             .symbols
-            .find_type_across_modules(self.debugger.current_dtb(), &lookup)
+            .find_type_across_modules(dtb, &lookup)
             .or_else(|| {
-                self.debugger
+                self.session
+                    .target
                     .symbols
-                    .find_type_across_modules(self.debugger.current_dtb(), &type_name)
+                    .find_type_across_modules(dtb, &type_name)
             })
             .ok_or_else(|| Error::StructNotFound(type_name.clone()))?;
         let address = request
@@ -525,7 +569,7 @@ impl AgentSession<'_> {
     }
 
     fn read_typed_field_value(&self, address: VirtAddr, ty: &ParsedType) -> Result<Value> {
-        let mem = self.debugger.current_process().memory();
+        let mem = self.session.target.current_process().memory();
         match ty {
             ParsedType::Primitive(name) => {
                 let value = match name.as_str() {
@@ -560,7 +604,7 @@ impl AgentSession<'_> {
 
     fn pte(&mut self, request: AgentRequest) -> Result<Value> {
         let address = self.eval_address(required(request.address, "address")?)?;
-        let traversal = self.debugger.pte_traverse(address)?;
+        let traversal = self.session.target.pte_traverse(address)?;
         let mut levels = vec![traversal.pxe, traversal.ppe];
         if let Some(pde) = traversal.pde {
             levels.push(pde);
@@ -587,22 +631,20 @@ impl AgentSession<'_> {
         }))
     }
 
+    /// Read the current thread's registers, caching them into the target so
+    /// expression evaluation (`@rip`, etc.) resolves, and return the raw bytes
+    /// for the descriptor/stack helpers that decode register context directly.
     fn current_regs(&mut self) -> Result<Vec<u8>> {
-        if self.client.is_running() {
+        if self.session.backend.is_running() {
             return Err(Error::InvalidExpression("VM is running".into()));
         }
-        self.session
-            .refresh_register_cache(self.client, self.debugger)
+        let regs = self.session.backend.read_registers()?;
+        self.session.target.registers = Some(self.session.register_map.to_hashmap(&regs));
+        Ok(regs)
     }
 
     fn qemu_register_descriptors(&mut self) -> Result<String> {
-        self.client.monitor_command("info registers").map_err(|e| {
-            if matches!(e, Error::NotSupported) {
-                Error::NotSupported
-            } else {
-                e
-            }
-        })
+        self.session.backend.monitor_command("info registers")
     }
 
     fn idt(&mut self, max_entries: Option<usize>) -> Result<Value> {
@@ -612,7 +654,7 @@ impl AgentSession<'_> {
             Error::InvalidExpression("QEMU monitor output did not contain IDT".into())
         })?;
         let entries = read_idt_entries(
-            self.debugger,
+            &self.session.target,
             &self.session.register_map,
             &regs,
             idtr,
@@ -641,7 +683,7 @@ impl AgentSession<'_> {
             Error::InvalidExpression("QEMU monitor output did not contain GDT".into())
         })?;
         let entries = read_gdt_entries(
-            self.debugger,
+            &self.session.target,
             &self.session.register_map,
             &regs,
             gdtr,
@@ -669,7 +711,7 @@ impl AgentSession<'_> {
             })?,
         };
         let (entry, stacks) = read_tss_stack_bases(
-            self.debugger,
+            &self.session.target,
             &self.session.register_map,
             &regs,
             gdtr,
@@ -686,17 +728,18 @@ impl AgentSession<'_> {
 
     fn pool(&mut self, request: AgentRequest) -> Result<Value> {
         let target = self.eval_address(required(request.address.or(request.expr), "address")?)?;
-        let layout = pool_layout(self.debugger)?;
-        let region = classify_pool_region(self.debugger, target).map(|(name, start, end)| {
-            json!({
-                "name": name,
-                "start": fmt_addr(start.0),
-                "end": fmt_addr(end.0),
-            })
-        });
+        let layout = pool_layout(&self.session.target)?;
+        let region =
+            classify_pool_region(&self.session.target, target).map(|(name, start, end)| {
+                json!({
+                    "name": name,
+                    "start": fmt_addr(start.0),
+                    "end": fmt_addr(end.0),
+                })
+            });
         let (blocks, target_index, page) =
-            locate_pool_block_in_page(self.debugger, &layout, target);
-        let big_pool = find_big_pool(self.debugger, &layout, target).map(big_pool_json);
+            locate_pool_block_in_page(&self.session.target, &layout, target);
+        let big_pool = find_big_pool(&self.session.target, &layout, target).map(big_pool_json);
         Ok(json!({
             "target": fmt_addr(target.0),
             "page": fmt_addr(page.0),
@@ -704,20 +747,18 @@ impl AgentSession<'_> {
             "target_index": target_index,
             "blocks": blocks.into_iter().map(pool_header_json).collect::<Vec<_>>(),
             "big_pool": big_pool,
-            "segment_heap_hint": if target_index.is_none() { segment_heap_hint(self.debugger) } else { None },
-            "near_symbol": if target_index.is_none() { annotate_near_symbol(self.debugger, target) } else { None },
+            "segment_heap_hint": if target_index.is_none() { segment_heap_hint(&self.session.target) } else { None },
+            "near_symbol": if target_index.is_none() { annotate_near_symbol(&self.session.target, target) } else { None },
         }))
     }
 
     fn stack_trace(&mut self, limit: Option<usize>) -> Result<Value> {
-        if self.client.is_running() {
+        if self.session.backend.is_running() {
             return Err(Error::InvalidExpression("VM is running".into()));
         }
-        let regs = self
-            .session
-            .refresh_register_cache(self.client, self.debugger)?;
+        let regs = self.current_regs()?;
         let limit = limit.unwrap_or(64);
-        let trace = build_stacktrace(self.debugger, &self.session.register_map, &regs, limit);
+        let trace = build_stacktrace(&self.session.target, &self.session.register_map, &regs, limit);
         Ok(json!({
             "thread": self.session.current_thread,
             "truncated": trace.truncated,
@@ -730,7 +771,6 @@ impl AgentSession<'_> {
                     FrameSource::Unwind => "unwind",
                     FrameSource::Scan => "scan",
                 },
-                "trap_frame": frame.trap_frame.map(fmt_addr),
             })).collect::<Vec<_>>()
         }))
     }
@@ -738,7 +778,7 @@ impl AgentSession<'_> {
     fn drivers(&self, filter: Option<String>) -> Result<Value> {
         let filter = filter.map(|s| s.to_lowercase());
         Ok(json!({
-            "drivers": self.debugger.enumerate_driver_objects()?
+            "drivers": self.session.target.enumerate_driver_objects()?
                 .into_iter()
                 .filter(|driver| driver_matches(driver, filter.as_deref()))
                 .map(driver_json)
@@ -749,7 +789,8 @@ impl AgentSession<'_> {
     fn processes(&self, filter: Option<String>) -> Result<Value> {
         let filter = filter.map(|s| s.to_lowercase());
         let rows: Vec<_> = self
-            .debugger
+            .session
+            .target
             .guest
             .enumerate_processes()?
             .into_iter()
@@ -772,10 +813,10 @@ impl AgentSession<'_> {
 
     fn modules(&self, filter: Option<String>) -> Result<Value> {
         let filter = filter.map(|s| s.to_lowercase());
-        let modules = if let Some(process_info) = &self.debugger.current_process_info {
-            self.debugger.guest.process_modules(process_info)?
+        let modules = if let Some(process_info) = &self.session.target.current_process_info {
+            self.session.target.guest.process_modules(process_info)?
         } else {
-            self.debugger.guest.kernel_modules()?
+            self.session.target.guest.kernel_modules()?
         };
         Ok(json!({
             "modules": modules
@@ -793,7 +834,7 @@ impl AgentSession<'_> {
     }
 
     fn vmmap(&mut self, request: AgentRequest) -> Result<Value> {
-        if self.client.is_running() {
+        if self.session.backend.is_running() {
             return Err(Error::InvalidExpression("VM is running".into()));
         }
 
@@ -801,9 +842,10 @@ impl AgentSession<'_> {
         let filter_address = filter
             .as_ref()
             .and_then(|value| self.eval_address(value.clone()).ok());
-        if let Some(process) = self.debugger.current_process_info.clone() {
+        if let Some(process) = self.session.target.current_process_info.clone() {
             let regions = self
-                .debugger
+                .session
+                .target
                 .enumerate_vad_regions_for_process_info(&process)?
                 .into_iter()
                 .filter(|region| region_matches_filter(region, filter.as_deref(), filter_address))
@@ -819,7 +861,8 @@ impl AgentSession<'_> {
 
         let filter_lower = filter.as_deref().map(str::to_ascii_lowercase);
         let regions = self
-            .debugger
+            .session
+            .target
             .guest
             .kernel_modules()?
             .into_iter()
@@ -846,17 +889,18 @@ impl AgentSession<'_> {
     fn search_symbols(&mut self, request: AgentRequest) -> Result<Value> {
         let query = required(request.query.or(request.expr), "query")?;
         let limit = request.limit.unwrap_or(4096).max(1);
-        let dtb = self.debugger.current_dtb();
+        let dtb = self.session.target.current_dtb();
         let (module_filter, names) = match query.split_once('!') {
             Some((module, query)) => (
                 Some(module.to_string()),
-                self.debugger
+                self.session
+                    .target
                     .symbols
                     .search_symbols_in_module(dtb, module, query, limit),
             ),
             None => (
                 None,
-                self.debugger.current_symbol_index().search(&query, limit),
+                self.session.target.current_symbol_index().search(&query, limit),
             ),
         };
 
@@ -867,8 +911,11 @@ impl AgentSession<'_> {
                 .as_ref()
                 .map(|module| format!("{module}!{name}"))
                 .unwrap_or_else(|| name.clone());
-            if let Some((address, module)) =
-                self.debugger.symbols.find_symbol_with_module(dtb, &lookup)
+            if let Some((address, module)) = self
+                .session
+                .target
+                .symbols
+                .find_symbol_with_module(dtb, &lookup)
             {
                 addresses.push(address.0);
                 results.push(json!({
@@ -879,7 +926,8 @@ impl AgentSession<'_> {
                 }));
             }
         }
-        self.debugger
+        self.session
+            .target
             .set_results(addresses, format!("symbol.search {query}"));
         Ok(json!({
             "query": query,
@@ -892,13 +940,15 @@ impl AgentSession<'_> {
     fn nearest_symbol(&mut self, request: AgentRequest) -> Result<Value> {
         let expression = required(request.address.or(request.expr), "address")?;
         let address = self.eval_address(expression)?;
+        let dtb = self.session.target.current_dtb();
         let result = self
-            .debugger
+            .session
+            .target
             .symbols
-            .find_closest_symbol_for_address(self.debugger.current_dtb(), address)
+            .find_closest_symbol_for_address(dtb, address)
             .map(|(module, name, offset)| {
                 let base = address.0.saturating_sub(offset as u64);
-                self.debugger.set_results(vec![base], "symbol.nearest");
+                self.session.target.set_results(vec![base], "symbol.nearest");
                 json!({
                     "address": fmt_addr(address.0),
                     "base": fmt_addr(base),
@@ -916,8 +966,8 @@ impl AgentSession<'_> {
     }
 
     fn variables(&self) -> Value {
-        let mut user = self
-            .debugger
+        let target = &self.session.target;
+        let mut user = target
             .user_vars
             .iter()
             .map(|(name, variable)| {
@@ -931,12 +981,12 @@ impl AgentSession<'_> {
         user.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
         json!({
             "user": user,
-            "results": self.debugger.results.iter().enumerate().map(|(index, value)| json!({
+            "results": target.results.iter().enumerate().map(|(index, value)| json!({
                 "name": format!("${index}"),
                 "value": fmt_addr(*value),
             })).collect::<Vec<_>>(),
-            "results_origin": self.debugger.results_origin,
-            "builtins": self.debugger.builtin_variables().into_iter().map(|variable| json!({
+            "results_origin": target.results_origin,
+            "builtins": target.builtin_variables().into_iter().map(|variable| json!({
                 "name": variable.name,
                 "value": fmt_addr(variable.value),
                 "source": variable.source,
@@ -959,7 +1009,7 @@ impl AgentSession<'_> {
         }
         let source = required(request.expr, "expr")?;
         let value = self.eval_address(source.clone())?;
-        self.debugger.user_vars.insert(
+        self.session.target.user_vars.insert(
             name.to_string(),
             UserVar {
                 value: value.0,
@@ -972,14 +1022,14 @@ impl AgentSession<'_> {
     fn unset_variable(&mut self, request: AgentRequest) -> Result<Value> {
         let raw_name = required(request.name.or(request.expr), "name")?;
         let name = raw_name.trim().trim_start_matches('$');
-        let removed = self.debugger.user_vars.remove(name).is_some();
+        let removed = self.session.target.user_vars.remove(name).is_some();
         Ok(json!({ "name": format!("${name}"), "removed": removed }))
     }
 
     fn load_symbols(&mut self, request: AgentRequest) -> Result<Value> {
         let path = required(request.path.or(request.expr), "path")?;
         let report = load_symbols_from_directory(
-            self.debugger,
+            &self.session.target,
             Path::new(&path),
             request.filter.as_deref(),
         )?;
@@ -991,7 +1041,7 @@ impl AgentSession<'_> {
         let AttachReport {
             name,
             symbol_report,
-        } = self.debugger.attach(pid)?;
+        } = self.session.target.attach(pid)?;
         Ok(json!({
             "pid": pid,
             "name": name,
@@ -1006,42 +1056,16 @@ impl AgentSession<'_> {
         }))
     }
 
-    fn active_windows_threads(&mut self) -> HashMap<u64, (String, ThreadInfo)> {
-        let Ok(original_vcpu) = self.client.get_stopped_thread_id() else {
-            return HashMap::new();
-        };
-        let Ok(vcpus) = self.client.get_thread_list() else {
-            return HashMap::new();
-        };
-        let mut active = HashMap::new();
-        for vcpu in &vcpus {
-            if self.client.set_current_thread(vcpu).is_err() {
-                continue;
-            }
-            let Some(processor) = backend_processor_index(vcpu) else {
-                continue;
-            };
-            if let Ok(thread) = self
-                .debugger
-                .current_windows_thread_for_processor(processor)
-            {
-                active.insert(thread.ethread.0, (vcpu.clone(), thread));
-            }
-        }
-        let _ = self.client.set_current_thread(&original_vcpu);
-        active
-    }
-
     fn vcpus(&mut self) -> Result<Value> {
-        if self.client.is_running() {
+        if self.session.backend.is_running() {
             return Err(Error::InvalidExpression("VM is running".into()));
         }
-        let original_vcpu = self.client.get_stopped_thread_id().ok();
+        let original_vcpu = self.session.backend.stopped_thread_id().ok();
         let mut rows = Vec::new();
-        for vcpu in self.client.get_thread_list()? {
+        for vcpu in self.session.backend.thread_list()? {
             let mut row = json!({ "id": vcpu });
-            if self.client.set_current_thread(&vcpu).is_ok()
-                && let Ok(regs) = self.client.read_registers()
+            if self.session.backend.set_current_thread(&vcpu).is_ok()
+                && let Ok(regs) = self.session.backend.read_registers()
             {
                 let rip = self.session.register_map.read_u64("rip", &regs).ok();
                 let cr3 = self.session.register_map.read_u64("cr3", &regs).ok();
@@ -1050,7 +1074,8 @@ impl AgentSession<'_> {
                 row["symbol"] = json!(rip.and_then(|rip| self.format_symbol(VirtAddr(rip))));
                 if let Some(processor) = backend_processor_index(&vcpu)
                     && let Ok(thread) = self
-                        .debugger
+                        .session
+                        .target
                         .current_windows_thread_for_processor(processor)
                 {
                     row["windows_thread"] = thread_json(&thread, Some(&vcpu));
@@ -1059,32 +1084,32 @@ impl AgentSession<'_> {
             rows.push(row);
         }
         if let Some(vcpu) = original_vcpu {
-            let _ = self.client.set_current_thread(&vcpu);
+            let _ = self.session.backend.set_current_thread(&vcpu);
         }
         Ok(json!({ "vcpus": rows }))
     }
 
     fn set_vcpu(&mut self, vcpu: String) -> Result<Value> {
-        let vcpus = self.client.get_thread_list()?;
+        let vcpus = self.session.backend.thread_list()?;
         if !vcpus.iter().any(|candidate| candidate == &vcpu) {
             return Err(Error::InvalidExpression(format!("vCPU '{vcpu}' not found")));
         }
-        self.client.set_current_thread(&vcpu)?;
+        self.session.backend.set_current_thread(&vcpu)?;
         self.session.current_thread = vcpu;
-        self.debugger.clear_context_dtb_override();
+        self.session.target.clear_context_dtb_override();
         refresh_windows_thread_context_for_backend_thread(
-            self.debugger,
+            &mut self.session.target,
             &self.session.current_thread,
         );
         Ok(self.status())
     }
 
     fn windows_threads(&mut self, filter: Option<String>) -> Result<Value> {
-        if self.client.is_running() {
+        if self.session.backend.is_running() {
             return Err(Error::InvalidExpression("VM is running".into()));
         }
-        let active = self.active_windows_threads();
-        let mut threads = self.debugger.enumerate_threads()?;
+        let active = self.session.active_thread_map();
+        let mut threads = self.session.target.enumerate_threads()?;
         for (_, thread) in active.values() {
             if !threads.iter().any(|known| known.ethread == thread.ethread) {
                 threads.push(thread.clone());
@@ -1103,18 +1128,19 @@ impl AgentSession<'_> {
     }
 
     fn set_windows_thread(&mut self, target: String) -> Result<Value> {
-        if self.client.is_running() {
+        if self.session.backend.is_running() {
             return Err(Error::InvalidExpression("VM is running".into()));
         }
-        let active = self.active_windows_threads();
-        let mut threads = self.debugger.enumerate_threads()?;
+        let active = self.session.active_thread_map();
+        let mut threads = self.session.target.enumerate_threads()?;
         for (_, thread) in active.values() {
             if !threads.iter().any(|known| known.ethread == thread.ethread) {
                 threads.push(thread.clone());
             }
         }
         let target_address = if target == "." {
-            self.debugger
+            self.session
+                .target
                 .current_windows_thread
                 .as_ref()
                 .map(|thread| thread.ethread)
@@ -1148,10 +1174,11 @@ impl AgentSession<'_> {
         };
         let active_vcpu = active.get(&thread.ethread.0).map(|(vcpu, _)| vcpu.clone());
         if let Some(vcpu) = &active_vcpu {
-            self.client.set_current_thread(vcpu)?;
+            self.session.backend.set_current_thread(vcpu)?;
             self.session.current_thread = vcpu.clone();
-            self.debugger.clear_context_dtb_override();
-            self.debugger
+            self.session.target.clear_context_dtb_override();
+            self.session
+                .target
                 .set_current_windows_thread_context(thread.clone());
         }
         Ok(json!({
@@ -1162,24 +1189,25 @@ impl AgentSession<'_> {
     }
 
     fn set_breakpoint(&mut self, request: AgentRequest) -> Result<Value> {
-        if self.client.is_running() {
+        if self.session.backend.is_running() {
             return Err(Error::InvalidExpression("VM is running".into()));
         }
 
+        // Upstream's shared breakpoint manager is software/temporary only; the
+        // fork's hardware-breakpoint extension is a separate follow-up.
+        if let Some(kind) = request.kind.as_deref()
+            && matches!(kind, "hardware" | "hbp")
+        {
+            return Err(Error::NotSupported);
+        }
+
         let address = self.eval_address(required(request.address, "address")?)?;
-        let kind = match request.kind.as_deref().unwrap_or("software") {
-            "software" | "bp" => BreakpointKind::Software,
-            "hardware" | "hbp" => BreakpointKind::Hardware,
-            other => {
-                return Err(Error::InvalidExpression(format!(
-                    "unknown breakpoint kind: {other}"
-                )));
-            }
-        };
+        let dtb = self.session.target.current_dtb();
         let symbol = self
-            .debugger
+            .session
+            .target
             .symbols
-            .find_closest_symbol_for_address(self.debugger.current_dtb(), address)
+            .find_closest_symbol_for_address(dtb, address)
             .map(|(module, sym, offset)| {
                 if offset == 0 {
                     format!("{module}!{sym}")
@@ -1188,51 +1216,38 @@ impl AgentSession<'_> {
                 }
             });
 
-        let id = match kind {
-            BreakpointKind::Software => self.session.breakpoints.add(
-                self.client,
-                self.debugger,
-                address,
-                symbol.clone(),
-                None,
-            )?,
-            BreakpointKind::Hardware => self.session.breakpoints.add_hardware(
-                self.client,
-                self.debugger,
-                address,
-                symbol.clone(),
-            )?,
-        };
+        let id = self.session.breakpoints.add(
+            self.session.backend.as_mut(),
+            &self.session.target,
+            address,
+            symbol.clone(),
+            request.condition.clone(),
+        )?;
 
         Ok(json!({
             "id": id,
-            "kind": kind.label(),
+            "kind": "software",
             "address": fmt_addr(address.0),
             "symbol": symbol,
+            "condition": request.condition,
         }))
     }
 
     fn clear_breakpoint(&mut self, id: Option<u32>) -> Result<Value> {
         let id = id.ok_or_else(|| Error::InvalidExpression("missing breakpoint".into()))?;
-        self.session
-            .breakpoints
-            .remove(self.client, self.debugger, id)?;
+        self.session.remove_breakpoint(id)?;
         Ok(json!({ "cleared": id }))
     }
 
     fn disable_breakpoint(&mut self, id: Option<u32>) -> Result<Value> {
         let id = id.ok_or_else(|| Error::InvalidExpression("missing breakpoint".into()))?;
-        self.session
-            .breakpoints
-            .disable(self.client, self.debugger, id)?;
+        self.session.disable_breakpoint(id)?;
         Ok(json!({ "disabled": id }))
     }
 
     fn enable_breakpoint(&mut self, id: Option<u32>) -> Result<Value> {
         let id = id.ok_or_else(|| Error::InvalidExpression("missing breakpoint".into()))?;
-        self.session
-            .breakpoints
-            .enable(self.client, self.debugger, id)?;
+        self.session.enable_breakpoint(id)?;
         Ok(json!({ "enabled": id }))
     }
 
@@ -1241,243 +1256,76 @@ impl AgentSession<'_> {
             "breakpoints": self.session.breakpoints.list().into_iter().map(|bp| json!({
                 "id": bp.id,
                 "enabled": bp.enabled,
-                "kind": bp.kind.label(),
+                // Software-only on the shared core; kept for consumer compatibility.
+                "kind": "software",
                 "address": fmt_addr(bp.address.0),
                 "symbol": bp.symbol,
                 "scope": bp.scope.label(),
+                "temporary": bp.temporary,
+                "condition": bp.condition,
             })).collect::<Vec<_>>()
         }))
     }
 
     fn continue_execution(&mut self, timeout_ms: Option<u64>) -> Result<Value> {
-        if self.client.is_running() {
-            return Err(Error::InvalidExpression("VM is running".into()));
-        }
-
-        // Step over a breakpoint at the current RIP and refresh the transport's
-        // breakpoint view, matching the REPL's resume path.
-        self.session.prepare_resume(self.client, self.debugger)?;
-        self.client.continue_execution()?;
-        self.debugger.registers = None;
-
-        let Some(timeout_ms) = timeout_ms else {
-            return Ok(json!({ "running": true }));
-        };
-
-        self.wait_for_stop(Some(Duration::from_millis(timeout_ms)))
-    }
-
-    fn wait_for_stop(&mut self, timeout: Option<Duration>) -> Result<Value> {
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
-        loop {
-            let event = match deadline {
-                Some(deadline) => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    let Some(event) = self.client.try_wait_for_stop(remaining)? else {
-                        return Ok(json!({ "running": true, "stopped": false }));
-                    };
-                    event
+        self.session.settle_pending_stop()?;
+        match timeout_ms {
+            None => {
+                if !self.session.backend.is_running() {
+                    self.session.resume()?;
                 }
-                None => self.client.wait_for_stop()?,
-            };
-
-            match self.process_stop_event(event)? {
-                Some(result) => return Ok(result),
-                None if deadline.is_some_and(|deadline| Instant::now() >= deadline) => {
-                    return Ok(json!({ "running": true, "stopped": false }));
-                }
-                None => {}
+                Ok(json!({ "running": true, "stopped": false }))
+            }
+            Some(ms) => {
+                let cancel = no_cancel();
+                let outcome = self
+                    .session
+                    .continue_until_break(Some(Duration::from_millis(ms)), &cancel)?;
+                self.outcome_json(outcome)
             }
         }
     }
 
-    fn process_stop_event(&mut self, mut event: StopEvent) -> Result<Option<Value>> {
-        if stop_event_requires_target_reload(self.debugger, &event) {
-            event.target_reloaded = true;
-            if let Some(thread) = event.thread_id.clone() {
-                self.session.current_thread = thread;
-            }
-            let dropped_breakpoints = self.session.breakpoints.list().len();
-            self.session.breakpoints = BreakpointManager::new();
-            let kernel_base_hint = event
-                .target_kernel_base_hint
-                .or_else(|| self.client.target_kernel_base_hint().ok().flatten());
-            let reload = match self
-                .debugger
-                .reload_guest_with_kernel_base_hint(kernel_base_hint)
-            {
-                Ok(report) => {
-                    let rediscovery_complete = report
-                        .startup
-                        .as_ref()
-                        .is_some_and(|startup| !startup.loaded_module_list.is_zero());
-                    if rediscovery_complete {
-                        self.client.note_target_rediscovery_complete();
-                    } else {
-                        self.client.note_target_rediscovery_pending();
-                    }
-                    json!({
-                        "status": if rediscovery_complete { "reloaded" } else { "pending_module_list" },
-                        "previous_kernel_base": fmt_addr(report.previous_base_address.0),
-                        "kernel_base": report.startup.as_ref().map(|startup| fmt_addr(startup.base_address.0)),
-                        "loaded_module_list": report.startup.as_ref().map(|startup| fmt_addr(startup.loaded_module_list.0)),
-                        "symbols": report.symbol_report.map(module_symbol_report_json),
-                        "symbol_error": report.symbol_error,
-                        "dropped_breakpoints": dropped_breakpoints,
-                    })
-                }
-                Err(error) => {
-                    self.client.note_target_rediscovery_pending();
-                    json!({
-                        "status": "pending",
-                        "kernel_base_hint": kernel_base_hint.map(|address| fmt_addr(address.0)),
-                        "error": error.to_string(),
-                        "dropped_breakpoints": dropped_breakpoints,
-                    })
-                }
-            };
-            return Ok(Some(self.stop_json(&event, None, Some(reload))?));
+    fn wait_for_stop_cmd(&mut self, timeout_ms: Option<u64>) -> Result<Value> {
+        // A stop the background servicer already parked is the proper event for
+        // this wait; surface it before waiting for a new one.
+        if let Some(parked) = self.session.take_parked_stop() {
+            return self.outcome_json(parked);
         }
-
-        match self
-            .session
-            .process_stop(self.client, self.debugger, &event)?
-        {
-            StopOutcome::Resumed(_) => Ok(None),
-            StopOutcome::TargetExited | StopOutcome::Stopped => {
-                self.refresh_context_after_stop();
-                Ok(Some(self.stop_json(&event, None, None)?))
-            }
-            StopOutcome::Breakpoint(bp) => {
-                self.refresh_context_after_stop();
-                Ok(Some(self.stop_json(&event, Some(&bp), None)?))
-            }
-        }
-    }
-
-    fn refresh_context_after_stop(&mut self) {
-        if let Ok(regs) = self.client.read_registers()
-            && let Ok(cr3) = self.session.register_map.read_u64("cr3", &regs)
-            && cr3 != 0
-        {
-            self.debugger.set_context_dtb_override(cr3);
-        }
-        refresh_windows_thread_context_for_backend_thread(
-            self.debugger,
-            &self.session.current_thread,
-        );
-        let _ = self.debugger.refresh_kernel_module_symbols();
-        let _ = self.client.take_modules_changed();
+        let cancel = no_cancel();
+        let timeout = timeout_ms.map(Duration::from_millis);
+        let outcome = self.session.wait_for_stop_bounded(timeout, &cancel)?;
+        self.outcome_json(outcome)
     }
 
     fn interrupt(&mut self) -> Result<Value> {
-        let event = self.client.interrupt()?;
-        self.process_stop_event(event)?
-            .ok_or_else(|| Error::DebugInfo("interrupt stop was automatically resumed".into()))
+        self.session.settle_pending_stop()?;
+        if self.session.backend.is_running() {
+            let _ = self.session.interrupt()?;
+        }
+        self.stopped_envelope("interrupt")
     }
 
     fn step(&mut self) -> Result<Value> {
-        if self.client.is_running() {
-            return Err(Error::InvalidExpression("VM is running".into()));
-        }
-
-        // Shared step-over/single-step path (handles sitting on a breakpoint).
-        let result = self.session.step(self.client, self.debugger)?;
-        self.process_stop_event(result.event)?
-            .ok_or_else(|| Error::DebugInfo("step stop was automatically resumed".into()))
+        self.require_halted()?;
+        self.session.step()?;
+        self.stopped_envelope("step")
     }
 
     fn step_over(&mut self, timeout_ms: Option<u64>) -> Result<Value> {
-        let regs = self.current_regs()?;
-        let rip = self.session.register_map.read_u64("rip", &regs)?;
-        let instruction = self.decode_instruction_at_current_rip(&regs)?;
-        if instruction.mnemonic() != Mnemonic::Call {
-            return self.step();
-        }
-        let next_ip = rip.saturating_add(instruction.len() as u64);
-        self.run_to_temporary_breakpoint(VirtAddr(next_ip), timeout_ms)
+        self.require_halted()?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let _timer = TimeoutCanceller::start(timeout_ms, cancel.clone());
+        let outcome = self.session.step_over(&cancel)?;
+        self.outcome_json(outcome)
     }
 
     fn step_out(&mut self, timeout_ms: Option<u64>) -> Result<Value> {
-        let regs = self.current_regs()?;
-        let trace = build_stacktrace(self.debugger, &self.session.register_map, &regs, 4);
-        let caller = trace
-            .frames
-            .get(1)
-            .ok_or_else(|| Error::DebugInfo("could not find caller return address".into()))?;
-        if caller.ip == 0 {
-            return Err(Error::DebugInfo("caller return address is null".into()));
-        }
-        self.run_to_temporary_breakpoint(VirtAddr(caller.ip), timeout_ms)
-    }
-
-    fn decode_instruction_at_current_rip(&self, regs: &[u8]) -> Result<Instruction> {
-        let rip = self.session.register_map.read_u64("rip", regs)?;
-        let cr3 = self.session.register_map.read_u64("cr3", regs).unwrap_or(0);
-        let trace = resolve_thread_trace_context(self.debugger, cr3);
-        let code_dtb = preferred_code_dtb(&trace, rip);
-        let mut bytes = [0u8; 16];
-        crate::memory::AddressSpace::new(&self.debugger.kvm, code_dtb)
-            .read_bytes(VirtAddr(rip), &mut bytes)?;
-        self.session
-            .breakpoints
-            .mask_breakpoint_bytes(VirtAddr(rip), &mut bytes, trace.active_dtb);
-        let mut decoder = Decoder::with_ip(64, &bytes, rip, DecoderOptions::NONE);
-        let instruction = decoder.decode();
-        if instruction.code() == Code::INVALID {
-            return Err(Error::DebugInfo(format!(
-                "failed to decode instruction at {rip:#x}"
-            )));
-        }
-        Ok(instruction)
-    }
-
-    fn run_to_temporary_breakpoint(
-        &mut self,
-        address: VirtAddr,
-        timeout_ms: Option<u64>,
-    ) -> Result<Value> {
-        if self
-            .session
-            .breakpoints
-            .enabled_breakpoint_id_for_current_context(self.debugger, address)
-            .is_none()
-        {
-            let temporary =
-                self.session
-                    .breakpoints
-                    .add_temporary_code(self.client, self.debugger, address)?;
-            self.session.prepare_resume(self.client, self.debugger)?;
-            self.client.continue_execution()?;
-            self.debugger.registers = None;
-            let mut result = self.wait_for_stop(timeout_ms.map(Duration::from_millis));
-            if result
-                .as_ref()
-                .ok()
-                .and_then(|value| value.get("running"))
-                .and_then(Value::as_bool)
-                == Some(true)
-            {
-                let event = self.client.interrupt()?;
-                result = self.process_stop_event(event)?.map_or_else(
-                    || Err(Error::DebugInfo("timeout interrupt was resumed".into())),
-                    |mut value| {
-                        value["timed_out"] = json!(true);
-                        Ok(value)
-                    },
-                );
-            }
-            let _ = self
-                .session
-                .breakpoints
-                .remove(self.client, self.debugger, temporary);
-            return result;
-        }
-
-        self.session.prepare_resume(self.client, self.debugger)?;
-        self.client.continue_execution()?;
-        self.debugger.registers = None;
-        self.wait_for_stop(timeout_ms.map(Duration::from_millis))
+        self.require_halted()?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let _timer = TimeoutCanceller::start(timeout_ms, cancel.clone());
+        let outcome = self.session.step_out(&cancel)?;
+        self.outcome_json(outcome)
     }
 
     fn qlog(&mut self, request: AgentRequest) -> Result<Value> {
@@ -1486,110 +1334,159 @@ impl AgentSession<'_> {
             .or(request.filter)
             .unwrap_or_else(|| "int,cpu_reset,guest_errors".to_string());
         if let Some(path) = request.path {
-            let _ = self.client.monitor_command(&format!("logfile {path}"))?;
+            let _ = self.session.backend.monitor_command(&format!("logfile {path}"))?;
         }
-        let output = self.client.monitor_command(&format!("log {items}"))?;
+        let output = self.session.backend.monitor_command(&format!("log {items}"))?;
         Ok(json!({
             "items": items,
             "output": output,
         }))
     }
 
-    /// Serialize a stop into the agent's JSON shape. The session has already
-    /// updated the current thread and refreshed the register cache; this reads
-    /// the current thread's registers for RIP/CR3/symbol context.
-    fn stop_json(
-        &mut self,
-        event: &StopEvent,
-        breakpoint: Option<&Breakpoint>,
-        reload: Option<Value>,
-    ) -> Result<Value> {
+    /// Require the VM halted for an inspection/step op, settling any pending stop
+    /// and finishing memory-completable rediscovery first (mirrors the MCP guard
+    /// and the REPL): only a truly running VM, or one stopped at a real site,
+    /// reaches the caller.
+    fn require_halted(&mut self) -> Result<()> {
+        self.session.settle_pending_stop()?;
+        self.session.try_finish_rediscovery_from_memory();
+        self.session.clear_deferred_reload_surface();
+        if self.session.backend.is_running() {
+            Err(Error::InvalidExpression(
+                "VM is running; interrupt first".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Render a [`ContinueOutcome`] into the agent's stop envelope.
+    fn outcome_json(&mut self, outcome: ContinueOutcome) -> Result<Value> {
+        match outcome {
+            ContinueOutcome::Running => Ok(json!({ "running": true, "stopped": false })),
+            ContinueOutcome::Breakpoint {
+                id,
+                address,
+                symbol,
+                temporary,
+                rip,
+            } => {
+                let mut out = self.stopped_envelope("breakpoint")?;
+                out["rip"] = json!(fmt_addr(rip));
+                out["breakpoint"] = json!({
+                    "id": id,
+                    "address": fmt_addr(address),
+                    "symbol": symbol.or_else(|| self.format_symbol(VirtAddr(rip))),
+                });
+                out["temporary"] = json!(temporary);
+                Ok(out)
+            }
+            ContinueOutcome::Bugcheck { rip, info } => {
+                let analysis = info
+                    .map(|i| analyze_bugcheck(&self.session.target, &i))
+                    .or_else(|| current_bugcheck(&self.session.target));
+                let mut out = self.stopped_envelope("bugcheck")?;
+                if let Some(rip) = rip {
+                    out["rip"] = json!(fmt_addr(rip));
+                }
+                out["is_bugcheck"] = json!(true);
+                out["bugcheck"] = analysis
+                    .as_ref()
+                    .map(|a| view::to_json(&view::bugcheck(a)))
+                    .unwrap_or(Value::Null);
+                Ok(out)
+            }
+            ContinueOutcome::Stopped {
+                rip,
+                exception_code,
+            } => {
+                let mut out = self.stopped_envelope("exception")?;
+                out["rip"] = json!(fmt_addr(rip));
+                out["exception_code"] = json!(exception_code.map(|code| format!("0x{code:08x}")));
+                Ok(out)
+            }
+            ContinueOutcome::Step { rip } => {
+                let mut out = self.stopped_envelope("step")?;
+                out["rip"] = json!(fmt_addr(rip));
+                Ok(out)
+            }
+            ContinueOutcome::TargetReloaded {
+                kernel_base,
+                coherent,
+            } => Ok(json!({
+                "running": false,
+                "stopped": true,
+                "stop": "target_reloaded",
+                "thread": self.session.current_thread,
+                "target_reloaded": true,
+                "kernel_base": kernel_base.map(fmt_addr),
+                "coherent": coherent,
+            })),
+            ContinueOutcome::Halted { rip } => {
+                let mut out = self.stopped_envelope("halted")?;
+                // Not a fresh event; the VM was already parked here.
+                out["event"] = json!(false);
+                out["rip"] = json!(fmt_addr(rip));
+                out["coherent"] = json!(self.session.kernel_coherent());
+                Ok(out)
+            }
+        }
+    }
+
+    /// Base stop envelope: refreshes the current thread's registers (caching them
+    /// for expression evaluation), and fills rip/cr3/symbol/process from the
+    /// current context.
+    fn stopped_envelope(&mut self, stop: &str) -> Result<Value> {
         let mut out = json!({
             "running": false,
             "stopped": true,
+            "stop": stop,
             "thread": self.session.current_thread,
-            "summary": event.summary,
-            "target_exited": event.target_exited,
-            "exception_code": event.exception_code.map(|code| format!("0x{code:08x}")),
-            "program_counter": event.program_counter.map(fmt_addr),
-            "is_bugcheck": event.is_bugcheck,
-            "bugcheck": event.bugcheck.as_ref().map(bugcheck_json),
-            "target_reloaded": event.target_reloaded,
-            "target_kernel_base_hint": event.target_kernel_base_hint.map(|address| fmt_addr(address.0)),
-            "assisted_breakin": event.assisted_breakin,
-            "reload": reload,
         });
 
-        if let Some(bp) = breakpoint {
-            out["breakpoint"] = json!({
-                "id": bp.id,
-                "symbol": bp.symbol,
-                "address": fmt_addr(bp.address.0),
-            });
-        }
-
-        if !event.target_exited
-            && let Ok(regs) = self.client.read_registers()
-        {
-            let rip = self
-                .session
-                .register_map
-                .read_u64("rip", &regs)
-                .unwrap_or(0);
-            let cr3 = self
-                .session
-                .register_map
-                .read_u64("cr3", &regs)
-                .unwrap_or(0);
-            self.debugger.registers = Some(self.session.register_map.to_hashmap(&regs));
+        if let Ok(regs) = self.session.backend.read_registers() {
+            let rip = self.session.register_map.read_u64("rip", &regs).unwrap_or(0);
+            let cr3 = self.session.register_map.read_u64("cr3", &regs).unwrap_or(0);
+            self.session.target.registers = Some(self.session.register_map.to_hashmap(&regs));
             out["rip"] = json!(fmt_addr(rip));
             out["cr3"] = json!(fmt_addr(cr3));
-            if let Some((module, symbol, offset)) = self
-                .debugger
-                .symbols
-                .find_closest_symbol_for_address(self.debugger.current_dtb(), VirtAddr(rip))
-            {
-                out["symbol"] = json!(if offset == 0 {
-                    format!("{module}!{symbol}")
-                } else {
-                    format!("{module}!{symbol}+0x{offset:x}")
-                });
+            if let Some(symbol) = self.format_symbol(VirtAddr(rip)) {
+                out["symbol"] = json!(symbol);
             }
         }
-
+        out["process"] = self
+            .session
+            .target
+            .current_process_info
+            .as_ref()
+            .map(|p| json!({ "pid": p.pid, "name": p.name }))
+            .unwrap_or(Value::Null);
         Ok(out)
     }
 
     fn eval_address(&mut self, expr: String) -> Result<VirtAddr> {
         self.ensure_register_cache()?;
-        Expr::eval(&expr, self.debugger)
+        Expr::eval(&expr, &self.session.target)
     }
 
     fn ensure_register_cache(&mut self) -> Result<()> {
-        if self.debugger.registers.is_some() || self.client.is_running() {
+        if self.session.target.registers.is_some() || self.session.backend.is_running() {
             return Ok(());
         }
-        if self.client.capabilities().iter().any(|entry| {
-            entry.capability == crate::dbg_backend::DebugCapability::ReadRegisters
-                && entry.supported
-        }) {
-            self.session
-                .refresh_register_cache(self.client, self.debugger)?;
+        if self
+            .session
+            .backend
+            .capabilities()
+            .iter()
+            .any(|entry| entry.capability == DebugCapability::ReadRegisters && entry.supported)
+        {
+            self.current_regs()?;
         }
         Ok(())
     }
 
     fn format_symbol(&self, address: VirtAddr) -> Option<String> {
-        self.debugger
-            .symbols
-            .find_closest_symbol_for_address(self.debugger.current_dtb(), address)
-            .map(|(module, symbol, offset)| {
-                if offset == 0 {
-                    format!("{module}!{symbol}")
-                } else {
-                    format!("{module}!{symbol}+0x{offset:x}")
-                }
-            })
+        self.session.target.closest_symbol_current_context(address)
     }
 }
 
@@ -1720,27 +1617,6 @@ fn big_pool_json(entry: BigPoolEntry) -> Value {
         "pattern": entry.pattern,
         "pool_flags": entry.pool_flags,
         "slush_size": entry.slush_size,
-    })
-}
-
-fn bugcheck_json(info: &crate::dbg_backend::BugcheckInfo) -> Value {
-    let descriptor = bugcheck_descriptor(info.code);
-    let arguments = descriptor
-        .as_ref()
-        .map(|descriptor| descriptor.arguments)
-        .unwrap_or(GENERIC_BUGCHECK_ARGS);
-    json!({
-        "code": format!("0x{:08x}", info.code),
-        "name": descriptor.as_ref().map(|descriptor| descriptor.name),
-        "description": descriptor.as_ref().and_then(|descriptor| descriptor.description),
-        "driver": info.driver,
-        "parameters": info.parameters.iter().zip(arguments).enumerate().map(
-            |(index, (value, description))| json!({
-                "index": index + 1,
-                "value": fmt_addr(*value),
-                "description": description,
-            })
-        ).collect::<Vec<_>>(),
     })
 }
 
@@ -1879,76 +1755,14 @@ fn module_symbol_report_json(report: ModuleSymbolLoadReport) -> Value {
     })
 }
 
-fn script_load_report_json(report: LoadReport) -> Value {
+fn script_load_report_json(report: &embed::LoadReport) -> Value {
     json!({
         "loaded": report.loaded,
-        "failed": report.failed.into_iter().map(|(path, error)| json!({
+        "failed": report.failed.iter().map(|(path, error)| json!({
             "path": path.display().to_string(),
             "error": error,
         })).collect::<Vec<_>>(),
     })
-}
-
-fn agent_builtin_names() -> HashSet<String> {
-    [
-        "status",
-        "capabilities",
-        "eval",
-        "registers",
-        "read-memory",
-        "write-memory",
-        "memory.read",
-        "memory.write",
-        "memory.search",
-        "memory.fill",
-        "disasm",
-        "dt",
-        "trap-frame",
-        "tf",
-        "pte",
-        "idt",
-        "gdt",
-        "tss",
-        "pool",
-        "k",
-        "drivers",
-        "ps",
-        "lm",
-        "vmmap",
-        "symbol.search",
-        "symbol.nearest",
-        "vars",
-        "variable.set",
-        "variable.unset",
-        "load-symbols",
-        "attach",
-        "detach",
-        "vcpus",
-        "vcpu.set",
-        "threads",
-        "thread.set",
-        "bp.set",
-        "bp.clear",
-        "bp.disable",
-        "bp.enable",
-        "bp.list",
-        "continue",
-        "interrupt",
-        "step",
-        "step.over",
-        "step.out",
-        "qcmd",
-        "qlog",
-        "scripts",
-        "script.list",
-        "script.reload",
-        "script.run",
-        "script.exec",
-        "quit",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
 }
 
 fn completion_strategy_name(strategy: crate::repl::CompletionStrategy) -> &'static str {
@@ -1966,11 +1780,8 @@ fn completion_strategy_name(strategy: crate::repl::CompletionStrategy) -> &'stat
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        agent_builtin_names, backend_processor_index, bugcheck_json, region_matches_filter,
-    };
-    use crate::dbg_backend::BugcheckInfo;
-    use crate::debugger::MemoryRegionInfo;
+    use super::{backend_processor_index, region_matches_filter};
+    use crate::target::MemoryRegionInfo;
     use crate::types::VirtAddr;
 
     #[test]
@@ -1980,36 +1791,6 @@ mod tests {
         assert_eq!(backend_processor_index("1"), Some(0));
         assert_eq!(backend_processor_index("2"), Some(1));
         assert_eq!(backend_processor_index("0"), None);
-    }
-
-    #[test]
-    fn agent_builtin_names_cover_v012_command_families() {
-        let names = agent_builtin_names();
-        for command in [
-            "capabilities",
-            "vmmap",
-            "symbol.search",
-            "symbol.nearest",
-            "variable.set",
-            "vcpus",
-            "threads",
-            "step.over",
-            "step.out",
-        ] {
-            assert!(names.contains(command), "missing agent command {command}");
-        }
-    }
-
-    #[test]
-    fn bugcheck_json_includes_descriptor_and_arguments() {
-        let value = bugcheck_json(&BugcheckInfo {
-            code: 0x0a,
-            parameters: [1, 2, 3, 4],
-            driver: Some("driver.sys".to_string()),
-        });
-        assert_eq!(value["name"], "IRQL_NOT_LESS_OR_EQUAL");
-        assert_eq!(value["driver"], "driver.sys");
-        assert_eq!(value["parameters"].as_array().unwrap().len(), 4);
     }
 
     #[test]

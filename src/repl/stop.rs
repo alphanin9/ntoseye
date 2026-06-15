@@ -3,9 +3,9 @@ use std::time::Duration;
 use owo_colors::OwoColorize;
 
 use crate::dbg_backend::{BugcheckInfo, DebugBackend, StopEvent};
-use crate::debugger::{DebuggerContext, DebuggerReloadReport, ThreadInfo, kthread_state_name};
 use crate::error::{Error, Result};
-use crate::gdb::{BreakpointHitResult, BreakpointManager, RegisterMap};
+use crate::gdb::{BreakpointManager, RegisterMap};
+use crate::target::{ReloadReport, Target, ThreadInfo, kthread_state_name};
 use crate::types::VirtAddr;
 use crate::ui;
 use crate::unwind::{format_symbol, resolve_thread_trace_context};
@@ -15,10 +15,7 @@ use crate::repl::*;
 /// Returns whether new kernel modules appeared (their symbols were just loaded),
 /// which the caller uses as a "module set changed" signal for backends without a
 /// load event.
-pub fn refresh_kernel_module_symbols_on_stop(
-    debugger: &DebuggerContext,
-    caches: &ReplCaches,
-) -> bool {
+pub fn refresh_kernel_module_symbols_on_stop(debugger: &Target, caches: &ReplCaches) -> bool {
     let Ok(report) = debugger.refresh_kernel_module_symbols() else {
         return false;
     };
@@ -31,7 +28,7 @@ pub fn refresh_kernel_module_symbols_on_stop(
     true
 }
 
-pub fn print_target_reload_report(report: &DebuggerReloadReport) {
+pub fn print_target_reload_report(report: &ReloadReport) {
     if let Some(startup) = &report.startup {
         println!(
             "{} kernel reloaded: {} -> {}, psmods {}",
@@ -92,12 +89,8 @@ impl TargetReloadStatus {
     }
 }
 
-pub fn reload_report_has_loaded_module_list(report: &DebuggerReloadReport) -> bool {
-    report
-        .startup
-        .as_ref()
-        .is_some_and(|startup| !startup.loaded_module_list.is_zero())
-}
+// In core; re-exported for the REPL.
+pub use crate::session::reload_report_has_loaded_module_list;
 
 pub fn update_reload_module_list_pending(pending: &mut bool, reload_status: TargetReloadStatus) {
     match reload_status {
@@ -111,7 +104,7 @@ pub fn update_reload_module_list_pending(pending: &mut bool, reload_status: Targ
 
 pub fn try_complete_pending_module_list_reload(
     client: &mut dyn DebugBackend,
-    debugger: &mut DebuggerContext,
+    debugger: &mut Target,
     caches: &ReplCaches,
     pending: &mut bool,
 ) -> bool {
@@ -151,7 +144,7 @@ pub fn try_complete_pending_module_list_reload(
 /// state for the new kernel image, marking `event.target_reloaded`.
 pub fn apply_target_reload_if_needed(
     client: &mut dyn DebugBackend,
-    debugger: &mut DebuggerContext,
+    debugger: &mut Target,
     breakpoints: &mut BreakpointManager,
     caches: &ReplCaches,
     event: &mut StopEvent,
@@ -162,20 +155,18 @@ pub fn apply_target_reload_if_needed(
     event.target_reloaded = true;
 
     let dropped_breakpoints = breakpoints.list().len();
-    *breakpoints = BreakpointManager::new();
+    // The reload action (drop breakpoints, resolve the hint, reload the guest,
+    // note rediscovery status) is shared with the SDK/MCP in core; the REPL
+    // layers its cache refresh + output on top.
+    let TargetReloadOutcome {
+        report,
+        hint: kernel_base_hint,
+    } = perform_target_reload(client, debugger, breakpoints, event.target_kernel_base_hint);
     *caches.breakpoints.write().unwrap() = Vec::new();
 
-    let kernel_base_hint = event
-        .target_kernel_base_hint
-        .or_else(|| client.target_kernel_base_hint().ok().flatten());
-    match debugger.reload_guest_with_kernel_base_hint(kernel_base_hint) {
+    match report {
         Ok(report) => {
             let loaded_module_list_available = reload_report_has_loaded_module_list(&report);
-            if loaded_module_list_available {
-                client.note_target_rediscovery_complete();
-            } else {
-                client.note_target_rediscovery_pending();
-            }
             print_target_reload_report(&report);
             caches.refresh_symbol_context(debugger);
             *caches.vcpus.write().unwrap() = client.thread_list().unwrap_or_default();
@@ -199,9 +190,10 @@ pub fn apply_target_reload_if_needed(
             }
         }
         Err(e) => {
+            // Rediscovery state was already noted as pending by
+            // `perform_target_reload`; here we only surface the reason.
             match e {
                 Error::NtoskrnlNotFound => {
-                    client.note_target_rediscovery_pending();
                     println!(
                         "{} reboot observed; Windows kernel is not discoverable yet",
                         "target:".bright_black()
@@ -231,14 +223,10 @@ pub const REPL_STOP_POLL: Duration = Duration::from_millis(100);
 
 pub const STATUS_BREAKPOINT: u32 = 0x8000_0003;
 
-pub fn processor_index_from_backend_thread_id(thread_id: &str) -> Option<u16> {
-    let stripped = thread_id.strip_prefix("p1.")?;
-    let one_based = u16::from_str_radix(stripped, 16).ok()?;
-    one_based.checked_sub(1)
-}
+pub use crate::session::processor_index_from_backend_thread_id;
 
 pub fn refresh_windows_thread_context_for_backend_thread(
-    debugger: &mut DebuggerContext,
+    debugger: &mut Target,
     thread_id: &str,
 ) -> Option<ThreadInfo> {
     let thread = processor_index_from_backend_thread_id(thread_id).and_then(|processor| {
@@ -295,56 +283,13 @@ pub fn print_stop_notice(event: &StopEvent) {
     print_stop_notice_parts(event.exception_code, event.program_counter);
 }
 
-pub fn stop_event_requires_target_reload(debugger: &DebuggerContext, event: &StopEvent) -> bool {
-    if event.target_reloaded {
-        return true;
-    }
+// In core (the reload state machine owns them); re-exported for the REPL.
+pub use crate::session::{
+    TargetReloadOutcome, clear_trap_flag, perform_target_reload, stop_event_requires_target_reload,
+    stop_is_assisted_refresh_breakin, stop_is_stray_single_step,
+};
 
-    let Some(pc) = event.program_counter else {
-        return false;
-    };
-    if !looks_like_kernel_pointer(pc) {
-        return false;
-    }
-
-    if !debugger.current_kernel_mapping_is_valid() {
-        return true;
-    }
-
-    let current_dtb = debugger.guest.ntoskrnl.dtb();
-    if debugger
-        .symbols
-        .find_module_for_address(current_dtb, VirtAddr(pc))
-        .is_some()
-    {
-        return false;
-    }
-
-    if !event.is_bugcheck
-        && pc.abs_diff(debugger.guest.ntoskrnl.base_address.0) < CURRENT_KERNEL_RELOAD_WINDOW
-    {
-        return false;
-    }
-
-    debugger
-        .rediscovered_kernel_identity_changed()
-        .unwrap_or(false)
-}
-
-pub fn set_current_thread_from_stop(
-    client: &mut dyn DebugBackend,
-    event: &StopEvent,
-    current: &mut String,
-) {
-    let stopped_tid = event
-        .thread_id
-        .clone()
-        .or_else(|| client.stopped_thread_id().ok());
-    if let Some(tid) = stopped_tid {
-        *current = tid;
-        let _ = client.set_current_thread(current);
-    }
-}
+pub use crate::session::set_current_thread_from_stop;
 
 /// Refresh the caches the stop output depends on (vcpus, kernel module symbols),
 /// done before any stop notice prints so it reflects the current kernel image.
@@ -354,7 +299,7 @@ pub fn set_current_thread_from_stop(
 /// diff (any backend).
 pub fn refresh_stop_caches_pre(
     client: &mut dyn DebugBackend,
-    debugger: &DebuggerContext,
+    debugger: &Target,
     caches: &ReplCaches,
 ) -> bool {
     caches.refresh_vcpus(client);
@@ -368,7 +313,7 @@ pub fn refresh_stop_caches_pre(
 /// near-static but expensive cache, so they re-enumerate only when the module set
 /// actually changed (`modules_changed`) rather than on every stop.
 pub fn refresh_stop_caches_post(
-    debugger: &DebuggerContext,
+    debugger: &Target,
     caches: &ReplCaches,
     target_reloaded: bool,
     modules_changed: bool,
@@ -394,7 +339,7 @@ pub struct StopOutcome {
 pub fn print_async_stop_context(
     client: &mut dyn DebugBackend,
     register_map: &RegisterMap,
-    debugger: &mut DebuggerContext,
+    debugger: &mut Target,
     breakpoints: &BreakpointManager,
     caches: &ReplCaches,
     current_thread: &mut String,
@@ -443,7 +388,7 @@ pub fn is_target_reload_load_symbols_stop(
 }
 
 pub fn print_target_reload_notification_context(
-    debugger: &DebuggerContext,
+    debugger: &Target,
     current_thread: &str,
     event: &StopEvent,
     reload_status: TargetReloadStatus,
@@ -467,7 +412,7 @@ pub fn print_target_reload_notification_context(
 }
 
 pub fn rebase_kernel_symbol_for_pending_reload(
-    debugger: &DebuggerContext,
+    debugger: &Target,
     pc: u64,
     kernel_base_hint: Option<VirtAddr>,
 ) -> Option<String> {
@@ -488,7 +433,7 @@ pub fn rebase_kernel_symbol_for_pending_reload(
 }
 
 pub fn pending_reload_location(
-    debugger: &DebuggerContext,
+    debugger: &Target,
     event: &StopEvent,
     reload_status: TargetReloadStatus,
     register_kernel_base_hint: Option<VirtAddr>,
@@ -520,7 +465,7 @@ pub fn pending_reload_register_kernel_base_hint(
 pub fn print_pending_rediscovery_stop_context(
     client: &mut dyn DebugBackend,
     register_map: &RegisterMap,
-    debugger: &DebuggerContext,
+    debugger: &Target,
     current_thread: &mut String,
     event: &StopEvent,
     reload_status: TargetReloadStatus,
@@ -552,13 +497,13 @@ pub fn print_pending_rediscovery_stop_context(
 }
 
 pub fn should_resume_assisted_refresh_stop(
+    debugger: &Target,
+    breakpoints: &BreakpointManager,
     event: &StopEvent,
     reload_status: TargetReloadStatus,
 ) -> bool {
     matches!(reload_status, TargetReloadStatus::Unchanged)
-        && event.assisted_breakin
-        && event.bugcheck.is_none()
-        && event.exception_code == Some(STATUS_BREAKPOINT)
+        && stop_is_assisted_refresh_breakin(debugger, breakpoints, event)
 }
 
 pub fn resume_assisted_refresh_stop(client: &mut dyn DebugBackend) -> Result<()> {
@@ -568,7 +513,7 @@ pub fn resume_assisted_refresh_stop(client: &mut dyn DebugBackend) -> Result<()>
 pub fn surface_pending_stop(
     client: &mut dyn DebugBackend,
     register_map: &RegisterMap,
-    debugger: &mut DebuggerContext,
+    debugger: &mut Target,
     breakpoints: &mut BreakpointManager,
     caches: &ReplCaches,
     current_thread: &mut String,
@@ -591,15 +536,14 @@ pub fn surface_pending_stop(
                 return Ok(true);
             }
             caches.refresh_vcpus(client);
-            let completed_pending_module_list = try_complete_pending_module_list_reload(
+            let _ = try_complete_pending_module_list_reload(
                 client,
                 debugger,
                 caches,
                 reload_module_list_pending,
             );
-            if !completed_pending_module_list
-                && !*reload_module_list_pending
-                && should_resume_assisted_refresh_stop(&event, reload_status)
+            if !*reload_module_list_pending
+                && should_resume_assisted_refresh_stop(debugger, breakpoints, &event, reload_status)
             {
                 resume_assisted_refresh_stop(client)?;
                 return Ok(true);
@@ -625,7 +569,7 @@ pub fn surface_pending_stop(
 pub fn surface_interrupt_stop(
     client: &mut dyn DebugBackend,
     register_map: &RegisterMap,
-    debugger: &mut DebuggerContext,
+    debugger: &mut Target,
     breakpoints: &mut BreakpointManager,
     caches: &ReplCaches,
     current_thread: &mut String,
@@ -647,19 +591,12 @@ pub fn surface_interrupt_stop(
         return Ok(());
     }
     caches.refresh_vcpus(client);
-    let completed_pending_module_list = try_complete_pending_module_list_reload(
+    let _ = try_complete_pending_module_list_reload(
         client,
         debugger,
         caches,
         reload_module_list_pending,
     );
-    if !completed_pending_module_list
-        && !*reload_module_list_pending
-        && should_resume_assisted_refresh_stop(&event, reload_status)
-    {
-        resume_assisted_refresh_stop(client)?;
-        return Ok(());
-    }
     print_async_stop_context(
         client,
         register_map,
@@ -675,128 +612,18 @@ pub fn surface_interrupt_stop(
     Ok(())
 }
 
-/// Single-step the current thread and clear `TF` from its RFLAGS afterwards.
-/// KVM sets `TF` when enabling `KVM_GUESTDBG_SINGLESTEP` but doesn't clear it
-/// when SINGLESTEP is removed; without this clear, the stepped thread keeps
-/// trapping after every instruction on resume
-pub fn step_one_and_clear_tf(
-    client: &mut dyn DebugBackend,
-    register_map: &RegisterMap,
-) -> Result<()> {
-    client.step()?;
-    client.wait_for_stop()?;
+// In core so the REPL and Python SDK share identical step semantics.
+pub use crate::session::step_one_and_clear_tf;
+pub use crate::session::step_over_current_breakpoint;
 
-    if let Ok(mut regs) = client.read_registers()
-        && let Ok(eflags) = register_map.read_u64("eflags", &regs)
-    {
-        let cleared = eflags & !(1u64 << 8);
-        if cleared != eflags && register_map.write_u64("eflags", &mut regs, cleared).is_ok() {
-            client.write_registers(&regs)?;
-        }
-    }
-
-    Ok(())
-}
-
-/// If the current thread's RIP sits on one of our enabled breakpoints,
-/// disable it, step the underlying instruction, then re-enable. Returns
-/// whether a step was performed. Caller must have set the gdb stub's
-/// control thread first
-pub fn step_over_current_breakpoint(
-    client: &mut dyn DebugBackend,
-    register_map: &RegisterMap,
-    debugger: &DebuggerContext,
-    breakpoints: &mut BreakpointManager,
-) -> Result<bool> {
-    let regs = client.read_registers()?;
-    let rip = register_map.read_u64("rip", &regs)?;
-    let cr3 = register_map.read_u64("cr3", &regs)?;
-
-    // Scope-agnostic: a wrong-process hit on a shared-page BP still needs the
-    // disable/step/enable dance so the wrong process can make forward progress
-    let Some(bp_id) = breakpoints.breakpoint_id_at_address(rip) else {
-        return Ok(false);
-    };
-
-    if let Err(err) = breakpoints.disable(client, debugger, bp_id) {
-        if matches!(err, Error::BadVirtualAddress(_)) {
-            breakpoints
-                .disable_guest_memory_patch_in_address_space(client, debugger, bp_id, cr3)?;
-        } else {
-            return Err(err);
-        }
-    }
-
-    step_one_and_clear_tf(client, register_map)?;
-
-    if let Err(err) = breakpoints.enable(client, debugger, bp_id) {
-        if matches!(err, Error::BadVirtualAddress(_)) {
-            let removed = breakpoints.discard(bp_id)?;
-            println!(
-                "{}",
-                format!(
-                    "breakpoint #{} removed: {} address space no longer exists",
-                    removed.id,
-                    removed.scope.label()
-                )
-                .yellow()
-            );
-        } else {
-            return Err(err);
-        }
-    }
-    Ok(true)
-}
-
-/// For every gdb thread whose RIP sits one byte past one of our breakpoints,
-/// rewind it back to the breakpoint address. The stub doesn't always adjust
-/// RIP back to the int3 when multiple vCPUs hit the same BP simultaneously;
-/// resuming an un-adjusted vCPU would decode the remainder of the original
-/// instruction's bytes as a different instruction and corrupt guest state.
-/// Restores Hg/Hc to `restore_thread` before returning
-pub fn rewind_threads_off_breakpoints(
-    client: &mut dyn DebugBackend,
-    register_map: &RegisterMap,
-    breakpoints: &BreakpointManager,
-    restore_thread: &str,
-) {
-    let threads = match client.thread_list() {
-        Ok(t) => t,
-        Err(_) => return,
-    };
-
-    for tid in &threads {
-        if client.set_current_thread(tid).is_err() {
-            continue;
-        }
-        let Ok(regs) = client.read_registers() else {
-            continue;
-        };
-        let rip = register_map.read_u64("rip", &regs).unwrap_or(0);
-        let cr3 = register_map.read_u64("cr3", &regs).unwrap_or(0);
-        let Some(prev) = rip.checked_sub(1) else {
-            continue;
-        };
-        if !matches!(
-            breakpoints.check_breakpoint_hit(prev, cr3),
-            BreakpointHitResult::Hit(_)
-        ) {
-            continue;
-        }
-        let mut adjusted = regs.clone();
-        if register_map.write_u64("rip", &mut adjusted, prev).is_err() {
-            continue;
-        }
-        let _ = client.write_registers(&adjusted);
-    }
-
-    let _ = client.set_current_thread(restore_thread);
-}
+// RIP-rewind for threads parked past a breakpoint int3; in core, shared with
+// `Session::continue_until_break`.
+pub use crate::session::rewind_threads_off_breakpoints;
 
 pub fn print_break_context(
     client: &mut dyn DebugBackend,
     register_map: &RegisterMap,
-    debugger: &mut DebuggerContext,
+    debugger: &mut Target,
     breakpoints: &BreakpointManager,
     thread_id: &str,
 ) {
@@ -806,7 +633,7 @@ pub fn print_break_context(
 pub fn print_break_context_for_bugcheck(
     client: &mut dyn DebugBackend,
     register_map: &RegisterMap,
-    debugger: &mut DebuggerContext,
+    debugger: &mut Target,
     breakpoints: &BreakpointManager,
     thread_id: &str,
     info: Option<&BugcheckInfo>,
@@ -824,7 +651,7 @@ pub fn print_break_context_for_bugcheck(
 pub fn print_break_context_at(
     client: &mut dyn DebugBackend,
     register_map: &RegisterMap,
-    debugger: &mut DebuggerContext,
+    debugger: &mut Target,
     breakpoints: &BreakpointManager,
     thread_id: &str,
     display_rip: Option<u64>,

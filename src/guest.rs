@@ -9,7 +9,7 @@ use crate::{
     },
     types::*,
 };
-use indicatif::ProgressStyle;
+use indicatif::{ProgressBar, ProgressStyle};
 use pelite::pe64::{Pe, PeFile, PeView};
 use rayon::prelude::*;
 use std::collections::HashSet;
@@ -201,6 +201,29 @@ pub fn read_pe_image<'a, B: MemoryOps<PhysAddr>>(
     })
 }
 
+/// Name of the PE section containing `address` within the image loaded at
+/// `base` (e.g. `.text`), or `None` if `address` isn't in a section or `base`
+/// isn't a readable PE. Reads only the header page, like `read_pe_image`'s
+/// prologue.
+pub fn section_name_at<'a, B: MemoryOps<PhysAddr>>(
+    memory: &memory::AddressSpace<'a, B>,
+    base: VirtAddr,
+    address: VirtAddr,
+) -> Option<String> {
+    let rva = u32::try_from(address.0.checked_sub(base.0)?).ok()?;
+    let mut header_buf = [0u8; 0x1000];
+    memory.read_bytes(base, &mut header_buf).ok()?;
+    let view = PeView::from_bytes(&header_buf).ok()?;
+    for section in view.section_headers() {
+        let va = section.VirtualAddress;
+        let size = section.VirtualSize.max(section.SizeOfRawData);
+        if rva >= va && rva < va.saturating_add(size) {
+            return section.name().ok().map(|s| s.to_string());
+        }
+    }
+    None
+}
+
 /// Build a complete (hole-free) `PeImage` from an on-disk PE file by mapping its
 /// raw sections to their RVAs: the same layout `read_pe_image` produces from
 /// guest memory, but sourced from the full file. Used to recover read-only data
@@ -253,7 +276,7 @@ impl SymbolRef<'_> {
 /// space (`dtb`) and the handles needed to read and resolve symbols/types
 /// (`kvm`, `symbols`), so navigation methods don't take them as arguments. The
 /// handles are shared (`Arc`), not borrowed; a `WinObject` can't borrow its
-/// `DebuggerContext` siblings, but it can own a refcounted handle to them.
+/// `Target` siblings, but it can own a refcounted handle to them.
 pub struct WinObject {
     pub base_address: VirtAddr,
     dtb: Dtb,
@@ -290,6 +313,13 @@ impl WinObject {
 
     pub fn dtb(&self) -> Dtb {
         self.dtb
+    }
+
+    /// Mark this object's module as the kernel in the shared symbol store, so
+    /// type/enum layout lookups prefer it across address spaces. Call after
+    /// [`load_symbols`](Self::load_symbols) so `guid` is populated.
+    pub fn register_as_kernel(&self) {
+        self.symbols.set_kernel_guid(self.guid);
     }
 
     /// Size of the cached binary snapshot (0 until [`view`](Self::view) has run).
@@ -524,12 +554,19 @@ impl<'a> StructRef<'a> {
     /// derived from the field's PDB metadata.
     pub fn embedded(&self, name: &str) -> Result<StructRef<'a>> {
         let field = self.field(name)?;
-        let ParsedType::Struct(struct_name) = &field.type_data else {
-            return Err(Error::FieldTypeMismatch(name.to_string(), "struct".into()));
+        // Embedded structs and unions both resolve by layout name; nested
+        // anonymous unions (e.g. `_IRP.Tail`) are unions, so accept both.
+        let type_name = match &field.type_data {
+            ParsedType::Struct(n) | ParsedType::Union(n) => n.clone(),
+            _ => {
+                return Err(Error::FieldTypeMismatch(
+                    name.to_string(),
+                    "struct or union".into(),
+                ));
+            }
         };
-        let struct_name = struct_name.clone();
         let base = self.base + field.offset as u64;
-        let ti = self.obj.types().layout(&struct_name)?;
+        let ti = self.obj.types().layout(&type_name)?;
         Ok(self.with(ti, base))
     }
 
@@ -791,6 +828,11 @@ impl Guest {
             find_ntoskrnl(kvm, symbols)?.ok_or(Error::NtoskrnlNotFound)?
         }
         .load_symbols()?;
+
+        // Type/enum layout lookups prefer the kernel's definitions over
+        // same-named user-mode types once attached to a process; tell the
+        // symbol store which guid is the kernel's.
+        ntoskrnl.register_as_kernel();
 
         Ok(Self { ntoskrnl })
     }
@@ -1127,7 +1169,7 @@ impl Guest {
         }
 
         if !ready_to_load.is_empty() {
-            let pb = crate::symbols::progress_bar(ready_to_load.len() as u64);
+            let pb = ProgressBar::new(ready_to_load.len() as u64);
             pb.set_style(
                 ProgressStyle::with_template("Indexing [{bar:40}] {pos}/{len}")
                     .unwrap()

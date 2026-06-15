@@ -31,12 +31,12 @@ use pelite::pe64::{
 
 use crate::{
     backend::MemoryOps,
-    debugger::DebuggerContext,
     gdb::RegisterMap,
     guest::{ModuleInfo, PeImage, ProcessInfo, read_pe_image, read_pe_image_from_file},
     host::KvmHandle,
     memory::AddressSpace,
     symbols::SymbolStore,
+    target::Target,
     types::{Dtb, VirtAddr},
 };
 
@@ -76,13 +76,25 @@ pub enum FrameSource {
     Scan,
 }
 
+impl FrameSource {
+    /// Stable lowercase tag for how a frame was recovered, surfaced by every
+    /// host. Explicit rather than derived from `Debug`, which would drift if a
+    /// variant were renamed.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FrameSource::Current => "current",
+            FrameSource::Unwind => "unwind",
+            FrameSource::Scan => "scan",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StackFrame {
     pub sp: u64,
     pub ip: u64,
     pub symbol: String,
     pub source: FrameSource,
-    pub trap_frame: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -96,25 +108,6 @@ struct RegisterContext {
     rip: u64,
     rsp: u64,
     regs: [Option<u64>; 16],
-    last_trap_frame: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TrapFrameLayout {
-    rip_offset: u64,
-    error_code_offset: Option<u64>,
-}
-
-impl TrapFrameLayout {
-    fn base_from_machine_frame(&self, machine_frame: u64, has_error_code: bool) -> Option<u64> {
-        let offset = if has_error_code {
-            self.error_code_offset
-                .unwrap_or(self.rip_offset.saturating_sub(8))
-        } else {
-            self.rip_offset
-        };
-        machine_frame.checked_sub(offset)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -175,10 +168,9 @@ struct StackTracer<'a> {
     symbols: &'a SymbolStore,
     memory: AddressSpace<'a, KvmHandle>,
     modules: HashMap<(Dtb, u64), CachedModule>,
-    trap_frame_layout: Option<TrapFrameLayout>,
 }
 
-pub fn resolve_thread_trace_context(debugger: &DebuggerContext, cr3: u64) -> ThreadTraceContext {
+pub fn resolve_thread_trace_context(debugger: &Target, cr3: u64) -> ThreadTraceContext {
     let cr3_masked = cr3 & CR3_PAGE_MASK;
     let kernel_dtb = debugger.guest.ntoskrnl.dtb();
     let kernel_dtb_masked = kernel_dtb & CR3_PAGE_MASK;
@@ -219,7 +211,7 @@ pub fn resolve_thread_trace_context(debugger: &DebuggerContext, cr3: u64) -> Thr
     }
 }
 
-pub fn format_symbol(debugger: &DebuggerContext, trace: &ThreadTraceContext, addr: u64) -> String {
+pub fn format_symbol(debugger: &Target, trace: &ThreadTraceContext, addr: u64) -> String {
     let try_format = |dtb| {
         debugger
             .symbols
@@ -255,7 +247,7 @@ pub fn preferred_code_dtb(trace: &ThreadTraceContext, addr: u64) -> Dtb {
 }
 
 pub fn build_stacktrace(
-    debugger: &DebuggerContext,
+    debugger: &Target,
     register_map: &RegisterMap,
     regs: &[u8],
     limit: usize,
@@ -269,8 +261,7 @@ pub fn build_stacktrace(
 
     // phase 1: walk the stack collecting raw frames (sp, ip, source). Symbols are
     // formatted afterwards so we can first lazily load the modules they land in.
-    let mut raw: Vec<(u64, u64, FrameSource, Option<u64>)> =
-        vec![(rsp, rip, FrameSource::Current, None)];
+    let mut raw: Vec<(u64, u64, FrameSource)> = vec![(rsp, rip, FrameSource::Current)];
     let mut tracer = StackTracer::new(debugger, &trace);
     let mut context = RegisterContext::from_registers(register_map, regs);
     let mut seen = HashSet::from([rip]);
@@ -290,13 +281,6 @@ pub fn build_stacktrace(
         if context.rip == 0 || context.rip == previous_rip {
             break;
         }
-        if let Some(trap_frame) = context.take_last_trap_frame()
-            && let Some(frame) = raw.last_mut()
-            && frame.1 == previous_rip
-        {
-            frame.3 = Some(trap_frame);
-        }
-
         // rsp must advance within a stack; a trap/interrupt frame can switch to
         // another stack, where the new rsp is unrelated to the previous one
         if !stack_switch && context.rsp <= previous_rsp {
@@ -304,21 +288,21 @@ pub fn build_stacktrace(
         }
 
         seen.insert(context.rip);
-        raw.push((context.rsp, context.rip, FrameSource::Unwind, None));
+        raw.push((context.rsp, context.rip, FrameSource::Unwind));
     }
 
     for (sp, ip) in tracer.scan_stack(context.rsp, &seen) {
-        raw.push((sp, ip, FrameSource::Scan, None));
+        raw.push((sp, ip, FrameSource::Scan));
     }
 
     // phase 2: lazily load symbols for the modules these frames land in, so
     // user-mode frames (e.g. ntdll in a process we never attached to) resolve to
     // `module!symbol` instead of `module+offset`
-    ensure_frame_module_symbols(debugger, &trace, raw.iter().map(|(_, ip, _, _)| *ip));
+    ensure_frame_module_symbols(debugger, &trace, raw.iter().map(|(_, ip, _)| *ip));
 
     // phase 3: format each frame, honouring the display limit
     let mut stacktrace = StackTrace::default();
-    for (sp, ip, source, trap_frame) in raw {
+    for (sp, ip, source) in raw {
         record_stack_frame(
             &mut stacktrace,
             limit,
@@ -327,7 +311,6 @@ pub fn build_stacktrace(
                 ip,
                 symbol: format_symbol(debugger, &trace, ip),
                 source,
-                trap_frame,
             },
         );
     }
@@ -339,7 +322,7 @@ pub fn build_stacktrace(
 /// prior load attempt are fetched (so kernel modules, loaded on stop, and an
 /// attached process's modules are skipped), and each is loaded once per session.
 fn ensure_frame_module_symbols(
-    debugger: &DebuggerContext,
+    debugger: &Target,
     trace: &ThreadTraceContext,
     ips: impl Iterator<Item = u64>,
 ) {
@@ -376,7 +359,7 @@ fn record_stack_frame(stacktrace: &mut StackTrace, limit: usize, frame: StackFra
     }
 }
 
-fn find_process_by_cr3(debugger: &DebuggerContext, cr3_masked: u64) -> Option<ProcessInfo> {
+fn find_process_by_cr3(debugger: &Target, cr3_masked: u64) -> Option<ProcessInfo> {
     debugger
         .guest
         .enumerate_processes()
@@ -396,7 +379,6 @@ impl RegisterContext {
             rip: register_map.read_u64("rip", regs).unwrap_or(0),
             rsp: register_map.read_u64("rsp", regs).unwrap_or(0),
             regs: register_values,
-            last_trap_frame: None,
         }
     }
 
@@ -415,10 +397,6 @@ impl RegisterContext {
         if let Some(slot) = self.regs.get_mut(register as usize) {
             *slot = Some(value);
         }
-    }
-
-    fn take_last_trap_frame(&mut self) -> Option<u64> {
-        self.last_trap_frame.take()
     }
 }
 
@@ -446,29 +424,13 @@ impl ThreadTraceContext {
 }
 
 impl<'a> StackTracer<'a> {
-    fn new(debugger: &'a DebuggerContext, trace: &'a ThreadTraceContext) -> Self {
-        let trap_frame_layout = debugger
-            .symbols
-            .find_type_across_modules(trace.kernel_dtb, "_KTRAP_FRAME")
-            .and_then(|ty| {
-                let rip_offset = u64::from(ty.fields.get("Rip")?.offset);
-                let error_code_offset = ty
-                    .fields
-                    .get("ErrorCode")
-                    .map(|field| u64::from(field.offset));
-                Some(TrapFrameLayout {
-                    rip_offset,
-                    error_code_offset,
-                })
-            });
-
+    fn new(debugger: &'a Target, trace: &'a ThreadTraceContext) -> Self {
         Self {
             trace,
             kvm: &debugger.kvm,
             symbols: &debugger.symbols,
             memory: AddressSpace::new(&debugger.kvm, trace.active_dtb),
             modules: HashMap::new(),
-            trap_frame_layout,
         }
     }
 
@@ -611,6 +573,7 @@ impl<'a> StackTracer<'a> {
             {
                 return Some(UnwindStep::MachineFrame);
             }
+
             index += slots_used;
         }
 
@@ -699,23 +662,21 @@ impl<'a> StackTracer<'a> {
                 }
             }
             UWOP_PUSH_MACHFRAME => {
-                let has_error_code = slot.op_info != 0;
-                let machine_frame = context.rsp;
-                let rip_slot = machine_frame.saturating_add(if has_error_code { 8 } else { 0 });
-                let saved_rip = self.memory.read::<u64>(VirtAddr(rip_slot)).ok()?;
-                let saved_rsp = self
+                // a hardware-pushed trap/interrupt frame in iretq layout. op_info
+                // == 1 means a CPU error code sits below it, so step over that to
+                // reach the record: [+0]=rip [+8]=cs [+16]=eflags [+24]=rsp [+32]=ss
+                let base = if slot.op_info == 1 {
+                    context.rsp.saturating_add(8)
+                } else {
+                    context.rsp
+                };
+                let return_rip = self.memory.read::<u64>(VirtAddr(base)).ok()?;
+                let return_rsp = self
                     .memory
-                    .read::<u64>(VirtAddr(rip_slot.saturating_add(24)))
+                    .read::<u64>(VirtAddr(base.saturating_add(24)))
                     .ok()?;
-
-                context.rip = saved_rip;
-                context.rsp = saved_rsp;
-                context.last_trap_frame = self
-                    .trap_frame_layout
-                    .and_then(|layout| {
-                        layout.base_from_machine_frame(machine_frame, has_error_code)
-                    })
-                    .or(Some(machine_frame));
+                context.rip = return_rip;
+                context.rsp = return_rsp;
                 return Some(UnwindStep::MachineFrame);
             }
             _ => return None,
@@ -1031,8 +992,8 @@ fn slot_u16(codes: &[UnwindCodeSlot], index: usize) -> Option<u16> {
 mod tests {
     use super::{
         FrameSource, ParsedUnwindInfo, PeImage, RUNTIME_FUNCTION, RegisterContext, StackFrame,
-        StackTrace, TrapFrameLayout, UnwindCodeSlot, frame_base, lookup_runtime_function,
-        parse_unwind_info, record_stack_frame, slot_u16, unwind_slot_count,
+        StackTrace, UnwindCodeSlot, frame_base, lookup_runtime_function, parse_unwind_info,
+        record_stack_frame, slot_u16, unwind_slot_count,
     };
 
     #[test]
@@ -1131,7 +1092,6 @@ mod tests {
             rip: 0,
             rsp: 0x1800,
             regs,
-            last_trap_frame: None,
         };
         let unwind = ParsedUnwindInfo {
             size_of_prolog: 0,
@@ -1142,23 +1102,6 @@ mod tests {
         };
 
         assert_eq!(frame_base(&context, &unwind), Some(0x1fe0));
-    }
-
-    #[test]
-    fn trap_frame_layout_maps_machine_frame_to_ktrap_frame_base() {
-        let layout = TrapFrameLayout {
-            rip_offset: 0x238,
-            error_code_offset: Some(0x230),
-        };
-
-        assert_eq!(
-            layout.base_from_machine_frame(0xffff_8000_0000_1238, false),
-            Some(0xffff_8000_0000_1000)
-        );
-        assert_eq!(
-            layout.base_from_machine_frame(0xffff_8000_0000_1230, true),
-            Some(0xffff_8000_0000_1000)
-        );
     }
 
     #[test]
@@ -1174,7 +1117,6 @@ mod tests {
                     ip,
                     symbol: String::new(),
                     source: FrameSource::Current,
-                    trap_frame: None,
                 },
             );
         }

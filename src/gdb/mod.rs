@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 pub mod breakpoints;
 pub mod registers;
 
-pub use breakpoints::{Breakpoint, BreakpointHitResult, BreakpointKind, BreakpointManager};
+pub use breakpoints::{BreakpointHitResult, BreakpointManager};
 pub use registers::{RegisterInfo, RegisterMap};
 
 #[derive(Debug, Default, Clone)]
@@ -356,34 +356,6 @@ impl GdbClient {
         }
     }
 
-    fn set_hardware_breakpoint(&mut self, addr: u64) -> Result<()> {
-        let response = self.send_packet(&format!("Z1,{:x},1", addr))?;
-        if response == "OK" {
-            Ok(())
-        } else if response.starts_with('E') {
-            Err(Error::Rsp(format!(
-                "failed to set hardware breakpoint at {:#x}: {}",
-                addr, response
-            )))
-        } else {
-            Err(Error::NotSupported)
-        }
-    }
-
-    fn remove_hardware_breakpoint(&mut self, addr: u64) -> Result<()> {
-        let response = self.send_packet(&format!("z1,{:x},1", addr))?;
-        if response == "OK" {
-            Ok(())
-        } else if response.starts_with('E') {
-            Err(Error::Rsp(format!(
-                "failed to remove hardware breakpoint at {:#x}: {}",
-                addr, response
-            )))
-        } else {
-            Err(Error::NotSupported)
-        }
-    }
-
     fn read_registers(&mut self) -> Result<Vec<u8>> {
         let response = self.send_packet("g")?;
 
@@ -417,38 +389,6 @@ impl GdbClient {
     fn send_command_no_reply(&mut self, data: &str) -> Result<()> {
         let packet = Self::encode_packet(data);
         self.send_raw_command(&packet)
-    }
-
-    fn monitor_command(&mut self, command: &str) -> Result<String> {
-        let encoded_command = hex::encode(command.as_bytes());
-        let packet = Self::encode_packet(&format!("qRcmd,{}", encoded_command));
-        self.send_raw_command(&packet)?;
-
-        let mut output = String::new();
-        loop {
-            let response = self.read_response_packet()?;
-            if response == "OK" {
-                return Ok(output);
-            }
-            if response.is_empty() {
-                return Err(Error::NotSupported);
-            }
-            if let Some(hex_output) = response.strip_prefix('O') {
-                let bytes = hex::decode(hex_output)?;
-                output.push_str(&String::from_utf8_lossy(&bytes));
-                continue;
-            }
-            if response.starts_with('E') {
-                return Err(Error::Rsp(format!(
-                    "monitor command failed for '{}': {}",
-                    command, response
-                )));
-            }
-            return Err(Error::Rsp(format!(
-                "unexpected qRcmd response for '{}': {}",
-                command, response
-            )));
-        }
     }
 
     fn continue_execution(&mut self) -> Result<()> {
@@ -636,36 +576,6 @@ impl GdbClient {
         Some(remainder[..end].to_string())
     }
 
-    fn stop_reply_summary(response: &str) -> Option<String> {
-        match response.as_bytes().first().copied()? {
-            b'W' => Some(format!(
-                "gdbstub target exited with status 0x{}",
-                response.get(1..).unwrap_or("")
-            )),
-            b'X' => Some(format!(
-                "gdbstub target terminated with signal 0x{}",
-                response.get(1..).unwrap_or("")
-            )),
-            b'N' => Some("gdbstub reports no resumed threads".to_string()),
-            b'S' => Some(format!(
-                "gdbstub stop signal 0x{}",
-                response.get(1..).unwrap_or("")
-            )),
-            b'T' => Some(format!(
-                "gdbstub stop signal 0x{}",
-                response.get(1..3).unwrap_or("")
-            )),
-            _ => None,
-        }
-    }
-
-    fn stop_reply_is_terminal(response: &str) -> bool {
-        matches!(
-            response.as_bytes().first().copied(),
-            Some(b'W' | b'X' | b'N')
-        )
-    }
-
     fn fetch_register_map(&mut self) -> Result<RegisterMap> {
         if !self.features.qxfer_features_read {
             return Err(Error::NotSupported);
@@ -769,6 +679,38 @@ impl DebugBackend for GdbClient {
         GdbClient::read_registers(self)
     }
 
+    /// Run a QEMU monitor command over the gdbstub `qRcmd` channel, accumulating
+    /// the `O<hex>` output packets until `OK`.
+    fn monitor_command(&mut self, command: &str) -> Result<String> {
+        let encoded_command = hex::encode(command.as_bytes());
+        let packet = Self::encode_packet(&format!("qRcmd,{encoded_command}"));
+        self.send_raw_command(&packet)?;
+
+        let mut output = String::new();
+        loop {
+            let response = self.read_response_packet()?;
+            if response == "OK" {
+                return Ok(output);
+            }
+            if response.is_empty() {
+                return Err(Error::NotSupported);
+            }
+            if let Some(hex_output) = response.strip_prefix('O') {
+                let bytes = hex::decode(hex_output)?;
+                output.push_str(&String::from_utf8_lossy(&bytes));
+                continue;
+            }
+            if response.starts_with('E') {
+                return Err(Error::Rsp(format!(
+                    "monitor command failed for '{command}': {response}"
+                )));
+            }
+            return Err(Error::Rsp(format!(
+                "unexpected qRcmd response for '{command}': {response}"
+            )));
+        }
+    }
+
     fn write_registers(&mut self, data: &[u8]) -> Result<()> {
         GdbClient::write_registers(self, data)
     }
@@ -779,14 +721,6 @@ impl DebugBackend for GdbClient {
 
     fn remove_breakpoint(&mut self, addr: u64) -> Result<()> {
         GdbClient::remove_breakpoint(self, addr)
-    }
-
-    fn set_hardware_breakpoint(&mut self, addr: u64) -> Result<()> {
-        GdbClient::set_hardware_breakpoint(self, addr)
-    }
-
-    fn remove_hardware_breakpoint(&mut self, addr: u64) -> Result<()> {
-        GdbClient::remove_hardware_breakpoint(self, addr)
     }
 
     fn continue_execution(&mut self) -> Result<()> {
@@ -801,8 +735,6 @@ impl DebugBackend for GdbClient {
         let response = GdbClient::interrupt(self)?;
         Ok(StopEvent {
             thread_id: Self::parse_stop_reply_thread_id(&response),
-            summary: Self::stop_reply_summary(&response),
-            target_exited: Self::stop_reply_is_terminal(&response),
             exception_code: None,
             program_counter: None,
             is_bugcheck: false,
@@ -817,8 +749,6 @@ impl DebugBackend for GdbClient {
         let response = GdbClient::wait_for_stop(self)?;
         Ok(StopEvent {
             thread_id: Self::parse_stop_reply_thread_id(&response),
-            summary: Self::stop_reply_summary(&response),
-            target_exited: Self::stop_reply_is_terminal(&response),
             exception_code: None,
             program_counter: None,
             is_bugcheck: false,
@@ -836,8 +766,6 @@ impl DebugBackend for GdbClient {
         let _ = self.stream.set_read_timeout(None);
         Ok(result?.map(|response| StopEvent {
             thread_id: Self::parse_stop_reply_thread_id(&response),
-            summary: Self::stop_reply_summary(&response),
-            target_exited: Self::stop_reply_is_terminal(&response),
             exception_code: None,
             program_counter: None,
             is_bugcheck: false,
@@ -858,10 +786,6 @@ impl DebugBackend for GdbClient {
 
     fn stopped_thread_id(&mut self) -> Result<String> {
         GdbClient::stopped_thread_id(self)
-    }
-
-    fn monitor_command(&mut self, command: &str) -> Result<String> {
-        GdbClient::monitor_command(self, command)
     }
 
     fn is_running(&self) -> bool {

@@ -1,7 +1,7 @@
 use crate::backend::MemoryOps;
-use crate::debugger::DebuggerContext;
 use crate::error::{Error, Result};
 use crate::symbols::{ParsedType, SymbolStore};
+use crate::target::Target;
 use crate::types::{Dtb, VirtAddr};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -36,7 +36,7 @@ pub enum Expr {
 }
 
 impl Expr {
-    pub fn eval(input: &str, context: &DebuggerContext) -> Result<VirtAddr> {
+    pub fn eval(input: &str, context: &Target) -> Result<VirtAddr> {
         Self::parse(input)?.resolve(context)
     }
 
@@ -119,7 +119,7 @@ impl Expr {
             return Ok((Expr::Register(reg_name.to_string()), suffix));
         }
 
-        if Self::is_numeric(input) {
+        if Self::starts_numeric(input) {
             let (value, remaining) = Self::parse_value(input)?;
             return Ok((Expr::Literal(VirtAddr(value)), remaining));
         }
@@ -239,20 +239,14 @@ impl Expr {
         Ok((value, remaining))
     }
 
-    fn is_numeric(s: &str) -> bool {
-        if s.is_empty() {
-            return false;
-        }
-        if s.starts_with("0x") || s.starts_with("0X") {
-            s.len() > 2 && s[2..].chars().all(|c| c.is_ascii_hexdigit())
-        } else if s.starts_with("0b") || s.starts_with("0B") {
-            s.len() > 2 && s[2..].chars().all(|c| c == '0' || c == '1')
-        } else {
-            s.chars().all(|c| c.is_ascii_digit())
-        }
+    fn starts_numeric(s: &str) -> bool {
+        s.trim_start()
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit())
     }
 
-    pub fn resolve(&self, context: &DebuggerContext) -> Result<VirtAddr> {
+    pub fn resolve(&self, context: &Target) -> Result<VirtAddr> {
         match self {
             Expr::Literal(addr) => Ok(*addr),
 
@@ -264,6 +258,17 @@ impl Expr {
                     return Ok(addr);
                 }
                 if let Some(value) = Self::parse_bare_hex_literal(name) {
+                    return Ok(VirtAddr(value));
+                }
+                // Fall back to a register / builtin pseudo-register of the same
+                // name, so a bare `rip`/`rsp` resolves like the WinDbg `u rip`
+                // idiom (and not just the `$rip` form). A real symbol still wins
+                // above, so this only kicks in for an otherwise-unresolved name;
+                // registers are available only when the VM is halted.
+                if let Some(value) = context.registers.as_ref().and_then(|r| r.get(name)) {
+                    return Ok(VirtAddr(*value));
+                }
+                if let Some(value) = context.builtin_variable_value(name) {
                     return Ok(VirtAddr(value));
                 }
                 Err(Error::SymbolNotFound(name.clone()))
@@ -399,14 +404,14 @@ impl Expr {
     /// determine the element size in bytes for array indexing
     /// uses type info from casts (e.g. `(dword*)addr[3]` -> 4 bytes per element)
     /// falls back to 1 if no type info is available
-    fn resolve_element_size(expr: &Expr, context: &DebuggerContext) -> u64 {
+    fn resolve_element_size(expr: &Expr, context: &Target) -> u64 {
         match expr {
             Expr::Cast(_, expr_type) => Self::expr_type_size(expr_type, context),
             _ => 1,
         }
     }
 
-    fn expr_type_size(expr_type: &ExprType, context: &DebuggerContext) -> u64 {
+    fn expr_type_size(expr_type: &ExprType, context: &Target) -> u64 {
         match expr_type {
             ExprType::Byte => 1,
             ExprType::Word => 2,
@@ -480,6 +485,21 @@ mod tests {
     fn test_parse_literal() {
         let expr = Expr::parse("0xfffff80123456789").unwrap();
         assert_eq!(expr, Expr::Literal(VirtAddr(0xfffff80123456789)));
+    }
+
+    #[test]
+    fn test_parse_hex_literal_with_addition() {
+        let expr = Expr::parse("0xffffa304cb692040 + 584").unwrap();
+        assert_eq!(
+            expr,
+            Expr::Add(Box::new(Expr::Literal(VirtAddr(0xffffa304cb692040))), 584)
+        );
+    }
+
+    #[test]
+    fn test_parse_decimal_literal_with_addition() {
+        let expr = Expr::parse("1000 + 24").unwrap();
+        assert_eq!(expr, Expr::Add(Box::new(Expr::Literal(VirtAddr(1000))), 24));
     }
 
     #[test]

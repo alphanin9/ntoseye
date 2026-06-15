@@ -1,9 +1,9 @@
 # NTOSEYE Agent Stdio Command Reference
 
-Use `--agent-stdio` to run NTOSEYE as a newline-delimited JSON control process instead of the interactive REPL:
+Use the `agent` subcommand to run NTOSEYE as a newline-delimited JSON control process instead of the interactive REPL (the global `--backend`/`--connect` flags go before the subcommand):
 
 ```bash
-sudo /usr/local/bin/ntoseye --backend gdb --connect 127.0.0.1:1234 --agent-stdio
+sudo /usr/local/bin/ntoseye --backend gdb --connect 127.0.0.1:1234 agent
 ```
 
 The first stdout line is a `ready` event. Each request is one JSON object on one line. Each response is one JSON object on one line.
@@ -39,7 +39,7 @@ Addresses are expression strings and use the same parser as the REPL: symbols, `
 | `disasm` / `u` | `address`, optional `length` | Disassembles bytes at `address`; default length is 32 bytes. |
 | `dt` / `type.dump` | `type`, optional `address`, optional `field` | Dumps type layout and, when `address` is present, field values. Leading underscore on the type is optional. |
 | `trap-frame` / `tf` | optional `address`, optional `field` | Equivalent to `dt` with type `KTRAP_FRAME`. |
-| `k` / `stack` / `stack.trace` | optional `length` | Builds a stack trace for the current stopped thread; default limit is 64 frames. |
+| `k` / `stack` / `stack.trace` | optional `length` | Builds a stack trace for the current stopped thread; default limit is 64 frames. Each frame is `{sp, ip, symbol, source}` (`source` is `current`/`unwind`/`scan`). For a thread's trap frame use `threads` (`trap_frame` field) or `tf`. |
 
 ## Memory
 
@@ -90,25 +90,26 @@ Addresses are expression strings and use the same parser as the REPL: symbols, `
 | `vcpu.set` / `vcpu` | `thread` | Selects a backend vCPU/execution context. |
 | `threads` | optional `filter` | Lists Windows threads with ETHREAD/KTHREAD, PID/TID, state, wait reason, stack metadata, pending IRPs, and active vCPU. |
 | `thread.set` / `thread` | `thread` | Resolves a Windows thread by TID or ETHREAD. If it is active, selects its vCPU and installs its pseudo-register context. |
-| `continue` / `go` | optional `timeout_ms` | Continues execution. If `timeout_ms` is present, waits that long for a stop and returns stop details or `{running:true, stopped:false}`. |
-| `interrupt` / `break` | none | Interrupts the target and refreshes current stopped thread when possible. |
-| `step` / `si` | none | Single-steps the current thread and returns stop details. Fails if already running. |
-| `step.over` / `p` / `ni` | optional `timeout_ms` | Steps over calls using a temporary breakpoint; non-call instructions single-step. |
-| `step.out` / `gu` / `finish` | optional `timeout_ms` | Runs to the caller found by the stack unwinder using a temporary breakpoint. |
+| `continue` / `go` | optional `timeout_ms` | Resumes execution. Without `timeout_ms` it returns immediately as `{running:true, stopped:false}` (poll with `wait`). With `timeout_ms` it waits that long and returns stop details or `{running:true, stopped:false}`. |
+| `wait` / `wait-for-stop` | optional `timeout_ms` | Waits for the next meaningful stop **without resuming** (drains a parked stop, drives reboot/breakpoint classification, absorbs debugger noise). Returns stop details, or `{running:true, stopped:false}` on timeout. |
+| `interrupt` / `break` | none | Interrupts the target and refreshes the current stopped thread when possible. |
+| `step` / `si` | none | Single-steps the current thread and returns stop details. Requires the VM halted. |
+| `step.over` / `p` / `ni` | optional `timeout_ms` | Steps over a call (runs to its return site) or single-steps a non-call. Requires the VM halted. With `timeout_ms`, returns `{running:true, stopped:false}` if it doesn't complete in time (the VM is left running). |
+| `step.out` / `gu` / `finish` | optional `timeout_ms` | Runs to the caller's return address. Requires the VM halted. With `timeout_ms`, returns `{running:true, stopped:false}` if it doesn't complete in time. |
 
-Stop responses can include `running`, `stopped`, `thread`, `summary`, `target_exited`, `rip`, `cr3`, nearest `symbol`, `exception_code`, `program_counter`, `is_bugcheck`, structured `bugcheck`, `target_reloaded`, `target_kernel_base_hint`, `assisted_breakin`, and a `reload` rediscovery report. Reload processing drops stale breakpoints and rebuilds guest state.
+Stop responses carry `running`, `stopped`, a `stop` kind (`"breakpoint"`, `"bugcheck"`, `"exception"`, `"step"`, `"halted"`, `"interrupt"`, or `"target_reloaded"`), `thread`, and — when halted with readable context — `rip`, `cr3`, and nearest `symbol`, plus the attached `process` (`{pid,name}`). Per kind: `breakpoint` adds `breakpoint:{id,address,symbol}` and `temporary`; `bugcheck` adds `is_bugcheck:true` and a structured `bugcheck`; `exception` adds `exception_code`; `target_reloaded` adds `kernel_base` and `coherent` (the guest rebooted — every prior address is stale, re-enumerate; reload classification, stale-breakpoint drop, and guest-state rebuild are handled inside the shared session core); `halted` adds `event:false` and `coherent`.
 
 ## Breakpoints
 
 | Command | Fields | Notes |
 | --- | --- | --- |
-| `bp.set` / `breakpoint.set` | `address`, optional `kind` | `kind` defaults to `software`; use `hardware` or `hbp` for QEMU gdbstub hardware execution breakpoints. |
+| `bp.set` / `breakpoint.set` | `address`, optional `condition` | Sets a software (`0xCC`) breakpoint scoped to the current inspection context. An optional `condition` is re-evaluated on each hit. |
 | `bp.clear` / `breakpoint.clear` | `breakpoint` | Clears a breakpoint by numeric ID. |
 | `bp.disable` / `breakpoint.disable` | `breakpoint` | Disables a breakpoint by ID. |
 | `bp.enable` / `breakpoint.enable` | `breakpoint` | Enables a breakpoint by ID. |
-| `bp.list` / `breakpoint.list` | none | Lists IDs, enabled state, kind, address, symbol, and scope. |
+| `bp.list` / `breakpoint.list` | none | Lists IDs, enabled state, `kind` (always `software`), address, symbol, scope, temporary flag, and condition. |
 
-Prefer `kind:"hardware"` for PatchGuard-sensitive driver debugging when QEMU gdbstub support is available. Keep `kind:"software"` for ordinary `0xCC` breakpoints.
+> **Software breakpoints only.** The shared upstream breakpoint core does not (yet) expose hardware execution breakpoints; passing `kind:"hardware"`/`"hbp"` returns a "not supported" error. Re-adding the fork's gdbstub hardware-breakpoint path on top of the shared core is a tracked follow-up.
 
 ## QEMU and Scripts
 
@@ -116,8 +117,9 @@ Prefer `kind:"hardware"` for PatchGuard-sensitive driver debugging when QEMU gdb
 | --- | --- | --- |
 | `qcmd` | `expr` | Sends a QEMU monitor command and returns `output`. |
 | `qlog` | optional `expr` or `filter`, optional `path` | Enables QEMU logging. Default items are `int,cpu_reset,guest_errors`; `path` sets the logfile first. |
-| `script.list` / `scripts` | none | Lists loaded Lua script commands with help and completion strategies. |
-| `script.reload` | none | Reloads agent-safe built-in scripts. |
+| `script.list` / `scripts` | none | Lists registered embedded-Python commands (`ntoseye.repl`) with help and completion strategies. |
+| `script.run` / `script.exec` | `expr` | Runs a Python command (`<name> [args...]`); the command's stdout is captured and returned as `output` so it can't corrupt the JSON stream. |
+| `script.reload` | none | Reloads the Python commands directory. |
 | `quit` | none | Returns `{bye:true}` and exits the agent loop. |
 
 ## Minimal Examples
@@ -131,7 +133,8 @@ Prefer `kind:"hardware"` for PatchGuard-sensitive driver debugging when QEMU gdb
 {"id":6,"command":"vcpus"}
 {"id":7,"command":"threads","filter":"System"}
 {"id":8,"command":"memory.read","address":"nt!MmAccessFault","length":16}
-{"id":9,"command":"bp.set","address":"mydrv!DriverEntry","kind":"hardware"}
+{"id":9,"command":"bp.set","address":"mydrv!DriverEntry"}
 {"id":10,"command":"continue","timeout_ms":1000}
-{"id":11,"command":"qlog","expr":"int,cpu_reset,guest_errors","path":"/tmp/ntoseye-qemu.log"}
+{"id":11,"command":"wait","timeout_ms":2000}
+{"id":12,"command":"qlog","expr":"int,cpu_reset,guest_errors","path":"/tmp/ntoseye-qemu.log"}
 ```

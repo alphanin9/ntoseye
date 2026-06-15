@@ -2,10 +2,10 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::debugger::DebuggerContext;
 use crate::error::{Error, Result};
 use crate::guest::{ModuleInfo, ModuleSymbolLoadReport};
 use crate::symbols::{ModuleSymbolDiscovery, SymbolStore};
+use crate::target::Target;
 use crate::types::Dtb;
 
 fn find_file_case_insensitive(dir: &Path, filename: &str) -> Option<PathBuf> {
@@ -21,7 +21,7 @@ fn find_file_case_insensitive(dir: &Path, filename: &str) -> Option<PathBuf> {
 }
 
 fn local_symbol_plan_for_module(
-    debugger: &DebuggerContext,
+    debugger: &Target,
     dir: &Path,
     dtb: Dtb,
     module: &ModuleInfo,
@@ -45,7 +45,7 @@ fn local_symbol_plan_for_module(
 }
 
 pub fn load_symbols_from_directory(
-    debugger: &DebuggerContext,
+    debugger: &Target,
     dir: &Path,
     filter: Option<&str>,
 ) -> Result<ModuleSymbolLoadReport> {

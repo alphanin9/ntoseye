@@ -1,5 +1,6 @@
 use strum::EnumMessage;
 use tabled::builder::Builder;
+use tabled::settings::Padding;
 
 use owo_colors::OwoColorize;
 
@@ -44,7 +45,7 @@ impl ReplState<'_> {
     }
 
     pub fn cmd_bp(&mut self, parts: &[&str]) -> Result<()> {
-        if self.client.is_running() {
+        if self.ctx.backend.is_running() {
             error!("VM is running");
             return Ok(());
         }
@@ -57,7 +58,7 @@ impl ReplState<'_> {
         let Some(condition) = Self::parse_breakpoint_condition(parts) else {
             return Ok(());
         };
-        let address = match Expr::eval(addr_str, self.debugger) {
+        let address = match Expr::eval(addr_str, &self.ctx.target) {
             Ok(a) => a,
             Err(e) => {
                 error!("{}", e);
@@ -66,19 +67,20 @@ impl ReplState<'_> {
         };
 
         let symbol = self
-            .debugger
+            .ctx
+            .target
             .symbols
-            .format_closest_symbol_for_address(self.debugger.current_dtb(), address);
+            .format_closest_symbol_for_address(self.ctx.target.current_dtb(), address);
 
-        match self.breakpoints.add(
-            &mut *self.client,
-            self.debugger,
+        match self.ctx.breakpoints.add(
+            &mut *self.ctx.backend,
+            &self.ctx.target,
             address,
             symbol.clone(),
             condition.clone(),
         ) {
             Ok(id) => {
-                self.caches.refresh_breakpoints(&self.breakpoints);
+                self.caches.refresh_breakpoints(&self.ctx.breakpoints);
                 let condition_label = condition
                     .as_ref()
                     .map(|condition| format!(" if {condition}"))
@@ -94,7 +96,8 @@ impl ReplState<'_> {
                     condition_label.bright_black(),
                     format!(
                         " ({})",
-                        self.breakpoints
+                        self.ctx
+                            .breakpoints
                             .list()
                             .into_iter()
                             .find(|bp| bp.id == id)
@@ -113,7 +116,7 @@ impl ReplState<'_> {
     }
 
     pub fn cmd_bl(&mut self, _parts: &[&str]) -> Result<()> {
-        let bps = self.breakpoints.list();
+        let bps = self.ctx.breakpoints.list();
         if bps.is_empty() {
             println!("no breakpoints set\n");
         } else {
@@ -132,23 +135,27 @@ impl ReplState<'_> {
                 let scope = bp.scope.label();
 
                 builder.push_record(vec![
-                    format!("{}   ", bp.id),
-                    format!("{}  ", status),
-                    format!("{}  ", ui::addr(bp.address.0)),
-                    format!("{}  ", bp.symbol.as_deref().unwrap_or("-")),
-                    format!("{}  ", bp.condition.as_deref().unwrap_or("-")),
+                    bp.id.to_string(),
+                    status.to_string(),
+                    ui::addr(bp.address.0),
+                    bp.symbol.as_deref().unwrap_or("-").to_string(),
+                    bp.condition.as_deref().unwrap_or("-").to_string(),
                     scope,
                 ]);
             }
 
-            print_plain_table(builder);
+            let mut table = builder.build();
+            table
+                .with(tabled::settings::Style::empty())
+                .with(Padding::new(0, 2, 0, 0));
+            println!("{table}\n");
         }
 
         Ok(())
     }
 
     pub fn cmd_bc(&mut self, parts: &[&str]) -> Result<()> {
-        if self.client.is_running() {
+        if self.ctx.backend.is_running() {
             error!("VM is running");
             return Ok(());
         }
@@ -158,11 +165,12 @@ impl ReplState<'_> {
         };
 
         match self
+            .ctx
             .breakpoints
-            .remove(&mut *self.client, self.debugger, id)
+            .remove(&mut *self.ctx.backend, &self.ctx.target, id)
         {
             Ok(()) => {
-                self.caches.refresh_breakpoints(&self.breakpoints);
+                self.caches.refresh_breakpoints(&self.ctx.breakpoints);
                 println!("breakpoint {} cleared\n", ui::bp_id(id));
             }
             Err(e) => {
@@ -174,7 +182,7 @@ impl ReplState<'_> {
     }
 
     pub fn cmd_bd(&mut self, parts: &[&str]) -> Result<()> {
-        if self.client.is_running() {
+        if self.ctx.backend.is_running() {
             error!("VM is running");
             return Ok(());
         }
@@ -184,11 +192,12 @@ impl ReplState<'_> {
         };
 
         match self
+            .ctx
             .breakpoints
-            .disable(&mut *self.client, self.debugger, id)
+            .disable(&mut *self.ctx.backend, &self.ctx.target, id)
         {
             Ok(()) => {
-                self.caches.refresh_breakpoints(&self.breakpoints);
+                self.caches.refresh_breakpoints(&self.ctx.breakpoints);
                 println!("breakpoint {} disabled\n", ui::bp_id(id));
             }
             Err(e) => {
@@ -200,7 +209,7 @@ impl ReplState<'_> {
     }
 
     pub fn cmd_be(&mut self, parts: &[&str]) -> Result<()> {
-        if self.client.is_running() {
+        if self.ctx.backend.is_running() {
             error!("VM is running");
             return Ok(());
         }
@@ -210,11 +219,12 @@ impl ReplState<'_> {
         };
 
         match self
+            .ctx
             .breakpoints
-            .enable(&mut *self.client, self.debugger, id)
+            .enable(&mut *self.ctx.backend, &self.ctx.target, id)
         {
             Ok(()) => {
-                self.caches.refresh_breakpoints(&self.breakpoints);
+                self.caches.refresh_breakpoints(&self.ctx.breakpoints);
                 println!("breakpoint {} enabled\n", ui::bp_id(id));
             }
             Err(e) => {

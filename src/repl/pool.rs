@@ -1,9 +1,9 @@
 use owo_colors::OwoColorize;
 
 use crate::backend::MemoryOps;
-use crate::debugger::DebuggerContext;
 use crate::error::{Error, Result};
 use crate::symbols::{ParsedType, TypeInfo, format_symbol_with_offset};
+use crate::target::Target;
 use crate::types::VirtAddr;
 use crate::ui;
 
@@ -53,7 +53,7 @@ pub struct PoolLayout {
     big_pool_entry_size: Option<u64>,
 }
 
-pub fn pool_layout(debugger: &DebuggerContext) -> Result<PoolLayout> {
+pub fn pool_layout(debugger: &Target) -> Result<PoolLayout> {
     let pool_header = debugger
         .symbols
         .find_type_across_modules(debugger.current_dtb(), "_POOL_HEADER")
@@ -205,7 +205,7 @@ pub fn pool_block_state(h: &PoolHeader) -> &'static str {
 }
 
 pub fn parse_pool_header(
-    debugger: &DebuggerContext,
+    debugger: &Target,
     layout: &PoolLayout,
     header: VirtAddr,
 ) -> Option<PoolHeader> {
@@ -250,7 +250,7 @@ pub fn pool_header_plausible(layout: &PoolLayout, h: &PoolHeader) -> bool {
 }
 
 pub fn try_pool_header_lax(
-    debugger: &DebuggerContext,
+    debugger: &Target,
     layout: &PoolLayout,
     addr: VirtAddr,
 ) -> Option<PoolHeader> {
@@ -259,7 +259,7 @@ pub fn try_pool_header_lax(
 }
 
 pub fn gap_free_pool_block(
-    debugger: &DebuggerContext,
+    debugger: &Target,
     layout: &PoolLayout,
     header: VirtAddr,
     size: u64,
@@ -278,7 +278,7 @@ pub fn gap_free_pool_block(
 }
 
 pub fn walk_pool_page_lax(
-    debugger: &DebuggerContext,
+    debugger: &Target,
     layout: &PoolLayout,
     base: VirtAddr,
 ) -> Vec<PoolHeader> {
@@ -314,7 +314,7 @@ pub fn walk_pool_page_lax(
 }
 
 pub fn scan_pool_page_lax(
-    debugger: &DebuggerContext,
+    debugger: &Target,
     layout: &PoolLayout,
     base: VirtAddr,
 ) -> Vec<PoolHeader> {
@@ -365,7 +365,7 @@ pub fn find_pool_block_index(blocks: &[PoolHeader], needle: &PoolHeader) -> Opti
 }
 
 pub fn locate_pool_block_in_page(
-    debugger: &DebuggerContext,
+    debugger: &Target,
     layout: &PoolLayout,
     target: VirtAddr,
 ) -> (Vec<PoolHeader>, Option<usize>, VirtAddr) {
@@ -400,7 +400,7 @@ pub fn locate_pool_block_in_page(
 }
 
 pub fn classify_pool_region(
-    debugger: &DebuggerContext,
+    debugger: &Target,
     addr: VirtAddr,
 ) -> Option<(&'static str, VirtAddr, VirtAddr)> {
     for (name, start, stop) in [
@@ -478,7 +478,7 @@ pub fn parse_big_pool_entry(
 }
 
 pub fn find_big_pool(
-    debugger: &DebuggerContext,
+    debugger: &Target,
     layout: &PoolLayout,
     target: VirtAddr,
 ) -> Option<BigPoolEntry> {
@@ -528,7 +528,7 @@ pub fn find_big_pool(
     None
 }
 
-pub fn segment_heap_hint(debugger: &DebuggerContext) -> Option<&'static str> {
+pub fn segment_heap_hint(debugger: &Target) -> Option<&'static str> {
     debugger
         .symbols
         .find_symbol_across_modules(debugger.current_dtb(), "RtlpHpHeapGlobals")?;
@@ -537,7 +537,7 @@ pub fn segment_heap_hint(debugger: &DebuggerContext) -> Option<&'static str> {
     )
 }
 
-pub fn annotate_near_symbol(debugger: &DebuggerContext, addr: VirtAddr) -> Option<String> {
+pub fn annotate_near_symbol(debugger: &Target, addr: VirtAddr) -> Option<String> {
     let (module, name, offset) = debugger
         .symbols
         .find_closest_symbol_for_address(debugger.current_dtb(), addr)?;

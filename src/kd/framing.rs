@@ -1,9 +1,6 @@
-//! KD packet framing
-//!
-//! ```text
-//! data:    [ leader=0x30303030 | type | bytecount | id | checksum ] [ payload ] [ 0xAA ]
-//! control: [ leader=0x69696969 | type | 0         | id | 0        ]
-//! ```
+// KD packet framing:
+// data:    [ leader=0x30303030 | type | bytecount | id | checksum ] [ payload ] [ 0xAA ]
+// control: [ leader=0x69696969 | type | 0         | id | 0        ]
 
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
@@ -287,6 +284,11 @@ impl<T: Read + Write> KdFraming<T> {
         let is_sync = packet_id & SYNC_PACKET_ID != 0;
         if is_sync {
             self.peer_reset_seen = true;
+            // The kernel reset *both* its packet ids, so our outbound stream
+            // must restart at INITIAL too (like handle_reset). Realigning only
+            // the inbound id leaves the next request carrying a stale id that
+            // the kernel link-ACKs but discards, so the reply never comes
+            self.current_packet_id = INITIAL_PACKET_ID;
         }
         if !is_sync && base != self.remote_packet_id {
             return false;
@@ -654,7 +656,7 @@ mod tests {
     fn recv_data_accepts_sync_flagged_packet_despite_id_mismatch() {
         // The kernel reset its send-id stream (e.g. re-entered the debugger on
         // a bugcheck) and sent a SYNC-flagged packet whose base id no longer
-        // matches our advanced expectation. It must be accepted, not skipped -
+        // matches our advanced expectation. It must be accepted, not skipped;
         // skipping it dropped the real bugcheck state-change
         let inbound = data_packet(
             PACKET_TYPE_KD_STATE_CHANGE64,
@@ -665,10 +667,16 @@ mod tests {
         // Pretend a prior packet advanced the expected id past the base
         framing.remote_packet_id = INITIAL_PACKET_ID ^ 1;
 
+        // Pretend our outbound id had advanced past INITIAL before the reset
+        framing.current_packet_id = INITIAL_PACKET_ID ^ 1;
+
         let pkt = framing.recv_data().unwrap();
         assert_eq!(pkt.payload, b"bugcheck");
         // Realigned to the kernel's stream, SYNC stripped, toggled for next
         assert_eq!(framing.remote_packet_id, INITIAL_PACKET_ID ^ 1);
+        // The kernel reset both ids, so our outbound id must restart at INITIAL
+        // or the next request is discarded as a stale retransmit
+        assert_eq!(framing.current_packet_id, INITIAL_PACKET_ID);
 
         // ACK carried the base id with SYNC stripped
         let out = &framing.transport.outbound;

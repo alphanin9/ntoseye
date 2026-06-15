@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use owo_colors::OwoColorize;
 
+use crate::dbg_backend::DebugLog;
 use crate::error::{Error, Result};
 use crate::kd::api;
 use crate::kd::framing::{
@@ -158,7 +159,7 @@ pub fn poll_for_initial_break(
         attempts += 1;
 
         // Initial handshake: surface whatever state-change arrives first
-        match await_state_change(framing, None, true, None, None) {
+        match await_state_change(framing, None, true, None, None, None, None) {
             Ok(stop) => break Ok(stop),
             Err(Error::Io(e))
                 if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
@@ -203,7 +204,7 @@ pub fn breakin_and_wait(
 ) -> Result<StateChange> {
     framing.send_breakin()?;
     framing.transport_mut().set_read_timeout(Some(budget))?;
-    let result = match await_state_change(framing, None, false, None, None) {
+    let result = match await_state_change(framing, None, false, None, None, None, None) {
         Ok(stop) => Ok(stop),
         Err(Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
             Err(Error::Kd(format!(
@@ -293,22 +294,37 @@ pub fn continue_transparent_state_change(
 /// Receive packets until a state-change we should surface arrives.
 ///
 /// - `surface_all`: return the first state-change of any kind (initial handshake)
-/// - `bugcheck`: when `Some`, run in bugcheck-aware mode - the refresh message
+/// - `bugcheck`: when `Some`, run in bugcheck-aware mode; the refresh message
 ///   sets the flag, after which the next state-change is surfaced rather than
 ///   continued, so the user catches the (frozen) bugcheck instead of riding its
 ///   symbol-unload teardown to reboot. The flag is the caller's so it survives
 ///   poll timeouts between the refresh print and the state-change
 /// - otherwise: continue load-symbols / command-string notifications
 ///   transparently (like WinDbg) and surface only exception breaks
+///
+/// `deadline` bounds the *total* time servicing transparent traffic: when it is
+/// reached between packets, the call returns a [`ErrorKind::TimedOut`] error so
+/// the caller treats it like an idle gap (hand the socket to the pump, schedule
+/// an assist poke, …). Without it, an uninterrupted stream of boot-time
+/// load-symbols / file-I/O packets keeps `recv_data` returning forever and
+/// starves the caller's own timeout, what used to pin the foreground actor for
+/// minutes after a reboot. `None` waits indefinitely for a surfaceable change.
 pub fn await_state_change(
     framing: &mut KdFraming<UnixStream>,
     mut saw_kd_refresh: Option<&mut bool>,
     surface_all: bool,
     mut bugcheck: Option<&mut bool>,
     mut bugcheck_capture: Option<&mut BugcheckCapture>,
+    deadline: Option<Instant>,
+    debug_log: Option<&DebugLog>,
 ) -> Result<StateChange> {
     let mut target_reloaded = false;
     loop {
+        if let Some(deadline) = deadline
+            && Instant::now() >= deadline
+        {
+            return Err(Error::Io(std::io::Error::from(ErrorKind::TimedOut)));
+        }
         let pkt = framing.recv_data()?;
         match pkt.packet_type {
             PACKET_TYPE_KD_STATE_CHANGE64 => {
@@ -353,6 +369,7 @@ pub fn await_state_change(
                     detect,
                     bugcheck_capture.as_deref_mut(),
                     bugcheck.as_deref().copied().unwrap_or(false),
+                    debug_log,
                     &mut std::io::stderr(),
                 )?;
                 if saw_refresh {
@@ -408,6 +425,10 @@ pub struct PumpHandle {
     pub join: JoinHandle<KdFraming<UnixStream>>,
     pub stop_rx: Receiver<std::result::Result<StateChange, String>>,
     pub shutdown: Arc<AtomicBool>,
+    /// Set by the pump the instant it places a result in `stop_rx` and exits.
+    /// Lets the foreground tell "running" from "stopped but not yet drained"
+    /// without consuming the result (see `KdBackend::has_pending_stop`).
+    pub reported_stop: Arc<AtomicBool>,
 }
 
 /// Background servicing pump. While the VM runs this thread owns the framing
@@ -422,8 +443,17 @@ pub fn run_pump(
     mut framing: KdFraming<UnixStream>,
     stop_tx: mpsc::Sender<std::result::Result<StateChange, String>>,
     shutdown: Arc<AtomicBool>,
+    reported_stop: Arc<AtomicBool>,
     reconnect_assist_delay: Option<Duration>,
+    debug_log: DebugLog,
 ) -> KdFraming<UnixStream> {
+    // Flag the result the moment it lands in the channel, before we exit, so a
+    // concurrent foreground `is_running()`/status read sees "stopped, undrained"
+    // rather than the stale running value.
+    let report = |result| {
+        reported_stop.store(true, Ordering::SeqCst);
+        let _ = stop_tx.send(result);
+    };
     let _ = framing.transport_mut().set_read_timeout(Some(PUMP_POLL));
     // Persists across poll iterations: once the bugcheck refresh is seen, the
     // next state-change is surfaced even if a timeout intervened first
@@ -435,16 +465,21 @@ pub fn run_pump(
     let mut assist_breakin_count = 0u32;
     let mut assisted_breakin_pending = false;
     while !shutdown.load(Ordering::SeqCst) {
+        // Bound each await to a poll interval so assist-poke scheduling runs on
+        // time even while boot traffic streams in continuously (otherwise the
+        // WouldBlock branch below, where assists are sent, never runs).
         match await_state_change(
             &mut framing,
             None,
             false,
             Some(&mut bugcheck),
             Some(&mut bugcheck_capture),
+            Some(Instant::now() + PUMP_POLL),
+            Some(&debug_log),
         ) {
             Ok(mut stop) => {
                 stop.assisted_breakin = assisted_breakin_pending;
-                let _ = stop_tx.send(Ok(stop));
+                report(Ok(stop));
                 break;
             }
             Err(Error::Io(e))
@@ -480,7 +515,7 @@ pub fn run_pump(
                         &mut assist_breakin_count,
                         reason,
                     ) {
-                        let _ = stop_tx.send(Err(e.to_string()));
+                        report(Err(e.to_string()));
                         break;
                     }
                     assisted_breakin_pending = true;
@@ -490,7 +525,7 @@ pub fn run_pump(
                 }
             }
             Err(e) => {
-                let _ = stop_tx.send(Err(e.to_string()));
+                report(Err(e.to_string()));
                 break;
             }
         }
