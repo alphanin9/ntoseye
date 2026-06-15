@@ -39,7 +39,7 @@ Addresses are expression strings and use the same parser as the REPL: symbols, `
 | `disasm` / `u` | `address`, optional `length` | Disassembles bytes at `address`; default length is 32 bytes. |
 | `dt` / `type.dump` | `type`, optional `address`, optional `field` | Dumps type layout and, when `address` is present, field values. Leading underscore on the type is optional. |
 | `trap-frame` / `tf` | optional `address`, optional `field` | Equivalent to `dt` with type `KTRAP_FRAME`. |
-| `k` / `stack` / `stack.trace` | optional `length` | Builds a stack trace for the current stopped thread; default limit is 64 frames. |
+| `k` / `stack` / `stack.trace` | optional `length` | Builds a stack trace for the current stopped thread; default limit is 64 frames. Each frame is `{sp, ip, symbol, source}` (`source` is `current`/`unwind`/`scan`). For a thread's trap frame use `threads` (`trap_frame` field) or `tf`. |
 
 ## Memory
 
@@ -94,8 +94,8 @@ Addresses are expression strings and use the same parser as the REPL: symbols, `
 | `wait` / `wait-for-stop` | optional `timeout_ms` | Waits for the next meaningful stop **without resuming** (drains a parked stop, drives reboot/breakpoint classification, absorbs debugger noise). Returns stop details, or `{running:true, stopped:false}` on timeout. |
 | `interrupt` / `break` | none | Interrupts the target and refreshes the current stopped thread when possible. |
 | `step` / `si` | none | Single-steps the current thread and returns stop details. Requires the VM halted. |
-| `step.over` / `p` / `ni` | (`timeout_ms` accepted, not yet enforced) | Steps over a call (runs to its return site) or single-steps a non-call. Requires the VM halted. |
-| `step.out` / `gu` / `finish` | (`timeout_ms` accepted, not yet enforced) | Runs to the caller's return address. Requires the VM halted. |
+| `step.over` / `p` / `ni` | optional `timeout_ms` | Steps over a call (runs to its return site) or single-steps a non-call. Requires the VM halted. With `timeout_ms`, returns `{running:true, stopped:false}` if it doesn't complete in time (the VM is left running). |
+| `step.out` / `gu` / `finish` | optional `timeout_ms` | Runs to the caller's return address. Requires the VM halted. With `timeout_ms`, returns `{running:true, stopped:false}` if it doesn't complete in time. |
 
 Stop responses carry `running`, `stopped`, a `stop` kind (`"breakpoint"`, `"bugcheck"`, `"exception"`, `"step"`, `"halted"`, `"interrupt"`, or `"target_reloaded"`), `thread`, and — when halted with readable context — `rip`, `cr3`, and nearest `symbol`, plus the attached `process` (`{pid,name}`). Per kind: `breakpoint` adds `breakpoint:{id,address,symbol}` and `temporary`; `bugcheck` adds `is_bugcheck:true` and a structured `bugcheck`; `exception` adds `exception_code`; `target_reloaded` adds `kernel_base` and `coherent` (the guest rebooted — every prior address is stale, re-enumerate; reload classification, stale-breakpoint drop, and guest-state rebuild are handled inside the shared session core); `halted` adds `event:false` and `coherent`.
 
@@ -107,7 +107,7 @@ Stop responses carry `running`, `stopped`, a `stop` kind (`"breakpoint"`, `"bugc
 | `bp.clear` / `breakpoint.clear` | `breakpoint` | Clears a breakpoint by numeric ID. |
 | `bp.disable` / `breakpoint.disable` | `breakpoint` | Disables a breakpoint by ID. |
 | `bp.enable` / `breakpoint.enable` | `breakpoint` | Enables a breakpoint by ID. |
-| `bp.list` / `breakpoint.list` | none | Lists IDs, enabled state, address, symbol, scope, temporary flag, and condition. |
+| `bp.list` / `breakpoint.list` | none | Lists IDs, enabled state, `kind` (always `software`), address, symbol, scope, temporary flag, and condition. |
 
 > **Software breakpoints only.** The shared upstream breakpoint core does not (yet) expose hardware execution breakpoints; passing `kind:"hardware"`/`"hbp"` returns a "not supported" error. Re-adding the fork's gdbstub hardware-breakpoint path on top of the shared core is a tracked follow-up.
 

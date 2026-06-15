@@ -79,9 +79,10 @@ cli = ["dep:ctrlc", "dep:argh", "dep:dialoguer", "dep:nu-ansi-term", "dep:reedli
 mcp = ["dep:rmcp", "dep:schemars", "dep:serde", "dep:serde_json", "dep:tokio", "dep:tokio-util", "dep:axum", "dep:tower-http", "dep:anyhow"]
 # `agent` exposes the line-delimited JSON stdio debugger protocol (the
 # `ntoseye agent` subcommand) used by AI agent workflows that need `sudo`. Pulls
-# Python for in-protocol scripting (the `script.*` commands) via the embedded
-# interpreter, and shares the neutral `view` renderer with MCP.
-agent = ["dep:serde", "dep:serde_json", "python"]
+# `python-embed` (not just `python`) so the in-protocol `script.*` commands have
+# a live, auto-initialized interpreter even in a minimal `--features agent` build,
+# and shares the neutral `view` renderer with MCP.
+agent = ["dep:serde", "dep:serde_json", "python-embed"]
 # `python` compiles the SDK. `python-embed` (binary) links libpython and
 # auto-starts the interpreter. `python-extension` is for the ntoseye-py wheel
 # shim (libpython resolved at load). The two libpython modes are mutually

@@ -296,12 +296,31 @@ pub fn dispatch(name: &str, args: &[&str], session: &mut Session) -> Result<(), 
     })
 }
 
+/// Restores `sys.stdout`/`sys.stderr` on drop, so [`dispatch_capture`]'s stream
+/// swap is undone unconditionally — across the `?` early-returns and any panic
+/// between the swap and the read-back, not just the happy path. Lives only inside
+/// the `Python::attach` closure, so the GIL is held when `Drop` runs.
+#[cfg(feature = "agent")]
+struct StreamRestore<'py> {
+    sys: Bound<'py, PyAny>,
+    stdout: Bound<'py, PyAny>,
+    stderr: Bound<'py, PyAny>,
+}
+
+#[cfg(feature = "agent")]
+impl Drop for StreamRestore<'_> {
+    fn drop(&mut self) {
+        let _ = self.sys.setattr("stdout", &self.stdout);
+        let _ = self.sys.setattr("stderr", &self.stderr);
+    }
+}
+
 /// Like [`dispatch`], but redirects the interpreter's `sys.stdout`/`sys.stderr`
 /// to an in-memory buffer for the call and returns whatever the command printed.
 /// The agent stdio protocol multiplexes line-delimited JSON on the process's
-/// real stdout, so a script printing directly would corrupt that stream;
+/// real stdout, so a script printing directly could mislead downstream tooling;
 /// capturing keeps script output inside the JSON response instead. The streams
-/// are restored before the buffer is read back, even if the command raised.
+/// are restored by an RAII guard, even if the command (or the setup) raised.
 #[cfg(feature = "agent")]
 pub fn dispatch_capture(name: &str, args: &[&str], session: &mut Session) -> Result<String, String> {
     Python::attach(|py| -> Result<String, String> {
@@ -324,6 +343,13 @@ pub fn dispatch_capture(name: &str, args: &[&str], session: &mut Session) -> Res
         let prev_stderr = sys.getattr("stderr").map_err(|e| e.to_string())?;
         sys.setattr("stdout", &buffer).map_err(|e| e.to_string())?;
         sys.setattr("stderr", &buffer).map_err(|e| e.to_string())?;
+        // From here on the streams are restored on every exit path (including the
+        // `?` returns below and a panic-unwind) when this guard drops.
+        let _restore = StreamRestore {
+            sys: sys.clone().into_any(),
+            stdout: prev_stdout,
+            stderr: prev_stderr,
+        };
 
         let valid = Arc::new(AtomicBool::new(true));
         let call_result = {
@@ -339,9 +365,8 @@ pub fn dispatch_capture(name: &str, args: &[&str], session: &mut Session) -> Res
             callable.call1(py, call_args).map(|_| ())
         };
 
-        // Restore the real streams before reading the buffer back.
-        let _ = sys.setattr("stdout", prev_stdout);
-        let _ = sys.setattr("stderr", prev_stderr);
+        // The StringIO still holds the captured text whether or not it is still
+        // the active stream, so reading it here (guard not yet dropped) is fine.
         let captured: String = buffer
             .call_method0("getvalue")
             .and_then(|v| v.extract())
@@ -350,7 +375,8 @@ pub fn dispatch_capture(name: &str, args: &[&str], session: &mut Session) -> Res
         match call_result {
             Ok(()) => Ok(captured),
             Err(e) if captured.is_empty() => Err(e.to_string()),
-            Err(e) => Err(format!("{captured}\n{e}")),
+            // `print()` output usually ends in a newline already; don't double it.
+            Err(e) => Err(format!("{}\n{e}", captured.trim_end_matches('\n'))),
         }
     })
 }

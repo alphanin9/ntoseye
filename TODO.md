@@ -20,9 +20,6 @@ The agent stdio frontend now sits on upstream's shared `Session` / `Target` /
   software/temporary/condition only. The fork's gdbstub hardware-breakpoint path
   (`Z1`/`z1`, `hwbreak+`, `hbp`, exact-RIP-no-rewind) needs re-porting on top of
   the shared core; until then `bp.set kind:"hardware"` returns "not supported".
-- **Step timeout.** `step.over`/`step.out` accept `timeout_ms` but don't enforce
-  it (the synchronous loop has no canceller). Add a watcher thread that flips the
-  `&AtomicBool` after the deadline if hangs become a problem.
 - **Protocol tests.** Add tests around the JSON protocol using a fake
   `DebugBackend`: breakpoint lifecycle, the `ContinueOutcome`-derived stop
   shapes, descriptor-table parsing, and register-backed expressions.

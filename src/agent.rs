@@ -13,8 +13,9 @@
 
 use std::io::{self, BufRead, Write};
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -102,11 +103,48 @@ struct AgentSession<'a> {
     session: &'a mut Session,
 }
 
-/// A never-cancelled token for run-control calls. The agent stdio loop is
-/// single-threaded and parent-driven, so bounded waits rely on the timeout the
-/// `Session` enforces rather than an out-of-band cancel signal.
+/// A never-cancelled token for run-control calls whose `Session` method already
+/// enforces a timeout internally (`continue_until_break` / `wait_for_stop_bounded`).
 fn no_cancel() -> AtomicBool {
     AtomicBool::new(false)
+}
+
+/// Sets a cancel flag after `timeout_ms` unless dropped first. Lets the agent
+/// bound `Session::step_over`/`step_out`, whose underlying `run_to` waits with no
+/// internal timeout (unlike `continue_until_break`); without this a step over a
+/// call that never returns would hang the single-threaded agent forever.
+struct TimeoutCanceller {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TimeoutCanceller {
+    fn start(timeout_ms: Option<u64>, cancel: Arc<AtomicBool>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = timeout_ms.map(|ms| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_millis(ms);
+                while Instant::now() < deadline {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                cancel.store(true, Ordering::Relaxed);
+            })
+        });
+        Self { stop, handle }
+    }
+}
+
+impl Drop for TimeoutCanceller {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 /// Drive the agent stdio protocol against a live [`Session`] until EOF or `quit`.
@@ -163,6 +201,10 @@ pub fn run(session: &mut Session) -> Result<()> {
         }
     }
 
+    // Best-effort: uninstall breakpoints and leave the guest usable on exit,
+    // matching the REPL and MCP frontends (the agent shouldn't be the one
+    // frontend that leaves int3 patches behind).
+    let _ = session.session.cleanup_for_exit();
     Ok(())
 }
 
@@ -1214,6 +1256,8 @@ impl AgentSession<'_> {
             "breakpoints": self.session.breakpoints.list().into_iter().map(|bp| json!({
                 "id": bp.id,
                 "enabled": bp.enabled,
+                // Software-only on the shared core; kept for consumer compatibility.
+                "kind": "software",
                 "address": fmt_addr(bp.address.0),
                 "symbol": bp.symbol,
                 "scope": bp.scope.label(),
@@ -1268,16 +1312,18 @@ impl AgentSession<'_> {
         self.stopped_envelope("step")
     }
 
-    fn step_over(&mut self, _timeout_ms: Option<u64>) -> Result<Value> {
+    fn step_over(&mut self, timeout_ms: Option<u64>) -> Result<Value> {
         self.require_halted()?;
-        let cancel = no_cancel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let _timer = TimeoutCanceller::start(timeout_ms, cancel.clone());
         let outcome = self.session.step_over(&cancel)?;
         self.outcome_json(outcome)
     }
 
-    fn step_out(&mut self, _timeout_ms: Option<u64>) -> Result<Value> {
+    fn step_out(&mut self, timeout_ms: Option<u64>) -> Result<Value> {
         self.require_halted()?;
-        let cancel = no_cancel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let _timer = TimeoutCanceller::start(timeout_ms, cancel.clone());
         let outcome = self.session.step_out(&cancel)?;
         self.outcome_json(outcome)
     }
