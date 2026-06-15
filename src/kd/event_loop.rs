@@ -22,8 +22,9 @@ use super::{
     BUGCHECK_MANUALLY_INITIATED_CRASH, BUGCHECK_REFRESH_ASSIST_GRACE, BugcheckCapture,
     DBG_KD_COMMAND_STRING_STATE_CHANGE, DBG_KD_EXCEPTION_STATE_CHANGE,
     DBG_KD_LOAD_SYMBOLS_STATE_CHANGE, KD_INITIAL_PROGRESS_INTERVAL, KD_INITIAL_TIMEOUT_DEFAULT,
-    KD_INITIAL_TIMEOUT_ENV, KD_REFRESH_BREAKIN_INTERVAL, KD_REFRESH_BREAKIN_TRACE_EVERY,
-    KD_REQUEST_TIMEOUT, PUMP_POLL, StateChange, handle_debug_io_with_output, handle_file_io,
+    KD_INITIAL_PROBE_TIMEOUT, KD_INITIAL_TIMEOUT_ENV, KD_REFRESH_BREAKIN_INTERVAL,
+    KD_REFRESH_BREAKIN_TRACE_EVERY, KD_REQUEST_TIMEOUT, PUMP_POLL, StateChange,
+    handle_debug_io_with_output, handle_file_io,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,7 +261,7 @@ pub fn is_initial_resync_error(error: &Error) -> bool {
 }
 
 pub fn probe_initial_request(framing: &mut KdFraming<UnixStream>, processor: u16) -> Result<()> {
-    with_framing_read_timeout_raw(framing, KD_REQUEST_TIMEOUT, |framing| {
+    with_framing_read_timeout_raw(framing, KD_INITIAL_PROBE_TIMEOUT, |framing| {
         api::get_version(framing, processor).map(|_| ())
     })
 }

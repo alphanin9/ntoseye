@@ -7,6 +7,26 @@
 See the project README and `examples/` for more.
 """
 
-from ._ntoseye import Debugger, Struct, Type, __version__, attach
+from ._ntoseye import (
+    Breakpoint,
+    Debugger,
+    MemoryAccessError,
+    NtoseyeError,
+    StopOutcome,
+    Struct,
+    Type,
+    __version__,
+    attach,
+)
 
-__all__ = ["Debugger", "Type", "Struct", "attach", "__version__"]
+__all__ = [
+    "Breakpoint",
+    "Debugger",
+    "MemoryAccessError",
+    "NtoseyeError",
+    "StopOutcome",
+    "Type",
+    "Struct",
+    "attach",
+    "__version__",
+]
