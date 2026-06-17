@@ -5,8 +5,8 @@ use crate::target::Target;
 use crate::types::VirtAddr;
 use crate::ui;
 
-// Bugcheck *analysis* (descriptor lookup, fault site, KiBugCheckData decode) lives
-// in core (`crate::bugchecks`), shared with the SDK/MCP; the REPL adds presentation.
+// Bugcheck *analysis* (descriptor lookup, fault site, KiBugCheckData decode)
+// lives in core, shared with the SDK/MCP; the REPL adds presentation.
 pub use crate::bugchecks::{
     BUGCHECK_DATA_SLOTS, CURRENT_KERNEL_RELOAD_WINDOW, analyze_bugcheck, bugcheck_fault_ip,
     bugcheck_site, current_bugcheck, looks_like_kernel_pointer, plausible_bugcheck_code,

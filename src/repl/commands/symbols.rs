@@ -1,5 +1,3 @@
-use strum::EnumMessage;
-
 use crate::error::Result;
 use crate::expr::Expr;
 use crate::symbols::format_symbol_with_offset;
@@ -8,10 +6,58 @@ use crate::ui;
 
 use crate::repl::*;
 
+repl_command! {
+    cmd_x;
+    names: ["x"],
+    usage: "x <query>  or  x <module>!<query>",
+    summary: "Fuzzy-search symbols by name.",
+    details: "operators: ^prefix  suffix$  'exact  !negate  (space = AND)",
+    completion: Symbol,
+}
+
+repl_command! {
+    cmd_ln;
+    names: ["ln"],
+    usage: "ln <address>",
+    summary: "List the nearest symbol to an address.",
+    completion: Expression,
+}
+
+repl_command! {
+    cmd_ev;
+    names: ["ev", "?"],
+    usage: "ev <expression>",
+    summary: "Evaluate an expression.",
+    completion: Expression,
+    style: ExpressionTail,
+}
+
+repl_command! {
+    cmd_set;
+    names: ["set"],
+    usage: "set $<name> <expression>",
+    summary: "Define a convenience variable usable in expressions as $<name>.",
+    completion: [None, Expression],
+}
+
+repl_command! {
+    cmd_vars();
+    names: ["vars"],
+    usage: "vars",
+    summary: "List defined convenience variables and result slots.",
+}
+
+repl_command! {
+    cmd_unset;
+    names: ["unset"],
+    usage: "unset $<name>",
+    summary: "Remove a convenience variable.",
+}
+
 impl ReplState<'_> {
-    pub fn cmd_x(&mut self, parts: &[&str]) -> Result<()> {
-        let Some(query) = parts.get(1) else {
-            error!("usage: x <query>  (or x <module>!<query>)");
+    fn cmd_x(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let Some(query) = invocation.arg(0) else {
+            println!("{}\n", command_help("x"));
             return Ok(());
         };
         // bounded purely for terminal-output sanity (resolution
@@ -77,9 +123,9 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_ln(&mut self, parts: &[&str]) -> Result<()> {
-        let Some(arg) = parts.get(1) else {
-            error!("usage: ln <address>");
+    fn cmd_ln(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let Some(arg) = invocation.arg(0) else {
+            println!("{}\n", command_help("ln"));
             return Ok(());
         };
         let addr = match Expr::eval(arg, &self.ctx.target) {
@@ -111,22 +157,14 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_ev(&mut self, parts: &[&str]) -> Result<()> {
-        if parts.is_empty() {
-            println!(
-                "{}\n",
-                ReplCommand::Ev.get_message().unwrap_or("invalid usage")
-            );
+    fn cmd_ev(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let expr_str = invocation.raw_tail;
+        if expr_str.is_empty() {
+            println!("{}\n", command_help("ev"));
             return Ok(());
         }
 
-        let expr_str = if parts.len() > 2 {
-            parts[1..].join(" ")
-        } else {
-            parts[1].to_string()
-        };
-
-        match Expr::eval(&expr_str, &self.ctx.target) {
+        match Expr::eval(expr_str, &self.ctx.target) {
             Ok(addr) => {
                 self.ctx.target.set_results(vec![addr.0], self.line.clone());
                 println!("{}", ui::addr(addr.0));
@@ -137,11 +175,10 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_set(&mut self, parts: &[&str]) -> Result<()> {
-        // set $<name> <expression>
-        let rest = parts[1..].join(" ");
+    fn cmd_set(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let rest = invocation.join_args(0);
         let Some((lhs, rhs)) = rest.split_once(char::is_whitespace) else {
-            error!("usage: set $<name> <expression>");
+            println!("{}\n", command_help("set"));
             return Ok(());
         };
         let name = lhs.trim().strip_prefix('$').unwrap_or(lhs.trim()).trim();
@@ -175,7 +212,7 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_vars(&mut self, _parts: &[&str]) -> Result<()> {
+    fn cmd_vars(&mut self) -> Result<()> {
         let builtins = self.ctx.target.builtin_variables();
         if self.ctx.target.user_vars.is_empty()
             && self.ctx.target.results.is_empty()
@@ -234,9 +271,9 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_unset(&mut self, parts: &[&str]) -> Result<()> {
-        let Some(arg) = parts.get(1) else {
-            error!("usage: unset $<name>");
+    fn cmd_unset(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let Some(arg) = invocation.arg(0) else {
+            println!("{}\n", command_help("unset"));
             return Ok(());
         };
         let name = arg.strip_prefix('$').unwrap_or(arg);
@@ -247,5 +284,18 @@ impl ReplState<'_> {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::repl::{CommandStyle, parse_command};
+
+    #[test]
+    fn ev_keeps_expression_tail() {
+        let parsed = parse_command("ev rax + rbx").unwrap().unwrap();
+        let invocation = parsed.invocation(CommandStyle::ExpressionTail).unwrap();
+        assert_eq!(invocation.raw_tail, "rax + rbx");
+        assert!(invocation.argv.is_empty());
     }
 }

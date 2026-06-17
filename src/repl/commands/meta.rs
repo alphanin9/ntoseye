@@ -4,32 +4,46 @@ use crate::python::embed;
 
 use crate::repl::*;
 
+repl_command! {
+    cmd_reload();
+    names: ["reload"],
+    usage: "reload",
+    summary: "Reload custom commands and aliases.",
+}
+
+repl_command! {
+    names: ["quit", "q"],
+    usage: "quit",
+    summary: "Exit the application.",
+    flow: Quit,
+}
+
 impl ReplState<'_> {
-    #[cfg_attr(not(feature = "python"), allow(unused_variables, unused_mut))]
-    pub fn cmd_reload(&mut self, _parts: &[&str]) -> Result<()> {
+    fn cmd_reload(&mut self) -> Result<()> {
         #[cfg(feature = "python")]
         {
             let py_report = embed::load_commands_dir();
             embed::print_script_load_report(&py_report, false);
             *self.caches.user_commands.write().unwrap() = initial_user_commands();
         }
+        let alias_report = self.reload_aliases();
+        print_alias_load_report(&alias_report, false);
         Ok(())
     }
 
-    #[cfg_attr(not(feature = "python"), allow(unused_variables))]
-    pub fn cmd_user(&mut self, cmd_str: &str, parts: &[&str]) -> Result<()> {
+    pub fn cmd_user(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
         #[cfg(feature = "python")]
-        if embed::has_command(cmd_str) {
-            let args: Vec<&str> = parts.iter().skip(1).copied().collect();
-            if let Err(e) = embed::dispatch(cmd_str, &args, self.ctx) {
-                error!("{}: {}", cmd_str, e);
+        if embed::has_command(invocation.name) {
+            let args: Vec<&str> = invocation.argv.iter().map(|arg| arg.as_ref()).collect();
+            if let Err(e) = embed::dispatch(invocation.name, &args, self.ctx) {
+                error!("{}: {}", invocation.name, e);
             }
             return Ok(());
         }
 
         println!(
             "unknown command: '{}' (try pressing tab to see available commands)\n",
-            cmd_str
+            invocation.name
         );
 
         Ok(())

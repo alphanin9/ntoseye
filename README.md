@@ -26,10 +26,12 @@ Windows kernel debugger for Linux hosts running Windows under KVM/QEMU. Essentia
 
 ### Disclaimer
 
-`ntoseye` needs to download symbols and images to initialize required offsets, it will only download symbols from Microsoft's official symbol server. All files which will be read/written to will be located in `$XDG_CONFIG_HOME/ntoseye`, which includes the following subfolders:
-- `commands/` for custom scripted commands
-- `images/` for binaries downloaded from the VM
-- `symbols/` for PDBs
+`ntoseye` needs to download symbols and images to initialize required offsets, it will only download symbols from Microsoft's official symbol server. Config, cache, and REPL state live under `~/.ntoseye`. If a legacy `~/.config/ntoseye` directory exists and `~/.ntoseye` does not, ntoseye moves it to `~/.ntoseye` automatically and prints a note. Notable paths:
+- `~/.ntoseye/commands/` for custom scripted commands
+- `~/.ntoseye/images/` for binaries downloaded from the VM
+- `~/.ntoseye/symbols/` for PDBs
+- `~/.ntoseye/aliases` for command aliases
+- `~/.ntoseye/history` for persistent REPL history
 
 ### Preview
 
@@ -85,6 +87,38 @@ The default and recommended backend is `kd` (KDCOM), which runs Windows KD over 
 For guests that aren't configured for KD, see [Choosing a backend](#choosing-a-backend) for the `gdb` and `memory` alternatives.
 
 The debugger is self-documented: run `ntoseye --help` for command-line arguments, and press tab in the REPL for completions and descriptions of commands, symbols, and types.
+
+## REPL syntax
+
+Expressions accept symbols, numeric literals, registers, casts, arithmetic, indexing, and pointer reads:
+
+```text
+ev @rip
+ev poi(nt!PsInitialSystemProcess)
+ev (_EPROCESS)poi(nt!PsInitialSystemProcess)->UniqueProcessId
+```
+
+Field access in `ev` needs an explicit cast so ntoseye knows the layout. The `dt` command gets the type from its first argument, so the address expression does not need a cast:
+
+```text
+dt _EPROCESS poi(nt!PsInitialSystemProcess) UniqueProcessId
+```
+
+Breakpoints accept conditions which are written directly after the address expression:
+
+```text
+bp nt!KeBugCheckEx @rcx == 0x50
+```
+
+Aliases use `alias <name> <expansion>`. `${1}` is the first argument passed to the alias, `${2}` is the second, and `${*}` expands to all alias arguments separated by spaces. Alias expansions can contain command lists separated by semicolons.
+
+```text
+alias ubp bp ${1}; g
+alias pe dt _EPROCESS poi(nt!PsInitialSystemProcess) ${1}
+unalias ubp
+```
+
+Aliases are saved in `~/.ntoseye/aliases`; `reload` reloads aliases and custom Python commands.
 
 ## Choosing a backend
 
@@ -229,7 +263,7 @@ The module is a native extension built with [maturin](https://www.maturin.rs/); 
 
 In addition to the standalone [Python SDK](#python-sdk), `ntoseye` can run Python commands inside the live REPL; the same SDK, but bound to the session you're already debugging rather than a separate attach. This requires a build with the embedded interpreter (which is enabled by default).
 
-Drop any `*.py` file in `$XDG_CONFIG_HOME/ntoseye/commands/`; they're auto-loaded at REPL startup. Run `reload` in the REPL to pick up edits without restarting.
+Drop any `*.py` file in `~/.ntoseye/commands/`; they're auto-loaded at REPL startup. Run `reload` in the REPL to pick up edits without restarting.
 
 Custom commands need no `pip install ntoseye` as the module is served by the embedded interpreter. However, it may be worth installing to get LSP completions and type diagnostics while you write them.
 

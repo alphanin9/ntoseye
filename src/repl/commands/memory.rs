@@ -1,4 +1,3 @@
-use strum::EnumMessage;
 use tabled::builder::Builder;
 
 use owo_colors::OwoColorize;
@@ -12,6 +11,88 @@ use crate::ui;
 use crate::unwind::{format_symbol, resolve_thread_trace_context};
 
 use crate::repl::*;
+
+repl_command! {
+    cmd_db;
+    names: ["db"],
+    usage: "db <address> [length or end]",
+    summary: "Display memory as bytes.",
+    completion: Expression,
+}
+
+repl_command! {
+    cmd_dd;
+    names: ["dd"],
+    usage: "dd <address> [length or end]",
+    summary: "Display memory as doublewords (4 bytes).",
+    completion: Expression,
+}
+
+repl_command! {
+    cmd_dq;
+    names: ["dq"],
+    usage: "dq <address> [length or end]",
+    summary: "Display memory as quadwords (8 bytes).",
+    completion: Expression,
+}
+
+repl_command! {
+    cmd_disasm;
+    names: ["disasm", "u"],
+    usage: "disasm <address> [length or end]",
+    summary: "Disassemble memory at a symbol or address.",
+    completion: Expression,
+}
+
+repl_command! {
+    cmd_dt;
+    names: ["dt"],
+    usage: "dt <type> [address] [field]",
+    summary: "Display type definition.",
+    completion: [Type, Expression],
+}
+
+repl_command! {
+    cmd_eb;
+    names: ["eb"],
+    usage: "eb <address> <expr>",
+    summary: "Write a byte to memory.",
+    completion: Expression,
+}
+
+repl_command! {
+    cmd_ed;
+    names: ["ed"],
+    usage: "ed <address> <expr>",
+    summary: "Write a doubleword (4 bytes) to memory.",
+    completion: Expression,
+}
+
+repl_command! {
+    cmd_eq;
+    names: ["eq"],
+    usage: "eq <address> <expr>",
+    summary: "Write a quadword (8 bytes) to memory.",
+    completion: Expression,
+}
+
+repl_command! {
+    cmd_f;
+    names: ["f"],
+    usage: "f <address> <hex bytes> [length or end]",
+    summary: "Fill memory with a repeated byte pattern.",
+    details: "hex bytes: 90, 4883792000740a, or \\x90\\x90",
+    completion: [Expression, None, Expression],
+}
+
+repl_command! {
+    cmd_s;
+    names: ["s"],
+    usage: "s <address> <hex bytes> [length]",
+    summary: "Search memory for a byte pattern.",
+    details: "hex bytes: 4883792000740a or \\x48\\x83\\x79\\x20\\x00\\x74\\x0a",
+    completion: [Expression, None, Expression],
+}
 
 impl ReplState<'_> {
     /// Read guest memory in the current process context for *display*, masking
@@ -27,18 +108,19 @@ impl ReplState<'_> {
 
     fn display_memory_command(
         &self,
-        parts: &[&str],
+        invocation: &CommandInvocation<'_>,
         default_count: u64,
         item_size: u64,
         mode: MemoryDisplayMode,
     ) -> Result<()> {
-        let range = match AddressRange::parse(parts, &self.ctx.target, default_count, item_size) {
-            Ok(r) => r,
-            Err(e) => {
-                error!("{}", e);
-                return Ok(());
-            }
-        };
+        let range =
+            match AddressRange::parse(invocation, &self.ctx.target, default_count, item_size) {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("{}", e);
+                    return Ok(());
+                }
+            };
 
         let mut data: Vec<u8> = vec![0u8; range.len()];
         if let Err(e) = self.read_for_display(range.start, &mut data) {
@@ -53,18 +135,18 @@ impl ReplState<'_> {
 
     fn write_scalar_command(
         &mut self,
-        parts: &[&str],
-        command: ReplCommand,
+        invocation: &CommandInvocation<'_>,
+        command: &str,
         noun: &str,
         encode: impl FnOnce(u64) -> Vec<u8>,
         display_value: impl FnOnce(u64) -> String,
     ) -> Result<()> {
-        if parts.len() < 3 {
-            println!("{}\n", command.get_message().unwrap_or("invalid usage"));
+        if invocation.argv.len() < 2 {
+            println!("{}\n", command_help(command));
             return Ok(());
         }
 
-        let address = match Expr::eval(parts[1], &self.ctx.target) {
+        let address = match Expr::eval(invocation.arg(0).unwrap(), &self.ctx.target) {
             Ok(a) => a,
             Err(e) => {
                 error!("{}", e);
@@ -72,7 +154,7 @@ impl ReplState<'_> {
             }
         };
 
-        let expr_str = parts[2..].join(" ");
+        let expr_str = invocation.join_args(1);
         let value = match Expr::eval(&expr_str, &self.ctx.target) {
             Ok(v) => v.0,
             Err(e) => {
@@ -98,20 +180,20 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_db(&mut self, parts: &[&str]) -> Result<()> {
-        self.display_memory_command(parts, 128, 1, MemoryDisplayMode::bytes())
+    fn cmd_db(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        self.display_memory_command(&invocation, 128, 1, MemoryDisplayMode::bytes())
     }
 
-    pub fn cmd_dd(&mut self, parts: &[&str]) -> Result<()> {
-        self.display_memory_command(parts, 16, 4, MemoryDisplayMode::dwords())
+    fn cmd_dd(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        self.display_memory_command(&invocation, 16, 4, MemoryDisplayMode::dwords())
     }
 
-    pub fn cmd_dq(&mut self, parts: &[&str]) -> Result<()> {
-        self.display_memory_command(parts, 8, 8, MemoryDisplayMode::qwords())
+    fn cmd_dq(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        self.display_memory_command(&invocation, 8, 8, MemoryDisplayMode::qwords())
     }
 
-    pub fn cmd_disasm(&mut self, parts: &[&str]) -> Result<()> {
-        let range = match AddressRange::parse(parts, &self.ctx.target, 32, 1) {
+    fn cmd_disasm(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let range = match AddressRange::parse(&invocation, &self.ctx.target, 32, 1) {
             Ok(r) => r,
             Err(e) => {
                 error!("{}", e);
@@ -141,46 +223,43 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_eb(&mut self, parts: &[&str]) -> Result<()> {
+    fn cmd_eb(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
         self.write_scalar_command(
-            parts,
-            ReplCommand::Eb,
+            &invocation,
+            "eb",
             "byte",
             |value| vec![value as u8],
             |value| format!("{:02x}", value as u8),
         )
     }
 
-    pub fn cmd_ed(&mut self, parts: &[&str]) -> Result<()> {
+    fn cmd_ed(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
         self.write_scalar_command(
-            parts,
-            ReplCommand::Ed,
+            &invocation,
+            "ed",
             "dword",
             |value| (value as u32).to_le_bytes().to_vec(),
             |value| format!("{:#x}", value as u32),
         )
     }
 
-    pub fn cmd_eq(&mut self, parts: &[&str]) -> Result<()> {
+    fn cmd_eq(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
         self.write_scalar_command(
-            parts,
-            ReplCommand::Eq,
+            &invocation,
+            "eq",
             "qword",
             |value| value.to_le_bytes().to_vec(),
             |value| format!("{:#x}", value),
         )
     }
 
-    pub fn cmd_f(&mut self, parts: &[&str]) -> Result<()> {
-        if parts.len() < 3 {
-            println!(
-                "{}\n",
-                ReplCommand::F.get_message().unwrap_or("invalid usage")
-            );
+    fn cmd_f(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        if invocation.argv.len() < 2 {
+            println!("{}\n", command_help("f"));
             return Ok(());
         }
 
-        let address = match Expr::eval(parts[1], &self.ctx.target) {
+        let address = match Expr::eval(invocation.arg(0).unwrap(), &self.ctx.target) {
             Ok(a) => a,
             Err(e) => {
                 error!("{}", e);
@@ -188,7 +267,7 @@ impl ReplState<'_> {
             }
         };
 
-        let pattern_str = parts[2];
+        let pattern_str = invocation.arg(1).unwrap();
         let pattern = match parse_byte_pattern(pattern_str) {
             Some(pattern) => pattern,
             None => {
@@ -197,7 +276,7 @@ impl ReplState<'_> {
             }
         };
 
-        let length = match parts.get(3) {
+        let length = match invocation.arg(2) {
             Some(length_arg) => match Expr::eval(length_arg, &self.ctx.target) {
                 Ok(value) => match resolve_length_or_end(address, value) {
                     Some(length) => length,
@@ -232,18 +311,15 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_s(&mut self, parts: &[&str]) -> Result<()> {
-        if parts.len() < 3 {
-            println!(
-                "{}\n",
-                ReplCommand::S.get_message().unwrap_or("invalid usage")
-            );
+    fn cmd_s(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        if invocation.argv.len() < 2 {
+            println!("{}\n", command_help("s"));
             return Ok(());
         }
 
-        let pattern_str = parts[2];
+        let pattern_str = invocation.arg(1).unwrap();
 
-        let start_addr = match Expr::eval(parts[1], &self.ctx.target) {
+        let start_addr = match Expr::eval(invocation.arg(0).unwrap(), &self.ctx.target) {
             Ok(a) => a,
             Err(e) => {
                 error!("{}", e);
@@ -259,7 +335,7 @@ impl ReplState<'_> {
             }
         };
 
-        let length = match parts.get(3) {
+        let length = match invocation.arg(2) {
             Some(length_arg) => match Expr::eval(length_arg, &self.ctx.target) {
                 Ok(value) => match usize::try_from(value.0) {
                     Ok(length) => length,
@@ -330,10 +406,10 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_dt(&mut self, parts: &[&str]) -> Result<()> {
-        let arg = require_arg!(parts, 1, ReplCommand::Dt);
+    fn cmd_dt(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let arg = require_arg!(invocation, 0, "dt");
 
-        let address = match Expr::eval(parts.get(2).copied().unwrap_or("0"), &self.ctx.target) {
+        let address = match Expr::eval(invocation.arg(1).unwrap_or("0"), &self.ctx.target) {
             Ok(a) => a,
             Err(e) => {
                 error!("{}", e);
@@ -341,7 +417,7 @@ impl ReplState<'_> {
             }
         };
 
-        let field_name = parts.get(3);
+        let field_name = invocation.arg(2);
 
         match self
             .ctx
@@ -420,7 +496,7 @@ impl ReplState<'_> {
                         Some(FieldValue::Bytes(_)) | None => String::new(),
                     };
 
-                    if field_name.is_none() || field_name.unwrap() == name {
+                    if field_name.is_none_or(|field| field == name.as_str()) {
                         builder.push_record(vec![
                             format!(
                                 "  {} {:-12}",

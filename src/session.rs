@@ -48,7 +48,8 @@ pub enum ContinueOutcome {
     },
     /// The guest is processing a bugcheck (BSOD). `info` carries the code +
     /// parameters when the backend decoded them from the KD stream; otherwise
-    /// read `nt!KiBugCheckData` from memory (`crate::bugchecks::current_bugcheck`).
+    /// read `nt!KiBugCheckData` from memory with
+    /// [`crate::bugchecks::current_bugcheck`].
     Bugcheck {
         rip: Option<u64>,
         info: Option<BugcheckInfo>,

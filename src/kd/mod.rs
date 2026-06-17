@@ -20,7 +20,7 @@ use crate::types::VirtAddr;
 
 macro_rules! kd_trace {
     ($($arg:tt)*) => {
-        if crate::kd::trace_enabled() {
+        if $crate::kd::trace_enabled() {
             eprintln!($($arg)*);
         }
     };
@@ -28,7 +28,7 @@ macro_rules! kd_trace {
 
 macro_rules! kd_trace_bytes {
     ($($arg:tt)*) => {
-        if crate::kd::trace_bytes_enabled() {
+        if $crate::kd::trace_bytes_enabled() {
             eprint!($($arg)*);
         }
     };

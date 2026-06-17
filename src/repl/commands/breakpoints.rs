@@ -1,4 +1,3 @@
-use strum::EnumMessage;
 use tabled::builder::Builder;
 use tabled::settings::Padding;
 
@@ -6,32 +5,79 @@ use owo_colors::OwoColorize;
 
 use crate::error::Result;
 use crate::expr::Expr;
+use crate::session::split_condition_operator;
 use crate::ui;
 
 use crate::repl::*;
 
-impl ReplState<'_> {
-    fn parse_breakpoint_condition(parts: &[&str]) -> Option<Option<String>> {
-        match parts {
-            [_cmd, _addr] => Some(None),
-            // legacy "if" prefix still accepted
-            [_cmd, _addr, "if", rest @ ..] if !rest.is_empty() => Some(Some(rest.join(" "))),
-            [_cmd, _addr, rest @ ..] if !rest.is_empty() && rest != ["if"] => {
-                Some(Some(rest.join(" ")))
-            }
-            _ => {
-                println!(
-                    "{}\n",
-                    ReplCommand::Bp.get_message().unwrap_or("invalid usage")
-                );
-                None
-            }
-        }
-    }
+repl_command! {
+    cmd_bp;
+    names: ["bp"],
+    usage: "bp <address> [<expr>]",
+    summary: "Set a breakpoint.",
+    completion: Expression,
+    run_state: Halted,
+}
 
-    fn breakpoint_id_arg(parts: &[&str], command: ReplCommand) -> Option<u32> {
-        let Some(id_str) = parts.get(1).copied() else {
-            println!("{}\n", command.get_message().unwrap_or("invalid usage"));
+repl_command! {
+    cmd_bl();
+    names: ["bl"],
+    usage: "bl",
+    summary: "List all breakpoints.",
+}
+
+repl_command! {
+    cmd_bc;
+    names: ["bc"],
+    usage: "bc <id>",
+    summary: "Clear a breakpoint by ID.",
+    completion: Breakpoint,
+    run_state: Halted,
+}
+
+repl_command! {
+    cmd_bd;
+    names: ["bd"],
+    usage: "bd <id>",
+    summary: "Disable a breakpoint by ID.",
+    completion: Breakpoint,
+    run_state: Halted,
+}
+
+repl_command! {
+    cmd_be;
+    names: ["be"],
+    usage: "be <id>",
+    summary: "Enable a breakpoint by ID.",
+    completion: Breakpoint,
+    run_state: Halted,
+}
+
+fn breakpoint_condition(
+    invocation: &CommandInvocation<'_>,
+) -> Result<Option<String>> {
+    if invocation.argv.len() <= 1 {
+        return Ok(None);
+    }
+    let condition = invocation.join_args(1);
+    validate_breakpoint_condition(&condition)?;
+    Ok(Some(condition))
+}
+
+fn validate_breakpoint_condition(condition: &str) -> Result<()> {
+    if let Some((left, _op, right)) = split_condition_operator(condition) {
+        Expr::parse(left)?;
+        Expr::parse(right)?;
+    } else {
+        Expr::parse(condition)?;
+    }
+    Ok(())
+}
+
+impl ReplState<'_> {
+    fn breakpoint_id_arg(invocation: &CommandInvocation<'_>, command: &str) -> Option<u32> {
+        let Some(id_str) = invocation.arg(0) else {
+            println!("{}\n", command_help(command));
             return None;
         };
 
@@ -44,19 +90,18 @@ impl ReplState<'_> {
         }
     }
 
-    pub fn cmd_bp(&mut self, parts: &[&str]) -> Result<()> {
-        if self.ctx.backend.is_running() {
-            error!("VM is running");
-            return Ok(());
-        }
-
+    fn cmd_bp(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
         // Process-scope BP support is per-backend; the
         // manager returns `Error::NotSupported` for
         // backends that can't honour them.
 
-        let addr_str = require_arg!(parts, 1, ReplCommand::Bp);
-        let Some(condition) = Self::parse_breakpoint_condition(parts) else {
-            return Ok(());
+        let addr_str = require_arg!(invocation, 0, "bp");
+        let condition = match breakpoint_condition(&invocation) {
+            Ok(condition) => condition,
+            Err(e) => {
+                error!("{}", e);
+                return Ok(());
+            }
         };
         let address = match Expr::eval(addr_str, &self.ctx.target) {
             Ok(a) => a,
@@ -115,7 +160,7 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_bl(&mut self, _parts: &[&str]) -> Result<()> {
+    fn cmd_bl(&mut self) -> Result<()> {
         let bps = self.ctx.breakpoints.list();
         if bps.is_empty() {
             println!("no breakpoints set\n");
@@ -154,13 +199,8 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_bc(&mut self, parts: &[&str]) -> Result<()> {
-        if self.ctx.backend.is_running() {
-            error!("VM is running");
-            return Ok(());
-        }
-
-        let Some(id) = Self::breakpoint_id_arg(parts, ReplCommand::Bc) else {
+    fn cmd_bc(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let Some(id) = Self::breakpoint_id_arg(&invocation, "bc") else {
             return Ok(());
         };
 
@@ -181,13 +221,8 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_bd(&mut self, parts: &[&str]) -> Result<()> {
-        if self.ctx.backend.is_running() {
-            error!("VM is running");
-            return Ok(());
-        }
-
-        let Some(id) = Self::breakpoint_id_arg(parts, ReplCommand::Bd) else {
+    fn cmd_bd(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let Some(id) = Self::breakpoint_id_arg(&invocation, "bd") else {
             return Ok(());
         };
 
@@ -208,13 +243,8 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_be(&mut self, parts: &[&str]) -> Result<()> {
-        if self.ctx.backend.is_running() {
-            error!("VM is running");
-            return Ok(());
-        }
-
-        let Some(id) = Self::breakpoint_id_arg(parts, ReplCommand::Be) else {
+    fn cmd_be(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let Some(id) = Self::breakpoint_id_arg(&invocation, "be") else {
             return Ok(());
         };
 
@@ -238,33 +268,32 @@ impl ReplState<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::ReplState;
+    use std::borrow::Cow;
+
+    use super::*;
+
+    fn bp_invocation<'a>(argv: &'a [&'a str]) -> CommandInvocation<'a> {
+        CommandInvocation {
+            name: "bp",
+            argv: argv.iter().copied().map(Cow::Borrowed).collect(),
+            raw_tail: "",
+        }
+    }
 
     #[test]
-    fn breakpoint_condition_parser_keeps_simple_form() {
+    fn breakpoint_condition_accepts_comparison_tail() {
+        let invocation = bp_invocation(&["nt!Foo", "$rax", "==", "1"]);
+
         assert_eq!(
-            ReplState::parse_breakpoint_condition(&["bp", "nt!KeBugCheck"]).unwrap(),
-            None
-        );
-        assert_eq!(
-            ReplState::parse_breakpoint_condition(&["bp", "nt!KeBugCheck", "$rax", "==", "1"])
-                .unwrap()
-                .as_deref(),
+            breakpoint_condition(&invocation).unwrap().as_deref(),
             Some("$rax == 1")
         );
-        assert_eq!(
-            ReplState::parse_breakpoint_condition(&[
-                "bp",
-                "nt!KeBugCheck",
-                "if",
-                "$rax",
-                "==",
-                "1"
-            ])
-            .unwrap()
-            .as_deref(),
-            Some("$rax == 1")
-        );
-        assert!(ReplState::parse_breakpoint_condition(&["bp", "addr", "if"]).is_none());
+    }
+
+    #[test]
+    fn breakpoint_condition_rejects_malformed_tail() {
+        let invocation = bp_invocation(&["nt!Foo", "$rax", "=="]);
+
+        assert!(breakpoint_condition(&invocation).is_err());
     }
 }

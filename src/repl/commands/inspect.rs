@@ -1,4 +1,3 @@
-use strum::EnumMessage;
 use tabled::builder::Builder;
 use tabled::settings::object::Rows;
 use tabled::settings::{Alignment, Modify, Panel};
@@ -13,9 +12,126 @@ use crate::ui;
 
 use crate::repl::*;
 
+repl_command! {
+    cmd_pte;
+    names: ["pte"],
+    usage: "pte <address>",
+    summary: "Display page table entries for an address.",
+    completion: Expression,
+}
+
+repl_command! {
+    cmd_pool;
+    names: ["pool"],
+    usage: "pool <address-expression>",
+    summary: "Inspect the pool page containing an address.",
+    completion: Expression,
+}
+
+repl_command! {
+    cmd_registers();
+    names: ["registers", "r"],
+    usage: "registers",
+    summary: "Display CPU registers.",
+    run_state: Halted,
+}
+
+repl_command! {
+    cmd_k;
+    names: ["k"],
+    usage: "k [count]",
+    summary: "Display stack backtrace.",
+    run_state: Halted,
+}
+
+repl_command! {
+    cmd_status();
+    names: ["status"],
+    usage: "status",
+    summary: "Display current VM status.",
+}
+
+repl_command! {
+    cmd_capabilities();
+    names: ["capabilities"],
+    usage: "capabilities",
+    summary: "Display backend capabilities.",
+}
+
+repl_command! {
+    cmd_dbgprint;
+    names: ["dbgprint"],
+    usage: "dbgprint [count]",
+    summary: "Show captured guest debug output (DbgPrint).",
+}
+
+repl_command! {
+    cmd_irp;
+    names: ["irp"],
+    usage: "irp <address-expression>",
+    summary: "Inspect an IRP and its current IO_STACK_LOCATION.",
+    completion: Expression,
+}
+
+repl_command! {
+    cmd_irps;
+    names: ["irps"],
+    usage: "irps [process-filter|driver-filter]",
+    summary: "Discover in-flight IRPs from thread IrpLists and device CurrentIrp.",
+    completion: Process,
+}
+
+repl_command! {
+    cmd_drvobj;
+    names: ["drvobj"],
+    usage: "drvobj <driver-object-expression-or-name>",
+    summary: "Inspect a DRIVER_OBJECT, its device chain and dispatch table.",
+    completion: Driver,
+}
+
+repl_command! {
+    cmd_devobj;
+    names: ["devobj"],
+    usage: "devobj <device-object-expression>",
+    summary: "Inspect a DEVICE_OBJECT and its attached stack.",
+    completion: Expression,
+}
+
+repl_command! {
+    cmd_object;
+    names: ["object"],
+    usage: "object <object-expression>",
+    summary: "Inspect an executive object header and body.",
+    completion: Expression,
+}
+
+repl_command! {
+    cmd_callbacks;
+    names: ["callbacks"],
+    usage: "callbacks [symbol-filter]",
+    summary: "Enumerate process/thread/image notification callbacks.",
+    completion: Symbol,
+}
+
+repl_command! {
+    cmd_ssdt();
+    names: ["ssdt"],
+    usage: "ssdt",
+    summary: "Dump the SSDT and shadow SSDT.",
+}
+
+repl_command! {
+    cmd_address;
+    names: ["address"],
+    usage: "address <address-expression>",
+    summary: "Describe what an address belongs to (module+section, or VAD region).",
+    completion: Expression,
+}
+
 impl ReplState<'_> {
-    pub fn cmd_pte(&mut self, parts: &[&str]) -> Result<()> {
-        let address = match Expr::eval(parts.get(1).copied().unwrap_or(""), &self.ctx.target) {
+    fn cmd_pte(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let expr = require_arg!(invocation, 0, "pte");
+        let address = match Expr::eval(expr, &self.ctx.target) {
             Ok(a) => a,
             Err(e) => {
                 error!("{}", e);
@@ -60,12 +176,9 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_pool(&mut self, parts: &[&str]) -> Result<()> {
-        let Some(expr) = parts.get(1).copied() else {
-            println!(
-                "{}\n",
-                ReplCommand::Pool.get_message().unwrap_or("invalid usage")
-            );
+    fn cmd_pool(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let Some(expr) = invocation.arg(0) else {
+            println!("{}\n", command_help("pool"));
             return Ok(());
         };
 
@@ -133,12 +246,7 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_registers(&mut self, _parts: &[&str]) -> Result<()> {
-        if self.ctx.backend.is_running() {
-            error!("VM is running");
-            return Ok(());
-        }
-
+    fn cmd_registers(&mut self) -> Result<()> {
         if let Err(e) = self
             .ctx
             .backend
@@ -204,13 +312,8 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_k(&mut self, parts: &[&str]) -> Result<()> {
-        if self.ctx.backend.is_running() {
-            error!("VM is running");
-            return Ok(());
-        }
-
-        let frame_limit: usize = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(64);
+    fn cmd_k(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let frame_limit: usize = invocation.arg(0).and_then(|s| s.parse().ok()).unwrap_or(64);
 
         if let Err(e) = self
             .ctx
@@ -242,7 +345,7 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_status(&mut self, _parts: &[&str]) -> Result<()> {
+    fn cmd_status(&mut self) -> Result<()> {
         if self.ctx.backend.is_running() {
             println!("VM is running\n");
         } else {
@@ -266,7 +369,7 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_capabilities(&mut self, _parts: &[&str]) -> Result<()> {
+    fn cmd_capabilities(&mut self) -> Result<()> {
         print_backend_capabilities(&self.ctx.capabilities());
 
         Ok(())
@@ -275,9 +378,9 @@ impl ReplState<'_> {
     /// Show captured guest debug output (DbgPrint). The stream also prints live
     /// to the terminal as it arrives; this shows the retained history, last
     /// `count` lines (default 50, or all retained when `count` is 0).
-    pub fn cmd_dbgprint(&mut self, parts: &[&str]) -> Result<()> {
+    fn cmd_dbgprint(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
         const DEFAULT_TAIL: usize = 50;
-        let count = match parts.get(1) {
+        let count = match invocation.arg(0) {
             Some(arg) => arg
                 .parse::<usize>()
                 .map_err(|_| Error::DebugInfo(format!("invalid count: {arg}")))?,
@@ -306,9 +409,9 @@ impl ReplState<'_> {
 
         Ok(())
     }
-    pub fn cmd_irp(&mut self, parts: &[&str]) -> Result<()> {
-        let Some(expr) = parts.get(1).copied() else {
-            println!("{}\n", ReplCommand::Irp.get_message().unwrap_or_default());
+    fn cmd_irp(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let Some(expr) = invocation.arg(0) else {
+            println!("{}\n", command_help("irp"));
             return Ok(());
         };
 
@@ -407,12 +510,9 @@ impl ReplState<'_> {
             .map(|d| d.object)
     }
 
-    pub fn cmd_drvobj(&mut self, parts: &[&str]) -> Result<()> {
-        let Some(expr) = parts.get(1).copied() else {
-            println!(
-                "{}\n",
-                ReplCommand::Drvobj.get_message().unwrap_or_default()
-            );
+    fn cmd_drvobj(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let Some(expr) = invocation.arg(0) else {
+            println!("{}\n", command_help("drvobj"));
             return Ok(());
         };
 
@@ -477,12 +577,9 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_devobj(&mut self, parts: &[&str]) -> Result<()> {
-        let Some(expr) = parts.get(1).copied() else {
-            println!(
-                "{}\n",
-                ReplCommand::Devobj.get_message().unwrap_or_default()
-            );
+    fn cmd_devobj(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let Some(expr) = invocation.arg(0) else {
+            println!("{}\n", command_help("devobj"));
             return Ok(());
         };
 
@@ -530,12 +627,9 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_object(&mut self, parts: &[&str]) -> Result<()> {
-        let Some(expr) = parts.get(1).copied() else {
-            println!(
-                "{}\n",
-                ReplCommand::Object.get_message().unwrap_or_default()
-            );
+    fn cmd_object(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let Some(expr) = invocation.arg(0) else {
+            println!("{}\n", command_help("object"));
             return Ok(());
         };
 
@@ -583,8 +677,8 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_callbacks(&mut self, parts: &[&str]) -> Result<()> {
-        let filter = parts.get(1).map(|s| s.to_lowercase());
+    fn cmd_callbacks(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let filter = invocation.arg(0).map(|s| s.to_lowercase());
 
         let callbacks = match self.ctx.target.enumerate_notify_callbacks() {
             Ok(c) => c,
@@ -625,7 +719,7 @@ impl ReplState<'_> {
         }
 
         if printed == 0 {
-            match parts.get(1) {
+            match invocation.arg(0) {
                 Some(f) => println!("no callbacks matching '{}'", f),
                 None => println!("no registered callbacks found"),
             }
@@ -635,7 +729,7 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_ssdt(&mut self, _parts: &[&str]) -> Result<()> {
+    fn cmd_ssdt(&mut self) -> Result<()> {
         let tables = match self.ctx.target.dump_ssdt() {
             Ok(t) => t,
             Err(e) => {
@@ -683,8 +777,8 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_irps(&mut self, parts: &[&str]) -> Result<()> {
-        let filter = parts.get(1).copied();
+    fn cmd_irps(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let filter = invocation.arg(0);
 
         let hits = match self.ctx.target.discover_irps(filter) {
             Ok(h) => h,
@@ -713,12 +807,8 @@ impl ReplState<'_> {
                     h.ethread
                         .map(|e| ui::addr(e.0))
                         .unwrap_or_else(|| "?".into()),
-                    h.state
-                        .map(kthread_state_name)
-                        .unwrap_or("?"),
-                    h.wait_reason
-                        .map(wait_reason_name)
-                        .unwrap_or("?"),
+                    h.state.map(kthread_state_name).unwrap_or("?"),
+                    h.wait_reason.map(wait_reason_name).unwrap_or("?"),
                 )
             } else {
                 format!(
@@ -742,12 +832,9 @@ impl ReplState<'_> {
 
         Ok(())
     }
-    pub fn cmd_address(&mut self, parts: &[&str]) -> Result<()> {
-        let Some(expr) = parts.get(1).copied() else {
-            println!(
-                "{}\n",
-                ReplCommand::Address.get_message().unwrap_or_default()
-            );
+    fn cmd_address(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let Some(expr) = invocation.arg(0) else {
+            println!("{}\n", command_help("address"));
             return Ok(());
         };
 

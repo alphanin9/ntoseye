@@ -1,4 +1,4 @@
-# Ported from the old ivshmem_patch.lua. Drop in $XDG_CONFIG_HOME/ntoseye/scripts/.
+# Ported from the old ivshmem_patch.lua. Drop in ~/.ntoseye/commands/.
 #
 # Patch the Windows IVSHMEM driver's ioctl_request_mmap to allow multiple
 # concurrent handles to the shared buffer. The unpatched driver fails with

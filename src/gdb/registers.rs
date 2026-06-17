@@ -84,9 +84,9 @@ impl RegisterMap {
             .collect()
     }
 
-    // pub fn is_empty(&self) -> bool {
-    //     self.ordered.is_empty()
-    // }
+    pub fn names(&self) -> Vec<String> {
+        self.ordered.iter().map(|reg| reg.name.clone()).collect()
+    }
 
     pub fn parse_target_xml(xml: &str) -> Self {
         let mut map = RegisterMap::default();

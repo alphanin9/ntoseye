@@ -9,6 +9,45 @@ use crate::ui;
 
 use crate::repl::*;
 
+repl_command! {
+    continue_vm();
+    names: ["continue", "g"],
+    usage: "continue",
+    summary: "Resume VM execution.",
+}
+
+repl_command! {
+    interrupt_running_vm();
+    names: ["break"],
+    usage: "break",
+    summary: "Break/pause VM execution.",
+    run_state: Running,
+}
+
+repl_command! {
+    single_step();
+    names: ["si", "t"],
+    usage: "si",
+    summary: "Single step (step into).",
+    run_state: Halted,
+}
+
+repl_command! {
+    cmd_p();
+    names: ["p", "ni"],
+    usage: "p or ni",
+    summary: "Step over the current instruction.",
+    run_state: Halted,
+}
+
+repl_command! {
+    cmd_gu();
+    names: ["gu", "finish"],
+    usage: "gu or finish",
+    summary: "Run until the current function returns.",
+    run_state: Halted,
+}
+
 impl ReplState<'_> {
     pub fn interrupt_running_vm(&mut self) -> Result<()> {
         match surface_pending_stop(
@@ -43,7 +82,7 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_continue(&mut self, _parts: &[&str]) -> Result<()> {
+    fn continue_vm(&mut self) -> Result<()> {
         if self.ctx.backend.is_running() {
             match surface_pending_stop(
                 &mut *self.ctx.backend,
@@ -315,21 +354,7 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_break(&mut self, _parts: &[&str]) -> Result<()> {
-        if !self.ctx.backend.is_running() {
-            error!("VM is already paused");
-            return Ok(());
-        }
-
-        self.interrupt_running_vm()
-    }
-
-    pub fn cmd_si(&mut self, _parts: &[&str]) -> Result<()> {
-        if self.ctx.backend.is_running() {
-            error!("VM is running");
-            return Ok(());
-        }
-
+    fn single_step(&mut self) -> Result<()> {
         // The step itself (over-breakpoint dance, trap-flag clear, breakpoint
         // re-arm, thread re-select) is the canonical `Session::step`;
         // the REPL only adds the break-context display.
@@ -357,7 +382,7 @@ impl ReplState<'_> {
             .enabled_breakpoint_id_for_current_context(&self.ctx.target, address)
             .is_some()
         {
-            return self.cmd_continue(&["continue"]);
+            return self.continue_vm();
         }
 
         let temp_id = match self.ctx.breakpoints.add_temporary_code(
@@ -377,7 +402,7 @@ impl ReplState<'_> {
         };
         self.caches.refresh_breakpoints(&self.ctx.breakpoints);
 
-        let result = self.cmd_continue(&["continue"]);
+        let result = self.continue_vm();
 
         let _ = self
             .ctx
@@ -388,17 +413,12 @@ impl ReplState<'_> {
         result
     }
 
-    pub fn cmd_p(&mut self, _parts: &[&str]) -> Result<()> {
-        if self.ctx.backend.is_running() {
-            error!("VM is running");
-            return Ok(());
-        }
-
+    fn cmd_p(&mut self) -> Result<()> {
         // The step-over decision (is the current insn a call? where does it
         // return?) is shared with the SDKs; the REPL only differs in *how* it
         // runs to the target, via its rich-display continue loop.
         match self.ctx.step_over_target() {
-            Ok(StepKind::Single) => self.cmd_si(&["si"]),
+            Ok(StepKind::Single) => self.single_step(),
             Ok(StepKind::RunTo(target)) => self.run_to_temporary_code_breakpoint(target),
             Err(e) => {
                 error!("failed to decode current instruction: {}", e);
@@ -407,12 +427,7 @@ impl ReplState<'_> {
         }
     }
 
-    pub fn cmd_gu(&mut self, _parts: &[&str]) -> Result<()> {
-        if self.ctx.backend.is_running() {
-            error!("VM is running");
-            return Ok(());
-        }
-
+    fn cmd_gu(&mut self) -> Result<()> {
         match self.ctx.step_out_target() {
             Ok(target) => self.run_to_temporary_code_breakpoint(target),
             Err(e) => {

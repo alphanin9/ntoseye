@@ -1646,13 +1646,12 @@ impl Debugger {
     /// printed to stdout, exactly as in the interactive REPL. Useful for quick
     /// one-offs; the typed methods above are the structured API.
     fn run_command(&mut self, line: &str) -> PyResult<()> {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.is_empty() {
+        if line.trim().is_empty() {
             return Ok(());
         }
         let mut state = ReplState::for_oneshot(&mut self.inner);
         state.line = line.trim().to_string();
-        state.dispatch(&parts).map(|_| ()).map_err(err)
+        state.dispatch_line(line).map(|_| ()).map_err(err)
     }
 
     /// Remove all breakpoints and leave the VM running. Called automatically

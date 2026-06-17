@@ -2,6 +2,7 @@ use owo_colors::OwoColorize;
 
 use crate::error::{Error, Result};
 use crate::expr::Expr;
+use crate::repl::CommandInvocation;
 use crate::target::Target;
 use crate::types::VirtAddr;
 use crate::ui;
@@ -13,15 +14,15 @@ pub struct AddressRange {
 
 impl AddressRange {
     pub fn parse(
-        parts: &[&str],
+        invocation: &CommandInvocation<'_>,
         debugger: &Target,
         default_count: u64,
         item_size: u64,
     ) -> Result<Self> {
-        let start_arg = parts.get(1).ok_or(Error::InvalidRange)?;
+        let start_arg = invocation.arg(0).ok_or(Error::InvalidRange)?;
         let start = Expr::eval(start_arg, debugger)?;
 
-        let end = if let Some(end_arg) = parts.get(2) {
+        let end = if let Some(end_arg) = invocation.arg(1) {
             let end = Expr::eval(end_arg, debugger)?;
             if end.0 < start.0 {
                 start + end.0 * item_size
