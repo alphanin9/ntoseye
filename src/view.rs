@@ -1,8 +1,8 @@
 use crate::bugchecks::BugcheckAnalysis;
 use crate::target::{
-    AddressDescription, DeviceObjectDetail, DriverObjectDetail, IoStackLocationInfo, IrpHit,
-    IrpInfo, NotifyCallback, ObjectHeaderDetail, PteLevel, SsdtTable, Target,
-    irp_major_function_name, kthread_state_name, wait_reason_name,
+    AddressDescription, AddressModule, DeviceObjectDetail, DriverObjectDetail, IoStackLocationInfo,
+    IrpHit, IrpInfo, MemoryRegionInfo, MemorySearchMatch, NotifyCallback, ObjectHeaderDetail,
+    PteLevel, SsdtTable, Target, irp_major_function_name, kthread_state_name, wait_reason_name,
 };
 
 // Shared shape for SDK/MCP structure rendering; surfaces disagree only on how
@@ -296,26 +296,30 @@ pub fn irp_hit(h: &IrpHit) -> View {
 
 /// What an address belongs to (the loaded module/section, the process VAD
 /// region, or nothing recognized).
+fn address_module(m: &AddressModule) -> View {
+    View::Object(vec![
+        ("name", View::Str(m.name.clone())),
+        ("base", View::Hex(m.base.0)),
+        ("size", View::Num(m.size as u64)),
+        ("offset", View::Hex(m.offset)),
+    ])
+}
+
+fn memory_region(r: &MemoryRegionInfo) -> View {
+    View::Object(vec![
+        ("start", View::Hex(r.start.0)),
+        ("end", View::Hex(r.end.0)),
+        ("protection", View::OptNum(r.protection)),
+        ("vad_type", View::OptNum(r.vad_type)),
+        ("private_memory", View::OptBool(r.private_memory)),
+        ("commit_charge", View::OptNum(r.commit_charge)),
+        ("details", View::OptStr(r.details.clone())),
+    ])
+}
+
 pub fn address_description(d: &AddressDescription) -> View {
-    let module = d.module.as_ref().map_or(View::Null, |m| {
-        View::Object(vec![
-            ("name", View::Str(m.name.clone())),
-            ("base", View::Hex(m.base.0)),
-            ("size", View::Num(m.size as u64)),
-            ("offset", View::Hex(m.offset)),
-        ])
-    });
-    let region = d.region.as_ref().map_or(View::Null, |r| {
-        View::Object(vec![
-            ("start", View::Hex(r.start.0)),
-            ("end", View::Hex(r.end.0)),
-            ("protection", View::OptNum(r.protection)),
-            ("vad_type", View::OptNum(r.vad_type)),
-            ("private_memory", View::OptBool(r.private_memory)),
-            ("commit_charge", View::OptNum(r.commit_charge)),
-            ("details", View::OptStr(r.details.clone())),
-        ])
-    });
+    let module = d.module.as_ref().map_or(View::Null, address_module);
+    let region = d.region.as_ref().map_or(View::Null, memory_region);
     View::Object(vec![
         ("address", View::Hex(d.address.0)),
         ("dtb", View::Hex(d.dtb)),
@@ -324,6 +328,27 @@ pub fn address_description(d: &AddressDescription) -> View {
         ("section", View::OptStr(d.section.clone())),
         ("va_type", View::OptStr(d.va_type.clone())),
         ("region", region),
+    ])
+}
+
+/// One structured memory-search hit.
+pub fn memory_search_match(m: &MemorySearchMatch) -> View {
+    let d = &m.description;
+    View::Object(vec![
+        ("address", View::Hex(m.address.0)),
+        ("offset", View::Hex(m.offset)),
+        ("symbol", View::OptStr(m.symbol.clone())),
+        ("kind", View::Str(d.kind.to_string())),
+        (
+            "module",
+            d.module.as_ref().map_or(View::Null, address_module),
+        ),
+        ("section", View::OptStr(d.section.clone())),
+        ("va_type", View::OptStr(d.va_type.clone())),
+        (
+            "region",
+            d.region.as_ref().map_or(View::Null, memory_region),
+        ),
     ])
 }
 

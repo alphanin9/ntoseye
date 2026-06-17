@@ -431,8 +431,8 @@ const READ_C_STRING_MAX_LENGTH: usize = 4096;
 const READ_C_STRING_DEFAULT_LENGTH: usize = 260; // MAX_PATH, the common case
 const WRITE_MEMORY_MAX_LENGTH: usize = 4096;
 const SEARCH_MAX_LENGTH: usize = 1 << 20; // 1 MiB scanned per call
-const SEARCH_DEFAULT_LIMIT: usize = 256;
-const SEARCH_MAX_LIMIT: usize = 4096;
+const SEARCH_DEFAULT_LIMIT: usize = 50;
+const SEARCH_MAX_LIMIT: usize = 500;
 
 const DISASSEMBLE_MAX_COUNT: usize = 128;
 const BACKTRACE_DEFAULT_LIMIT: usize = 64;
@@ -1742,7 +1742,7 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "Search guest memory in the current address space: scan `length` bytes from `start` for a byte `pattern` (contiguous lowercase hex). Returns {start, length, total, offset, returned, has_more, next_offset?, matches:[addr...]}; `total` is the full match count and `matches` is the offset/limit window."
+        description = "Search guest memory in the current address space: scan `length` bytes from `start` for a byte `pattern` (contiguous lowercase hex). Returns {start, length, total, offset, returned, has_more, next_offset?, matches:[{address, offset, symbol, kind, module, section, va_type, region}]}; `total` is the full match count and `matches` is the offset/limit window."
     )]
     async fn search(
         &self,
@@ -1769,11 +1769,13 @@ impl NtoseyeMcp {
                     .search(VirtAddr(start_addr), &needle, length)
                     .map_err(ToolError::from)?;
                 let total = matches.len();
-                let items: Vec<Value> = matches
-                    .into_iter()
-                    .skip(offset)
-                    .take(limit)
-                    .map(|a| Value::from(hex(a)))
+                let page: Vec<u64> = matches.into_iter().skip(offset).take(limit).collect();
+                let items: Vec<Value> = ctx
+                    .target
+                    .describe_search_matches(VirtAddr(start_addr), &page)
+                    .map_err(ToolError::from)?
+                    .iter()
+                    .map(|m| view::to_json(&view::memory_search_match(m)))
                     .collect();
                 let mut out = paged(total, offset, "matches", items);
                 out["start"] = Value::from(hex(start_addr));

@@ -396,10 +396,6 @@ impl ReplState<'_> {
                 hits.len() - 1
             );
         }
-        // TODO: expose search results to Python scripts as a list
-        // of {address, symbol} rows so scripts can iterate over
-        // every match (e.g. nop/patch all hits, or filter by
-        // symbol); the $0..$N slots only cover acting on one
         self.ctx.target.set_results(hits, self.line.clone());
         println!();
 

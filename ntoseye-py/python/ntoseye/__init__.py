@@ -8,9 +8,12 @@ See the project README and `examples/` for more.
 """
 
 from ._ntoseye import (
+    AddressModule,
     Breakpoint,
     Debugger,
     MemoryAccessError,
+    MemoryRegion,
+    MemorySearchMatch,
     NtoseyeError,
     StopOutcome,
     Struct,
@@ -20,9 +23,12 @@ from ._ntoseye import (
 )
 
 __all__ = [
+    "AddressModule",
     "Breakpoint",
     "Debugger",
     "MemoryAccessError",
+    "MemoryRegion",
+    "MemorySearchMatch",
     "NtoseyeError",
     "StopOutcome",
     "Type",

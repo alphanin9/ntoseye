@@ -23,6 +23,10 @@ use crate::memory_backend::MemoryBackend;
 use crate::repl::ReplState;
 use crate::session::{ContinueOutcome, Session};
 use crate::symbols::{FieldValue, ParsedType, TypeInfo, le_uint};
+use crate::target::{
+    AddressModule as CoreAddressModule, MemoryRegionInfo,
+    MemorySearchMatch as CoreMemorySearchMatch,
+};
 use crate::types::VirtAddr;
 use crate::view;
 
@@ -453,6 +457,244 @@ impl StopOutcome {
     }
 }
 
+/// Module context for a structured memory-search hit.
+#[pyclass(unsendable, skip_from_py_object)]
+#[derive(Clone)]
+pub struct AddressModule {
+    name: String,
+    base: u64,
+    size: u32,
+    offset: u64,
+}
+
+impl From<CoreAddressModule> for AddressModule {
+    fn from(module: CoreAddressModule) -> Self {
+        Self {
+            name: module.name,
+            base: module.base.0,
+            size: module.size,
+            offset: module.offset,
+        }
+    }
+}
+
+#[pymethods]
+impl AddressModule {
+    #[getter]
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[getter]
+    fn base(&self) -> u64 {
+        self.base
+    }
+
+    #[getter]
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    #[getter]
+    fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("name", &self.name)?;
+        d.set_item("base", self.base)?;
+        d.set_item("size", self.size)?;
+        d.set_item("offset", self.offset)?;
+        Ok(d)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<AddressModule {} base={:#x}>", self.name, self.base)
+    }
+}
+
+/// VAD/context region for a structured memory-search hit.
+#[pyclass(unsendable, skip_from_py_object)]
+#[derive(Clone)]
+pub struct MemoryRegion {
+    start: u64,
+    end: u64,
+    protection: Option<u64>,
+    vad_type: Option<u64>,
+    private_memory: Option<bool>,
+    commit_charge: Option<u64>,
+    details: Option<String>,
+}
+
+impl From<MemoryRegionInfo> for MemoryRegion {
+    fn from(region: MemoryRegionInfo) -> Self {
+        Self {
+            start: region.start.0,
+            end: region.end.0,
+            protection: region.protection,
+            vad_type: region.vad_type,
+            private_memory: region.private_memory,
+            commit_charge: region.commit_charge,
+            details: region.details,
+        }
+    }
+}
+
+#[pymethods]
+impl MemoryRegion {
+    #[getter]
+    fn start(&self) -> u64 {
+        self.start
+    }
+
+    #[getter]
+    fn end(&self) -> u64 {
+        self.end
+    }
+
+    #[getter]
+    fn protection(&self) -> Option<u64> {
+        self.protection
+    }
+
+    #[getter]
+    fn vad_type(&self) -> Option<u64> {
+        self.vad_type
+    }
+
+    #[getter]
+    fn private_memory(&self) -> Option<bool> {
+        self.private_memory
+    }
+
+    #[getter]
+    fn commit_charge(&self) -> Option<u64> {
+        self.commit_charge
+    }
+
+    #[getter]
+    fn details(&self) -> Option<String> {
+        self.details.clone()
+    }
+
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("start", self.start)?;
+        d.set_item("end", self.end)?;
+        d.set_item("protection", self.protection)?;
+        d.set_item("vad_type", self.vad_type)?;
+        d.set_item("private_memory", self.private_memory)?;
+        d.set_item("commit_charge", self.commit_charge)?;
+        d.set_item("details", self.details.clone())?;
+        Ok(d)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<MemoryRegion {:#x}..{:#x}>", self.start, self.end)
+    }
+}
+
+/// A memory-search hit with symbol and location context.
+#[pyclass(unsendable, skip_from_py_object)]
+#[derive(Clone)]
+pub struct MemorySearchMatch {
+    address: u64,
+    offset: u64,
+    symbol: Option<String>,
+    kind: String,
+    module: Option<AddressModule>,
+    section: Option<String>,
+    va_type: Option<String>,
+    region: Option<MemoryRegion>,
+}
+
+impl MemorySearchMatch {
+    fn from_core(hit: CoreMemorySearchMatch) -> Self {
+        Self {
+            address: hit.address.0,
+            offset: hit.offset,
+            symbol: hit.symbol,
+            kind: hit.description.kind.to_string(),
+            module: hit.description.module.map(AddressModule::from),
+            section: hit.description.section,
+            va_type: hit.description.va_type,
+            region: hit.description.region.map(MemoryRegion::from),
+        }
+    }
+}
+
+#[pymethods]
+impl MemorySearchMatch {
+    #[getter]
+    fn address(&self) -> u64 {
+        self.address
+    }
+
+    #[getter]
+    fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    #[getter]
+    fn symbol(&self) -> Option<String> {
+        self.symbol.clone()
+    }
+
+    #[getter]
+    fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    #[getter]
+    fn module(&self) -> Option<AddressModule> {
+        self.module.clone()
+    }
+
+    #[getter]
+    fn section(&self) -> Option<String> {
+        self.section.clone()
+    }
+
+    #[getter]
+    fn va_type(&self) -> Option<String> {
+        self.va_type.clone()
+    }
+
+    #[getter]
+    fn region(&self) -> Option<MemoryRegion> {
+        self.region.clone()
+    }
+
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("address", self.address)?;
+        d.set_item("offset", self.offset)?;
+        d.set_item("symbol", self.symbol.clone())?;
+        d.set_item("kind", &self.kind)?;
+        if let Some(module) = &self.module {
+            d.set_item("module", module.to_dict(py)?)?;
+        } else {
+            d.set_item("module", py.None())?;
+        }
+        d.set_item("section", self.section.clone())?;
+        d.set_item("va_type", self.va_type.clone())?;
+        if let Some(region) = &self.region {
+            d.set_item("region", region.to_dict(py)?)?;
+        } else {
+            d.set_item("region", py.None())?;
+        }
+        Ok(d)
+    }
+
+    fn __repr__(&self) -> String {
+        match &self.symbol {
+            Some(symbol) => format!("<MemorySearchMatch {:#x} {}>", self.address, symbol),
+            None => format!("<MemorySearchMatch {:#x}>", self.address),
+        }
+    }
+}
+
 #[pymethods]
 impl StopOutcome {
     #[getter]
@@ -689,6 +931,26 @@ impl Debugger {
         self.inner
             .target
             .search(VirtAddr(start), pattern, length)
+            .map_err(err)
+    }
+
+    /// Search memory and return typed rows with address, offset, nearest symbol,
+    /// and module/region context. `search` is the cheaper address-only variant.
+    fn search_details(
+        &self,
+        start: u64,
+        pattern: &[u8],
+        length: usize,
+    ) -> PyResult<Vec<MemorySearchMatch>> {
+        if length > MAX_SEARCH_LEN {
+            return Err(raise(format!(
+                "search length {length} exceeds cap {MAX_SEARCH_LEN} (0x{MAX_SEARCH_LEN:x})"
+            )));
+        }
+        self.inner
+            .target
+            .search_details(VirtAddr(start), pattern, length)
+            .map(|matches| matches.into_iter().map(MemorySearchMatch::from_core).collect())
             .map_err(err)
     }
 
@@ -2421,6 +2683,9 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Debugger>()?;
     m.add_class::<Breakpoint>()?;
     m.add_class::<StopOutcome>()?;
+    m.add_class::<AddressModule>()?;
+    m.add_class::<MemoryRegion>()?;
+    m.add_class::<MemorySearchMatch>()?;
     m.add_class::<Type>()?;
     m.add_class::<Struct>()?;
     m.add_function(wrap_pyfunction!(attach, m)?)?;
