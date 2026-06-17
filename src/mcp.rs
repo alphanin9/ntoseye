@@ -357,8 +357,8 @@ struct SearchArgs {
     )]
     offset: Option<usize>,
     #[schemars(
-        range(min = 1, max = 4096),
-        description = "Max matches to return from offset (default 256, range 1-4096). A short pattern over a dense region can match millions of times."
+        range(min = 1, max = 500),
+        description = "Max matches to return from offset (default 50, range 1-500). A short pattern over a dense region can match millions of times."
     )]
     limit: Option<usize>,
 }
