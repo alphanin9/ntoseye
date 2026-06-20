@@ -26,11 +26,13 @@ class _Completion:
 
 Process = _Completion("process")
 Symbol = _Completion("symbol")
+Expression = _Completion("expression")
 Type = _Completion("type")
 Driver = _Completion("driver")
 Thread = _Completion("thread")
 Vcpu = _Completion("vcpu")
 Breakpoint = _Completion("breakpoint")
+Alias = _Completion("alias")
 
 
 def register_command(
@@ -63,9 +65,11 @@ __all__ = [
     "command",
     "Process",
     "Symbol",
+    "Expression",
     "Type",
     "Driver",
     "Thread",
     "Vcpu",
     "Breakpoint",
+    "Alias",
 ]

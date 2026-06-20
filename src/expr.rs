@@ -3,6 +3,14 @@ use crate::error::{Error, Result};
 use crate::symbols::{ParsedType, SymbolStore};
 use crate::target::Target;
 use crate::types::{Dtb, VirtAddr};
+use crate::ui;
+use owo_colors::OwoColorize;
+use std::ops::Range;
+use winnow::Parser;
+use winnow::combinator::{alt, peek, repeat};
+use winnow::error::{ErrMode, ModalResult, ParserError};
+use winnow::stream::{LocatingSlice, Location, Stream};
+use winnow::token::{literal, one_of, take_till, take_while};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExprType {
@@ -29,10 +37,38 @@ pub enum Expr {
     FieldAccess(Box<Expr>, String),
     /// `expr[index]`
     Index(Box<Expr>, u64),
-    Add(Box<Expr>, u64),
-    Sub(Box<Expr>, u64),
+    Add(Box<Expr>, Box<Expr>),
+    Sub(Box<Expr>, Box<Expr>),
     /// `(TYPE)expr` or `(TYPE*)expr`
     Cast(Box<Expr>, ExprType),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExprParseError {
+    pub span: Range<usize>,
+    pub label: String,
+}
+
+impl ExprParseError {
+    fn new(span: Range<usize>, label: impl Into<String>) -> Self {
+        Self {
+            span,
+            label: label.into(),
+        }
+    }
+
+    pub fn render(&self, input: &str) -> String {
+        let start = self.span.start.min(input.len());
+        let end = self.span.end.min(input.len()).max(start + 1);
+        let caret_width = end.saturating_sub(start).max(1);
+        format!(
+            "{}\n{}{} {}",
+            input,
+            " ".repeat(start),
+            "^".repeat(caret_width).red(),
+            ui::muted(&self.label)
+        )
+    }
 }
 
 impl Expr {
@@ -41,101 +77,26 @@ impl Expr {
     }
 
     pub fn parse(input: &str) -> Result<Self> {
-        let input = input.trim();
-        if input.is_empty() {
-            return Err(Error::InvalidExpression("empty expression".into()));
-        }
-        let (expr, suffix) = Self::parse_base_with_suffix(input)?;
-        if suffix.is_empty() {
-            Ok(expr)
-        } else {
-            Self::parse_suffix(expr, suffix)
-        }
+        Self::parse_detailed(input).map_err(|err| Error::InvalidExpression(err.render(input)))
     }
 
-    fn split_parens(input: &str) -> Result<(&str, &str)> {
-        let mut depth = 0;
-        for (i, c) in input.char_indices() {
-            match c {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        let inner = &input[1..i];
-                        let rest = input[i + 1..].trim();
-                        return Ok((inner, rest));
-                    }
-                }
-                _ => {}
-            }
+    pub fn parse_detailed(input: &str) -> std::result::Result<Self, ExprParseError> {
+        let mut input = LocatingSlice::new(input);
+        let expr = parse_additive
+            .parse_next(&mut input)
+            .map_err(unwrap_parse_error)?;
+        ws0.parse_next(&mut input).map_err(unwrap_parse_error)?;
+        if input.peek_token().is_some() {
+            return Err(error_at(&input, "expected end of expression"));
         }
-        Err(Error::InvalidExpression("unmatched parentheses".into()))
+        Ok(expr)
     }
 
-    /// check if a string looks like a valid type name for casting
     fn is_type_name(s: &str) -> bool {
         let s = s.trim().trim_end_matches('*').trim();
         !s.is_empty()
             && s.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
             && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    }
-
-    fn parse_base_with_suffix(input: &str) -> Result<(Expr, String)> {
-        let input = input.trim();
-
-        if input.starts_with('(') {
-            let (inner, rest) = Self::split_parens(input)?;
-
-            // try as cast: (TYPE)expr, must have a valid type name and something after
-            if !rest.is_empty() && Self::is_type_name(inner) {
-                let expr_type = Self::parse_type(inner)?;
-                let (base_expr, suffix) = Self::parse_base_with_suffix(rest)?;
-                let cast_expr = Expr::Cast(Box::new(base_expr), expr_type);
-                if suffix.is_empty() {
-                    return Ok((cast_expr, String::new()));
-                }
-                return Ok((Self::parse_suffix(cast_expr, suffix)?, String::new()));
-            }
-
-            // otherwise it's grouping: (expr)
-            let expr = Self::parse(inner)?;
-            return Ok((expr, rest.to_string()));
-        }
-
-        if let Some(stripped) = input.strip_prefix('*') {
-            let (inner, suffix) = Self::parse_base_with_suffix(stripped.trim())?;
-            return Ok((Expr::Deref(Box::new(inner)), suffix));
-        }
-
-        if let Some(stripped) = input.strip_prefix('$') {
-            let name_end = stripped
-                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                .unwrap_or(stripped.len());
-            let reg_name = &stripped[..name_end];
-            if reg_name.is_empty() {
-                return Err(Error::InvalidExpression("empty register name".into()));
-            }
-            let suffix = stripped[name_end..].trim().to_string();
-            return Ok((Expr::Register(reg_name.to_string()), suffix));
-        }
-
-        if Self::starts_numeric(input) {
-            let (value, remaining) = Self::parse_value(input)?;
-            return Ok((Expr::Literal(VirtAddr(value)), remaining));
-        }
-
-        let suffix_start = Self::find_suffix_start(input);
-        if suffix_start > 0 {
-            let symbol_name = input[..suffix_start].trim();
-            let suffix = input[suffix_start..].trim().to_string();
-            Ok((Expr::Symbol(symbol_name.to_string()), suffix))
-        } else {
-            Ok((Expr::Symbol(input.to_string()), String::new()))
-        }
-    }
-
-    fn find_suffix_start(input: &str) -> usize {
-        input.find(['+', '-', '[']).unwrap_or(0)
     }
 
     fn parse_type(type_str: &str) -> Result<ExprType> {
@@ -160,90 +121,6 @@ impl Expr {
             | "size_t" | "uint64_t" | "int64_t" | "usize" => Ok(ExprType::Qword),
             _ => Ok(ExprType::Struct(type_str.to_string())),
         }
-    }
-
-    fn parse_suffix(expr: Expr, rest: String) -> Result<Expr> {
-        let rest = rest.trim();
-
-        if rest.is_empty() {
-            return Ok(expr);
-        }
-
-        // field access
-        if rest.starts_with("->") {
-            let rest = rest.trim_start_matches("->").trim_start();
-            let field_end = rest
-                .find(|c: char| c == '+' || c == '-' || c == '[' || c.is_whitespace())
-                .unwrap_or(rest.len());
-            let field_name = rest[..field_end].trim().to_string();
-            let remaining = rest[field_end..].trim().to_string();
-            let result = Expr::FieldAccess(Box::new(expr), field_name);
-            return Self::parse_suffix(result, remaining);
-        }
-
-        // array
-        if rest.starts_with('[') {
-            let close = rest
-                .find(']')
-                .ok_or_else(|| Error::InvalidExpression("unmatched '['".into()))?;
-            let index_str = rest[1..close].trim();
-            let (index, _) = Self::parse_value(index_str)?;
-            let remaining = rest[close + 1..].trim().to_string();
-            let result = Expr::Index(Box::new(expr), index);
-            return Self::parse_suffix(result, remaining);
-        }
-
-        if rest.starts_with('+') {
-            let rest = rest.trim_start_matches('+').trim();
-            let (value, remaining) = Self::parse_value(rest)?;
-            let result = Expr::Add(Box::new(expr), value);
-            return Self::parse_suffix(result, remaining);
-        }
-
-        if rest.starts_with('-') {
-            let rest = rest.trim_start_matches('-').trim();
-            let (value, remaining) = Self::parse_value(rest)?;
-            let result = Expr::Sub(Box::new(expr), value);
-            return Self::parse_suffix(result, remaining);
-        }
-
-        Err(Error::InvalidExpression(format!(
-            "unexpected token: {}",
-            rest
-        )))
-    }
-
-    fn parse_value(s: &str) -> Result<(u64, String)> {
-        let s = s.trim();
-
-        let end = s
-            .find(|c: char| c.is_whitespace() || c == ')' || c == '+' || c == '-')
-            .unwrap_or(s.len());
-        let value_str = &s[..end];
-        let remaining = s[end..].trim().to_string();
-
-        let value = if value_str.starts_with("0x") || value_str.starts_with("0X") {
-            u64::from_str_radix(&value_str[2..], 16).map_err(|_| {
-                Error::InvalidExpression(format!("invalid hex value: {}", value_str))
-            })?
-        } else if value_str.starts_with("0b") || value_str.starts_with("0B") {
-            u64::from_str_radix(&value_str[2..], 2).map_err(|_| {
-                Error::InvalidExpression(format!("invalid binary value: {}", value_str))
-            })?
-        } else {
-            value_str.parse::<u64>().map_err(|_| {
-                Error::InvalidExpression(format!("invalid numeric value: {}", value_str))
-            })?
-        };
-
-        Ok((value, remaining))
-    }
-
-    fn starts_numeric(s: &str) -> bool {
-        s.trim_start()
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_digit())
     }
 
     pub fn resolve(&self, context: &Target) -> Result<VirtAddr> {
@@ -354,14 +231,16 @@ impl Expr {
                 Ok(base_addr + index * elem_size)
             }
 
-            Expr::Add(inner, value) => {
-                let base = inner.resolve(context)?;
-                Ok(base + *value)
+            Expr::Add(lhs, rhs) => {
+                let base = lhs.resolve(context)?;
+                let value = rhs.resolve(context)?;
+                Ok(base + value.0)
             }
 
-            Expr::Sub(inner, value) => {
-                let base = inner.resolve(context)?;
-                Ok(base - *value)
+            Expr::Sub(lhs, rhs) => {
+                let base = lhs.resolve(context)?;
+                let value = rhs.resolve(context)?;
+                Ok(base - value.0)
             }
 
             Expr::Cast(expr, _) => expr.resolve(context),
@@ -471,349 +350,256 @@ impl Expr {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+type ExprInput<'a> = LocatingSlice<&'a str>;
+type ParseResult<T> = ModalResult<T, ExprParseError>;
 
-    #[test]
-    fn test_parse_symbol() {
-        let expr = Expr::parse("PsInitialSystemProcess").unwrap();
-        assert_eq!(expr, Expr::Symbol("PsInitialSystemProcess".to_string()));
+impl<'a> ParserError<ExprInput<'a>> for ExprParseError {
+    type Inner = Self;
+
+    fn from_input(input: &ExprInput<'a>) -> Self {
+        error_at(input, "expected expression")
     }
 
-    #[test]
-    fn test_parse_literal() {
-        let expr = Expr::parse("0xfffff80123456789").unwrap();
-        assert_eq!(expr, Expr::Literal(VirtAddr(0xfffff80123456789)));
+    fn into_inner(self) -> std::result::Result<Self::Inner, Self> {
+        Ok(self)
     }
 
-    #[test]
-    fn test_parse_hex_literal_with_addition() {
-        let expr = Expr::parse("0xffffa304cb692040 + 584").unwrap();
-        assert_eq!(
-            expr,
-            Expr::Add(Box::new(Expr::Literal(VirtAddr(0xffffa304cb692040))), 584)
-        );
-    }
-
-    #[test]
-    fn test_parse_decimal_literal_with_addition() {
-        let expr = Expr::parse("1000 + 24").unwrap();
-        assert_eq!(expr, Expr::Add(Box::new(Expr::Literal(VirtAddr(1000))), 24));
-    }
-
-    #[test]
-    fn test_parse_bare_hex_stays_symbol_until_resolution() {
-        let expr = Expr::parse("fffff80123456789").unwrap();
-        assert_eq!(expr, Expr::Symbol("fffff80123456789".to_string()));
-    }
-
-    #[test]
-    fn test_parse_bare_decimal_stays_decimal_literal() {
-        let expr = Expr::parse("1000").unwrap();
-        assert_eq!(expr, Expr::Literal(VirtAddr(1000)));
-    }
-
-    #[test]
-    fn test_bare_hex_literal_fallback_requires_hex_letter() {
-        assert_eq!(
-            Expr::parse_bare_hex_literal("fffff80123456789"),
-            Some(0xfffff80123456789)
-        );
-        assert_eq!(Expr::parse_bare_hex_literal("DEADBEEF"), Some(0xdeadbeef));
-        assert_eq!(Expr::parse_bare_hex_literal("1000"), None);
-        assert_eq!(Expr::parse_bare_hex_literal("nt!KeBugCheck"), None);
-    }
-
-    #[test]
-    fn test_parse_deref() {
-        let expr = Expr::parse("*PsInitialSystemProcess").unwrap();
-        assert_eq!(
-            expr,
-            Expr::Deref(Box::new(Expr::Symbol("PsInitialSystemProcess".to_string())))
-        );
-    }
-
-    #[test]
-    fn test_parse_addition() {
-        let expr = Expr::parse("PsInitialSystemProcess + 0x20").unwrap();
-        assert_eq!(
-            expr,
-            Expr::Add(
-                Box::new(Expr::Symbol("PsInitialSystemProcess".to_string())),
-                0x20
-            )
-        );
-    }
-
-    #[test]
-    fn test_parse_parentheses() {
-        let expr = Expr::parse("(PsInitialSystemProcess + 0x20)").unwrap();
-        assert_eq!(
-            expr,
-            Expr::Add(
-                Box::new(Expr::Symbol("PsInitialSystemProcess".to_string())),
-                0x20
-            )
-        );
-    }
-
-    #[test]
-    fn test_parse_complex() {
-        let expr = Expr::parse("*PsInitialSystemProcess + 8").unwrap();
-        assert_eq!(
-            expr,
-            Expr::Add(
-                Box::new(Expr::Deref(Box::new(Expr::Symbol(
-                    "PsInitialSystemProcess".to_string()
-                )))),
-                8
-            )
-        );
-    }
-
-    #[test]
-    fn test_parse_field_access() {
-        let expr = Expr::parse("PsInitialSystemProcess->Token").unwrap();
-        assert_eq!(
-            expr,
-            Expr::FieldAccess(
-                Box::new(Expr::Symbol("PsInitialSystemProcess".to_string())),
-                "Token".to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn test_parse_cast_primitive() {
-        let expr = Expr::parse("(dword)0x12345678").unwrap();
-        assert_eq!(
-            expr,
-            Expr::Cast(
-                Box::new(Expr::Literal(VirtAddr(0x12345678))),
-                ExprType::Dword
-            )
-        );
-    }
-
-    #[test]
-    fn test_parse_cast_struct() {
-        let expr = Expr::parse("(EPROCESS)PsInitialSystemProcess").unwrap();
-        assert_eq!(
-            expr,
-            Expr::Cast(
-                Box::new(Expr::Symbol("PsInitialSystemProcess".to_string())),
-                ExprType::Struct("EPROCESS".to_string())
-            )
-        );
-    }
-
-    #[test]
-    fn test_parse_cast_pointer() {
-        let expr = Expr::parse("(EPROCESS*)addr").unwrap();
-        assert_eq!(
-            expr,
-            Expr::Cast(
-                Box::new(Expr::Symbol("addr".to_string())),
-                ExprType::Pointer(Box::new(ExprType::Struct("EPROCESS".to_string())))
-            )
-        );
-    }
-
-    #[test]
-    fn test_parse_cast_with_field_access() {
-        let expr = Expr::parse("(EPROCESS)PsInitialSystemProcess->Token").unwrap();
-        assert_eq!(
-            expr,
-            Expr::FieldAccess(
-                Box::new(Expr::Cast(
-                    Box::new(Expr::Symbol("PsInitialSystemProcess".to_string())),
-                    ExprType::Struct("EPROCESS".to_string())
-                )),
-                "Token".to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn test_parse_nested_field_access() {
-        let expr = Expr::parse("(EPROCESS)PsInitialSystemProcess->Token->Value").unwrap();
-        // should parse as FieldAccess(FieldAccess(Cast(Symbol, EPROCESS), Token), Value)
-        if let Expr::FieldAccess(inner, field2) = &expr {
-            assert_eq!(field2, "Value");
-            if let Expr::FieldAccess(inner2, field1) = inner.as_ref() {
-                assert_eq!(field1, "Token");
-                if let Expr::Cast(_, expr_type) = inner2.as_ref() {
-                    assert!(matches!(expr_type, ExprType::Struct(name) if name == "EPROCESS"));
-                } else {
-                    panic!("Expected Cast");
-                }
-            } else {
-                panic!("Expected FieldAccess");
-            }
+    fn or(self, other: Self) -> Self {
+        if other.span.start >= self.span.start {
+            other
         } else {
-            panic!("Expected FieldAccess");
+            self
         }
-    }
-
-    #[test]
-    fn test_parse_deref_with_cast() {
-        let expr = Expr::parse("*(dword)addr").unwrap();
-        assert_eq!(
-            expr,
-            Expr::Deref(Box::new(Expr::Cast(
-                Box::new(Expr::Symbol("addr".to_string())),
-                ExprType::Dword
-            )))
-        );
-    }
-
-    #[test]
-    fn test_parse_cast_with_arithmetic() {
-        let expr = Expr::parse("(qword)(addr + 0x10)").unwrap();
-        assert_eq!(
-            expr,
-            Expr::Cast(
-                Box::new(Expr::Add(Box::new(Expr::Symbol("addr".to_string())), 0x10)),
-                ExprType::Qword
-            )
-        );
-    }
-
-    #[test]
-    fn test_parse_cast_pointer_with_literal_and_field() {
-        let expr = Expr::parse("(EPROCESS*)(0xffffe70c61240080)->Token").unwrap();
-        // should parse as FieldAccess(Cast(Literal(addr), Pointer(EPROCESS)), "Token")
-        if let Expr::FieldAccess(inner, field) = &expr {
-            assert_eq!(field, "Token");
-            if let Expr::Cast(inner2, expr_type) = inner.as_ref() {
-                if let ExprType::Pointer(inner_type) = expr_type {
-                    if let ExprType::Struct(name) = inner_type.as_ref() {
-                        assert_eq!(name, "EPROCESS");
-                    } else {
-                        panic!("Expected Struct");
-                    }
-                } else {
-                    panic!("Expected Pointer");
-                }
-                if let Expr::Literal(addr) = inner2.as_ref() {
-                    assert_eq!(addr.0, 0xffffe70c61240080);
-                } else {
-                    panic!("Expected Literal, got {:?}", inner2);
-                }
-            } else {
-                panic!("Expected Cast, got {:?}", inner);
-            }
-        } else {
-            panic!("Expected FieldAccess, got {:?}", expr);
-        }
-    }
-
-    #[test]
-    fn test_parse_cast_struct_with_literal_and_field() {
-        let expr = Expr::parse("(EPROCESS)(0xffffe70c61240080)->Token").unwrap();
-        // should parse as FieldAccess(Cast(Literal(addr), EPROCESS), "Token")
-        if let Expr::FieldAccess(inner, field) = &expr {
-            assert_eq!(field, "Token");
-            if let Expr::Cast(inner2, expr_type) = inner.as_ref() {
-                if let ExprType::Struct(name) = expr_type {
-                    assert_eq!(name, "EPROCESS");
-                } else {
-                    panic!("Expected Struct");
-                }
-                if let Expr::Literal(addr) = inner2.as_ref() {
-                    assert_eq!(addr.0, 0xffffe70c61240080);
-                } else {
-                    panic!("Expected Literal, got {:?}", inner2);
-                }
-            } else {
-                panic!("Expected Cast, got {:?}", inner);
-            }
-        } else {
-            panic!("Expected FieldAccess, got {:?}", expr);
-        }
-    }
-
-    #[test]
-    fn test_parse_grouped_deref() {
-        // *(sym + 0x10) should parse as Deref(Add(Symbol, 0x10))
-        let expr = Expr::parse("*(PsInitialSystemProcess + 0x10)").unwrap();
-        assert_eq!(
-            expr,
-            Expr::Deref(Box::new(Expr::Add(
-                Box::new(Expr::Symbol("PsInitialSystemProcess".to_string())),
-                0x10
-            )))
-        );
-    }
-
-    #[test]
-    fn test_parse_grouped_deref_with_field() {
-        // *(EPROCESS)(*sym)->Token should parse correctly
-        let expr = Expr::parse("(_EPROCESS)(*PsInitialSystemProcess)->Token").unwrap();
-        if let Expr::FieldAccess(inner, field) = &expr {
-            assert_eq!(field, "Token");
-            if let Expr::Cast(inner2, _) = inner.as_ref() {
-                assert!(matches!(inner2.as_ref(), Expr::Deref(_)));
-            } else {
-                panic!("Expected Cast, got {:?}", inner);
-            }
-        } else {
-            panic!("Expected FieldAccess, got {:?}", expr);
-        }
-    }
-
-    #[test]
-    fn test_parse_index() {
-        let expr = Expr::parse("addr[3]").unwrap();
-        assert_eq!(
-            expr,
-            Expr::Index(Box::new(Expr::Symbol("addr".to_string())), 3)
-        );
-    }
-
-    #[test]
-    fn test_parse_index_hex() {
-        let expr = Expr::parse("addr[0x10]").unwrap();
-        assert_eq!(
-            expr,
-            Expr::Index(Box::new(Expr::Symbol("addr".to_string())), 0x10)
-        );
-    }
-
-    #[test]
-    fn test_parse_field_then_index() {
-        // (TYPE)addr->field[2] should parse as Index(FieldAccess(Cast(...), field), 2)
-        let expr = Expr::parse("(EPROCESS)addr->field[2]").unwrap();
-        if let Expr::Index(inner, index) = &expr {
-            assert_eq!(*index, 2);
-            assert!(matches!(inner.as_ref(), Expr::FieldAccess(_, _)));
-        } else {
-            panic!("Expected Index, got {:?}", expr);
-        }
-    }
-
-    #[test]
-    fn test_parse_register() {
-        let expr = Expr::parse("$rax").unwrap();
-        assert_eq!(expr, Expr::Register("rax".to_string()));
-    }
-
-    #[test]
-    fn test_parse_register_with_arithmetic() {
-        let expr = Expr::parse("$rsp+0x10").unwrap();
-        assert_eq!(
-            expr,
-            Expr::Add(Box::new(Expr::Register("rsp".to_string())), 0x10)
-        );
-    }
-
-    #[test]
-    fn test_parse_deref_register() {
-        let expr = Expr::parse("*$rsp").unwrap();
-        assert_eq!(
-            expr,
-            Expr::Deref(Box::new(Expr::Register("rsp".to_string())))
-        );
     }
 }
+
+enum Suffix {
+    Field(String),
+    Index(u64),
+}
+
+fn parse_additive(input: &mut ExprInput<'_>) -> ParseResult<Expr> {
+    let expr = parse_postfix.parse_next(input)?;
+    let terms: Vec<(char, Expr)> = repeat(0.., parse_additive_tail).parse_next(input)?;
+
+    Ok(terms
+        .into_iter()
+        .fold(expr, |expr, (op, rhs)| match (op, rhs) {
+            ('+', rhs) => Expr::Add(Box::new(expr), Box::new(rhs)),
+            ('-', rhs) => Expr::Sub(Box::new(expr), Box::new(rhs)),
+            _ => unreachable!(),
+        }))
+}
+
+fn parse_additive_tail(input: &mut ExprInput<'_>) -> ParseResult<(char, Expr)> {
+    ws0.parse_next(input)?;
+    let op = one_of(['+', '-']).parse_next(input)?;
+    let rhs = parse_postfix.parse_next(input).map_err(ErrMode::cut)?;
+    Ok((op, rhs))
+}
+
+fn parse_postfix(input: &mut ExprInput<'_>) -> ParseResult<Expr> {
+    let expr = parse_prefix.parse_next(input)?;
+    let suffixes: Vec<Suffix> =
+        repeat(0.., alt((parse_field_suffix, parse_index_suffix))).parse_next(input)?;
+
+    Ok(suffixes
+        .into_iter()
+        .fold(expr, |expr, suffix| match suffix {
+            Suffix::Field(field) => Expr::FieldAccess(Box::new(expr), field),
+            Suffix::Index(index) => Expr::Index(Box::new(expr), index),
+        }))
+}
+
+fn parse_field_suffix(input: &mut ExprInput<'_>) -> ParseResult<Suffix> {
+    ws0.parse_next(input)?;
+    literal("->").parse_next(input)?;
+    ws0.parse_next(input)?;
+    let field = parse_field_name
+        .parse_next(input)
+        .map_err(|_| ErrMode::Cut(error_at(input, "expected field name after '->'")))?;
+    Ok(Suffix::Field(field.to_string()))
+}
+
+fn parse_index_suffix(input: &mut ExprInput<'_>) -> ParseResult<Suffix> {
+    ws0.parse_next(input)?;
+    one_of('[').parse_next(input)?;
+    ws0.parse_next(input)?;
+    let index = parse_number_literal(input, "expected numeric index")?;
+    ws0.parse_next(input)?;
+    expect_char(input, ']', "expected ']'")?;
+    Ok(Suffix::Index(index))
+}
+
+fn parse_prefix(input: &mut ExprInput<'_>) -> ParseResult<Expr> {
+    ws0.parse_next(input)?;
+
+    alt((parse_deref_prefix, parse_poi, parse_cast, parse_atom)).parse_next(input)
+}
+
+fn parse_deref_prefix(input: &mut ExprInput<'_>) -> ParseResult<Expr> {
+    one_of('*').parse_next(input)?;
+    let inner = parse_prefix.parse_next(input).map_err(ErrMode::cut)?;
+    Ok(Expr::Deref(Box::new(inner)))
+}
+
+fn parse_poi(input: &mut ExprInput<'_>) -> ParseResult<Expr> {
+    literal("poi").parse_next(input)?;
+    ws0.parse_next(input)?;
+    one_of('(').parse_next(input)?;
+    ws0.parse_next(input)?;
+    let inner = parse_additive.parse_next(input).map_err(ErrMode::cut)?;
+    ws0.parse_next(input)?;
+    expect_char(input, ')', "expected ')' after poi expression")?;
+    Ok(Expr::Deref(Box::new(inner)))
+}
+
+fn parse_cast(input: &mut ExprInput<'_>) -> ParseResult<Expr> {
+    let expr_type = parse_cast_type.parse_next(input)?;
+    ws0.parse_next(input)?;
+    peek(parse_operand_start).parse_next(input)?;
+    let base = parse_prefix.parse_next(input).map_err(ErrMode::cut)?;
+    Ok(Expr::Cast(Box::new(base), expr_type))
+}
+
+fn parse_cast_type(input: &mut ExprInput<'_>) -> ParseResult<ExprType> {
+    one_of('(').parse_next(input)?;
+    ws0.parse_next(input)?;
+    let span = take_till(1.., ')').parse_next(input)?;
+    let type_str = span.trim();
+    if !Expr::is_type_name(type_str) {
+        return Err(ErrMode::Backtrack(error_at(input, "expected expression")));
+    }
+    let expr_type = Expr::parse_type(type_str)
+        .map_err(|_| ErrMode::Cut(error_at(input, "invalid cast type")))?;
+    expect_char(input, ')', "expected ')'")?;
+    Ok(expr_type)
+}
+
+fn parse_atom(input: &mut ExprInput<'_>) -> ParseResult<Expr> {
+    alt((
+        parse_group,
+        parse_register,
+        parse_literal_expr,
+        parse_symbol_expr,
+    ))
+    .parse_next(input)
+}
+
+fn parse_group(input: &mut ExprInput<'_>) -> ParseResult<Expr> {
+    one_of('(').parse_next(input)?;
+    ws0.parse_next(input)?;
+    let expr = parse_additive.parse_next(input).map_err(ErrMode::cut)?;
+    ws0.parse_next(input)?;
+    expect_char(input, ')', "expected ')'")?;
+    Ok(expr)
+}
+
+fn parse_register(input: &mut ExprInput<'_>) -> ParseResult<Expr> {
+    let (sigil, span) = one_of(['$', '@']).with_span().parse_next(input)?;
+    let name = parse_register_name.parse_next(input).map_err(|_| {
+        ErrMode::Cut(ExprParseError::new(
+            span,
+            format!("expected register name after '{sigil}'"),
+        ))
+    })?;
+    Ok(Expr::Register(name.to_string()))
+}
+
+fn parse_literal_expr(input: &mut ExprInput<'_>) -> ParseResult<Expr> {
+    peek(one_of('0'..='9')).parse_next(input)?;
+    let value = parse_number_literal(input, "expected numeric literal").map_err(ErrMode::cut)?;
+    Ok(Expr::Literal(VirtAddr(value)))
+}
+
+fn parse_symbol_expr(input: &mut ExprInput<'_>) -> ParseResult<Expr> {
+    let symbol = parse_symbol_name
+        .parse_next(input)
+        .map_err(|_| ErrMode::Backtrack(error_at(input, "expected expression")))?;
+    Ok(Expr::Symbol(symbol.to_string()))
+}
+
+fn parse_number_literal(input: &mut ExprInput<'_>, label: &'static str) -> ParseResult<u64> {
+    let (token, span) = parse_number_token
+        .with_span()
+        .parse_next(input)
+        .map_err(|_| ErrMode::Backtrack(error_at(input, label)))?;
+
+    if token.starts_with("0x") || token.starts_with("0X") {
+        return u64::from_str_radix(&token[2..], 16)
+            .map_err(|_| ErrMode::Cut(ExprParseError::new(span, "invalid hex literal")));
+    }
+    if token.starts_with("0b") || token.starts_with("0B") {
+        return u64::from_str_radix(&token[2..], 2)
+            .map_err(|_| ErrMode::Cut(ExprParseError::new(span, "invalid binary literal")));
+    }
+    token
+        .parse::<u64>()
+        .map_err(|_| ErrMode::Cut(ExprParseError::new(span, "invalid numeric literal")))
+}
+
+fn parse_operand_start(input: &mut ExprInput<'_>) -> ParseResult<()> {
+    ws0.parse_next(input)?;
+    alt((
+        one_of(['(', '*', '$', '@']).void(),
+        one_of('0'..='9').void(),
+        take_while(1.., symbol_char).void(),
+    ))
+    .parse_next(input)
+}
+
+fn parse_register_name<'a>(input: &mut ExprInput<'a>) -> ParseResult<&'a str> {
+    take_while(1.., |c: char| c.is_ascii_alphanumeric() || c == '_').parse_next(input)
+}
+
+fn parse_field_name<'a>(input: &mut ExprInput<'a>) -> ParseResult<&'a str> {
+    take_while(1.., |c: char| !is_expr_boundary(c) && c != ']').parse_next(input)
+}
+
+fn parse_symbol_name<'a>(input: &mut ExprInput<'a>) -> ParseResult<&'a str> {
+    take_while(1.., symbol_char).parse_next(input)
+}
+
+fn parse_number_token<'a>(input: &mut ExprInput<'a>) -> ParseResult<&'a str> {
+    take_while(1.., |c: char| !is_expr_boundary(c) && c != ']').parse_next(input)
+}
+
+fn ws0(input: &mut ExprInput<'_>) -> ParseResult<()> {
+    take_while(0.., char::is_whitespace)
+        .void()
+        .parse_next(input)
+}
+
+fn expect_char(input: &mut ExprInput<'_>, expected: char, label: &'static str) -> ParseResult<()> {
+    let parsed: ParseResult<char> = one_of(expected).parse_next(input);
+    parsed
+        .map(|_| ())
+        .map_err(|_| ErrMode::Cut(error_at(input, label)))
+}
+
+fn error_at(input: &ExprInput<'_>, label: impl Into<String>) -> ExprParseError {
+    let start = input.current_token_start();
+    let end = input
+        .peek_token()
+        .map(|ch| start + ch.len_utf8())
+        .unwrap_or(start + 1);
+    ExprParseError::new(start..end, label)
+}
+
+fn unwrap_parse_error(err: ErrMode<ExprParseError>) -> ExprParseError {
+    match err {
+        ErrMode::Backtrack(err) | ErrMode::Cut(err) => err,
+        ErrMode::Incomplete(_) => ExprParseError::new(0..1, "incomplete expression"),
+    }
+}
+
+fn symbol_char(ch: char) -> bool {
+    !is_expr_boundary(ch) && ch != '*' && ch != ']'
+}
+
+fn is_expr_boundary(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, '(' | ')' | '[' | '+' | '-')
+}
+
+#[cfg(test)]
+mod tests;

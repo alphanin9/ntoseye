@@ -86,37 +86,100 @@ pub fn format_symbol_with_offset(module: &str, name: &str, offset: u32) -> Strin
     }
 }
 
-pub fn cache_root() -> Option<PathBuf> {
-    let config_dir = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("SUDO_USER")
-                .ok()
-                .map(|user| PathBuf::from(format!("/home/{}/.config", user)))
-                .or_else(|| {
-                    std::env::var_os("HOME").map(|home| {
-                        let mut path = PathBuf::from(home);
-                        path.push(".config");
-                        path
-                    })
-                })
-        })?;
+static HOME_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+static HOME_MIGRATION: OnceLock<Option<(PathBuf, PathBuf)>> = OnceLock::new();
 
-    let cache_root = config_dir.join("ntoseye");
-    std::fs::create_dir_all(&cache_root).ok()?;
-    Some(cache_root)
+pub fn ntoseye_home() -> Option<PathBuf> {
+    HOME_PATH.get_or_init(resolve_ntoseye_home).clone()
+}
+
+pub fn home_migration() -> Option<(PathBuf, PathBuf)> {
+    let _ = ntoseye_home();
+    HOME_MIGRATION.get().and_then(|migration| migration.clone())
+}
+
+fn resolve_ntoseye_home() -> Option<PathBuf> {
+    let user_home = user_home_dir()?;
+    let path = user_home.join(".ntoseye");
+    let legacy = user_home.join(".config").join("ntoseye");
+    let migration = migrate_legacy_home(&legacy, &path).ok()?;
+    let _ = HOME_MIGRATION.set(migration);
+    std::fs::create_dir_all(&path).ok()?;
+    Some(path)
+}
+
+fn migrate_legacy_home(legacy: &Path, home: &Path) -> std::io::Result<Option<(PathBuf, PathBuf)>> {
+    if legacy.is_dir() && !home.exists() {
+        std::fs::rename(legacy, home)?;
+        return Ok(Some((legacy.to_path_buf(), home.to_path_buf())));
+    }
+    Ok(None)
+}
+
+fn user_home_dir() -> Option<PathBuf> {
+    std::env::var("SUDO_USER")
+        .ok()
+        .map(|user| PathBuf::from(format!("/home/{user}")))
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
 }
 
 fn symbols_directory() -> Option<PathBuf> {
-    let symbols_path = cache_root()?.join("symbols");
+    let symbols_path = ntoseye_home()?.join("symbols");
     std::fs::create_dir_all(&symbols_path).ok()?;
     Some(symbols_path)
 }
 
 fn images_directory() -> Option<PathBuf> {
-    let images_path = cache_root()?.join("images");
+    let images_path = ntoseye_home()?.join("images");
     std::fs::create_dir_all(&images_path).ok()?;
     Some(images_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("ntoseye-{name}-{nonce}"))
+    }
+
+    #[test]
+    fn migrate_legacy_home_moves_directory() {
+        let root = temp_root("home-migrate");
+        let legacy = root.join(".config").join("ntoseye");
+        let home = root.join(".ntoseye");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("aliases"), "alias ubp bp ${1}; g\n").unwrap();
+
+        let migration = migrate_legacy_home(&legacy, &home).unwrap();
+
+        assert!(migration.is_some());
+        assert!(!legacy.exists());
+        assert!(home.join("aliases").exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn migrate_legacy_home_does_not_merge_when_new_home_exists() {
+        let root = temp_root("home-existing");
+        let legacy = root.join(".config").join("ntoseye");
+        let home = root.join(".ntoseye");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+
+        let migration = migrate_legacy_home(&legacy, &home).unwrap();
+
+        assert!(migration.is_none());
+        assert!(legacy.exists());
+        assert!(home.exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 /// Information needed to download a PDB file

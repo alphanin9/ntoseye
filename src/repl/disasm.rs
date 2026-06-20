@@ -111,7 +111,7 @@ pub fn print_registers(register_map: &RegisterMap, regs: &[u8], embedded: bool) 
     );
 }
 
-// Decoding lives in core (`crate::disasm`); the REPL owns the *rendering*
+// Decoding lives in core; the REPL owns the *rendering*
 // (`format_disasm_line`/`render_rows` below).
 pub use crate::disasm::{DisasmRow, decode_rows, disasm_formatter};
 

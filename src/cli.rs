@@ -219,6 +219,8 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
+    print_home_migration();
+
     symbols::FORCE_DOWNLOADS
         .set(args.redownload_symbols)
         .map_err(|_| {
@@ -279,4 +281,14 @@ fn connect_session(args: &Args) -> Result<session::Session> {
             }
         })
     })
+}
+
+fn print_home_migration() {
+    if let Some((old, new)) = symbols::home_migration() {
+        diagnostics::eprint_note(format!(
+            "migrated ntoseye home from {} to {}",
+            old.display(),
+            new.display()
+        ));
+    }
 }

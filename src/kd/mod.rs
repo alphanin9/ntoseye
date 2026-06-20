@@ -14,12 +14,13 @@ use crate::dbg_backend::{
 };
 use crate::error::{Error, Result};
 use crate::gdb::RegisterMap;
+use crate::session::clear_trap_flag;
 use crate::kd::framing::{BREAKIN_BYTE, KdFraming};
 use crate::types::VirtAddr;
 
 macro_rules! kd_trace {
     ($($arg:tt)*) => {
-        if crate::kd::trace_enabled() {
+        if $crate::kd::trace_enabled() {
             eprintln!($($arg)*);
         }
     };
@@ -27,7 +28,7 @@ macro_rules! kd_trace {
 
 macro_rules! kd_trace_bytes {
     ($($arg:tt)*) => {
-        if crate::kd::trace_bytes_enabled() {
+        if $crate::kd::trace_bytes_enabled() {
             eprint!($($arg)*);
         }
     };
@@ -94,7 +95,9 @@ const KSPECIAL_REGISTERS_CR4_OFFSET: usize = 0x18;
 const KSPECIAL_REGISTERS_CR8_OFFSET: usize = 0xA0;
 const KSPECIAL_REGISTERS_MIN_SIZE: usize = KSPECIAL_REGISTERS_CR8_OFFSET + 8;
 const STATUS_BREAKPOINT: u32 = 0x8000_0003;
+const STATUS_SINGLE_STEP: u32 = 0x8000_0004;
 const KD_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const KD_INITIAL_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const DBGKD_DEBUG_IO_HEADER_SIZE: usize = 16;
 const DBGKD_DEBUG_IO_MIN_HEADER_SIZE: usize = 12;
 const DBGKD_PRINT_STRING_API: u32 = 0x0000_3230;
@@ -152,6 +155,18 @@ fn parse_thread_id_for_processor_count(tid: &str, processor_count: u16) -> Resul
 
 fn should_advance_rip_before_continue(exception_code: u32, managed_breakpoint_stop: bool) -> bool {
     exception_code == STATUS_BREAKPOINT && !managed_breakpoint_stop
+}
+
+/// Whether a stop seen during exit is a stray single-step: `STATUS_SINGLE_STEP`
+/// away from any int3 we installed (and not a bugcheck). The backend-layer twin
+/// of [`crate::session::stop_is_stray_single_step`]; `managed_bp_addresses` is
+/// our installed-int3 set, standing in for the session's breakpoint manager.
+fn exit_stop_is_stray_single_step(stop: &StopEvent, managed_bp_addresses: &HashSet<u64>) -> bool {
+    stop.exception_code == Some(STATUS_SINGLE_STEP)
+        && !stop.is_bugcheck
+        && stop
+            .program_counter
+            .is_none_or(|pc| !managed_bp_addresses.contains(&pc))
 }
 
 fn append_control_registers_from_special(ctx: &mut Vec<u8>, special: &[u8]) -> Result<()> {
@@ -459,6 +474,18 @@ impl KdBackend {
             && !self.managed_bp_addresses.contains(&stop.program_counter)
     }
 
+    /// Classify post-resume stops that are safe to drain. Managed breakpoints
+    /// are never drained; the REPL handles wrong-process hits. We absorb raw
+    /// int3 re-breaks at the resumed RIP and stale KD break-in stops.
+    fn is_spurious_continue_rebreak(&self, stop: &StateChange, resumed_from_rip: u64) -> bool {
+        if self.managed_bp_addresses.contains(&stop.program_counter) {
+            return false;
+        }
+        let raw_rebreak_in_place = stop.exception_code == STATUS_BREAKPOINT
+            && stop.program_counter == resumed_from_rip;
+        raw_rebreak_in_place || self.known_breakin_stop(stop)
+    }
+
     fn mark_known_breakin_stop(&self, mut stop: StateChange) -> StateChange {
         if self.known_breakin_stop(&stop) {
             stop.assisted_breakin = true;
@@ -637,7 +664,23 @@ impl KdBackend {
             api::continue_api2(framing, processor, api::DBG_CONTINUE, false)
         })?;
         self.record_running();
+        // The resume consumed the current stop. Any stashed pending_stop from
+        // an earlier break-in is stale now; keeping it can make exit issue
+        // manipulate requests while the target is already running.
+        self.pending_stop = None;
         Ok(())
+    }
+
+    /// Exit absorbs stray single-steps the same way run-control does: clear TF
+    /// on the stopped vCPU, then continue. Otherwise a leaked TF can retrigger
+    /// until exit gives up.
+    fn absorb_stray_single_step_for_exit(&mut self, stop: &StopEvent) {
+        if exit_stop_is_stray_single_step(stop, &self.managed_bp_addresses) {
+            // record_stop selected the stop's processor, so this clears TF on the
+            // offending vCPU. Clone the map to avoid borrowing self twice.
+            let register_map = self.register_map.clone();
+            let _ = clear_trap_flag(self, &register_map);
+        }
     }
 
     fn finish_for_exit(&mut self, leave_running: bool) -> Result<()> {
@@ -649,12 +692,16 @@ impl KdBackend {
         }
 
         for _ in 0..KD_EXIT_MAX_CONTINUES {
-            if self.is_running && self.try_wait_for_stop(KD_EXIT_STOP_POLL)?.is_none() {
-                return Ok(());
+            if self.is_running {
+                match self.try_wait_for_stop(KD_EXIT_STOP_POLL)? {
+                    None => return Ok(()),
+                    Some(stop) => self.absorb_stray_single_step_for_exit(&stop),
+                }
             }
             self.continue_stopped_for_exit()?;
-            if self.try_wait_for_stop(KD_EXIT_STOP_POLL)?.is_none() {
-                return Ok(());
+            match self.try_wait_for_stop(KD_EXIT_STOP_POLL)? {
+                None => return Ok(()),
+                Some(stop) => self.absorb_stray_single_step_for_exit(&stop),
             }
         }
 
@@ -846,10 +893,7 @@ impl DebugBackend for KdBackend {
 
             match result {
                 Ok(stop) => {
-                    // Don't drain managed BPs; the REPL handles wrong-process hits
-                    let is_spurious = stop.exception_code == STATUS_BREAKPOINT
-                        && stop.program_counter == resumed_from_rip
-                        && !self.managed_bp_addresses.contains(&stop.program_counter);
+                    let is_spurious = self.is_spurious_continue_rebreak(&stop, resumed_from_rip);
                     if is_spurious && drained < MAX_DRAIN_ITERATIONS {
                         drained += 1;
                         kd_trace!(
@@ -1759,6 +1803,48 @@ mod tests {
     }
 
     #[test]
+    fn continue_drains_in_place_rebreak_and_stale_breakin() {
+        let (_kernel, host) = UnixStream::pair().unwrap();
+        let mut backend = kd_backend_with_framing(host);
+        let resumed_from = 0xfffff800_1340c4;
+        let breakin = 0xfffff800_002f90d0;
+        backend.breakin_addresses.insert(breakin);
+
+        let stop_at = |code: u32, pc: u64| StateChange {
+            processor: 0,
+            number_processors: 1,
+            new_state: DBG_KD_EXCEPTION_STATE_CHANGE,
+            exception_code: code,
+            program_counter: pc,
+            kernel_base_hint: None,
+            is_bugcheck: false,
+            bugcheck: None,
+            target_reloaded: false,
+            assisted_breakin: false,
+        };
+
+        // Raw int3 re-break at the rip we resumed from: drain it.
+        assert!(backend
+            .is_spurious_continue_rebreak(&stop_at(STATUS_BREAKPOINT, resumed_from), resumed_from));
+        // Stale break-in byte trapping at the KD break-in instruction: drain it,
+        // even though it's nowhere near resumed_from.
+        assert!(
+            backend.is_spurious_continue_rebreak(&stop_at(STATUS_BREAKPOINT, breakin), resumed_from)
+        );
+
+        // A managed breakpoint hit is a real stop, never drained.
+        backend.managed_bp_addresses.insert(breakin);
+        assert!(!backend
+            .is_spurious_continue_rebreak(&stop_at(STATUS_BREAKPOINT, breakin), resumed_from));
+
+        // An unrelated breakpoint elsewhere, and a single-step, are real stops.
+        assert!(!backend
+            .is_spurious_continue_rebreak(&stop_at(STATUS_BREAKPOINT, 0xdead_0000), resumed_from));
+        assert!(!backend
+            .is_spurious_continue_rebreak(&stop_at(STATUS_SINGLE_STEP, resumed_from), resumed_from));
+    }
+
+    #[test]
     fn pending_write_breakpoint_retry_completes_late_reply_without_resend() {
         let (mut kernel, host) = UnixStream::pair().unwrap();
         kernel
@@ -1902,7 +1988,10 @@ mod tests {
         let kernel_thread = std::thread::spawn(move || {
             let pc = 0xfffff800_deadbeef;
             let mut payload = exception_state_change_payload(pc);
-            payload[32..36].copy_from_slice(&0x8000_0004u32.to_le_bytes());
+            // A plain access violation: exercises the consume-then-continue path
+            // without tripping the stray-single-step or int3-advance absorbs,
+            // which would issue register reads this mock kernel doesn't service.
+            payload[32..36].copy_from_slice(&0xc000_0005u32.to_le_bytes());
             kernel
                 .write_all(&wire_data_packet(
                     PACKET_TYPE_KD_STATE_CHANGE64,
@@ -1961,6 +2050,101 @@ mod tests {
             u32::from_le_bytes(request[16..20].try_into().unwrap()),
             api::DBG_CONTINUE
         );
+    }
+
+    #[test]
+    fn exit_classifies_stray_single_step_but_spares_real_stops() {
+        let pc = 0xfffff800_deadbeef;
+        let mut managed = HashSet::new();
+        let stop_at = |code: Option<u32>, pc: Option<u64>, is_bugcheck: bool| StopEvent {
+            thread_id: None,
+            exception_code: code,
+            program_counter: pc,
+            is_bugcheck,
+            bugcheck: None,
+            target_reloaded: false,
+            target_kernel_base_hint: None,
+            assisted_breakin: false,
+        };
+
+        // Stray single-step away from any installed int3: absorb it.
+        assert!(exit_stop_is_stray_single_step(
+            &stop_at(Some(STATUS_SINGLE_STEP), Some(pc), false),
+            &managed,
+        ));
+        // Unknown PC still counts as stray (can't prove it's at a breakpoint).
+        assert!(exit_stop_is_stray_single_step(
+            &stop_at(Some(STATUS_SINGLE_STEP), None, false),
+            &managed,
+        ));
+
+        // A single-step landing on one of our breakpoints is a real hit, not stray.
+        managed.insert(pc);
+        assert!(!exit_stop_is_stray_single_step(
+            &stop_at(Some(STATUS_SINGLE_STEP), Some(pc), false),
+            &managed,
+        ));
+
+        // A breakpoint stop or a bugcheck is never a stray single-step.
+        assert!(!exit_stop_is_stray_single_step(
+            &stop_at(Some(STATUS_BREAKPOINT), Some(0x1000), false),
+            &managed,
+        ));
+        assert!(!exit_stop_is_stray_single_step(
+            &stop_at(Some(STATUS_SINGLE_STEP), Some(0x1000), true),
+            &managed,
+        ));
+    }
+
+    #[test]
+    fn exit_continue_clears_stale_pending_stop() {
+        // Repro for the exit hang: the host's `cont()` resumed past the KD
+        // break-in instruction and stashed the immediate re-break as
+        // pending_stop, which it never drained. The exit continue must clear it;
+        // otherwise the loop re-surfaces the stale stop and issues GetContext
+        // while the target is already running.
+        let (mut kernel, host) = UnixStream::pair().unwrap();
+        kernel
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut backend = kd_backend_with_framing(host);
+
+        backend.pending_stop = Some(StateChange {
+            processor: 0,
+            number_processors: 1,
+            new_state: 0x3030,
+            exception_code: STATUS_BREAKPOINT,
+            program_counter: 0xfffff800_002f90d0,
+            kernel_base_hint: None,
+            is_bugcheck: false,
+            bugcheck: None,
+            target_reloaded: false,
+            assisted_breakin: false,
+        });
+        // A single-step last stop keeps `continue_stopped_for_exit` from issuing
+        // advance_rip's GetContext, so this mock only needs to ACK the continue.
+        backend.last_exception_code = STATUS_SINGLE_STEP;
+        backend.last_stop_was_managed_breakpoint = false;
+
+        let kernel_thread = std::thread::spawn(move || {
+            let _continue_req = read_wire_packet(&mut kernel);
+            kernel
+                .write_all(&wire_control_packet(
+                    PACKET_TYPE_KD_ACKNOWLEDGE,
+                    WIRE_FIRST_PACKET_ID,
+                ))
+                .unwrap();
+            kernel.flush().unwrap();
+        });
+
+        backend.continue_stopped_for_exit().unwrap();
+        kernel_thread.join().expect("kernel thread panicked");
+
+        assert!(
+            backend.pending_stop.is_none(),
+            "exit-continue must clear the stale pending_stop"
+        );
+        assert!(backend.is_running);
     }
 
     #[test]

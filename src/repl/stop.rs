@@ -135,6 +135,7 @@ pub fn try_complete_pending_module_list_reload(
     caches.clear_threads();
     caches.refresh_drivers(debugger);
     caches.refresh_vcpus(client);
+    caches.refresh_expression_context(debugger);
     client.note_target_rediscovery_complete();
     *pending = false;
     true
@@ -177,6 +178,7 @@ pub fn apply_target_reload_if_needed(
             caches.clear_threads();
             *caches.drivers.write().unwrap() =
                 debugger.enumerate_driver_objects().unwrap_or_default();
+            caches.refresh_expression_context(debugger);
             if dropped_breakpoints > 0 {
                 println!(
                     "{} dropped {} stale breakpoint(s)",
@@ -206,6 +208,7 @@ pub fn apply_target_reload_if_needed(
             *caches.processes.write().unwrap() = Vec::new();
             *caches.vcpus.write().unwrap() = client.thread_list().unwrap_or_default();
             *caches.drivers.write().unwrap() = Vec::new();
+            caches.refresh_expression_context(debugger);
             if dropped_breakpoints > 0 {
                 println!(
                     "{} dropped {} stale breakpoint(s)",
@@ -325,6 +328,7 @@ pub fn refresh_stop_caches_post(
     if modules_changed {
         caches.refresh_drivers(debugger);
     }
+    caches.refresh_expression_context(debugger);
 }
 
 /// A classified stop: the raw event plus the target-reload status derived from

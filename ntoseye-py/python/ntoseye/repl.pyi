@@ -12,11 +12,13 @@ class _Completion:
 
 Process: _Completion
 Symbol: _Completion
+Expression: _Completion
 Type: _Completion
 Driver: _Completion
 Thread: _Completion
 Vcpu: _Completion
 Breakpoint: _Completion
+Alias: _Completion
 
 def register_command(
     name: str,
