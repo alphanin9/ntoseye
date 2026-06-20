@@ -1769,12 +1769,14 @@ fn completion_strategy_name(strategy: crate::repl::CompletionStrategy) -> &'stat
     match strategy {
         crate::repl::CompletionStrategy::None => "none",
         crate::repl::CompletionStrategy::Symbol => "symbol",
+        crate::repl::CompletionStrategy::Expression => "expression",
         crate::repl::CompletionStrategy::Type => "type",
         crate::repl::CompletionStrategy::Process => "process",
         crate::repl::CompletionStrategy::Thread => "thread",
         crate::repl::CompletionStrategy::Vcpu => "vcpu",
         crate::repl::CompletionStrategy::Breakpoint => "breakpoint",
         crate::repl::CompletionStrategy::Driver => "driver",
+        crate::repl::CompletionStrategy::Alias => "alias",
     }
 }
 
