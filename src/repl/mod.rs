@@ -2,8 +2,8 @@
 use nu_ansi_term::{Color, Style};
 #[cfg(feature = "cli")]
 use reedline::{
-    DescriptionMode, Emacs, IdeMenu, KeyCode, KeyModifiers, MenuBuilder, ReedlineEvent,
-    ReedlineMenu, default_emacs_keybindings,
+    DescriptionMode, Emacs, FileBackedHistory, IdeMenu, KeyCode, KeyModifiers, MenuBuilder,
+    ReedlineEvent, ReedlineMenu, default_emacs_keybindings,
 };
 #[cfg(feature = "cli")]
 use reedline::{Reedline, Signal};
@@ -13,7 +13,6 @@ use std::sync::atomic::AtomicBool;
 #[cfg(feature = "cli")]
 use std::sync::atomic::Ordering;
 
-use strum_macros::{Display, EnumIter, EnumMessage, EnumString};
 use tabled::builder::Builder;
 use tabled::settings::Padding;
 
@@ -29,6 +28,8 @@ use crate::guest::ModuleSymbolLoadReport;
 use crate::python::embed;
 use crate::session::Session;
 #[cfg(feature = "cli")]
+use crate::symbols::ntoseye_home;
+#[cfg(feature = "cli")]
 use crate::target::Target;
 #[cfg(feature = "cli")]
 use crate::ui;
@@ -36,258 +37,18 @@ use crate::ui;
 pub static INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
 pub const BREAK_STACKTRACE_DISPLAY_LIMIT: usize = 8;
 pub const BREAK_STACKTRACE_PROBE_LIMIT: usize = 64;
+#[cfg(feature = "cli")]
+const REPL_HISTORY_SIZE: usize = 5000;
 macro_rules! require_arg {
-    ($parts:expr, $idx:expr, $cmd:expr) => {
-        match $parts.get($idx) {
-            Some(a) => *a,
+    ($invocation:expr, $idx:expr, $cmd:expr) => {
+        match $invocation.arg($idx) {
+            Some(a) => a,
             None => {
-                println!("{}\n", $cmd.get_message().unwrap_or("invalid usage"));
+                println!("{}\n", command_help($cmd));
                 return Ok(());
             }
         }
     };
-}
-
-// TODO
-//
-// Memory Display:
-//   da, du       - Display ASCII/Unicode strings
-//   dps          - Display pointers with symbol resolution
-// Memory Write:
-//   ea, eu       - Write ASCII/Unicode string
-// Execution Control:
-//   t / si       - Single step (step into)
-//   p / ni       - Step over
-//   gu           - Go until return
-//   st           - Switch threads/VCPU
-// Breakpoints:
-//   Conditional breakpoints
-// Registers:
-//   context      - Auto-display regs/stack/disasm on break
-// Stack Analysis:
-//   k            - Stack backtrace
-//   kv, kp       - Backtrace with locals/params
-// Search:
-//   x            - Search symbols by wildcard
-//   ln           - List nearest symbols to address
-// Expression Evaluation
-// Misc:
-//   vmmap        - Memory region map
-
-#[derive(Debug, Clone, Copy, PartialEq, EnumIter, Display, EnumString, EnumMessage)]
-#[strum(serialize_all = "kebab-case")]
-pub enum ReplCommand {
-    // memory read
-    #[strum(message = "Display memory as bytes.\n(usage: db <address> [length or end])")]
-    Db,
-    #[strum(
-        message = "Display memory as doublewords (4 bytes).\n(usage: dd <address> [length or end])"
-    )]
-    Dd,
-    #[strum(
-        message = "Display memory as quadwords (8 bytes).\n(usage: dq <address> [length or end])"
-    )]
-    Dq,
-    #[strum(
-        message = "Disassemble memory at a symbol or address.\n(usage: disasm <address> [length or end])"
-    )]
-    Disasm,
-    #[strum(message = "Display type definition.\n(usage: dt <type> [address] [field])")]
-    Dt,
-
-    // memory write
-    #[strum(message = "Write a byte to memory.\n(usage: eb <address> <expr>)")]
-    Eb,
-    #[strum(message = "Write a doubleword (4 bytes) to memory.\n(usage: ed <address> <expr>)")]
-    Ed,
-    #[strum(message = "Write a quadword (8 bytes) to memory.\n(usage: eq <address> <expr>)")]
-    Eq,
-    #[strum(
-        message = "Fill memory with a repeated byte pattern.\n(usage: f <address> <hex bytes> [length or end])\nhex bytes: 90, 4883792000740a, or \\x90\\x90"
-    )]
-    F,
-
-    // memory search
-    #[strum(
-        message = "Search memory for a byte pattern.\n(usage: s <address> <hex bytes> [length])\nhex bytes: 4883792000740a or \\x48\\x83\\x79\\x20\\x00\\x74\\x0a"
-    )]
-    S,
-
-    // symbol search
-    #[strum(
-        message = "Fuzzy-search symbols by name.\n(usage: x <query>  or  x <module>!<query>)\noperators: ^prefix  suffix$  'exact  !negate  (space = AND)"
-    )]
-    X,
-    #[strum(message = "List the nearest symbol to an address.\n(usage: ln <address>)")]
-    Ln,
-
-    // expression
-    #[strum(message = "Evaluate an expression.\n(usage: ev <expression>)")]
-    Ev,
-    #[strum(
-        message = "Define a convenience variable usable in expressions as $<name>.\n(usage: set $<name> <expression>)"
-    )]
-    Set,
-    #[strum(message = "List defined convenience variables and result slots.\n(usage: vars)")]
-    Vars,
-    #[strum(message = "Remove a convenience variable.\n(usage: unset $<name>)")]
-    Unset,
-
-    // page table
-    #[strum(message = "Display page table entries for an address.\n(usage: pte <address>)")]
-    Pte,
-    #[strum(
-        message = "Inspect the pool page containing an address.\n(usage: pool <address-expression>)"
-    )]
-    Pool,
-    #[strum(
-        message = "Display virtual memory regions for the attached process, or kernel modules when detached.\n(usage: vmmap [address|filter])"
-    )]
-    Vmmap,
-
-    // execution
-    #[strum(message = "Resume VM execution.\n(usage: continue)")]
-    Continue,
-    #[strum(message = "Break/pause VM execution.\n(usage: break)")]
-    Break,
-    #[strum(message = "Single step (step into).\n(usage: si)")]
-    Si,
-    #[strum(
-        serialize = "ni",
-        to_string = "p",
-        message = "Step over the current instruction.\n(usage: p or ni)"
-    )]
-    P,
-    #[strum(
-        serialize = "finish",
-        to_string = "gu",
-        message = "Run until the current function returns.\n(usage: gu or finish)"
-    )]
-    Gu,
-
-    // breakpoints
-    #[strum(message = "Set a breakpoint.\n(usage: bp <address> [<expr>])")]
-    Bp,
-    #[strum(message = "List all breakpoints.\n(usage: bl)")]
-    Bl,
-    #[strum(message = "Clear a breakpoint by ID.\n(usage: bc <id>)")]
-    Bc,
-    #[strum(message = "Disable a breakpoint by ID.\n(usage: bd <id>)")]
-    Bd,
-    #[strum(message = "Enable a breakpoint by ID.\n(usage: be <id>)")]
-    Be,
-
-    // inspection
-    #[strum(message = "Display CPU registers.\n(usage: registers)")]
-    Registers,
-    #[strum(message = "Display stack backtrace.\n(usage: k [count])")]
-    K,
-    #[strum(message = "Display current VM status.\n(usage: status)")]
-    Status,
-    #[strum(message = "Display backend capabilities.\n(usage: capabilities)")]
-    Capabilities,
-    #[strum(message = "Show captured guest debug output (DbgPrint).\n(usage: dbgprint [count])")]
-    Dbgprint,
-    #[strum(
-        message = "Inspect an IRP and its current IO_STACK_LOCATION.\n(usage: irp <address-expression>)"
-    )]
-    Irp,
-    #[strum(
-        message = "Discover in-flight IRPs from thread IrpLists and device CurrentIrp.\n(usage: irps [process-filter|driver-filter])"
-    )]
-    Irps,
-    #[strum(
-        message = "Inspect a DRIVER_OBJECT, its device chain and dispatch table.\n(usage: drvobj <driver-object-expression-or-name>)"
-    )]
-    Drvobj,
-    #[strum(
-        message = "Inspect a DEVICE_OBJECT and its attached stack.\n(usage: devobj <device-object-expression>)"
-    )]
-    Devobj,
-    #[strum(
-        message = "Inspect an executive object header and body.\n(usage: object <object-expression>)"
-    )]
-    Object,
-    #[strum(
-        message = "Enumerate process/thread/image notification callbacks.\n(usage: callbacks [symbol-filter])"
-    )]
-    Callbacks,
-    #[strum(message = "Dump the SSDT and shadow SSDT.\n(usage: ssdt)")]
-    Ssdt,
-    #[strum(
-        message = "Describe what an address belongs to (module+section, or VAD region).\n(usage: address <address-expression>)"
-    )]
-    Address,
-
-    // execution contexts / processes / modules
-    #[strum(message = "List vCPU contexts and their RIP values.\n(usage: vcpus)")]
-    Vcpus,
-    #[strum(message = "Switch to a different vCPU context.\n(usage: vcpu <id>)")]
-    Vcpu,
-    #[strum(
-        message = "List Windows threads, optionally filtered by process, PID, TID, or ETHREAD.\n(usage: threads [filter])"
-    )]
-    Threads,
-    #[strum(
-        message = "Inspect a Windows thread and switch to it if it is currently running.\n(usage: thread <tid|ethread|.> [k|r] [count])"
-    )]
-    Thread,
-    #[strum(message = "List running processes.\n(usage: ps [filter])")]
-    Ps,
-    #[strum(message = "List loaded modules.\n(usage: lm [filter])")]
-    Lm,
-    #[strum(
-        message = "List driver objects from the \\Driver object directory.\n(usage: drivers [filter])"
-    )]
-    Drivers,
-    #[strum(message = "Attach to a process by PID.\n(usage: attach <pid>)")]
-    Attach,
-    #[strum(message = "Detach from current process.\n(usage: detach)")]
-    Detach,
-
-    #[strum(
-        message = "Reload custom commands from $XDG_CONFIG_HOME/ntoseye/commands.\n(usage: reload)"
-    )]
-    Reload,
-
-    #[strum(message = "Exit the application.")]
-    Quit,
-}
-
-impl ReplCommand {
-    pub fn completion_type(&self) -> CompletionStrategy {
-        match self {
-            Self::Db
-            | Self::Dd
-            | Self::Dq
-            | Self::Disasm
-            | Self::Eb
-            | Self::Ed
-            | Self::Eq
-            | Self::F
-            | Self::S
-            | Self::Ev
-            | Self::Set
-            | Self::X
-            | Self::Ln
-            | Self::Pte
-            | Self::Pool
-            | Self::Vmmap
-            | Self::Irp
-            | Self::Devobj
-            | Self::Object
-            | Self::Callbacks
-            | Self::Address
-            | Self::Bp => CompletionStrategy::Symbol,
-            Self::Dt => CompletionStrategy::Type,
-            Self::Drvobj => CompletionStrategy::Driver,
-            Self::Attach | Self::Threads | Self::Irps => CompletionStrategy::Process,
-            Self::Thread => CompletionStrategy::Thread,
-            Self::Vcpu => CompletionStrategy::Vcpu,
-            Self::Bc | Self::Bd | Self::Be => CompletionStrategy::Breakpoint,
-            _ => CompletionStrategy::None,
-        }
-    }
 }
 
 pub fn error(msg: &str) {
@@ -300,7 +61,9 @@ macro_rules! error {
     };
 }
 
+mod aliases;
 mod bugcheck;
+mod command;
 mod commands;
 mod completion;
 mod disasm;
@@ -310,12 +73,14 @@ mod memory_view;
 mod pool;
 mod stop;
 
+pub use crate::repl_command;
+pub use aliases::*;
 pub use bugcheck::*;
-pub use completion::CompletionStrategy;
+pub use command::*;
 pub use completion::*;
 pub use disasm::*;
 #[cfg(feature = "cli")]
-pub use line_editor::*;
+use line_editor::{CustomPrompt, MyCompleter, TrackingHighlighter};
 pub use memory_view::*;
 pub use pool::*;
 pub use stop::*;
@@ -400,6 +165,7 @@ pub fn print_plain_table(builder: Builder) {
     println!("{table}\n");
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Flow {
     Continue,
     Quit,
@@ -408,19 +174,21 @@ pub enum Flow {
 pub struct ReplState<'a> {
     pub ctx: &'a mut Session,
     pub caches: ReplCaches,
+    pub aliases: UserAliases,
     pub line: String,
 }
 
 /// The user-command completion set: the registered Python commands when the
 /// binary embeds Python (`python-embed`), else empty.
-pub(crate) fn initial_user_commands() -> Vec<(String, String, Vec<CompletionStrategy>)> {
-    #[allow(unused_mut)]
-    let mut cmds: Vec<(String, String, Vec<CompletionStrategy>)> = Vec::new();
+pub fn initial_user_commands() -> Vec<(String, String, Vec<CompletionStrategy>)> {
     #[cfg(feature = "python")]
-    for (name, help, strategies) in embed::command_list() {
-        cmds.push((name, help, strategies));
+    {
+        embed::command_list()
     }
-    cmds
+    #[cfg(not(feature = "python"))]
+    {
+        Vec::new()
+    }
 }
 
 impl<'a> ReplState<'a> {
@@ -439,14 +207,21 @@ impl<'a> ReplState<'a> {
             vcpus: Arc::new(RwLock::new(Vec::new())),
             breakpoints: Arc::new(RwLock::new(Vec::new())),
             drivers: Arc::new(RwLock::new(Vec::new())),
+            registers: Arc::new(ctx.register_map.names()),
+            expression_variables: Arc::new(RwLock::new(Vec::new())),
             user_commands: Arc::new(RwLock::new(initial_user_commands())),
+            aliases: Arc::new(RwLock::new(Vec::new())),
         };
 
-        ReplState {
+        let state = ReplState {
             ctx,
             caches,
+            aliases: UserAliases::load(),
             line: String::new(),
-        }
+        };
+        state.caches.refresh_expression_context(&state.ctx.target);
+        state.refresh_alias_cache();
+        state
     }
 }
 
@@ -574,6 +349,8 @@ pub fn start_repl(ctx: &mut Session) -> Result<()> {
         embed::print_script_load_report(&py_report, true);
     }
 
+    let (aliases, alias_report) = UserAliases::load_with_report();
+    print_alias_load_report(&alias_report, true);
     let caches = ReplCaches {
         symbols: Arc::new(RwLock::new(debugger.current_symbol_index())),
         types: Arc::new(RwLock::new(debugger.current_types_index())),
@@ -585,8 +362,12 @@ pub fn start_repl(ctx: &mut Session) -> Result<()> {
         vcpus: Arc::new(RwLock::new(initial_vcpus)),
         breakpoints: Arc::new(RwLock::new(Vec::new())),
         drivers: Arc::new(RwLock::new(initial_drivers)),
+        registers: Arc::new(ctx.register_map.names()),
+        expression_variables: Arc::new(RwLock::new(Vec::new())),
         user_commands: Arc::new(RwLock::new(initial_user_commands())),
+        aliases: Arc::new(RwLock::new(aliases.entries())),
     };
+    caches.refresh_expression_context(debugger);
 
     let completor = Box::new(MyCompleter {
         caches: caches.clone(),
@@ -601,12 +382,26 @@ pub fn start_repl(ctx: &mut Session) -> Result<()> {
         .with_completer(completor)
         .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
         .with_edit_mode(edit_mode)
-        .with_highlighter(Box::new(highlighter));
+        .with_highlighter(Box::new(highlighter))
+        .with_history_exclusion_prefix(Some(" ".to_string()));
+    if let Some(history_path) = ntoseye_home().map(|root| root.join("history")) {
+        match FileBackedHistory::with_file(REPL_HISTORY_SIZE, history_path.clone()) {
+            Ok(history) => {
+                line_editor = line_editor.with_history(Box::new(history));
+            }
+            Err(err) => diagnostics::print_warning(format!(
+                "failed to load command history from {}: {}",
+                history_path.display(),
+                err
+            )),
+        }
+    }
     let prompt = CustomPrompt {};
 
     let mut state = ReplState {
         ctx,
         caches,
+        aliases,
         line: String::new(),
     };
     // The reload state machine lives on the Session now; seed it from the
@@ -618,12 +413,9 @@ pub fn start_repl(ctx: &mut Session) -> Result<()> {
         let sig = line_editor.read_line(&prompt)?;
         match sig {
             Signal::Success(buffer) => {
-                let parts: Vec<&str> = buffer.split_whitespace().collect();
-                if !parts.is_empty() {
-                    // TODO: add first-class aliases (`lt` -> `vcpus`,
-                    // `thread` -> `vcpu`) without making them primary names.
+                if !buffer.trim().is_empty() {
                     state.line = buffer.trim().to_string();
-                    match state.dispatch(&parts)? {
+                    match state.dispatch_line(&buffer)? {
                         Flow::Quit => break,
                         Flow::Continue => {}
                     }

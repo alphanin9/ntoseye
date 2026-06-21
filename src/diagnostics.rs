@@ -26,6 +26,14 @@ pub fn eprint_warning(message: impl Display) {
     );
 }
 
+pub fn eprint_note(message: impl Display) {
+    print_labeled_stderr(
+        "note:",
+        &"note:".bright_cyan().bold().to_string(),
+        &message.to_string(),
+    );
+}
+
 fn print_labeled_stdout(label: &str, styled_label: &str, message: &str) {
     for line in labeled_lines(label, styled_label, message) {
         println!("{line}");

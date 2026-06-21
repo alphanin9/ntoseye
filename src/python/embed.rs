@@ -1,8 +1,8 @@
 use std::ffi::CString;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule, PyString, PyTuple};
@@ -10,7 +10,7 @@ use pyo3::types::{PyDict, PyList, PyModule, PyString, PyTuple};
 use crate::diagnostics;
 use crate::repl::CompletionStrategy;
 use crate::session::Session;
-use crate::symbols::cache_root;
+use crate::symbols::ntoseye_home;
 
 use super::{Debugger, Struct, Type};
 
@@ -26,11 +26,13 @@ class _Completion:
 
 Process = _Completion("process")
 Symbol = _Completion("symbol")
+Expression = _Completion("expression")
 Type = _Completion("type")
 Driver = _Completion("driver")
 Thread = _Completion("thread")
 Vcpu = _Completion("vcpu")
 Breakpoint = _Completion("breakpoint")
+Alias = _Completion("alias")
 
 def command(name, help, **completions):
     import inspect
@@ -44,18 +46,6 @@ def command(name, help, **completions):
         return fn
     return deco
 "#;
-
-const REPL_EXPORTS: &[&str] = &[
-    "register_command",
-    "command",
-    "Process",
-    "Symbol",
-    "Type",
-    "Driver",
-    "Thread",
-    "Vcpu",
-    "Breakpoint",
-];
 
 /// Outcome of loading the python commands dir: names registered, and per-file
 /// load failures.
@@ -94,8 +84,8 @@ struct Registered {
 // Send+Sync and a Mutex keeps the registry sound regardless.
 static REGISTRY: Mutex<Vec<Registered>> = Mutex::new(Vec::new());
 
-/// Exposed as `ntoseye.repl.register_command` and copied into script globals
-/// for compatibility. Scripts usually go through `repl.command`.
+/// Exposed as `ntoseye.repl.register_command`. Scripts usually go through
+/// `repl.command`.
 #[pyfunction]
 #[pyo3(signature = (name, help, callable, strategies=None))]
 fn register_command(
@@ -153,17 +143,6 @@ fn install_repl_module<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyModule>> {
     Ok(repl)
 }
 
-fn inject_legacy_globals(globals: &Bound<'_, PyDict>, repl: &Bound<'_, PyModule>) -> PyResult<()> {
-    let dict = repl.dict();
-    for name in REPL_EXPORTS {
-        globals.set_item(
-            name,
-            dict.get_item(name)?.expect("repl export should exist"),
-        )?;
-    }
-    Ok(())
-}
-
 /// Drop every registered command (used by `reload` before re-execing scripts).
 pub fn clear_commands() {
     REGISTRY.lock().unwrap().clear();
@@ -186,12 +165,11 @@ pub fn has_command(name: &str) -> bool {
 }
 
 fn commands_dir() -> Option<PathBuf> {
-    cache_root().map(|r| r.join("commands"))
+    ntoseye_home().map(|r| r.join("commands"))
 }
 
 /// Clear the registry and (re-)execute every `*.py` in the python commands dir
-/// (`$XDG_CONFIG_HOME/ntoseye/commands/`), returning a load report for the REPL
-/// to print.
+/// (`~/.ntoseye/commands/`), returning a load report for the REPL to print.
 pub fn load_commands_dir() -> LoadReport {
     clear_commands();
     let mut report = LoadReport {
@@ -203,7 +181,6 @@ pub fn load_commands_dir() -> LoadReport {
         return report;
     };
     if !dir.exists() {
-        let _ = std::fs::create_dir_all(&dir);
         return report;
     }
 
@@ -240,8 +217,7 @@ pub fn load_commands_dir() -> LoadReport {
 pub fn exec_script(source: &str, script_name: &str) -> Result<(), String> {
     Python::attach(|py| -> PyResult<()> {
         let globals = PyDict::new(py);
-        let repl = install_repl_module(py)?;
-        inject_legacy_globals(&globals, &repl)?;
+        install_repl_module(py)?;
         let code = CString::new(source)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         py.run(code.as_c_str(), Some(&globals), None)?;
@@ -385,39 +361,6 @@ pub fn dispatch_capture(name: &str, args: &[&str], session: &mut Session) -> Res
 mod tests {
     use super::*;
 
-    // Exercises the full registration path: start the embedded interpreter,
-    // exec a script with `register_command` injected into its globals, and read
-    // the command back out of the registry. (Dispatch needs a live Session, so
-    // that half is only reachable from the REPL.)
-    #[test]
-    fn script_registers_a_command_via_injected_global() {
-        clear_commands();
-        let src = "def hi(dbg, *args):\n    return None\n\
-                   register_command('pytest_hi', 'a help string', hi)\n";
-        exec_script(src, "test.py").expect("script should execute");
-
-        assert!(has_command("pytest_hi"));
-        assert!(
-            command_list()
-                .iter()
-                .any(|(n, h, _)| n == "pytest_hi" && h == "a help string")
-        );
-
-        // The `command` decorator binds completion to a parameter by name.
-        let deco = "@command('pytest_hide', 'help', target=Process)\n\
-                    def _h(dbg, target):\n    return None\n";
-        exec_script(deco, "deco.py").expect("decorator script should execute");
-        let entry = command_list()
-            .into_iter()
-            .find(|(n, ..)| n == "pytest_hide")
-            .expect("decorator should register the command");
-        assert!(matches!(entry.2.as_slice(), [CompletionStrategy::Process]));
-
-        // A syntactically broken script surfaces a stringified error, not a panic.
-        assert!(exec_script("def (:\n", "bad.py").is_err());
-        clear_commands();
-    }
-
     #[test]
     fn script_registers_a_command_via_repl_module() {
         clear_commands();
@@ -430,6 +373,18 @@ mod tests {
             .find(|(n, ..)| n == "pytest_repl_hide")
             .expect("decorator should register the command");
         assert!(matches!(entry.2.as_slice(), [CompletionStrategy::Process]));
+        clear_commands();
+    }
+
+    #[test]
+    fn scripts_use_explicit_repl_module_imports() {
+        clear_commands();
+        let src = "def hi(dbg, *args):\n    return None\n\
+                   register_command('pytest_hi', 'a help string', hi)\n";
+        assert!(exec_script(src, "test.py").is_err());
+
+        // A syntactically broken script surfaces a stringified error, not a panic.
+        assert!(exec_script("def (:\n", "bad.py").is_err());
         clear_commands();
     }
 }

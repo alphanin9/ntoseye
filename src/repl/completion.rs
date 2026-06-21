@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -8,16 +9,18 @@ use crate::symbols::{SymbolIndex, SymbolStore};
 use crate::target::{DriverObjectInfo, Target, ThreadInfo};
 use crate::types::{Dtb, VirtAddr};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompletionStrategy {
     None,
     Symbol,
+    Expression,
     Type,
     Process,
     Thread,
     Vcpu,
     Breakpoint,
     Driver,
+    Alias,
 }
 
 impl CompletionStrategy {
@@ -25,12 +28,14 @@ impl CompletionStrategy {
         Some(match s {
             "none" | "" => Self::None,
             "symbol" => Self::Symbol,
+            "expression" => Self::Expression,
             "type" => Self::Type,
             "process" => Self::Process,
             "thread" => Self::Thread,
             "vcpu" => Self::Vcpu,
             "breakpoint" => Self::Breakpoint,
             "driver" => Self::Driver,
+            "alias" => Self::Alias,
             _ => return None,
         })
     }
@@ -51,8 +56,14 @@ pub type BreakpointCache = Vec<(u32, bool, VirtAddr, Option<String>)>;
 /// Cached driver object info for completion
 pub type DriverObjectCache = Vec<DriverObjectInfo>;
 
+/// Cached expression variable name and display kind
+pub type ExpressionVariableCache = Vec<(String, &'static str)>;
+
 /// Cached (name, help, per-arg strategies) for script-registered commands
 pub type UserCommandCache = Vec<(String, String, Vec<CompletionStrategy>)>;
+
+/// Cached user alias definitions for completion
+pub type AliasCache = Vec<(String, String)>;
 
 /// Completion-facing state shared between the REPL loop (which rewrites the
 /// caches as the target's state changes) and the tab completer. Every field is
@@ -68,7 +79,10 @@ pub struct ReplCaches {
     pub vcpus: Arc<RwLock<VcpuCache>>,
     pub breakpoints: Arc<RwLock<BreakpointCache>>,
     pub drivers: Arc<RwLock<DriverObjectCache>>,
+    pub registers: Arc<Vec<String>>,
+    pub expression_variables: Arc<RwLock<ExpressionVariableCache>>,
     pub user_commands: Arc<RwLock<UserCommandCache>>,
+    pub aliases: Arc<RwLock<AliasCache>>,
 }
 
 impl ReplCaches {
@@ -126,5 +140,21 @@ impl ReplCaches {
         if let Ok(drivers) = debugger.enumerate_driver_objects() {
             *self.drivers.write().unwrap() = drivers;
         }
+    }
+
+    pub fn refresh_expression_context(&self, debugger: &Target) {
+        let mut variables = BTreeMap::new();
+        for name in debugger.user_vars.keys() {
+            if !self.registers.contains(name) {
+                variables.insert(name.clone(), "Variable");
+            }
+        }
+        for index in 0..debugger.results.len() {
+            variables.insert(index.to_string(), "Result");
+        }
+        for var in debugger.builtin_variables() {
+            variables.entry(var.name.to_string()).or_insert("Builtin");
+        }
+        *self.expression_variables.write().unwrap() = variables.into_iter().collect();
     }
 }

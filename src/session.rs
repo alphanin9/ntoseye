@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use iced_x86::{Code, Decoder, DecoderOptions, Instruction, Mnemonic};
@@ -48,7 +48,8 @@ pub enum ContinueOutcome {
     },
     /// The guest is processing a bugcheck (BSOD). `info` carries the code +
     /// parameters when the backend decoded them from the KD stream; otherwise
-    /// read `nt!KiBugCheckData` from memory (`crate::bugchecks::current_bugcheck`).
+    /// read `nt!KiBugCheckData` from memory with
+    /// [`crate::bugchecks::current_bugcheck`].
     Bugcheck {
         rip: Option<u64>,
         info: Option<BugcheckInfo>,
@@ -217,6 +218,11 @@ const STATUS_SINGLE_STEP: u32 = 0x8000_0004;
 /// The root owner of a live debugging session: the introspection context, the
 /// backend that drives the target, and the session state layered on top.
 pub struct Session {
+    /// Process-unique session id, assigned at construction from a monotonic
+    /// counter. Hosts use it as a stable identity token for handles they hand
+    /// out (e.g. the Python `Breakpoint`/`StopOutcome` session guard) without
+    /// reasoning about pointer reuse across reattach.
+    id: usize,
     pub target: Target,
     pub backend: Box<dyn DebugBackend>,
     pub breakpoints: BreakpointManager,
@@ -287,7 +293,10 @@ impl Session {
             "1".to_string()
         };
 
+        static NEXT_SESSION_ID: AtomicUsize = AtomicUsize::new(1);
+
         Ok(Self {
+            id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             target,
             backend,
             breakpoints: BreakpointManager::new(),
@@ -757,8 +766,20 @@ impl Session {
         addr: VirtAddr,
         condition: Option<String>,
     ) -> Result<u32> {
+        self.add_breakpoint_with_symbol_condition(addr, None, condition)
+    }
+
+    /// Set a code breakpoint at `addr`, carrying an optional display `symbol`
+    /// for hosts that created it from a user expression rather than a raw
+    /// address.
+    pub fn add_breakpoint_with_symbol_condition(
+        &mut self,
+        addr: VirtAddr,
+        symbol: Option<String>,
+        condition: Option<String>,
+    ) -> Result<u32> {
         self.breakpoints
-            .add(self.backend.as_mut(), &self.target, addr, None, condition)
+            .add(self.backend.as_mut(), &self.target, addr, symbol, condition)
     }
 
     /// Remove a breakpoint by id.
@@ -783,6 +804,16 @@ impl Session {
     /// List all breakpoints.
     pub fn list_breakpoints(&self) -> Vec<&Breakpoint> {
         self.breakpoints.list()
+    }
+
+    /// This session's process-unique identity (see the `id` field).
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
+    /// Return one breakpoint by id.
+    pub fn breakpoint(&self, id: u32) -> Option<&Breakpoint> {
+        self.breakpoints.list().into_iter().find(|bp| bp.id == id)
     }
 
     /// Inspect every backend execution context (vCPU): its RIP, the address space

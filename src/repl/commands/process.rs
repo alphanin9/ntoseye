@@ -1,7 +1,6 @@
 use indicatif::{ProgressBar, ProgressStyle};
 use std::time::Duration;
 
-use strum::EnumMessage;
 use tabled::builder::Builder;
 
 use owo_colors::OwoColorize;
@@ -16,6 +15,86 @@ use crate::types::{Value, VirtAddr};
 use crate::ui;
 
 use crate::repl::*;
+
+repl_command! {
+    cmd_vcpus();
+    names: ["vcpus"],
+    usage: "vcpus",
+    summary: "List vCPU contexts and their RIP values.",
+    run_state: Halted,
+}
+
+repl_command! {
+    cmd_vcpu;
+    names: ["vcpu"],
+    usage: "vcpu <id>",
+    summary: "Switch to a different vCPU context.",
+    completion: Vcpu,
+    run_state: Halted,
+}
+
+repl_command! {
+    cmd_threads;
+    names: ["threads"],
+    usage: "threads [filter]",
+    summary: "List Windows threads, optionally filtered by process, PID, TID, or ETHREAD.",
+    completion: Process,
+    run_state: Halted,
+}
+
+repl_command! {
+    cmd_thread;
+    names: ["thread"],
+    usage: "thread <tid|ethread|.> [k|r] [count]",
+    summary: "Inspect a Windows thread and switch to it if it is currently running.",
+    completion: [Thread, None, None],
+    run_state: Halted,
+}
+
+repl_command! {
+    cmd_ps;
+    names: ["ps"],
+    usage: "ps [filter]",
+    summary: "List running processes.",
+}
+
+repl_command! {
+    cmd_lm;
+    names: ["lm"],
+    usage: "lm [filter]",
+    summary: "List loaded modules.",
+}
+
+repl_command! {
+    cmd_drivers;
+    names: ["drivers"],
+    usage: "drivers [filter]",
+    summary: "List driver objects from the \\Driver object directory.",
+}
+
+repl_command! {
+    cmd_attach;
+    names: ["attach"],
+    usage: "attach <pid>",
+    summary: "Attach to a process by PID.",
+    completion: Process,
+}
+
+repl_command! {
+    cmd_detach();
+    names: ["detach"],
+    usage: "detach",
+    summary: "Detach from current process.",
+}
+
+repl_command! {
+    cmd_vmmap;
+    names: ["vmmap"],
+    usage: "vmmap [address|filter]",
+    summary: "Display virtual memory regions for the attached process, or kernel modules when detached.",
+    completion: Expression,
+    run_state: Halted,
+}
 
 fn thread_state_label(thread: &ThreadInfo) -> String {
     thread
@@ -201,12 +280,7 @@ fn region_matches_filter(
 }
 
 impl ReplState<'_> {
-    pub fn cmd_vcpus(&mut self, _parts: &[&str]) -> Result<()> {
-        if self.ctx.backend.is_running() {
-            error!("VM is running");
-            return Ok(());
-        }
-
+    fn cmd_vcpus(&mut self) -> Result<()> {
         let pb = ProgressBar::new_spinner();
         pb.set_style(
             ProgressStyle::default_spinner()
@@ -251,13 +325,8 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_threads(&mut self, parts: &[&str]) -> Result<()> {
-        if self.ctx.backend.is_running() {
-            error!("VM is running");
-            return Ok(());
-        }
-
-        let filter = parts.get(1).copied();
+    fn cmd_threads(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let filter = invocation.arg(0);
         let (mut threads, active) = match self.ctx.windows_threads() {
             Ok(result) => result,
             Err(e) => {
@@ -323,13 +392,8 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_thread(&mut self, parts: &[&str]) -> Result<()> {
-        if self.ctx.backend.is_running() {
-            error!("VM is running");
-            return Ok(());
-        }
-
-        let target = require_arg!(parts, 1, ReplCommand::Thread);
+    fn cmd_thread(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let target = require_arg!(invocation, 0, "thread");
         let mut threads = match self.ctx.target.enumerate_threads() {
             Ok(threads) => threads,
             Err(e) => {
@@ -385,9 +449,9 @@ impl ReplState<'_> {
             }
         };
 
-        let action = parts.get(2).copied();
-        let frame_limit = parts
-            .get(3)
+        let action = invocation.arg(1);
+        let frame_limit = invocation
+            .arg(2)
             .and_then(|count| count.parse::<usize>().ok())
             .unwrap_or(16)
             .max(1);
@@ -455,13 +519,8 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_vmmap(&mut self, parts: &[&str]) -> Result<()> {
-        if self.ctx.backend.is_running() {
-            error!("VM is running");
-            return Ok(());
-        }
-
-        let filter = parts.get(1).copied();
+    fn cmd_vmmap(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let filter = invocation.arg(0);
         let filter_address = filter.and_then(|filter| Expr::eval(filter, &self.ctx.target).ok());
 
         if let Some(process) = self.ctx.target.current_process_info.clone() {
@@ -575,8 +634,8 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_ps(&mut self, parts: &[&str]) -> Result<()> {
-        let filter = parts.get(1).copied();
+    fn cmd_ps(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let filter = invocation.arg(0);
 
         match self.ctx.target.guest.enumerate_processes() {
             Ok(processes) => {
@@ -621,8 +680,8 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_drivers(&mut self, parts: &[&str]) -> Result<()> {
-        let filter = parts.get(1).map(|s| s.to_lowercase());
+    fn cmd_drivers(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let filter = invocation.arg(0).map(|s| s.to_lowercase());
 
         match self.ctx.target.enumerate_driver_objects() {
             Ok(drivers) => {
@@ -682,8 +741,8 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_lm(&mut self, parts: &[&str]) -> Result<()> {
-        let filter = parts.get(1).map(|s| s.to_lowercase());
+    fn cmd_lm(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let filter = invocation.arg(0).map(|s| s.to_lowercase());
 
         let dtb = match &self.ctx.target.current_process_info {
             Some(process_info) => process_info.dtb,
@@ -751,8 +810,8 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_attach(&mut self, parts: &[&str]) -> Result<()> {
-        let pid_str = require_arg!(parts, 1, ReplCommand::Attach);
+    fn cmd_attach(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let pid_str = require_arg!(invocation, 0, "attach");
         match pid_str.parse::<u64>() {
             Ok(pid) => match self.ctx.target.attach(pid) {
                 Ok(AttachReport {
@@ -779,7 +838,7 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_detach(&mut self, _parts: &[&str]) -> Result<()> {
+    fn cmd_detach(&mut self) -> Result<()> {
         if self.ctx.target.current_process.is_none() {
             error!("not attached to any process");
         } else {
@@ -794,13 +853,8 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    pub fn cmd_vcpu(&mut self, parts: &[&str]) -> Result<()> {
-        if self.ctx.backend.is_running() {
-            error!("VM is running");
-            return Ok(());
-        }
-
-        let thread_id = require_arg!(parts, 1, ReplCommand::Vcpu);
+    fn cmd_vcpu(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let thread_id = require_arg!(invocation, 0, "vcpu");
 
         let threads = match self.ctx.backend.thread_list() {
             Ok(t) => t,

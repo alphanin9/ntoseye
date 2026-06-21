@@ -233,6 +233,16 @@ pub struct AddressModule {
     pub offset: u64,
 }
 
+/// One memory-search hit, enriched with the same location/symbol context used
+/// by the SDK and MCP.
+#[derive(Debug, Clone)]
+pub struct MemorySearchMatch {
+    pub address: VirtAddr,
+    pub offset: u64,
+    pub symbol: Option<String>,
+    pub description: AddressDescription,
+}
+
 #[derive(Debug, Clone)]
 pub struct ThreadInfo {
     pub ethread: VirtAddr,
@@ -527,6 +537,39 @@ impl Target {
             .filter(|&i| &buf[i..i + pattern.len()] == pattern)
             .map(|i| start.0.wrapping_add(i as u64))
             .collect())
+    }
+
+    /// Add symbol/module/region context to already-computed search hits. Keeping
+    /// this separate from `search` lets paged callers enrich only returned rows.
+    pub fn describe_search_matches(
+        &self,
+        start: VirtAddr,
+        matches: &[u64],
+    ) -> Result<Vec<MemorySearchMatch>> {
+        matches
+            .iter()
+            .copied()
+            .map(|addr| {
+                let address = VirtAddr(addr);
+                Ok(MemorySearchMatch {
+                    address,
+                    offset: addr.wrapping_sub(start.0),
+                    symbol: self.closest_symbol_current_context(address),
+                    description: self.describe_address(address)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Search memory and return structured rows instead of bare addresses.
+    pub fn search_details(
+        &self,
+        start: VirtAddr,
+        pattern: &[u8],
+        length: usize,
+    ) -> Result<Vec<MemorySearchMatch>> {
+        let matches = self.search(start, pattern, length)?;
+        self.describe_search_matches(start, &matches)
     }
 
     /// Walk an intrusive `_LIST_ENTRY` from `head` (the list-head address) in

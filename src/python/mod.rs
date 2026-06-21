@@ -5,22 +5,28 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use pyo3::class::basic::CompareOp;
 use pyo3::IntoPyObjectExt;
-use pyo3::exceptions::PyAttributeError;
+use pyo3::exceptions::{PyAttributeError, PyKeyError, PyTypeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList};
+use pyo3::types::{PyAny, PyBytes, PyDict, PyList};
 
 use crate::backend::MemoryOps;
 use crate::bugchecks::{analyze_bugcheck, current_bugcheck};
 use crate::dbg_backend::DebugBackend;
 use crate::error::Error;
 use crate::expr::Expr;
+use crate::gdb::breakpoints::Breakpoint as CoreBreakpoint;
 use crate::gdb::GdbClient;
 use crate::kd::KdBackend;
 use crate::memory_backend::MemoryBackend;
 use crate::repl::ReplState;
 use crate::session::{ContinueOutcome, Session};
 use crate::symbols::{FieldValue, ParsedType, TypeInfo, le_uint};
+use crate::target::{
+    AddressModule as CoreAddressModule, MemoryRegionInfo,
+    MemorySearchMatch as CoreMemorySearchMatch,
+};
 use crate::types::VirtAddr;
 use crate::view;
 
@@ -91,6 +97,36 @@ fn view_list<'py>(py: Python<'py>, v: &view::View) -> PyResult<Bound<'py, PyList
     view::to_py(py, v)?
         .cast_into::<PyList>()
         .map_err(|e| raise(e.to_string()))
+}
+
+fn breakpoint_id_arg(value: &Bound<'_, PyAny>, session_id: usize) -> PyResult<u32> {
+    if let Ok(bp) = value.extract::<PyRef<'_, Breakpoint>>() {
+        if bp.session_id != session_id {
+            return Err(raise(
+                "breakpoint handle belongs to a different debugger session",
+            ));
+        }
+        return Ok(bp.id());
+    }
+    value.extract::<u32>().map_err(|_| {
+        PyTypeError::new_err("expected a breakpoint id or ntoseye.Breakpoint handle")
+    })
+}
+
+fn breakpoint_target_arg(
+    dbg: &Debugger,
+    target: &Bound<'_, PyAny>,
+) -> PyResult<(u64, Option<String>)> {
+    if let Ok(addr) = target.extract::<u64>() {
+        return Ok((addr, None));
+    }
+    if let Ok(expr) = target.extract::<String>() {
+        let addr = Expr::eval(&expr, &dbg.inner.target).map_err(err)?.0;
+        return Ok((addr, Some(expr)));
+    }
+    Err(PyTypeError::new_err(
+        "expected a breakpoint address or debugger expression",
+    ))
 }
 
 /// A live debugging session. Owns the engine + backend; drive it from Python.
@@ -170,6 +206,695 @@ impl DerefMut for SessionHandle {
     }
 }
 
+#[derive(Clone)]
+struct BreakpointSnapshot {
+    id: u32,
+    address: u64,
+    enabled: bool,
+    symbol: Option<String>,
+    scope: String,
+    condition: Option<String>,
+    temporary: bool,
+}
+
+impl BreakpointSnapshot {
+    fn from_core(bp: &CoreBreakpoint) -> Self {
+        Self {
+            id: bp.id,
+            address: bp.address.0,
+            enabled: bp.enabled,
+            symbol: bp.symbol.clone(),
+            scope: bp.scope.label(),
+            condition: bp.condition.clone(),
+            temporary: bp.temporary,
+        }
+    }
+}
+
+/// A live breakpoint handle. Equality is debugger-session + breakpoint id, so
+/// a handle returned from `dbg.breakpoint(...)` compares equal to the handle
+/// surfaced later in `outcome.breakpoints`.
+#[pyclass(unsendable)]
+pub struct Breakpoint {
+    dbg: Option<Py<Debugger>>,
+    session_id: usize,
+    snapshot: BreakpointSnapshot,
+}
+
+impl Breakpoint {
+    fn live_snapshot(&self, py: Python<'_>) -> Option<BreakpointSnapshot> {
+        let dbg = self.dbg.as_ref()?.borrow(py);
+        if dbg.session_id() != self.session_id {
+            return None;
+        }
+        dbg.inner
+            .breakpoint(self.snapshot.id)
+            .map(BreakpointSnapshot::from_core)
+    }
+
+    fn require_live_debugger<'py>(
+        &'py self,
+        py: Python<'py>,
+    ) -> PyResult<PyRefMut<'py, Debugger>> {
+        let Some(dbg) = &self.dbg else {
+            return Err(raise("breakpoint handle is not attached to a live debugger"));
+        };
+        let dbg = dbg.borrow_mut(py);
+        if dbg.session_id() != self.session_id {
+            return Err(raise("breakpoint handle belongs to a different debugger session"));
+        }
+        Ok(dbg)
+    }
+}
+
+#[pymethods]
+impl Breakpoint {
+    #[getter]
+    fn id(&self) -> u32 {
+        self.snapshot.id
+    }
+
+    #[getter]
+    fn address(&self) -> u64 {
+        self.snapshot.address
+    }
+
+    #[getter]
+    fn symbol(&self) -> Option<String> {
+        self.snapshot.symbol.clone()
+    }
+
+    #[getter]
+    fn scope(&self) -> String {
+        self.snapshot.scope.clone()
+    }
+
+    #[getter]
+    fn condition(&self) -> Option<String> {
+        self.snapshot.condition.clone()
+    }
+
+    #[getter]
+    fn temporary(&self) -> bool {
+        self.snapshot.temporary
+    }
+
+    #[getter]
+    fn valid(&self, py: Python<'_>) -> bool {
+        self.live_snapshot(py).is_some()
+    }
+
+    fn is_valid(&self, py: Python<'_>) -> bool {
+        self.valid(py)
+    }
+
+    #[getter]
+    fn enabled(&self, py: Python<'_>) -> bool {
+        self.live_snapshot(py)
+            .map(|bp| bp.enabled)
+            .unwrap_or(false)
+    }
+
+    #[setter]
+    fn set_enabled(&self, py: Python<'_>, enabled: bool) -> PyResult<()> {
+        if enabled {
+            self.enable(py)
+        } else {
+            self.disable(py)
+        }
+    }
+
+    /// Remove this breakpoint from the target.
+    fn clear(&self, py: Python<'_>) -> PyResult<()> {
+        let mut dbg = self.require_live_debugger(py)?;
+        dbg.require_halted("breakpoint.clear")?;
+        dbg.inner.remove_breakpoint(self.snapshot.id).map_err(err)
+    }
+
+    /// Alias for `clear()`, matching GDB's breakpoint object vocabulary.
+    fn delete(&self, py: Python<'_>) -> PyResult<()> {
+        self.clear(py)
+    }
+
+    /// Re-enable this breakpoint.
+    fn enable(&self, py: Python<'_>) -> PyResult<()> {
+        let mut dbg = self.require_live_debugger(py)?;
+        dbg.require_halted("breakpoint.enable")?;
+        dbg.inner.enable_breakpoint(self.snapshot.id).map_err(err)
+    }
+
+    /// Disable this breakpoint without deleting it.
+    fn disable(&self, py: Python<'_>) -> PyResult<()> {
+        let mut dbg = self.require_live_debugger(py)?;
+        dbg.require_halted("breakpoint.disable")?;
+        dbg.inner.disable_breakpoint(self.snapshot.id).map_err(err)
+    }
+
+    /// The flat mapping `{id, address, enabled, symbol, scope, condition,
+    /// temporary}` (the shape the breakpoint lister used to return directly).
+    /// `enabled` reflects the live state when the handle is still valid.
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("id", self.snapshot.id)?;
+        d.set_item("address", self.snapshot.address)?;
+        d.set_item("enabled", self.enabled(py))?;
+        d.set_item("symbol", self.snapshot.symbol.clone())?;
+        d.set_item("scope", self.snapshot.scope.clone())?;
+        d.set_item("condition", self.snapshot.condition.clone())?;
+        d.set_item("temporary", self.snapshot.temporary)?;
+        Ok(d)
+    }
+
+    fn __richcmp__(&self, other: PyRef<'_, Breakpoint>, op: CompareOp) -> bool {
+        let equal = self.session_id == other.session_id && self.snapshot.id == other.snapshot.id;
+        match op {
+            CompareOp::Eq => equal,
+            CompareOp::Ne => !equal,
+            _ => false,
+        }
+    }
+
+    fn __hash__(&self) -> isize {
+        (self.session_id as isize).wrapping_mul(31) ^ self.snapshot.id as isize
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> String {
+        let state = if self.valid(py) { "valid" } else { "invalid" };
+        let symbol = self
+            .snapshot
+            .symbol
+            .as_ref()
+            .map(|s| format!(" {s}"))
+            .unwrap_or_default();
+        format!(
+            "<Breakpoint #{} at {:#x}{} {}>",
+            self.snapshot.id, self.snapshot.address, symbol, state
+        )
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StopKind {
+    Breakpoint,
+    Bugcheck,
+    Exception,
+    Step,
+    TargetReloaded,
+    Running,
+    Halted,
+}
+
+impl StopKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Breakpoint => "breakpoint",
+            Self::Bugcheck => "bugcheck",
+            Self::Exception => "exception",
+            Self::Step => "step",
+            Self::TargetReloaded => "target_reloaded",
+            Self::Running => "running",
+            Self::Halted => "halted",
+        }
+    }
+}
+
+struct StopOutcomeData {
+    kind: StopKind,
+    rip: Option<u64>,
+    symbol: Option<String>,
+    process: Option<(u64, String)>,
+    breakpoints: Vec<BreakpointSnapshot>,
+    address: Option<u64>,
+    temporary: Option<bool>,
+    exception_code: Option<u32>,
+    bugcheck_info: Option<Py<PyAny>>,
+    kernel_base: Option<u64>,
+    coherent: Option<bool>,
+}
+
+/// The result of `run()`, `wait_for_stop()`, `step_over()`, or `step_out()`.
+/// Use predicate properties for control flow (`running`, `bugcheck`,
+/// `target_reloaded`) and `breakpoints` for breakpoint identity.
+#[pyclass(unsendable)]
+pub struct StopOutcome {
+    dbg: Py<Debugger>,
+    session_id: usize,
+    data: StopOutcomeData,
+}
+
+impl StopOutcome {
+    fn breakpoint_handles(&self, py: Python<'_>) -> Vec<Breakpoint> {
+        self.data
+            .breakpoints
+            .iter()
+            .cloned()
+            .map(|snapshot| Breakpoint {
+                dbg: Some(self.dbg.clone_ref(py)),
+                session_id: self.session_id,
+                snapshot,
+            })
+            .collect()
+    }
+}
+
+/// Module context for a structured memory-search hit.
+#[pyclass(unsendable, skip_from_py_object)]
+#[derive(Clone)]
+pub struct AddressModule {
+    name: String,
+    base: u64,
+    size: u32,
+    offset: u64,
+}
+
+impl From<CoreAddressModule> for AddressModule {
+    fn from(module: CoreAddressModule) -> Self {
+        Self {
+            name: module.name,
+            base: module.base.0,
+            size: module.size,
+            offset: module.offset,
+        }
+    }
+}
+
+#[pymethods]
+impl AddressModule {
+    #[getter]
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[getter]
+    fn base(&self) -> u64 {
+        self.base
+    }
+
+    #[getter]
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    #[getter]
+    fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("name", &self.name)?;
+        d.set_item("base", self.base)?;
+        d.set_item("size", self.size)?;
+        d.set_item("offset", self.offset)?;
+        Ok(d)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<AddressModule {} base={:#x}>", self.name, self.base)
+    }
+}
+
+/// VAD/context region for a structured memory-search hit.
+#[pyclass(unsendable, skip_from_py_object)]
+#[derive(Clone)]
+pub struct MemoryRegion {
+    start: u64,
+    end: u64,
+    protection: Option<u64>,
+    vad_type: Option<u64>,
+    private_memory: Option<bool>,
+    commit_charge: Option<u64>,
+    details: Option<String>,
+}
+
+impl From<MemoryRegionInfo> for MemoryRegion {
+    fn from(region: MemoryRegionInfo) -> Self {
+        Self {
+            start: region.start.0,
+            end: region.end.0,
+            protection: region.protection,
+            vad_type: region.vad_type,
+            private_memory: region.private_memory,
+            commit_charge: region.commit_charge,
+            details: region.details,
+        }
+    }
+}
+
+#[pymethods]
+impl MemoryRegion {
+    #[getter]
+    fn start(&self) -> u64 {
+        self.start
+    }
+
+    #[getter]
+    fn end(&self) -> u64 {
+        self.end
+    }
+
+    #[getter]
+    fn protection(&self) -> Option<u64> {
+        self.protection
+    }
+
+    #[getter]
+    fn vad_type(&self) -> Option<u64> {
+        self.vad_type
+    }
+
+    #[getter]
+    fn private_memory(&self) -> Option<bool> {
+        self.private_memory
+    }
+
+    #[getter]
+    fn commit_charge(&self) -> Option<u64> {
+        self.commit_charge
+    }
+
+    #[getter]
+    fn details(&self) -> Option<String> {
+        self.details.clone()
+    }
+
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("start", self.start)?;
+        d.set_item("end", self.end)?;
+        d.set_item("protection", self.protection)?;
+        d.set_item("vad_type", self.vad_type)?;
+        d.set_item("private_memory", self.private_memory)?;
+        d.set_item("commit_charge", self.commit_charge)?;
+        d.set_item("details", self.details.clone())?;
+        Ok(d)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<MemoryRegion {:#x}..{:#x}>", self.start, self.end)
+    }
+}
+
+/// A memory-search hit with symbol and location context.
+#[pyclass(unsendable, skip_from_py_object)]
+#[derive(Clone)]
+pub struct MemorySearchMatch {
+    address: u64,
+    offset: u64,
+    symbol: Option<String>,
+    kind: String,
+    module: Option<AddressModule>,
+    section: Option<String>,
+    va_type: Option<String>,
+    region: Option<MemoryRegion>,
+}
+
+impl MemorySearchMatch {
+    fn from_core(hit: CoreMemorySearchMatch) -> Self {
+        Self {
+            address: hit.address.0,
+            offset: hit.offset,
+            symbol: hit.symbol,
+            kind: hit.description.kind.to_string(),
+            module: hit.description.module.map(AddressModule::from),
+            section: hit.description.section,
+            va_type: hit.description.va_type,
+            region: hit.description.region.map(MemoryRegion::from),
+        }
+    }
+}
+
+#[pymethods]
+impl MemorySearchMatch {
+    #[getter]
+    fn address(&self) -> u64 {
+        self.address
+    }
+
+    #[getter]
+    fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    #[getter]
+    fn symbol(&self) -> Option<String> {
+        self.symbol.clone()
+    }
+
+    #[getter]
+    fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    #[getter]
+    fn module(&self) -> Option<AddressModule> {
+        self.module.clone()
+    }
+
+    #[getter]
+    fn section(&self) -> Option<String> {
+        self.section.clone()
+    }
+
+    #[getter]
+    fn va_type(&self) -> Option<String> {
+        self.va_type.clone()
+    }
+
+    #[getter]
+    fn region(&self) -> Option<MemoryRegion> {
+        self.region.clone()
+    }
+
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("address", self.address)?;
+        d.set_item("offset", self.offset)?;
+        d.set_item("symbol", self.symbol.clone())?;
+        d.set_item("kind", &self.kind)?;
+        if let Some(module) = &self.module {
+            d.set_item("module", module.to_dict(py)?)?;
+        } else {
+            d.set_item("module", py.None())?;
+        }
+        d.set_item("section", self.section.clone())?;
+        d.set_item("va_type", self.va_type.clone())?;
+        if let Some(region) = &self.region {
+            d.set_item("region", region.to_dict(py)?)?;
+        } else {
+            d.set_item("region", py.None())?;
+        }
+        Ok(d)
+    }
+
+    fn __repr__(&self) -> String {
+        match &self.symbol {
+            Some(symbol) => format!("<MemorySearchMatch {:#x} {}>", self.address, symbol),
+            None => format!("<MemorySearchMatch {:#x}>", self.address),
+        }
+    }
+}
+
+#[pymethods]
+impl StopOutcome {
+    #[getter]
+    fn reason(&self) -> &'static str {
+        self.data.kind.as_str()
+    }
+
+    #[getter]
+    fn running(&self) -> bool {
+        self.data.kind == StopKind::Running
+    }
+
+    #[getter]
+    fn timed_out(&self) -> bool {
+        self.running()
+    }
+
+    #[getter]
+    fn breakpoint_stop(&self) -> bool {
+        self.data.kind == StopKind::Breakpoint
+    }
+
+    #[getter]
+    fn exception(&self) -> bool {
+        self.data.kind == StopKind::Exception
+    }
+
+    #[getter]
+    fn step(&self) -> bool {
+        self.data.kind == StopKind::Step
+    }
+
+    #[getter]
+    fn bugcheck(&self) -> bool {
+        self.data.kind == StopKind::Bugcheck
+    }
+
+    #[getter]
+    fn target_reloaded(&self) -> bool {
+        self.data.kind == StopKind::TargetReloaded
+    }
+
+    #[getter]
+    fn reload(&self) -> bool {
+        self.target_reloaded()
+    }
+
+    #[getter]
+    fn halted(&self) -> bool {
+        self.data.kind == StopKind::Halted
+    }
+
+    #[getter]
+    fn terminal(&self) -> bool {
+        self.bugcheck() || self.target_reloaded()
+    }
+
+    #[getter]
+    fn rip(&self) -> Option<u64> {
+        self.data.rip
+    }
+
+    #[getter]
+    fn symbol(&self) -> Option<String> {
+        self.data.symbol.clone()
+    }
+
+    #[getter]
+    fn process(&self) -> Option<(u64, String)> {
+        self.data.process.clone()
+    }
+
+    #[getter]
+    fn breakpoints(&self, py: Python<'_>) -> Vec<Breakpoint> {
+        self.breakpoint_handles(py)
+    }
+
+    #[getter]
+    fn breakpoint(&self, py: Python<'_>) -> Option<Breakpoint> {
+        self.breakpoint_handles(py).into_iter().next()
+    }
+
+    #[getter]
+    fn breakpoint_ids(&self) -> Vec<u32> {
+        self.data.breakpoints.iter().map(|bp| bp.id).collect()
+    }
+
+    #[getter]
+    fn breakpoint_id(&self) -> Option<u32> {
+        self.data.breakpoints.first().map(|bp| bp.id)
+    }
+
+    #[getter]
+    fn address(&self) -> Option<u64> {
+        self.data.address
+    }
+
+    #[getter]
+    fn temporary(&self) -> Option<bool> {
+        self.data.temporary
+    }
+
+    #[getter]
+    fn exception_code(&self) -> Option<u32> {
+        self.data.exception_code
+    }
+
+    #[getter]
+    fn bugcheck_info(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.data
+            .bugcheck_info
+            .as_ref()
+            .map(|info| info.clone_ref(py))
+    }
+
+    #[getter]
+    fn kernel_base(&self) -> Option<u64> {
+        self.data.kernel_base
+    }
+
+    #[getter]
+    fn coherent(&self) -> Option<bool> {
+        self.data.coherent
+    }
+
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("stop", self.reason())?;
+        match self.data.kind {
+            StopKind::Breakpoint => {
+                d.set_item("rip", self.data.rip)?;
+                if let Some(bp) = self.data.breakpoints.first() {
+                    d.set_item("id", bp.id)?;
+                    d.set_item("breakpoint", bp.id)?;
+                    d.set_item("address", self.data.address.unwrap_or(bp.address))?;
+                    d.set_item("symbol", self.data.symbol.clone())?;
+                    d.set_item("temporary", self.data.temporary.unwrap_or(bp.temporary))?;
+                }
+                d.set_item("process", self.data.process.clone())?;
+            }
+            StopKind::Bugcheck => {
+                d.set_item("rip", self.data.rip)?;
+                match &self.data.bugcheck_info {
+                    Some(info) => d.set_item("bugcheck", info.clone_ref(py))?,
+                    None => d.set_item("bugcheck", true)?,
+                }
+            }
+            StopKind::Exception => {
+                d.set_item("rip", self.data.rip)?;
+                d.set_item("exception_code", self.data.exception_code)?;
+                d.set_item("symbol", self.data.symbol.clone())?;
+                d.set_item("process", self.data.process.clone())?;
+            }
+            StopKind::Step => {
+                d.set_item("rip", self.data.rip)?;
+                d.set_item("symbol", self.data.symbol.clone())?;
+                d.set_item("process", self.data.process.clone())?;
+            }
+            StopKind::TargetReloaded => {
+                d.set_item("target_reloaded", true)?;
+                d.set_item("kernel_base", self.data.kernel_base)?;
+                d.set_item("coherent", self.data.coherent)?;
+            }
+            StopKind::Running => {}
+            StopKind::Halted => {
+                d.set_item("rip", self.data.rip)?;
+                d.set_item("symbol", self.data.symbol.clone())?;
+            }
+        }
+        Ok(d)
+    }
+
+    #[pyo3(signature = (key, default=None))]
+    fn get(&self, py: Python<'_>, key: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
+        let d = self.to_dict(py)?;
+        match d.get_item(key)? {
+            Some(value) => Ok(value.unbind()),
+            None => Ok(default.unwrap_or_else(|| py.None())),
+        }
+    }
+
+    fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
+        let d = self.to_dict(py)?;
+        d.get_item(key)?
+            .map(|value| value.unbind())
+            .ok_or_else(|| PyKeyError::new_err(key.to_string()))
+    }
+
+    fn __contains__(&self, py: Python<'_>, key: &str) -> PyResult<bool> {
+        self.to_dict(py)?.contains(key)
+    }
+
+    fn __repr__(&self) -> String {
+        match self.data.rip {
+            Some(rip) => format!("<StopOutcome {} rip={:#x}>", self.reason(), rip),
+            None => format!("<StopOutcome {}>", self.reason()),
+        }
+    }
+}
+
 #[pymethods]
 impl Debugger {
     // --- memory ---
@@ -206,6 +931,26 @@ impl Debugger {
         self.inner
             .target
             .search(VirtAddr(start), pattern, length)
+            .map_err(err)
+    }
+
+    /// Search memory and return typed rows with address, offset, nearest symbol,
+    /// and module/region context. `search` is the cheaper address-only variant.
+    fn search_details(
+        &self,
+        start: u64,
+        pattern: &[u8],
+        length: usize,
+    ) -> PyResult<Vec<MemorySearchMatch>> {
+        if length > MAX_SEARCH_LEN {
+            return Err(raise(format!(
+                "search length {length} exceeds cap {MAX_SEARCH_LEN} (0x{MAX_SEARCH_LEN:x})"
+            )));
+        }
+        self.inner
+            .target
+            .search_details(VirtAddr(start), pattern, length)
+            .map(|matches| matches.into_iter().map(MemorySearchMatch::from_core).collect())
             .map_err(err)
     }
 
@@ -300,106 +1045,152 @@ impl Debugger {
     }
 
     /// Wait for the next stop WITHOUT resuming, up to `timeout_ms` (None blocks,
-    /// polling for KeyboardInterrupt between 1s slices). Returns the same dict as
-    /// `run()`. Since it does not resume, a VM already halted at a stop is reported
-    /// in place; use `cont()` (or `run()`) to advance.
+    /// polling for KeyboardInterrupt between 1s slices). Returns a
+    /// [`StopOutcome`]. Since it does not resume, a VM already halted at a stop
+    /// is reported in place; use `cont()` (or `run()`) to advance.
     #[pyo3(signature = (timeout_ms=None))]
     fn wait_for_stop<'py>(
-        &mut self,
+        slf: Bound<'py, Self>,
         py: Python<'py>,
         timeout_ms: Option<u64>,
-    ) -> PyResult<Bound<'py, PyDict>> {
+    ) -> PyResult<StopOutcome> {
         let never = std::sync::atomic::AtomicBool::new(false);
-        let outcome = match timeout_ms {
-            Some(ms) => self
-                .inner
-                .wait_for_stop_bounded(Some(Duration::from_millis(ms)), &never)
-                .map_err(err)?,
-            None => loop {
-                match self
+        let (session_id, data) = {
+            let mut dbg = slf.borrow_mut();
+            let outcome = match timeout_ms {
+                Some(ms) => dbg
                     .inner
-                    .wait_for_stop_bounded(Some(Duration::from_secs(1)), &never)
-                    .map_err(err)?
-                {
-                    ContinueOutcome::Running => {
-                        py.check_signals()?;
-                        continue;
+                    .wait_for_stop_bounded(Some(Duration::from_millis(ms)), &never)
+                    .map_err(err)?,
+                None => loop {
+                    match dbg
+                        .inner
+                        .wait_for_stop_bounded(Some(Duration::from_secs(1)), &never)
+                        .map_err(err)?
+                    {
+                        ContinueOutcome::Running => {
+                            py.check_signals()?;
+                            continue;
+                        }
+                        other => break other,
                     }
-                    other => break other,
-                }
-            },
+                },
+            };
+            (dbg.session_id(), dbg.continue_outcome_data(py, outcome)?)
         };
-        Ok(self.continue_outcome_dict(py, outcome))
+        Ok(StopOutcome {
+            dbg: slf.unbind(),
+            session_id,
+            data,
+        })
     }
 
-    /// Resume the VM and wait for the next meaningful stop, returning a dict
-    /// `{stop: "breakpoint"|"exception"|"bugcheck"|"target_reloaded"|"running", ...}`.
+    /// Resume the VM and wait for the next meaningful stop, returning a
+    /// [`StopOutcome`].
     ///
     /// This is the scope-aware run-control loop shared with the REPL and MCP: it
     /// silently steps over and resumes past wrong-process int3 hits (a breakpoint
     /// scoped to one process whose `int3` lives on a shared page) and false
     /// conditional breakpoints, so only the relevant hit surfaces. With
-    /// `timeout_ms` it returns `{stop: "running"}` if nothing stopped in that
-    /// window (poll again); with `timeout_ms=None` it blocks until a stop,
-    /// checking for Ctrl+C between polls.
+    /// `timeout_ms` it returns an outcome with `running` true if nothing stopped
+    /// in that window (poll again); with `timeout_ms=None` it blocks until a
+    /// stop, checking for Ctrl+C between polls.
     #[pyo3(signature = (timeout_ms=None))]
     fn run<'py>(
-        &mut self,
+        slf: Bound<'py, Self>,
         py: Python<'py>,
         timeout_ms: Option<u64>,
-    ) -> PyResult<Bound<'py, PyDict>> {
+    ) -> PyResult<StopOutcome> {
         // Python drives the loop in 1s chunks and checks for KeyboardInterrupt
         // between them, so no in-loop cancellation flag is needed here.
         let never = std::sync::atomic::AtomicBool::new(false);
-        let outcome = match timeout_ms {
-            Some(ms) => self
-                .inner
-                .continue_until_break(Some(Duration::from_millis(ms)), &never)
-                .map_err(err)?,
-            None => loop {
-                match self
+        let (session_id, data) = {
+            let mut dbg = slf.borrow_mut();
+            let outcome = match timeout_ms {
+                Some(ms) => dbg
                     .inner
-                    .continue_until_break(Some(Duration::from_secs(1)), &never)
-                    .map_err(err)?
-                {
-                    ContinueOutcome::Running => {
-                        py.check_signals()?; // let a Python KeyboardInterrupt break the wait
-                        continue;
+                    .continue_until_break(Some(Duration::from_millis(ms)), &never)
+                    .map_err(err)?,
+                None => loop {
+                    match dbg
+                        .inner
+                        .continue_until_break(Some(Duration::from_secs(1)), &never)
+                        .map_err(err)?
+                    {
+                        ContinueOutcome::Running => {
+                            py.check_signals()?; // let a Python KeyboardInterrupt break the wait
+                            continue;
+                        }
+                        other => break other,
                     }
-                    other => break other,
-                }
-            },
+                },
+            };
+            (dbg.session_id(), dbg.continue_outcome_data(py, outcome)?)
         };
-        Ok(self.continue_outcome_dict(py, outcome))
+        Ok(StopOutcome {
+            dbg: slf.unbind(),
+            session_id,
+            data,
+        })
     }
 
     /// Single-step one instruction (issues the step, waits for the stop, clears
     /// the trap flag, re-arms breakpoints, and re-selects the stopped thread).
-    fn step(&mut self) -> PyResult<()> {
-        self.require_halted("step")?;
-        self.inner.step().map_err(err)
+    /// Returns a [`StopOutcome`] (a `step` stop at the landed-on instruction),
+    /// matching `step_over()`/`step_out()`. Requires the VM halted.
+    fn step<'py>(slf: Bound<'py, Self>, py: Python<'py>) -> PyResult<StopOutcome> {
+        let (session_id, data) = {
+            let mut dbg = slf.borrow_mut();
+            dbg.require_halted("step")?;
+            dbg.inner.step().map_err(err)?;
+            let regs = dbg.inner.backend.read_registers().map_err(err)?;
+            let rip = dbg.inner.register_map.read_u64("rip", &regs).map_err(err)?;
+            let data = dbg.continue_outcome_data(py, ContinueOutcome::Step { rip })?;
+            (dbg.session_id(), data)
+        };
+        Ok(StopOutcome {
+            dbg: slf.unbind(),
+            session_id,
+            data,
+        })
     }
 
     /// Step over the current instruction: if it's a `call`, run to its return
     /// site, otherwise single-step. Blocks until the step completes (or a
-    /// breakpoint/bugcheck/exception is hit en route). Returns the same dict
-    /// shape as `run()` (`{stop: "step"|"breakpoint"|...}`). Requires the VM
-    /// halted (`interrupt()` first, or be at a breakpoint).
-    fn step_over<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        self.require_halted("step_over")?;
+    /// breakpoint/bugcheck/exception is hit en route). Returns a
+    /// [`StopOutcome`]. Requires the VM halted (`interrupt()` first, or be at a
+    /// breakpoint).
+    fn step_over<'py>(slf: Bound<'py, Self>, py: Python<'py>) -> PyResult<StopOutcome> {
         let never = std::sync::atomic::AtomicBool::new(false);
-        let outcome = self.inner.step_over(&never).map_err(err)?;
-        Ok(self.continue_outcome_dict(py, outcome))
+        let (session_id, data) = {
+            let mut dbg = slf.borrow_mut();
+            dbg.require_halted("step_over")?;
+            let outcome = dbg.inner.step_over(&never).map_err(err)?;
+            (dbg.session_id(), dbg.continue_outcome_data(py, outcome)?)
+        };
+        Ok(StopOutcome {
+            dbg: slf.unbind(),
+            session_id,
+            data,
+        })
     }
 
     /// Step out of the current function: run to the caller's return address.
     /// Blocks until reached (or a breakpoint/bugcheck/exception en route).
-    /// Returns the same dict shape as `run()`. Requires the VM halted.
-    fn step_out<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        self.require_halted("step_out")?;
+    /// Returns a [`StopOutcome`]. Requires the VM halted.
+    fn step_out<'py>(slf: Bound<'py, Self>, py: Python<'py>) -> PyResult<StopOutcome> {
         let never = std::sync::atomic::AtomicBool::new(false);
-        let outcome = self.inner.step_out(&never).map_err(err)?;
-        Ok(self.continue_outcome_dict(py, outcome))
+        let (session_id, data) = {
+            let mut dbg = slf.borrow_mut();
+            dbg.require_halted("step_out")?;
+            let outcome = dbg.inner.step_out(&never).map_err(err)?;
+            (dbg.session_id(), dbg.continue_outcome_data(py, outcome)?)
+        };
+        Ok(StopOutcome {
+            dbg: slf.unbind(),
+            session_id,
+            data,
+        })
     }
 
     /// Pause the VM, adopting the stopped thread as the current one.
@@ -1042,55 +1833,87 @@ impl Debugger {
             .map_err(err)
     }
 
-    /// Remove a breakpoint by id.
-    fn clear_breakpoint(&mut self, id: u32) -> PyResult<()> {
+    /// Set a code breakpoint from an address or debugger expression; returns a
+    /// live breakpoint handle.
+    #[pyo3(signature = (target, condition=None))]
+    fn breakpoint(
+        slf: Bound<'_, Self>,
+        target: &Bound<'_, PyAny>,
+        condition: Option<String>,
+    ) -> PyResult<Breakpoint> {
+        let (session_id, snapshot) = {
+            let mut dbg = slf.borrow_mut();
+            dbg.require_halted("breakpoint")?;
+            let (addr, symbol) = breakpoint_target_arg(&dbg, target)?;
+            let id = dbg
+                .inner
+                .add_breakpoint_with_symbol_condition(VirtAddr(addr), symbol, condition)
+                .map_err(err)?;
+            let snapshot = dbg
+                .inner
+                .breakpoint(id)
+                .map(BreakpointSnapshot::from_core)
+                .ok_or_else(|| raise(format!("breakpoint {id} disappeared after install")))?;
+            (dbg.session_id(), snapshot)
+        };
+        Ok(Breakpoint {
+            dbg: Some(slf.unbind()),
+            session_id,
+            snapshot,
+        })
+    }
+
+    /// Remove a breakpoint by id or handle.
+    fn clear_breakpoint(&mut self, id: &Bound<'_, PyAny>) -> PyResult<()> {
+        let id = breakpoint_id_arg(id, self.session_id())?;
         self.require_halted("clear_breakpoint")?;
         self.inner.remove_breakpoint(id).map_err(err)
     }
 
-    /// Re-arm a disabled breakpoint by id (re-patch its `int3`).
-    fn enable_breakpoint(&mut self, id: u32) -> PyResult<()> {
+    /// Re-arm a disabled breakpoint by id or handle (re-patch its `int3`).
+    fn enable_breakpoint(&mut self, id: &Bound<'_, PyAny>) -> PyResult<()> {
+        let id = breakpoint_id_arg(id, self.session_id())?;
         self.require_halted("enable_breakpoint")?;
         self.inner.enable_breakpoint(id).map_err(err)
     }
 
     /// Disable a breakpoint by id (restore the original byte) without forgetting
     /// it, so it can be re-enabled later.
-    fn disable_breakpoint(&mut self, id: u32) -> PyResult<()> {
+    fn disable_breakpoint(&mut self, id: &Bound<'_, PyAny>) -> PyResult<()> {
+        let id = breakpoint_id_arg(id, self.session_id())?;
         self.require_halted("disable_breakpoint")?;
         self.inner.disable_breakpoint(id).map_err(err)
     }
 
-    /// List breakpoints as dicts `{id, address, enabled, symbol, scope,
-    /// condition, temporary}` (`scope` is `"global"` for kernel-wide, or
-    /// `"name (pid)"` for a process-scoped breakpoint).
-    fn breakpoints<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
-        let mut out = Vec::new();
-        for b in self.inner.list_breakpoints() {
-            let d = PyDict::new(py);
-            d.set_item("id", b.id)?;
-            d.set_item("address", b.address.0)?;
-            d.set_item("enabled", b.enabled)?;
-            d.set_item("symbol", b.symbol.clone())?;
-            d.set_item("scope", b.scope.label())?;
-            d.set_item("condition", b.condition.clone())?;
-            d.set_item("temporary", b.temporary)?;
-            out.push(d);
-        }
-        Ok(out)
+    /// List the installed breakpoints as live [`Breakpoint`] handles (the same
+    /// handle type `breakpoint()` returns and `outcome.breakpoints` surfaces, so
+    /// the listed entries can be cleared/enabled/disabled directly). Inspect a
+    /// handle's `id`/`address`/`scope`/etc. properties, or `to_dict()` for the
+    /// flat mapping.
+    fn breakpoints(slf: Bound<'_, Self>) -> Vec<Breakpoint> {
+        let dbg = slf.borrow();
+        let session_id = dbg.session_id();
+        dbg.inner
+            .list_breakpoints()
+            .into_iter()
+            .map(|b| Breakpoint {
+                dbg: Some(slf.clone().unbind()),
+                session_id,
+                snapshot: BreakpointSnapshot::from_core(b),
+            })
+            .collect()
     }
 
     /// Run any REPL command (e.g. `"dt _EPROCESS"`, `"lm"`, `"k"`). Output is
     /// printed to stdout, exactly as in the interactive REPL. Useful for quick
     /// one-offs; the typed methods above are the structured API.
     fn run_command(&mut self, line: &str) -> PyResult<()> {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.is_empty() {
+        if line.trim().is_empty() {
             return Ok(());
         }
         let mut state = ReplState::for_oneshot(&mut self.inner);
         state.line = line.trim().to_string();
-        state.dispatch(&parts).map(|_| ()).map_err(err)
+        state.dispatch_line(line).map(|_| ()).map_err(err)
     }
 
     /// Remove all breakpoints and leave the VM running. Called automatically
@@ -1145,6 +1968,10 @@ impl Debugger {
         }
     }
 
+    fn session_id(&self) -> usize {
+        self.inner.id()
+    }
+
     /// Require a halted target before mutating debugger state that patches guest
     /// memory or backend breakpoint state.
     fn require_halted(&mut self, operation: &str) -> PyResult<()> {
@@ -1160,15 +1987,15 @@ impl Debugger {
         }
     }
 
-    /// Build the `run()` result dict from a [`ContinueOutcome`], enriching
-    /// breakpoint/exception stops with the resolved symbol and current process.
+    /// Build the Python stop object payload from a [`ContinueOutcome`],
+    /// enriching breakpoint/exception stops with resolved symbols and process
+    /// context.
     /// Not a Python method.
-    fn continue_outcome_dict<'py>(
+    fn continue_outcome_data(
         &self,
-        py: Python<'py>,
+        py: Python<'_>,
         outcome: ContinueOutcome,
-    ) -> Bound<'py, PyDict> {
-        let d = PyDict::new(py);
+    ) -> PyResult<StopOutcomeData> {
         let symbol_at = |rip: u64| {
             self.inner
                 .target
@@ -1181,75 +2008,139 @@ impl Debugger {
             .as_ref()
             .map(|p| (p.pid, p.name.clone()));
 
-        // set_item only errors on an unhashable key; ours are all &str, so the
-        // results are infallible. swallow them to keep this non-fallible.
-        let _ = match outcome {
+        let data = match outcome {
             ContinueOutcome::Breakpoint {
                 id,
                 address,
                 symbol,
                 temporary,
                 rip,
-            } => (|| -> PyResult<()> {
-                d.set_item("stop", "breakpoint")?;
-                d.set_item("rip", rip)?;
-                d.set_item("id", id)?;
-                d.set_item("breakpoint", id)?; // back-compat key
-                d.set_item("address", address)?;
-                d.set_item("symbol", symbol.or_else(|| symbol_at(rip)))?;
-                d.set_item("temporary", temporary)?;
-                d.set_item("process", process)?;
-                Ok(())
-            })(),
-            ContinueOutcome::Bugcheck { rip, info } => (|| -> PyResult<()> {
-                d.set_item("stop", "bugcheck")?;
-                d.set_item("rip", rip)?;
+            } => {
+                let snapshot = self
+                    .inner
+                    .breakpoint(id)
+                    .map(BreakpointSnapshot::from_core)
+                    .unwrap_or(BreakpointSnapshot {
+                        id,
+                        address,
+                        enabled: true,
+                        symbol: symbol.clone(),
+                        scope: "unknown".to_string(),
+                        condition: None,
+                        temporary,
+                    });
+                StopOutcomeData {
+                    kind: StopKind::Breakpoint,
+                    rip: Some(rip),
+                    symbol: snapshot
+                        .symbol
+                        .clone()
+                        .or_else(|| symbol.or_else(|| symbol_at(rip))),
+                    process,
+                    breakpoints: vec![snapshot],
+                    address: Some(address),
+                    temporary: Some(temporary),
+                    exception_code: None,
+                    bugcheck_info: None,
+                    kernel_base: None,
+                    coherent: None,
+                }
+            }
+            ContinueOutcome::Bugcheck { rip, info } => {
                 let analysis = info
                     .map(|i| analyze_bugcheck(&self.inner.target, &i))
                     .or_else(|| current_bugcheck(&self.inner.target));
-                match analysis {
-                    Some(a) => d.set_item("bugcheck", view_dict(py, &view::bugcheck(&a))?)?,
-                    None => d.set_item("bugcheck", true)?, // back-compat flag
+                let bugcheck_info = match analysis {
+                    Some(a) => Some(view_dict(py, &view::bugcheck(&a))?.into_any().unbind()),
+                    None => None,
+                };
+                StopOutcomeData {
+                    kind: StopKind::Bugcheck,
+                    rip,
+                    symbol: rip.and_then(symbol_at),
+                    process: None,
+                    breakpoints: Vec::new(),
+                    address: None,
+                    temporary: None,
+                    exception_code: None,
+                    bugcheck_info,
+                    kernel_base: None,
+                    coherent: None,
                 }
-                Ok(())
-            })(),
+            }
             ContinueOutcome::Stopped {
                 rip,
                 exception_code,
-            } => (|| -> PyResult<()> {
-                d.set_item("stop", "exception")?;
-                d.set_item("rip", rip)?;
-                d.set_item("exception_code", exception_code)?;
-                d.set_item("symbol", symbol_at(rip))?;
-                d.set_item("process", process)?;
-                Ok(())
-            })(),
-            ContinueOutcome::Step { rip } => (|| -> PyResult<()> {
-                d.set_item("stop", "step")?;
-                d.set_item("rip", rip)?;
-                d.set_item("symbol", symbol_at(rip))?;
-                d.set_item("process", process)?;
-                Ok(())
-            })(),
+            } => StopOutcomeData {
+                kind: StopKind::Exception,
+                rip: Some(rip),
+                symbol: symbol_at(rip),
+                process,
+                breakpoints: Vec::new(),
+                address: None,
+                temporary: None,
+                exception_code,
+                bugcheck_info: None,
+                kernel_base: None,
+                coherent: None,
+            },
+            ContinueOutcome::Step { rip } => StopOutcomeData {
+                kind: StopKind::Step,
+                rip: Some(rip),
+                symbol: symbol_at(rip),
+                process,
+                breakpoints: Vec::new(),
+                address: None,
+                temporary: None,
+                exception_code: None,
+                bugcheck_info: None,
+                kernel_base: None,
+                coherent: None,
+            },
             ContinueOutcome::TargetReloaded {
                 kernel_base,
                 coherent,
-            } => (|| -> PyResult<()> {
-                d.set_item("stop", "target_reloaded")?;
-                d.set_item("target_reloaded", true)?; // back-compat flag
-                d.set_item("kernel_base", kernel_base)?;
-                d.set_item("coherent", coherent)?;
-                Ok(())
-            })(),
-            ContinueOutcome::Running => d.set_item("stop", "running"),
-            ContinueOutcome::Halted { rip } => (|| -> PyResult<()> {
-                d.set_item("stop", "halted")?;
-                d.set_item("rip", rip)?;
-                d.set_item("symbol", symbol_at(rip))?;
-                Ok(())
-            })(),
+            } => StopOutcomeData {
+                kind: StopKind::TargetReloaded,
+                rip: None,
+                symbol: None,
+                process: None,
+                breakpoints: Vec::new(),
+                address: None,
+                temporary: None,
+                exception_code: None,
+                bugcheck_info: None,
+                kernel_base,
+                coherent: Some(coherent),
+            },
+            ContinueOutcome::Running => StopOutcomeData {
+                kind: StopKind::Running,
+                rip: None,
+                symbol: None,
+                process: None,
+                breakpoints: Vec::new(),
+                address: None,
+                temporary: None,
+                exception_code: None,
+                bugcheck_info: None,
+                kernel_base: None,
+                coherent: None,
+            },
+            ContinueOutcome::Halted { rip } => StopOutcomeData {
+                kind: StopKind::Halted,
+                rip: Some(rip),
+                symbol: symbol_at(rip),
+                process: None,
+                breakpoints: Vec::new(),
+                address: None,
+                temporary: None,
+                exception_code: None,
+                bugcheck_info: None,
+                kernel_base: None,
+                coherent: None,
+            },
         };
-        d
+        Ok(data)
     }
 
     /// Read a fixed-size buffer from guest memory. Not exposed to Python; backs
@@ -1790,6 +2681,11 @@ fn attach(backend: &str, connect: Option<&str>) -> PyResult<Debugger> {
 /// can't strip it, while the actual SDK lives here in core.
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Debugger>()?;
+    m.add_class::<Breakpoint>()?;
+    m.add_class::<StopOutcome>()?;
+    m.add_class::<AddressModule>()?;
+    m.add_class::<MemoryRegion>()?;
+    m.add_class::<MemorySearchMatch>()?;
     m.add_class::<Type>()?;
     m.add_class::<Struct>()?;
     m.add_function(wrap_pyfunction!(attach, m)?)?;
@@ -1821,5 +2717,36 @@ mod tests {
         };
         // Triggers `Deref`, which must panic on the false flag.
         let _ = &*handle;
+    }
+
+    #[test]
+    fn breakpoint_id_arg_rejects_foreign_handles() {
+        Python::attach(|py| {
+            let bp = Py::new(
+                py,
+                Breakpoint {
+                    dbg: None,
+                    session_id: 7,
+                    snapshot: BreakpointSnapshot {
+                        id: 42,
+                        address: 0x1000,
+                        enabled: true,
+                        symbol: None,
+                        scope: "global".to_string(),
+                        condition: None,
+                        temporary: false,
+                    },
+                },
+            )
+            .unwrap();
+            let bp = bp.bind(py);
+
+            assert_eq!(breakpoint_id_arg(bp.as_any(), 7).unwrap(), 42);
+            let err = breakpoint_id_arg(bp.as_any(), 8).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("breakpoint handle belongs to a different debugger session")
+            );
+        });
     }
 }

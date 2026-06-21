@@ -13,7 +13,7 @@ import ntoseye
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--backend", default="gdb", choices=["gdb", "kd"])
+    ap.add_argument("--backend", default="kd", choices=["gdb", "kd"])
     ap.add_argument("--connect", default=None)
     ap.add_argument("--symbol", default="nt!KeWaitForSingleObject")
     ap.add_argument("--hits", type=int, default=3, help="how many times to run-to-hit")
@@ -28,32 +28,30 @@ def main() -> None:
     dbg = ntoseye.attach(backend=args.backend, connect=args.connect)
     dbg.interrupt()
 
-    addr = dbg.eval(args.symbol)
-    bid = dbg.set_breakpoint(addr)
-    print(f"breakpoint {bid} at {args.symbol} = {addr:#x}\n")
+    bp = dbg.breakpoint(args.symbol)
+    print(f"breakpoint {bp.id} at {args.symbol} = {bp.address:#x}\n")
 
-    vm_running = False
-    leave_running = True
+    timed_out = False
+    resume_on_exit = True
     try:
         hits = 0
         timeout = None if args.timeout_ms == 0 else args.timeout_ms
         while hits < args.hits:
             stop = dbg.run(timeout_ms=timeout)
-            stop_kind = stop.get("stop")
-            vm_running = stop_kind == "running"
-            if vm_running:
+            if stop.running:
+                timed_out = True
                 print(f"timeout waiting for a stop after {args.timeout_ms}ms")
                 break
 
-            rip = stop.get("rip", 0)
-            sym = stop.get("symbol") or dbg.closest_symbol(rip)
-            if stop_kind != "breakpoint" or stop.get("breakpoint") != bid:
+            rip = stop.rip or 0
+            sym = stop.symbol or dbg.closest_symbol(rip)
+            if bp not in stop.breakpoints:
                 print(
-                    f"stop: {stop_kind}  rip={rip:#x} ({sym})  "
-                    f"bp={stop.get('breakpoint')}  exception={stop.get('exception_code')}"
+                    f"stop: {stop.reason}  rip={rip:#x} ({sym})  "
+                    f"bp={stop.breakpoint_id}  exception={stop.exception_code}"
                 )
-                if stop_kind in {"bugcheck", "target_reloaded"}:
-                    leave_running = False
+                if stop.terminal:
+                    resume_on_exit = False
                     break
                 continue
 
@@ -61,23 +59,23 @@ def main() -> None:
             regs = dbg.registers()
             print(
                 f"hit #{hits}: rip={rip:#x} ({sym})  "
-                f"bp={stop.get('breakpoint')}  rcx={regs.get('rcx', 0):#x}"
+                f"bp={bp.id}  rcx={regs.get('rcx', 0):#x}"
             )
             # show the next two instructions at the hit
             for ip, _hex, asm, comment in dbg.disassemble(rip, 2):
                 c = f"   ; {comment}" if comment else ""
                 print(f"    {ip:#x}: {asm}{c}")
     finally:
-        if vm_running:
+        if timed_out:
             dbg.interrupt()
         try:
-            dbg.clear_breakpoint(bid)
+            bp.clear()
             cleared = True
-        except RuntimeError as exc:
+        except ntoseye.NtoseyeError as exc:
             cleared = False
             print(f"\nbreakpoint cleanup skipped: {exc}")
 
-        if leave_running:
+        if resume_on_exit:
             dbg.cont()
             if cleared:
                 print("\nbreakpoint cleared, VM resumed.")

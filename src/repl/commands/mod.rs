@@ -1,6 +1,6 @@
-use std::str::FromStr;
-
 use crate::repl::*;
+
+const ALIAS_RECURSION_LIMIT: usize = 16;
 
 mod breakpoints;
 mod exec;
@@ -11,64 +11,89 @@ mod process;
 mod symbols;
 
 impl ReplState<'_> {
-    pub fn dispatch(&mut self, parts: &[&str]) -> Result<Flow> {
-        let cmd_str = parts[0];
-        match ReplCommand::from_str(cmd_str) {
-            Ok(ReplCommand::Quit) => return Ok(Flow::Quit),
-            Ok(ReplCommand::Pte) => self.cmd_pte(parts)?,
-            Ok(ReplCommand::Pool) => self.cmd_pool(parts)?,
-            Ok(ReplCommand::Vmmap) => self.cmd_vmmap(parts)?,
-            Ok(ReplCommand::Db) => self.cmd_db(parts)?,
-            Ok(ReplCommand::Dd) => self.cmd_dd(parts)?,
-            Ok(ReplCommand::Dq) => self.cmd_dq(parts)?,
-            Ok(ReplCommand::Disasm) => self.cmd_disasm(parts)?,
-            Ok(ReplCommand::Eb) => self.cmd_eb(parts)?,
-            Ok(ReplCommand::Ed) => self.cmd_ed(parts)?,
-            Ok(ReplCommand::Eq) => self.cmd_eq(parts)?,
-            Ok(ReplCommand::F) => self.cmd_f(parts)?,
-            Ok(ReplCommand::S) => self.cmd_s(parts)?,
-            Ok(ReplCommand::X) => self.cmd_x(parts)?,
-            Ok(ReplCommand::Ln) => self.cmd_ln(parts)?,
-            Ok(ReplCommand::Ev) => self.cmd_ev(parts)?,
-            Ok(ReplCommand::Set) => self.cmd_set(parts)?,
-            Ok(ReplCommand::Vars) => self.cmd_vars(parts)?,
-            Ok(ReplCommand::Unset) => self.cmd_unset(parts)?,
-            Ok(ReplCommand::Vcpus) => self.cmd_vcpus(parts)?,
-            Ok(ReplCommand::Threads) => self.cmd_threads(parts)?,
-            Ok(ReplCommand::Thread) => self.cmd_thread(parts)?,
-            Ok(ReplCommand::Continue) => self.cmd_continue(parts)?,
-            Ok(ReplCommand::Break) => self.cmd_break(parts)?,
-            Ok(ReplCommand::Dt) => self.cmd_dt(parts)?,
-            Ok(ReplCommand::Ps) => self.cmd_ps(parts)?,
-            Ok(ReplCommand::Drivers) => self.cmd_drivers(parts)?,
-            Ok(ReplCommand::Lm) => self.cmd_lm(parts)?,
-            Ok(ReplCommand::Attach) => self.cmd_attach(parts)?,
-            Ok(ReplCommand::Reload) => self.cmd_reload(parts)?,
-            Ok(ReplCommand::Detach) => self.cmd_detach(parts)?,
-            Ok(ReplCommand::Registers) => self.cmd_registers(parts)?,
-            Ok(ReplCommand::Si) => self.cmd_si(parts)?,
-            Ok(ReplCommand::P) => self.cmd_p(parts)?,
-            Ok(ReplCommand::Gu) => self.cmd_gu(parts)?,
-            Ok(ReplCommand::Vcpu) => self.cmd_vcpu(parts)?,
-            Ok(ReplCommand::Bp) => self.cmd_bp(parts)?,
-            Ok(ReplCommand::Bl) => self.cmd_bl(parts)?,
-            Ok(ReplCommand::Bc) => self.cmd_bc(parts)?,
-            Ok(ReplCommand::Bd) => self.cmd_bd(parts)?,
-            Ok(ReplCommand::Be) => self.cmd_be(parts)?,
-            Ok(ReplCommand::K) => self.cmd_k(parts)?,
-            Ok(ReplCommand::Status) => self.cmd_status(parts)?,
-            Ok(ReplCommand::Capabilities) => self.cmd_capabilities(parts)?,
-            Ok(ReplCommand::Dbgprint) => self.cmd_dbgprint(parts)?,
-            Ok(ReplCommand::Irp) => self.cmd_irp(parts)?,
-            Ok(ReplCommand::Irps) => self.cmd_irps(parts)?,
-            Ok(ReplCommand::Drvobj) => self.cmd_drvobj(parts)?,
-            Ok(ReplCommand::Devobj) => self.cmd_devobj(parts)?,
-            Ok(ReplCommand::Object) => self.cmd_object(parts)?,
-            Ok(ReplCommand::Callbacks) => self.cmd_callbacks(parts)?,
-            Ok(ReplCommand::Ssdt) => self.cmd_ssdt(parts)?,
-            Ok(ReplCommand::Address) => self.cmd_address(parts)?,
-            Err(_) => self.cmd_user(cmd_str, parts)?,
+    pub fn dispatch_line(&mut self, line: &str) -> Result<Flow> {
+        self.dispatch_line_inner(line, 0)
+    }
+
+    fn dispatch_line_inner(&mut self, line: &str, depth: usize) -> Result<Flow> {
+        let commands = match split_command_list(line) {
+            Ok(commands) => commands,
+            Err(err) => {
+                report_command_parse_error(line, err);
+                return Ok(Flow::Continue);
+            }
+        };
+
+        for command in commands {
+            match self.dispatch_one(command, depth)? {
+                Flow::Quit => return Ok(Flow::Quit),
+                Flow::Continue => {}
+            }
+            self.caches.refresh_expression_context(&self.ctx.target);
         }
+        Ok(Flow::Continue)
+    }
+
+    fn dispatch_one(&mut self, line: &str, depth: usize) -> Result<Flow> {
+        let parsed = match parse_command(line) {
+            Ok(Some(parsed)) => parsed,
+            Ok(None) => return Ok(Flow::Continue),
+            Err(err) => {
+                report_command_parse_error(line, err);
+                return Ok(Flow::Continue);
+            }
+        };
+
+        if let Some(spec) = command_registry().get(parsed.name) {
+            if !check_run_state(self, spec) {
+                return Ok(Flow::Continue);
+            }
+            match spec.handler {
+                CommandHandler::NoArgs(handler) => {
+                    if !parsed.raw_tail.trim().is_empty() {
+                        println!("{}\n", command_help(parsed.name));
+                        return Ok(Flow::Continue);
+                    }
+                    handler(self)?;
+                }
+                CommandHandler::Args(handler) => {
+                    let invocation = match parsed.invocation(spec.style) {
+                        Ok(invocation) => invocation,
+                        Err(err) => {
+                            report_command_parse_error(line, err);
+                            return Ok(Flow::Continue);
+                        }
+                    };
+                    handler(self, invocation)?;
+                }
+            }
+            return Ok(spec.flow);
+        }
+
+        let invocation = match parsed.invocation(CommandStyle::StructuredArgs) {
+            Ok(invocation) => invocation,
+            Err(err) => {
+                report_command_parse_error(line, err);
+                return Ok(Flow::Continue);
+            }
+        };
+
+        match self.aliases.expand(invocation.name, &invocation.argv) {
+            Ok(Some(expanded)) => {
+                if depth >= ALIAS_RECURSION_LIMIT {
+                    error!("alias expansion limit reached");
+                    return Ok(Flow::Continue);
+                }
+                return self.dispatch_line_inner(&expanded, depth + 1);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                error!("{}", err);
+                return Ok(Flow::Continue);
+            }
+        }
+
+        self.cmd_user(invocation)?;
         Ok(Flow::Continue)
     }
 }

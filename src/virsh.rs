@@ -226,7 +226,7 @@ fn prompt_error(error: dialoguer::Error) -> Error {
 }
 
 fn backup_path(domain: &str) -> Result<PathBuf> {
-    let root = symbols::cache_root().ok_or(Error::StorageNotFound)?;
+    let root = symbols::ntoseye_home().ok_or(Error::StorageNotFound)?;
     let dir = root.join("virsh-backups");
     fs::create_dir_all(&dir)?;
     let ts = SystemTime::now()

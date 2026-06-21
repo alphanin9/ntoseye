@@ -2,7 +2,7 @@
 members = ["ntoseye-py"]
 
 [workspace.package]
-version = "0.13.0"
+version = "0.16.1"
 
 [package]
 name = "ntoseye"
@@ -30,8 +30,6 @@ owo-colors = "4.2.3"
 pelite = "0.10.0"
 # rustls, not the default native-tls, to avoid linking system OpenSSL (portable wheel)
 reqwest = { version = "0.12.28", default-features = false, features = [ "blocking", "rustls-tls", "charset", "http2" ] }
-strum = "0.27.2"
-strum_macros = "0.27.2"
 tabled = { version = "0.20.0", features = [ "ansi" ] }
 zerocopy = { version = "0.8.31", features = [ "derive" ] }
 rayon = "1.11.0"
@@ -43,6 +41,8 @@ spin = "0.10.0"
 dashmap = "6.1.0"
 nucleo-matcher = "0.3.1"
 single-instance = "0.3.3"
+winnow = "0.7"
+linkme = "0.3"
 
 # pyo3 SDK + embedded interpreter, gated behind the `python` features. abi3 so
 # the wheel works against any Python 3.9+; per build the embed/extension toggle
