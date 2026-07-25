@@ -96,9 +96,9 @@ enum Command {
 #[derive(FromArgs)]
 #[argh(subcommand, name = "agent")]
 /// run as an AI-agent stdio server: line-delimited JSON requests on stdin,
-/// JSON responses on stdout (reads the top-level --backend/--connect to choose
-/// how to attach). Drives the same debugger core as the REPL; intended to be
-/// launched under `sudo` by an agent harness.
+/// JSON responses on stdout (reads the top-level --backend/--connect/--dump to
+/// choose how to attach). Drives the same debugger core as the REPL; intended to
+/// be launched under `sudo` by an agent harness.
 struct AgentCommand {}
 
 #[cfg(feature = "mcp")]
