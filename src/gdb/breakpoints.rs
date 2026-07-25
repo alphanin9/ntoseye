@@ -331,7 +331,43 @@ impl BreakpointManager {
         debugger: &Target,
         id: u32,
     ) -> Result<()> {
-        self.remove_if_uninstalled(id, |bp| Self::uninstall_breakpoint(client, debugger, bp))
+        self.remove_if_uninstalled(id, |bp| {
+            match Self::uninstall_breakpoint(client, debugger, bp) {
+                Ok(()) => Ok(()),
+                // A backend can reject the removal precisely because it no
+                // longer holds the breakpoint: QEMU's gdbstub drops ours across
+                // a single-step and then answers `z0` with `E22`, which used to
+                // leave a breakpoint that could never be cleared while halted.
+                // Forgetting it is only safe when no `int3` is left behind, so
+                // check the guest byte rather than trusting the error text.
+                // Anything we cannot read back keeps the original error and
+                // stays tracked.
+                Err(err) => match Self::armed_in_guest(debugger, bp) {
+                    Ok(false) => Ok(()),
+                    _ => Err(err),
+                },
+            }
+        })
+    }
+
+    /// Whether `bp`'s `int3` is still present in guest memory. Used to tell a
+    /// removal that failed because the breakpoint was already gone from one
+    /// that failed with the patch still in place.
+    fn armed_in_guest(debugger: &Target, bp: &Breakpoint) -> Result<bool> {
+        // A hardware breakpoint lives in the debug registers, not guest memory,
+        // so a failed clear may well have left its slot armed. Never report it
+        // as already gone.
+        if matches!(bp.backend, BreakpointBackend::Hardware) {
+            return Ok(true);
+        }
+
+        let dtb = match &bp.scope {
+            BreakpointScope::Process { dtb, .. } => *dtb,
+            BreakpointScope::Kernel => debugger.kernel_dtb(),
+        };
+        let mut byte = [0u8; 1];
+        AddressSpace::new(&debugger.phys, dtb).read_bytes(bp.address, &mut byte)?;
+        Ok(byte[0] == 0xcc)
     }
 
     fn remove_if_uninstalled(
