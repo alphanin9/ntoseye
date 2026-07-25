@@ -93,6 +93,14 @@ pub struct SymbolStore {
     /// consults this guid first regardless of the attached DTB; updated whenever
     /// the kernel module (re)loads.
     kernel_guid: Mutex<Option<u128>>,
+
+    /// DTB the kernel modules are registered under. The kernel is mapped into
+    /// every process's address space, so kernel modules stay in scope for name
+    /// lookups and completion while the active DTB is a user process's --
+    /// otherwise `nt!X` would stop resolving the moment the debugger halted on
+    /// a user thread. `None` until the kernel is discovered (e.g. triage dumps
+    /// without a kernel), which degrades scoping to an exact DTB match.
+    kernel_dtb: Mutex<Option<Dtb>>,
 }
 
 fn guid_to_u128(guid: GUID) -> u128 {
@@ -614,6 +622,7 @@ impl SymbolStore {
             module_status: DashMap::new(),
             module_source: DashMap::new(),
             kernel_guid: Mutex::new(None),
+            kernel_dtb: Mutex::new(None),
         }
     }
 
@@ -625,6 +634,27 @@ impl SymbolStore {
 
     pub fn kernel_guid(&self) -> Option<u128> {
         *self.kernel_guid.lock()
+    }
+
+    /// Record which DTB the kernel modules live under, so they stay in scope for
+    /// lookups made while attached to (or halted in) a process. Called when
+    /// `ntoskrnl` loads, and again after a reboot re-discovers it.
+    pub fn set_kernel_dtb(&self, dtb: Option<Dtb>) {
+        *self.kernel_dtb.lock() = dtb;
+    }
+
+    pub fn kernel_dtb(&self) -> Option<Dtb> {
+        *self.kernel_dtb.lock()
+    }
+
+    /// Whether a module registered under `module_dtb` is visible to a lookup
+    /// scoped to `dtb`. Kernel modules are visible from every address space
+    /// because the kernel is mapped into all of them; this is the name-lookup
+    /// counterpart to [`crate::unwind::preferred_code_dtb`], which resolves the
+    /// other direction by picking the DTB of the module *containing* a known
+    /// address.
+    fn module_in_scope(&self, module_dtb: Dtb, dtb: Dtb) -> bool {
+        module_dtb == dtb || self.kernel_dtb() == Some(module_dtb)
     }
 
     pub fn clear_modules_for_dtb(&self, dtb: Dtb) {
@@ -1227,7 +1257,9 @@ impl SymbolStore {
         let total_modules = self
             .modules
             .iter()
-            .filter(|module| dtb.is_none_or(|filter_dtb| module.dtb == filter_dtb))
+            .filter(|module| {
+                dtb.is_none_or(|filter_dtb| self.module_in_scope(module.dtb, filter_dtb))
+            })
             .count();
         let progress = ProgressBar::new((total_modules + 1) as u64);
         progress.set_style(task_progress_style());
@@ -1237,7 +1269,7 @@ impl SymbolStore {
 
         for module in self.modules.iter() {
             if let Some(filter_dtb) = dtb
-                && module.dtb != filter_dtb
+                && !self.module_in_scope(module.dtb, filter_dtb)
             {
                 continue;
             }
@@ -1262,7 +1294,9 @@ impl SymbolStore {
         let total_modules = self
             .modules
             .iter()
-            .filter(|module| dtb.is_none_or(|filter_dtb| module.dtb == filter_dtb))
+            .filter(|module| {
+                dtb.is_none_or(|filter_dtb| self.module_in_scope(module.dtb, filter_dtb))
+            })
             .count();
         let progress = ProgressBar::new((total_modules + 1) as u64);
         progress.set_style(task_progress_style());
@@ -1272,7 +1306,7 @@ impl SymbolStore {
 
         for module in self.modules.iter() {
             if let Some(filter_dtb) = dtb
-                && module.dtb != filter_dtb
+                && !self.module_in_scope(module.dtb, filter_dtb)
             {
                 continue;
             }
@@ -1297,7 +1331,9 @@ impl SymbolStore {
         let total_modules = self
             .modules
             .iter()
-            .filter(|module| dtb.is_none_or(|filter_dtb| module.dtb == filter_dtb))
+            .filter(|module| {
+                dtb.is_none_or(|filter_dtb| self.module_in_scope(module.dtb, filter_dtb))
+            })
             .count();
         let progress = ProgressBar::new((total_modules + 1) as u64);
         progress.set_style(task_progress_style());
@@ -1307,7 +1343,7 @@ impl SymbolStore {
 
         for module in self.modules.iter() {
             if let Some(filter_dtb) = dtb
-                && module.dtb != filter_dtb
+                && !self.module_in_scope(module.dtb, filter_dtb)
             {
                 continue;
             }
@@ -1410,6 +1446,27 @@ impl SymbolStore {
             Some((module, name)) => (Some(module), name),
             None => (None, symbol_name),
         };
+
+        // Two passes rather than one widened filter: the active address space
+        // must win a bare-name collision with the kernel, so kernel modules are
+        // only consulted once the current DTB has come up empty.
+        self.find_symbol_in_dtb(dtb, module_filter, name)
+            .or_else(|| {
+                let kernel_dtb = self.kernel_dtb()?;
+                if kernel_dtb == dtb {
+                    return None;
+                }
+                self.find_symbol_in_dtb(kernel_dtb, module_filter, name)
+            })
+    }
+
+    /// Resolve `name` within the modules of exactly one address space.
+    fn find_symbol_in_dtb(
+        &self,
+        dtb: Dtb,
+        module_filter: Option<&str>,
+        name: &str,
+    ) -> Option<(VirtAddr, String)> {
         for module in self.modules.iter() {
             if module.dtb != dtb {
                 continue;
@@ -1437,7 +1494,7 @@ impl SymbolStore {
         limit: usize,
     ) -> Vec<String> {
         for module in self.modules.iter() {
-            if module.dtb != dtb {
+            if !self.module_in_scope(module.dtb, dtb) {
                 continue;
             }
             if !ModuleInfo::derive_short_name(&module.name).eq_ignore_ascii_case(module_short) {
@@ -1456,7 +1513,10 @@ impl SymbolStore {
         address: VirtAddr,
     ) -> Option<(String, String, u32)> {
         for module in self.modules.iter() {
-            if module.dtb != dtb {
+            // Safe to widen to kernel modules without a second pass: a match
+            // also requires the address to fall inside the module, and kernel
+            // and user ranges never overlap.
+            if !self.module_in_scope(module.dtb, dtb) {
                 continue;
             }
 
@@ -1479,7 +1539,9 @@ impl SymbolStore {
     pub fn find_module_for_address(&self, dtb: Dtb, address: VirtAddr) -> Option<LoadedModule> {
         self.modules
             .iter()
-            .find(|module| module.dtb == dtb && module.contains_address(address))
+            .find(|module| {
+                self.module_in_scope(module.dtb, dtb) && module.contains_address(address)
+            })
             .map(|module| module.clone())
     }
 

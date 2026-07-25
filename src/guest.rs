@@ -529,10 +529,12 @@ impl WinObject {
     }
 
     /// Mark this object's module as the kernel in the shared symbol store, so
-    /// type/enum layout lookups prefer it across address spaces. Call after
+    /// type/enum layout lookups prefer it across address spaces and kernel
+    /// symbols stay resolvable from a process's address space. Call after
     /// [`load_symbols`](Self::load_symbols) so `guid` is populated.
     pub fn register_as_kernel(&self) {
         self.symbols.set_kernel_guid(self.guid);
+        self.symbols.set_kernel_dtb(Some(self.dtb));
     }
 
     /// Size of the cached binary snapshot (0 until [`view`](Self::view) has run).
