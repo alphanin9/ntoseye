@@ -584,7 +584,7 @@ impl ReplState<'_> {
             return Ok(());
         }
 
-        let modules = match self.ctx.target.guest.kernel_modules() {
+        let modules = match self.ctx.target.kernel_modules_with_versions() {
             Ok(modules) => modules,
             Err(e) => {
                 error!("failed to enumerate kernel modules: {}", e);
@@ -637,7 +637,14 @@ impl ReplState<'_> {
     fn cmd_ps(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
         let filter = invocation.arg(0);
 
-        match self.ctx.target.guest.enumerate_processes() {
+        let guest = match self.ctx.target.guest() {
+            Ok(g) => g,
+            Err(_) => {
+                error!("process enumeration requires the kernel; not available in this dump");
+                return Ok(());
+            }
+        };
+        match guest.enumerate_processes() {
             Ok(processes) => {
                 *self.caches.processes.write().unwrap() =
                     processes.iter().map(|p| (p.name.clone(), p.pid)).collect();
@@ -709,10 +716,7 @@ impl ReplState<'_> {
                         .ctx
                         .target
                         .symbols
-                        .find_module_for_address(
-                            self.ctx.target.guest.ntoskrnl.dtb(),
-                            driver.driver_start,
-                        )
+                        .find_module_for_address(self.ctx.target.kernel_dtb(), driver.driver_start)
                         .map(|module| module.name)
                         .unwrap_or_else(|| "-".to_string());
                     builder.push_record(vec![
@@ -746,16 +750,17 @@ impl ReplState<'_> {
 
         let dtb = match &self.ctx.target.current_process_info {
             Some(process_info) => process_info.dtb,
-            None => self.ctx.target.guest.ntoskrnl.dtb(),
+            None => self.ctx.target.kernel_dtb(),
         };
 
-        match self.ctx.target.modules() {
+        match self.ctx.target.modules_with_versions() {
             Ok(modules) => {
                 let mut builder = Builder::default();
                 builder.push_record(vec![
                     "Start".to_string(),
                     "End".to_string(),
                     "Module".to_string(),
+                    "Version".to_string(),
                     "Symbols".to_string(),
                     "Source".to_string(),
                     "Image".to_string(),
@@ -774,6 +779,7 @@ impl ReplState<'_> {
                         format!("{}  ", ui::addr(module.base_address.0)),
                         format!("{}  ", ui::addr(module.end_address().0)),
                         format!("{}  ", module.short_name),
+                        format!("{}  ", module.file_version.as_deref().unwrap_or("-")),
                         format!(
                             "{}  ",
                             self.ctx

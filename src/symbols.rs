@@ -6,6 +6,7 @@ use crate::{
     types::{Dtb, PhysAddr, VirtAddr},
 };
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use memmap2::Mmap;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
@@ -26,12 +27,37 @@ use std::{
     mem::size_of,
     path::{Path, PathBuf},
     ptr,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use std::{fmt, io::Cursor};
 
 // NOTE global is probably fine here?
 pub static FORCE_DOWNLOADS: OnceLock<bool> = OnceLock::new();
+
+pub static PDB_SERVERS: OnceLock<Vec<String>> = OnceLock::new();
+
+const DEFAULT_SYMBOL_SERVER: &str = "https://msdl.microsoft.com/download/symbols";
+
+fn pdb_servers() -> &'static [String] {
+    static RESOLVED: OnceLock<Vec<String>> = OnceLock::new();
+    RESOLVED.get_or_init(|| {
+        let mut servers = PDB_SERVERS.get().cloned().unwrap_or_default();
+        if let Ok(env_val) = std::env::var("NTOSEYE_PDB_SERVERS") {
+            servers.extend(
+                env_val
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from),
+            );
+        }
+        servers.push(DEFAULT_SYMBOL_SERVER.to_string());
+        servers
+    })
+}
 
 #[derive(Default, Clone)]
 pub struct SymbolIndex {
@@ -185,7 +211,7 @@ mod tests {
 /// Information needed to download a PDB file
 #[derive(Debug, Clone)]
 pub struct DownloadJob {
-    pub url: String,
+    pub urls: Vec<String>,
     pub path: PathBuf,
     pub filename: String,
 }
@@ -305,8 +331,23 @@ fn download_job(job: &DownloadJob, pb: ProgressBar) -> Result<()> {
         return Ok(());
     }
 
-    let response = reqwest::blocking::get(&job.url)?;
-    let response = response.error_for_status()?;
+    let mut last_err = None;
+    for url in &job.urls {
+        match reqwest::blocking::get(url).and_then(|r| r.error_for_status()) {
+            Ok(response) => {
+                return download_response(job, response, pb);
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.expect("DownloadJob.urls must not be empty").into())
+}
+
+fn download_response(
+    job: &DownloadJob,
+    response: reqwest::blocking::Response,
+    pb: ProgressBar,
+) -> Result<()> {
     let total_size = response.content_length().unwrap_or(0);
 
     pb.set_style(download_progress_style()?);
@@ -316,10 +357,29 @@ fn download_job(job: &DownloadJob, pb: ProgressBar) -> Result<()> {
     if let Some(parent) = job.path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut file = File::create(&job.path)?;
+
+    // Download to a unique temp file and rename into place. Writing the final
+    // path directly truncates it in place, which corrupts the file under
+    // concurrent duplicate jobs and rips pages out from under any existing
+    // mmap of it (--force-download-symbols re-downloads loaded PDBs); a rename
+    // leaves prior mappings on the old inode intact.
+    static DOWNLOAD_SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp_path = job.path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        DOWNLOAD_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let mut file = File::create(&tmp_path)?;
     let mut downloaded = pb.wrap_read(response);
 
-    std::io::copy(&mut downloaded, &mut file)?;
+    let copied = std::io::copy(&mut downloaded, &mut file);
+    drop(file);
+    if let Err(e) = copied {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    std::fs::rename(&tmp_path, &job.path)?;
     pb.finish_and_clear();
 
     Ok(())
@@ -527,6 +587,12 @@ impl LoadedModule {
 
     fn contains_address(&self, address: VirtAddr) -> bool {
         address.0 >= self.base_address.0 && address.0 < self.end_address().0
+    }
+}
+
+impl Default for SymbolStore {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -793,10 +859,11 @@ impl SymbolStore {
             guid.Data4[7],
         );
 
-        let url = format!(
-            "https://msdl.microsoft.com/download/symbols/{}/{}{:X}/{}",
-            server_name, guid_str, age, server_name
-        );
+        let index_path = format!("{}/{}{:X}/{}", server_name, guid_str, age, server_name);
+        let urls: Vec<String> = pdb_servers()
+            .iter()
+            .map(|base| format!("{}/{}", base.trim_end_matches('/'), index_path))
+            .collect();
 
         let stem = server_name
             .rsplit_once('.')
@@ -809,7 +876,7 @@ impl SymbolStore {
 
         let guid = guid_to_u128(guid);
         let job = DownloadJob {
-            url,
+            urls,
             path,
             filename: format!("{}.pdb", stem),
         };
@@ -832,22 +899,23 @@ impl SymbolStore {
         Ok(job.path)
     }
 
-    fn build_image_download_job(
+    pub fn build_image_download_job(
         image_file_name: &str,
         time_date_stamp: u32,
         size_of_image: u32,
     ) -> Result<DownloadJob> {
         let server_name = Self::symbol_server_file_name(image_file_name);
         let image_id = format!("{time_date_stamp:08X}{size_of_image:X}");
-        let url = format!(
-            "https://msdl.microsoft.com/download/symbols/{}/{}/{}",
-            server_name, image_id, server_name
-        );
+        let index_path = format!("{}/{}/{}", server_name, image_id, server_name);
+        let urls: Vec<String> = pdb_servers()
+            .iter()
+            .map(|base| format!("{}/{}", base.trim_end_matches('/'), index_path))
+            .collect();
         let storage_dir = images_directory().ok_or(Error::StorageNotFound)?;
         let path = storage_dir.join(format!("{}.{}", image_id, server_name));
 
         Ok(DownloadJob {
-            url,
+            urls,
             path,
             filename: server_name.to_string(),
         })
@@ -860,7 +928,7 @@ impl SymbolStore {
     // TODO (everywhere) use MemoryOps, not KvmHandle...
     // TODO (everywhere) propagate errors with format!
     // NOTE dont check for more than 1 CV entry, there shouldn't be more than 1
-    pub fn load_from_binary(&self, object: &mut WinObject) -> Result<Option<u128>> {
+    pub fn load_from_binary(&self, object: &mut WinObject, name: &str) -> Result<Option<u128>> {
         let view = object.view().ok_or(Error::ViewFailed)?;
         let debug = view.debug()?;
 
@@ -868,10 +936,65 @@ impl SymbolStore {
             download_job(&job, ProgressBar::new(0))?;
             self.ensure_pdb_loaded(guid, &job.path)?;
 
+            let module_key = Self::module_key(object.dtb(), object.base_address);
+            if !self.modules.contains_key(&module_key) {
+                self.modules.insert(
+                    module_key,
+                    LoadedModule {
+                        name: name.to_string(),
+                        guid,
+                        base_address: object.base_address,
+                        size: object.binary_size().try_into().unwrap_or(u32::MAX),
+                        dtb: object.dtb(),
+                    },
+                );
+            }
+
             return Ok(Some(guid));
         }
 
         Ok(None)
+    }
+
+    /// Load symbols for a module using its image metadata (TimeDateStamp +
+    /// SizeOfImage) when the PE header can't be read from memory — the common
+    /// case for ntoskrnl in triage dumps.  Downloads the PE from Microsoft's
+    /// symbol server, extracts the PDB GUID, downloads the PDB, and registers
+    /// the module.
+    pub fn load_from_module_info(
+        &self,
+        name: &str,
+        base_address: VirtAddr,
+        dtb: Dtb,
+        time_date_stamp: u32,
+        size_of_image: u32,
+    ) -> Result<Option<u128>> {
+        let image_job = Self::build_image_download_job(name, time_date_stamp, size_of_image)?;
+        download_job(&image_job, ProgressBar::new(0))?;
+
+        let Some((pdb_job, guid)) = Self::extract_download_job_from_image_file(&image_job.path)?
+        else {
+            return Ok(None);
+        };
+
+        download_job(&pdb_job, ProgressBar::new(0))?;
+        self.ensure_pdb_loaded(guid, &pdb_job.path)?;
+
+        let module_key = Self::module_key(dtb, base_address);
+        if !self.modules.contains_key(&module_key) {
+            self.modules.insert(
+                module_key,
+                LoadedModule {
+                    name: name.to_string(),
+                    guid,
+                    base_address,
+                    size: size_of_image,
+                    dtb,
+                },
+            );
+        }
+
+        Ok(Some(guid))
     }
 
     pub fn has_guid(&self, guid: u128) -> bool {
@@ -893,6 +1016,7 @@ impl SymbolStore {
             }),
             Ok(None) => Self::plan_image_fallback(&addr_space, module_name, base_address),
             Err(Error::BadVirtualAddress(_))
+            | Err(Error::AddressNotInDump(_))
             | Err(Error::PartialRead(_))
             | Err(Error::DebugInfo(_)) => {
                 Self::plan_image_fallback(&addr_space, module_name, base_address)
@@ -950,7 +1074,8 @@ impl SymbolStore {
 
         let load = ModuleSymbolLoad::new(
             DownloadJob {
-                url: String::new(),
+                // Already on disk, so there is nothing to download from.
+                urls: Vec::new(),
                 path: pdb_path.to_path_buf(),
                 filename: pdb_path
                     .file_name()
@@ -1080,8 +1205,19 @@ impl SymbolStore {
         let cursor = Cursor::new(static_slice);
         let pdb = pdb2::PDB::open(cursor)?;
 
-        self.mmaps.insert(guid, mmap);
-        self.pdbs.insert(guid, pdb.into());
+        // Exactly one loader may win per guid: parallel loads of two modules
+        // sharing a PDB both get past the contains_key fast path, and a plain
+        // insert would replace the winner's Arc<Mmap>, unmapping pages the
+        // stored PDB's 'static cursor still points into (a cold-cache SIGSEGV).
+        // The loser drops its own pdb+mmap pair instead. `build_index` takes
+        // the pdbs shard again, so it must run after the entry guard drops.
+        match self.pdbs.entry(guid) {
+            Entry::Occupied(_) => return Ok(()),
+            Entry::Vacant(entry) => {
+                self.mmaps.insert(guid, mmap);
+                entry.insert(pdb.into());
+            }
+        }
         self.build_index(guid);
 
         Ok(())
@@ -1803,7 +1939,7 @@ fn variant_to_i64(v: &pdb2::Variant) -> i64 {
         pdb2::Variant::I8(x) => x as i64,
         pdb2::Variant::I16(x) => x as i64,
         pdb2::Variant::I32(x) => x as i64,
-        pdb2::Variant::I64(x) => x as i64,
+        pdb2::Variant::I64(x) => x,
     }
 }
 

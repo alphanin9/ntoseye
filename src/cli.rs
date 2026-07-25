@@ -1,19 +1,25 @@
 use argh::{FromArgValue, FromArgs};
 
-use crate::{
-    dbg_backend::DebugBackend,
-    diagnostics,
-    error::{Error, Result},
-    gdb::GdbClient,
-    kd::KdBackend,
-    memory_backend::MemoryBackend,
-    repl::start_repl,
-    session, symbols, virsh,
-};
+use std::path::PathBuf;
+use std::sync::Arc;
+
 #[cfg(feature = "agent")]
 use crate::agent;
 #[cfg(feature = "mcp")]
 use crate::mcp;
+use crate::resolve_target;
+use crate::{
+    dbg_backend::DebugBackend,
+    diagnostics,
+    dmp::DmpBackend,
+    error::{Error, Result},
+    gdb::GdbClient,
+    kd::KdBackend,
+    memory_backend::MemoryBackend,
+    phys::PhysMem,
+    repl::start_repl,
+    session, symbols, virsh,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BackendKind {
@@ -46,6 +52,12 @@ struct Args {
     #[argh(switch, long = "force-download-symbols")]
     redownload_symbols: bool,
 
+    /// additional PDB symbol server URL (repeatable; tried before the Microsoft
+    /// default). Uses the standard symbol-server path convention:
+    /// {server}/{filename}/{guid}{age}/{filename}
+    #[argh(option, long = "pdb-server")]
+    pdb_server: Vec<String>,
+
     /// help instructions with enabling gdbstub in qemu
     #[argh(switch, long = "gdbstub-instructions")]
     gdbstub_instructions: bool,
@@ -61,6 +73,11 @@ struct Args {
     /// backend connection target. Defaults: '127.0.0.1:1234' for gdb, '/tmp/ntoseye-kd.sock' for kd; unused by memory.
     #[argh(option, long = "connect")]
     connect: Option<String>,
+
+    /// open a Windows kernel crash dump (.dmp) for offline analysis instead of attaching to a live VM
+    #[argh(option, long = "dump")]
+    dump: Option<PathBuf>,
+
     #[argh(subcommand)]
     command: Option<Command>,
 }
@@ -88,8 +105,9 @@ struct AgentCommand {}
 #[derive(FromArgs)]
 #[argh(subcommand, name = "mcp")]
 /// run as an MCP server, exposing the debugger as tools (reads the top-level
-/// --backend/--connect to choose how to attach). Defaults to the stdio transport
-/// (the client launches this binary); pass --http to serve over the network.
+/// --backend/--connect/--dump to choose how to attach). Defaults to the stdio
+/// transport (the client launches this binary); pass --http to serve over the
+/// network.
 struct McpCommand {
     /// serve the Streamable HTTP transport on this address (e.g. 127.0.0.1:8080)
     /// instead of stdio, for web MCP clients that connect over the network
@@ -102,6 +120,12 @@ struct McpCommand {
     /// cross-origin requests are restricted to loopback origins.
     #[argh(switch, long = "unsafe-http")]
     unsafe_http: bool,
+
+    /// additional PDB symbol server URL (repeatable; tried before the Microsoft
+    /// default). Same as the top-level --pdb-server; can be placed before or
+    /// after the 'mcp' subcommand.
+    #[argh(option, long = "pdb-server")]
+    pdb_server: Vec<String>,
 }
 
 #[derive(FromArgs)]
@@ -208,7 +232,6 @@ fn run() -> Result<()> {
         println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-
     if args.gdbstub_instructions {
         println!("{}", GDBSTUB_INSTRUCTIONS);
         return Ok(());
@@ -227,6 +250,27 @@ fn run() -> Result<()> {
             Error::DebugInfo("symbol download flag was initialized before startup".into())
         })?;
 
+    // Merge top-level and subcommand --pdb-server lists (the subcommand may
+    // carry its own, e.g. `ntoseye mcp --pdb-server URL`).
+    let mut pdb_servers = std::mem::take(&mut args.pdb_server);
+    #[cfg(feature = "mcp")]
+    if let Some(Command::Mcp(ref mcp_args)) = args.command {
+        pdb_servers.extend(mcp_args.pdb_server.clone());
+    }
+    if !pdb_servers.is_empty() {
+        symbols::PDB_SERVERS.set(pdb_servers).map_err(|_| {
+            Error::DebugInfo("PDB server list was initialized before startup".into())
+        })?;
+    }
+
+    if args.dump.is_some() && args.connect.is_some() {
+        return Err(Error::DebugInfo(
+            "--dump opens a crash dump and does not use --connect".to_string(),
+        ));
+    }
+
+    // `take()` rather than moving out of `args`: the agent branch below passes
+    // `&args` to connect_session, which a partial move would forbid.
     if let Some(command) = args.command.take() {
         return match command {
             Command::Virsh(_) => virsh::run_interactive(),
@@ -240,6 +284,7 @@ fn run() -> Result<()> {
                 mcp::run(
                     backend.to_string(),
                     args.connect.clone(),
+                    args.dump.clone(),
                     mcp_args.http.clone(),
                     mcp_args.unsafe_http,
                 )
@@ -257,30 +302,52 @@ fn run() -> Result<()> {
     start_repl(&mut ctx)
 }
 
-/// Acquire the single-instance lock and connect the selected backend. The lock
-/// is taken before the backend handshake, so a second ntoseye fails fast instead
-/// of racing on the transport. Backend selection stays a frontend concern.
+/// Open a dump or connect the selected live backend. Live backends take a
+/// per-target instance lock before the handshake, so a second ntoseye fails fast
+/// instead of racing on the transport. Backend selection stays a frontend
+/// concern; shared by the REPL and `ntoseye agent`.
 fn connect_session(args: &Args) -> Result<session::Session> {
-    session::Session::connect(|| -> Result<Box<dyn DebugBackend>> {
-        Ok(match args.backend {
-            BackendKind::Gdb => {
-                let addr = args.connect.as_deref().unwrap_or("127.0.0.1:1234");
-                Box::new(GdbClient::connect(addr)?)
-            }
-            BackendKind::Kd => {
-                let path = args.connect.as_deref().unwrap_or("/tmp/ntoseye-kd.sock");
-                Box::new(KdBackend::connect(path)?)
-            }
-            BackendKind::Memory => {
-                if args.connect.is_some() {
-                    return Err(Error::DebugInfo(
-                        "memory backend does not use --connect".to_string(),
-                    ));
+    if let Some(dump_path) = &args.dump {
+        let phys = Arc::new(PhysMem::dmp(dump_path)?);
+        let info = phys
+            .dmp_info()
+            .expect("dmp_info must be Some for DMP backend")
+            .clone();
+        // A dump is read-only, so no per-target lock: any number of sessions
+        // can analyse dumps alongside a live debugger.
+        return session::Session::connect(phys, None, || -> Result<Box<dyn DebugBackend>> {
+            Ok(Box::new(DmpBackend::new(&info)))
+        });
+    }
+
+    // kd/gdb take a per-target instance lock so a second ntoseye can't
+    // attach to the same backend resource; passive memory introspection
+    // passes None and coexists with anything.
+    let backend_str = match args.backend {
+        BackendKind::Gdb => "gdb",
+        BackendKind::Kd => "kd",
+        BackendKind::Memory => "memory",
+    };
+    let target = resolve_target(backend_str, args.connect.as_deref());
+    let phys = Arc::new(PhysMem::kvm()?);
+    session::Session::connect(
+        phys,
+        target.as_deref(),
+        || -> Result<Box<dyn DebugBackend>> {
+            Ok(match args.backend {
+                BackendKind::Gdb => Box::new(GdbClient::connect(target.as_deref().unwrap())?),
+                BackendKind::Kd => Box::new(KdBackend::connect(target.as_deref().unwrap())?),
+                BackendKind::Memory => {
+                    if args.connect.is_some() {
+                        return Err(Error::DebugInfo(
+                            "memory backend does not use --connect".to_string(),
+                        ));
+                    }
+                    Box::new(MemoryBackend::new())
                 }
-                Box::new(MemoryBackend::new())
-            }
-        })
-    })
+            })
+        },
+    )
 }
 
 fn print_home_migration() {

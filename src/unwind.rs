@@ -32,9 +32,9 @@ use pelite::pe64::{
 use crate::{
     backend::MemoryOps,
     gdb::RegisterMap,
-    guest::{ModuleInfo, PeImage, ProcessInfo, read_pe_image, read_pe_image_from_file},
-    host::KvmHandle,
-    memory::AddressSpace,
+    guest::{Guest, ModuleInfo, PeImage, ProcessInfo, read_pe_image, read_pe_image_from_file},
+    memory::{AddressSpace, DTB_IDENTITY},
+    phys::PhysMem,
     symbols::SymbolStore,
     target::Target,
     types::{Dtb, VirtAddr},
@@ -164,24 +164,26 @@ enum Unwound {
 
 struct StackTracer<'a> {
     trace: &'a ThreadTraceContext,
-    kvm: &'a KvmHandle,
+    phys: &'a PhysMem,
     symbols: &'a SymbolStore,
-    memory: AddressSpace<'a, KvmHandle>,
+    memory: AddressSpace<'a, PhysMem>,
     modules: HashMap<(Dtb, u64), CachedModule>,
 }
 
 pub fn resolve_thread_trace_context(debugger: &Target, cr3: u64) -> ThreadTraceContext {
     let cr3_masked = cr3 & CR3_PAGE_MASK;
-    let kernel_dtb = debugger.guest.ntoskrnl.dtb();
+    let kernel_dtb = debugger.kernel_dtb();
     let kernel_dtb_masked = kernel_dtb & CR3_PAGE_MASK;
 
-    if cr3_masked == kernel_dtb_masked {
+    // Triage dumps use DTB_IDENTITY — page-table walks are impossible,
+    // so force the kernel context regardless of the thread's real CR3.
+    if kernel_dtb == DTB_IDENTITY || cr3_masked == kernel_dtb_masked {
         return ThreadTraceContext {
             description: "kernel".to_string(),
             active_dtb: kernel_dtb,
             kernel_dtb,
             process_dtb: None,
-            kernel_modules: debugger.guest.kernel_modules().unwrap_or_default(),
+            kernel_modules: debugger.kernel_modules().unwrap_or_default(),
             process_modules: Vec::new(),
         };
     }
@@ -189,14 +191,15 @@ pub fn resolve_thread_trace_context(debugger: &Target, cr3: u64) -> ThreadTraceC
     if let Some(proc_info) = find_process_by_cr3(debugger, cr3_masked) {
         let process_modules = debugger
             .guest
-            .process_modules(&proc_info)
+            .as_ref()
+            .map(|g| g.process_modules(&proc_info).unwrap_or_default())
             .unwrap_or_default();
         return ThreadTraceContext {
             description: format!("{} ({})", proc_info.name, proc_info.pid),
             active_dtb: cr3_masked,
             kernel_dtb,
             process_dtb: Some(proc_info.dtb),
-            kernel_modules: debugger.guest.kernel_modules().unwrap_or_default(),
+            kernel_modules: debugger.kernel_modules().unwrap_or_default(),
             process_modules,
         };
     }
@@ -206,12 +209,16 @@ pub fn resolve_thread_trace_context(debugger: &Target, cr3: u64) -> ThreadTraceC
         active_dtb: cr3_masked,
         kernel_dtb,
         process_dtb: None,
-        kernel_modules: debugger.guest.kernel_modules().unwrap_or_default(),
+        kernel_modules: debugger.kernel_modules().unwrap_or_default(),
         process_modules: Vec::new(),
     }
 }
 
-pub fn format_symbol(debugger: &Target, trace: &ThreadTraceContext, addr: u64) -> String {
+pub fn try_format_symbol(
+    debugger: &Target,
+    trace: &ThreadTraceContext,
+    addr: u64,
+) -> Option<String> {
     let try_format = |dtb| {
         debugger
             .symbols
@@ -219,24 +226,24 @@ pub fn format_symbol(debugger: &Target, trace: &ThreadTraceContext, addr: u64) -
     };
 
     if let Some(module) = trace.module_for_address(addr) {
-        return try_format(module.dtb).unwrap_or_else(|| {
+        return Some(try_format(module.dtb).unwrap_or_else(|| {
             // TODO lazily load module symbols on stop so user return addresses resolve past module+offset.
             let offset = addr.saturating_sub(module.info.base_address.0);
             format!("{}+{:#x}", module.info.short_name, offset)
-        });
+        }));
     }
 
     if let Some(process_dtb) = trace.process_dtb
         && let Some(symbol) = try_format(process_dtb)
     {
-        return symbol;
+        return Some(symbol);
     }
 
-    if let Some(symbol) = try_format(trace.kernel_dtb) {
-        return symbol;
-    }
+    try_format(trace.kernel_dtb)
+}
 
-    format!("{:#x}", addr)
+pub fn format_symbol(debugger: &Target, trace: &ThreadTraceContext, addr: u64) -> String {
+    try_format_symbol(debugger, trace, addr).unwrap_or_else(|| format!("{addr:#x}"))
 }
 
 pub fn preferred_code_dtb(trace: &ThreadTraceContext, addr: u64) -> Dtb {
@@ -344,10 +351,11 @@ fn ensure_frame_module_symbols(
     }
 
     for (dtb, modules) in by_dtb {
-        let _ =
-            debugger
-                .guest
-                .load_symbols_for_modules(&debugger.kvm, &debugger.symbols, modules, dtb);
+        let _ = if let Some(g) = debugger.guest.as_ref() {
+            g.load_symbols_for_modules(&debugger.phys, &debugger.symbols, modules, dtb)
+        } else {
+            Guest::load_module_symbols(&debugger.phys, &debugger.symbols, modules, dtb, false)
+        };
     }
 }
 
@@ -362,6 +370,7 @@ fn record_stack_frame(stacktrace: &mut StackTrace, limit: usize, frame: StackFra
 fn find_process_by_cr3(debugger: &Target, cr3_masked: u64) -> Option<ProcessInfo> {
     debugger
         .guest
+        .as_ref()?
         .enumerate_processes()
         .ok()?
         .into_iter()
@@ -427,9 +436,9 @@ impl<'a> StackTracer<'a> {
     fn new(debugger: &'a Target, trace: &'a ThreadTraceContext) -> Self {
         Self {
             trace,
-            kvm: &debugger.kvm,
+            phys: &debugger.phys,
             symbols: &debugger.symbols,
-            memory: AddressSpace::new(&debugger.kvm, trace.active_dtb),
+            memory: AddressSpace::new(&debugger.phys, trace.active_dtb),
             modules: HashMap::new(),
         }
     }
@@ -580,10 +589,14 @@ impl<'a> StackTracer<'a> {
         Some(UnwindStep::Continue)
     }
 
-    fn unwind_leaf(&self, context: &mut RegisterContext) -> Unwound {
+    fn unwind_leaf(&mut self, context: &mut RegisterContext) -> Unwound {
         let Ok(return_address) = self.memory.read::<u64>(VirtAddr(context.rsp)) else {
             return Unwound::Stop;
         };
+
+        if !self.is_executable_address(return_address) {
+            return Unwound::Stop;
+        }
 
         context.rip = return_address;
         context.rsp = context.rsp.saturating_add(8);
@@ -790,8 +803,24 @@ impl<'a> StackTracer<'a> {
             return Some(());
         }
 
-        let image_memory = AddressSpace::new(self.kvm, module.dtb);
-        let image = read_pe_image(module.info.base_address, &image_memory).ok()?;
+        let image_memory = AddressSpace::new(self.phys, module.dtb);
+        let image = match read_pe_image(module.info.base_address, &image_memory) {
+            Ok(img) => img,
+            Err(_) => {
+                // Triage dumps don't contain PE headers; download the PE from
+                // the symbol server using the driver list's metadata.
+                let tds = module.info.time_date_stamp?;
+                unwind_trace!(
+                    "unwind: in-memory PE unreadable for {}, downloading via timestamp",
+                    module.info.short_name
+                );
+                let path = self
+                    .symbols
+                    .ensure_module_image_on_disk(&module.info.name, tds, module.info.size)
+                    .ok()?;
+                read_pe_image_from_file(&path).ok()?
+            }
+        };
         let executable_ranges = executable_ranges(&image);
 
         self.modules.insert(

@@ -155,7 +155,7 @@ pub fn read_idt_entries(
         return Err(Error::InvalidRange);
     }
     let mut data = vec![0u8; entry_count * 16];
-    AddressSpace::new(&debugger.kvm, cr3).read_bytes(idtr.base, &mut data)?;
+    AddressSpace::new(&debugger.phys, cr3).read_bytes(idtr.base, &mut data)?;
     Ok(data
         .chunks_exact(16)
         .enumerate()
@@ -223,7 +223,7 @@ pub fn read_gdt_entries(
     }
     let read_len = gdt_size.min(entry_count * 8 + 8);
     let mut data = vec![0u8; read_len];
-    AddressSpace::new(&debugger.kvm, cr3).read_bytes(gdtr.base, &mut data)?;
+    AddressSpace::new(&debugger.phys, cr3).read_bytes(gdtr.base, &mut data)?;
     let mut entries = Vec::new();
     for index in 0..entry_count {
         let offset = index * 8;
@@ -301,7 +301,7 @@ pub fn read_tss_stack_bases(
     let size = ((entry.effective_limit + 1).min(0x1000) as usize).max(0x68);
     let mut data = vec![0u8; size];
     let cr3 = register_map.read_u64("cr3", regs)? & CR3_PAGE_MASK;
-    AddressSpace::new(&debugger.kvm, cr3).read_bytes(VirtAddr(entry.base), &mut data)?;
+    AddressSpace::new(&debugger.phys, cr3).read_bytes(VirtAddr(entry.base), &mut data)?;
     let stacks = parse_tss_stack_bases(&data)?;
     Ok((entry, stacks))
 }

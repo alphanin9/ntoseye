@@ -26,7 +26,7 @@ fn local_symbol_plan_for_module(
     dtb: Dtb,
     module: &ModuleInfo,
 ) -> Result<Option<(PathBuf, u128)>> {
-    match SymbolStore::extract_download_job(&debugger.kvm, dtb, &module.name, module.base_address)?
+    match SymbolStore::extract_download_job(&debugger.phys, dtb, &module.name, module.base_address)?
     {
         ModuleSymbolDiscovery::Ready { job, guid, .. } => {
             Ok(find_file_case_insensitive(dir, &job.filename).map(|path| (path, guid)))
@@ -57,14 +57,13 @@ pub fn load_symbols_from_directory(
     }
     let (modules, dtb) = if let Some(process_info) = &debugger.current_process_info {
         (
-            debugger.guest.process_modules(process_info)?,
+            debugger.guest()?.process_modules(process_info)?,
             process_info.dtb,
         )
     } else {
-        (
-            debugger.guest.kernel_modules()?,
-            debugger.guest.ntoskrnl.dtb(),
-        )
+        // Target::kernel_modules/kernel_dtb fall back to the triage snapshot and
+        // identity mapping when a dump has no discoverable kernel.
+        (debugger.kernel_modules()?, debugger.kernel_dtb())
     };
     let filter = filter.map(str::to_lowercase);
     let selected: Vec<ModuleInfo> = modules

@@ -22,7 +22,7 @@ use owo_colors::OwoColorize;
 use crate::dbg_backend::DebugBackend;
 use crate::dbg_backend::{BackendCapability, DebugCapability};
 use crate::diagnostics;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::guest::ModuleSymbolLoadReport;
 #[cfg(feature = "python")]
 use crate::python::embed;
@@ -31,11 +31,10 @@ use crate::session::Session;
 use crate::symbols::ntoseye_home;
 #[cfg(feature = "cli")]
 use crate::target::Target;
-#[cfg(feature = "cli")]
 use crate::ui;
 
 pub static INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
-pub const BREAK_STACKTRACE_DISPLAY_LIMIT: usize = 8;
+pub const BREAK_STACKTRACE_DISPLAY_LIMIT: usize = 6;
 pub const BREAK_STACKTRACE_PROBE_LIMIT: usize = 64;
 #[cfg(feature = "cli")]
 const REPL_HISTORY_SIZE: usize = 5000;
@@ -86,7 +85,7 @@ pub use pool::*;
 pub use stop::*;
 
 pub fn print_module_symbol_report(report: &ModuleSymbolLoadReport) {
-    let mut summary = format!("symbols: loaded {}/{}", report.loaded, report.total);
+    let mut summary = format!("loaded {}/{}", report.loaded, report.total);
     if report.failed_count() > 0 {
         summary.push_str(&format!(", {} failed", report.failed_count()));
     }
@@ -96,7 +95,7 @@ pub fn print_module_symbol_report(report: &ModuleSymbolLoadReport) {
     if report.skipped > 0 {
         summary.push_str(&format!(", {} skipped", report.skipped));
     }
-    println!("{summary}");
+    println!("{} {summary}", ui::muted("symbols:"));
 }
 
 pub fn print_backend_capabilities(capabilities: &[BackendCapability]) {
@@ -236,22 +235,84 @@ pub fn start_repl(ctx: &mut Session) -> Result<()> {
         INTERRUPT_REQUESTED.store(true, Ordering::SeqCst);
     })?;
 
-    let message_data = debugger.startup_message_data()?;
+    let backend_label = client.name();
 
-    println!("{}", "target".bold());
-    println!("  kernel: Windows {}", message_data.build_number.0);
-    println!("  base:   {}", ui::addr(message_data.base_address.0));
-    println!(
-        "  psmods: {}",
-        ui::addr_opt(message_data.loaded_module_list)
-    );
-    println!();
+    // Loaded up front so the summary prints with the transport banner and
+    // the completion caches below see them.
+    #[cfg(feature = "python")]
+    let py_report = embed::load_commands_dir();
+    let (aliases, alias_report) = UserAliases::load_with_report();
+    let mut loaded_parts: Vec<String> = Vec::new();
+    #[cfg(feature = "python")]
+    if !py_report.loaded.is_empty() || !py_report.failed.is_empty() {
+        let mut part = format!("{} python", py_report.loaded.len());
+        if !py_report.failed.is_empty() {
+            part.push_str(&format!(" ({} failed)", py_report.failed.len()));
+        }
+        loaded_parts.push(part);
+    }
+    if alias_report.loaded > 0 || !alias_report.failed.is_empty() {
+        let n = alias_report.loaded;
+        let mut part = format!("{n} alias{}", if n == 1 { "" } else { "es" });
+        if !alias_report.failed.is_empty() {
+            part.push_str(&format!(" ({} failed)", alias_report.failed.len()));
+        }
+        loaded_parts.push(part);
+    }
+    if !loaded_parts.is_empty() {
+        println!(
+            "{}",
+            ui::muted(&format!("loaded: {}", loaded_parts.join(", ")))
+        );
+    }
+    #[cfg(feature = "python")]
+    embed::print_script_load_failures(&py_report);
+    print_alias_load_failures(&alias_report);
+
+    // Triage dumps may lack the ntoskrnl PE header needed for full kernel
+    // discovery; a missing kernel is non-fatal and commands that need it
+    // fail individually.
+    let reload_module_list_pending = match debugger.startup_message_data() {
+        Ok(message_data) => {
+            println!("\n{}", ui::label("target"));
+            println!(
+                "  {} Windows {}",
+                ui::muted("kernel"),
+                message_data.build_number.0
+            );
+            println!(
+                "  {} {}",
+                ui::muted("base  "),
+                ui::addr(message_data.base_address.0)
+            );
+            println!(
+                "  {} {}",
+                ui::muted("psmods"),
+                ui::addr_opt(message_data.loaded_module_list)
+            );
+            println!();
+            message_data.loaded_module_list.is_zero()
+        }
+        Err(Error::NtoskrnlNotFound) | Err(Error::AddressNotInDump(_)) => {
+            println!("\n{}", ui::label("target"));
+            if let Some(base) = debugger.kernel_base() {
+                println!("  {} {}", ui::muted("base  "), ui::addr(base.0));
+            } else {
+                println!(
+                    "  {} {}",
+                    ui::muted("kernel"),
+                    ui::muted("unknown (ntoskrnl not found in dump)")
+                );
+            }
+            println!();
+            false
+        }
+        Err(e) => return Err(e),
+    };
     let capabilities = client.capabilities();
     print_backend_capability_warning(&capabilities);
 
     let has_register_context = supports_capability(&capabilities, DebugCapability::ReadRegisters);
-
-    let reload_module_list_pending = message_data.loaded_module_list.is_zero();
 
     if has_register_context {
         print_break_context(
@@ -331,7 +392,8 @@ pub fn start_repl(ctx: &mut Session) -> Result<()> {
 
     let initial_processes = debugger
         .guest
-        .enumerate_processes()
+        .as_ref()
+        .and_then(|g| g.enumerate_processes().ok())
         .map(|procs| procs.into_iter().map(|p| (p.name, p.pid)).collect())
         .unwrap_or_default();
     let initial_vcpus = if supports_capability(&capabilities, DebugCapability::ThreadList) {
@@ -341,16 +403,6 @@ pub fn start_repl(ctx: &mut Session) -> Result<()> {
     };
     let initial_drivers = debugger.enumerate_driver_objects().unwrap_or_default();
 
-    // In-REPL Python commands (the embedded-interpreter build). Loaded here so
-    // they're in the completion set below.
-    #[cfg(feature = "python")]
-    {
-        let py_report = embed::load_commands_dir();
-        embed::print_script_load_report(&py_report, true);
-    }
-
-    let (aliases, alias_report) = UserAliases::load_with_report();
-    print_alias_load_report(&alias_report, true);
     let caches = ReplCaches {
         symbols: Arc::new(RwLock::new(debugger.current_symbol_index())),
         types: Arc::new(RwLock::new(debugger.current_types_index())),
@@ -396,7 +448,6 @@ pub fn start_repl(ctx: &mut Session) -> Result<()> {
             )),
         }
     }
-    let prompt = CustomPrompt {};
 
     let mut state = ReplState {
         ctx,
@@ -410,6 +461,7 @@ pub fn start_repl(ctx: &mut Session) -> Result<()> {
     state.ctx.reload_module_list_pending = reload_module_list_pending;
 
     loop {
+        let prompt = CustomPrompt::new(backend_label, &state.ctx.current_thread);
         let sig = line_editor.read_line(&prompt)?;
         match sig {
             Signal::Success(buffer) => {
@@ -436,6 +488,7 @@ pub fn start_repl(ctx: &mut Session) -> Result<()> {
                     error!("VM is already paused");
                 }
             }
+            _ => {}
         }
     }
 

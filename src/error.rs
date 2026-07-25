@@ -119,8 +119,8 @@ pub enum Error {
     )]
     PtraceDenied { pid: i32, scope: String },
 
-    #[error("Another instance of ntoseye is running")]
-    AlreadyRunning,
+    #[error("Another instance of ntoseye is already attached to {0}")]
+    AlreadyRunning(String),
 
     #[error("Data doesn't fit in buffer")]
     BufferNotEnough,
@@ -137,8 +137,17 @@ pub enum Error {
     #[error("Bad virtual address: {0:x}")]
     BadVirtualAddress(VirtAddr),
 
+    #[error("Address {0:x} is not captured in the triage dump's memory snapshot")]
+    AddressNotInDump(VirtAddr),
+
     #[error("Bad physical address: {0:x}")]
     BadPhysicalAddress(PhysAddr),
+
+    #[error("crash dump is read-only")]
+    ReadOnlyDump,
+
+    #[error("invalid crash dump: {0}")]
+    InvalidDump(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

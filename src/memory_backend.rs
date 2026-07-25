@@ -5,6 +5,7 @@ use crate::error::{Error, Result};
 use crate::gdb::RegisterMap;
 use crate::types::VirtAddr;
 
+#[derive(Default)]
 pub struct MemoryBackend {
     register_map: RegisterMap,
 }
@@ -26,6 +27,9 @@ impl MemoryBackend {
 impl DebugBackend for MemoryBackend {
     fn register_map(&self) -> &RegisterMap {
         &self.register_map
+    }
+    fn name(&self) -> &'static str {
+        "mem"
     }
 
     fn capabilities(&self) -> Vec<BackendCapability> {

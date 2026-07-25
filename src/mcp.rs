@@ -11,23 +11,31 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::backend::MemoryOps;
-use crate::bugchecks::{analyze_bugcheck, current_bugcheck};
-use crate::dbg_backend::DebugBackend;
+use crate::bugchecks::{analyze_bugcheck, bugcheck_from_dump_info, current_bugcheck};
+use crate::dbg_backend::{DebugBackend, WatchpointAccess};
+use crate::dmp::{DmpBackend, DmpException, DmpSystemInfo, TriageCrashInfo, UnloadedDriver};
 use crate::error::Error;
 use crate::expr::Expr;
 use crate::gdb::GdbClient;
+use crate::guest::ModuleInfo;
 use crate::kd::KdBackend;
 use crate::memory_backend::MemoryBackend;
-use crate::session::{ContinueOutcome, Session};
+use crate::phys::PhysMem;
+use crate::session::{ContinueOutcome, RunStatus, Session};
 use crate::symbols::{FieldValue, TypeInfo};
 use crate::target::{kthread_state_name, wait_reason_name};
+use crate::trapframe::read_ktrap_frame_at_or_current;
+use crate::triage::TriagePrcbInfo;
 use crate::types::VirtAddr;
+use crate::unwind::StackFrame;
 use crate::view;
+use crate::{DEFAULT_KD_SOCKET, resolve_target};
 
 // MCP handlers are async/Send, but `Session` is not. A dedicated actor thread
 // owns the session; handlers send closures and await one reply.
@@ -71,6 +79,7 @@ fn cleanup_session(ctx: &mut Session) {
 fn spawn_session(
     backend: String,
     connect: Option<String>,
+    dump: Option<PathBuf>,
 ) -> anyhow::Result<(mpsc::UnboundedSender<Command>, Arc<AtomicBool>)> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
@@ -83,22 +92,38 @@ fn spawn_session(
     let service_pending_actor = service_pending.clone();
 
     std::thread::spawn(move || {
-        // `connect` takes the single-instance lock (on this actor thread, where
-        // the `!Send` session lives) before building the backend, so the MCP
-        // server refuses to attach if another ntoseye already owns the VM.
-        let built = Session::connect(|| {
-            let backend: Box<dyn DebugBackend> = match backend.as_str() {
-                "gdb" => Box::new(GdbClient::connect(
-                    connect.as_deref().unwrap_or("127.0.0.1:1234"),
-                )?),
-                "kd" => Box::new(KdBackend::connect(
-                    connect.as_deref().unwrap_or("/tmp/ntoseye-kd.sock"),
-                )?),
-                "memory" => Box::new(MemoryBackend::new()),
-                other => return Err(Error::DebugInfo(format!("unknown backend '{other}'"))),
-            };
-            Ok(backend)
-        })
+        let is_dump = dump.is_some();
+
+        // `connect` takes the per-target instance lock (on this actor thread,
+        // where the `!Send` session lives) before building the backend, so a
+        // second ntoseye can't attach to the same resource. Dumps and passive
+        // memory introspection pass `None` (no lock needed).
+        let built = (|| {
+            if let Some(dump_path) = &dump {
+                let phys = Arc::new(PhysMem::dmp(dump_path)?);
+                let info = phys
+                    .dmp_info()
+                    .expect("dmp_info must be Some for DMP backend")
+                    .clone();
+                Session::connect(phys, None, || -> Result<Box<dyn DebugBackend>, Error> {
+                    Ok(Box::new(DmpBackend::new(&info)))
+                })
+            } else {
+                let target = resolve_target(backend.as_str(), connect.as_deref());
+                let phys = Arc::new(PhysMem::kvm()?);
+                Session::connect(phys, target.as_deref(), || {
+                    let backend: Box<dyn DebugBackend> = match backend.as_str() {
+                        "gdb" => Box::new(GdbClient::connect(target.as_deref().unwrap())?),
+                        "kd" => Box::new(KdBackend::connect(target.as_deref().unwrap())?),
+                        "memory" => Box::new(MemoryBackend::new()),
+                        other => {
+                            return Err(Error::DebugInfo(format!("unknown backend '{other}'")));
+                        }
+                    };
+                    Ok(backend)
+                })
+            }
+        })()
         .map_err(|e| e.to_string());
 
         let mut ctx = match built {
@@ -112,11 +137,10 @@ fn spawn_session(
             }
         };
 
-        // Unlike the REPL (which pauses at its prompt), the MCP keeps the guest
-        // running for the session; the connect handshake broke the target in, so
-        // resume now. Live introspection reads go through /dev/kvm; tools that need
-        // a stopped target say so and ask the client to call `interrupt` first.
-        if !ctx.backend.is_running() {
+        // For live targets the MCP keeps the guest running between tool calls;
+        // tools that need a stopped target ask the client to call `interrupt`
+        // first. Dumps are always halted — skip the resume.
+        if !is_dump && !ctx.backend.is_running() {
             let _ = ctx.backend.continue_execution();
         }
 
@@ -142,6 +166,7 @@ fn spawn_session(
                 }
                 Some(Command::Shutdown { ack }) => {
                     cleanup_session(&mut ctx);
+                    drop(ctx);
                     let _ = ack.send(());
                     break;
                 }
@@ -160,9 +185,83 @@ fn spawn_session(
     }
 }
 
+/// The one shared session slot all transports funnel into. `Opening(gen)`
+/// reserves the slot while `open_dump`/`open` builds a session off-thread,
+/// so a concurrent open can't race the vacancy check and leak a second
+/// actor. The generation counter lets [`OpeningGuard`] detect when its
+/// reservation has been cancelled by a concurrent `close`.
+enum SessionSlot {
+    Vacant,
+    Opening(u64),
+    Active(mpsc::UnboundedSender<Command>),
+}
+
+static OPENING_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+type SharedSession = Arc<std::sync::Mutex<SessionSlot>>;
+
+/// RAII guard that rolls `SessionSlot` back to `Vacant` if the opening future
+/// is cancelled (e.g. MCP client timeout). Call [`OpeningGuard::promote`] to
+/// install the active sender and defuse the rollback. The generation counter
+/// ensures promote/drop only act on the `Opening` this guard created, not one
+/// set by a concurrent open after a close race.
+struct OpeningGuard {
+    session: SharedSession,
+    generation: u64,
+}
+
+impl OpeningGuard {
+    fn claim(session: &SharedSession) -> Result<Self, McpError> {
+        let mut guard = session.lock().unwrap();
+        match *guard {
+            SessionSlot::Vacant => {
+                let id = OPENING_GENERATION.fetch_add(1, Ordering::Relaxed);
+                *guard = SessionSlot::Opening(id);
+                Ok(Self {
+                    session: session.clone(),
+                    generation: id,
+                })
+            }
+            _ => Err(McpError::invalid_request(
+                "a debugger session is already active or opening",
+                None,
+            )),
+        }
+    }
+
+    fn promote(self, tx: mpsc::UnboundedSender<Command>) -> Result<(), McpError> {
+        let mut guard = self.session.lock().unwrap();
+        match *guard {
+            SessionSlot::Opening(id) if id == self.generation => {
+                *guard = SessionSlot::Active(tx);
+                Ok(())
+            }
+            _ => Err(McpError::internal_error("session open was cancelled", None)),
+        }
+    }
+}
+
+impl Drop for OpeningGuard {
+    fn drop(&mut self) {
+        let mut guard = self.session.lock().unwrap();
+        if matches!(*guard, SessionSlot::Opening(id) if id == self.generation) {
+            *guard = SessionSlot::Vacant;
+        }
+    }
+}
+
+struct InterruptResetGuard(Arc<AtomicBool>);
+
+impl Drop for InterruptResetGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone)]
 struct NtoseyeMcp {
-    tx: mpsc::UnboundedSender<Command>,
+    session: SharedSession,
+    #[allow(dead_code)] // accessed by the #[tool_router] macro expansion
     tool_router: ToolRouter<Self>,
     /// Flipped on shutdown so an in-flight `wait_for_stop` bails out promptly and
     /// the actor can run cleanup (resume the VM) before exit.
@@ -177,6 +276,14 @@ struct AddressArgs {
         description = "Address as a debugger expression (symbol, register, hex, arithmetic)"
     )]
     address: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct TrapFrameArgs {
+    #[schemars(
+        description = "Optional trap-frame address as a debugger expression; omit to use the current Windows thread's saved KTHREAD.TrapFrame"
+    )]
+    address: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -328,7 +435,42 @@ struct SetBreakpointArgs {
     )]
     address: String,
     #[schemars(
-        description = "Optional break condition, re-evaluated each hit; the breakpoint only surfaces when it holds (e.g. \"$rcx == 0x4\" or a bare expression treated as non-zero). Comparison ops: == != < <= > >="
+        description = "Optional break condition, parsed when installed and re-evaluated each hit; the breakpoint only surfaces when it holds. Uses the normal expression grammar, including comparisons (== != < <= > >=), bitwise operators (~ & ^ | << >>), and short-circuiting !, &&, ||."
+    )]
+    condition: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum WatchpointAccessArg {
+    Write,
+    ReadWrite,
+}
+
+impl From<WatchpointAccessArg> for WatchpointAccess {
+    fn from(access: WatchpointAccessArg) -> Self {
+        match access {
+            WatchpointAccessArg::Write => Self::Write,
+            WatchpointAccessArg::ReadWrite => Self::ReadWrite,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SetWatchpointArgs {
+    #[schemars(description = "Data address to watch as a debugger expression")]
+    address: String,
+    #[schemars(
+        description = "Access to watch: write, or read_write (x86 cannot trap reads without also trapping writes)"
+    )]
+    access: WatchpointAccessArg,
+    #[schemars(
+        range(min = 1, max = 8),
+        description = "Watched width in bytes: 1, 2, 4, or 8; address must be naturally aligned"
+    )]
+    length: u8,
+    #[schemars(
+        description = "Optional condition, parsed when installed and re-evaluated after the watch fires. Uses the normal expression grammar, including comparisons, bitwise operators, and short-circuiting !, &&, ||."
     )]
     condition: Option<String>,
 }
@@ -404,6 +546,38 @@ struct SetRegisterArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct OpenDumpArgs {
+    #[schemars(description = "Absolute path to a Windows kernel crash dump (.dmp) file")]
+    path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct OpenArgs {
+    #[schemars(
+        description = "Backend to use: \"kd\" (KD over Unix socket), \"gdb\" (GDB remote stub), or \"memory\" (physical memory only, no debug transport)"
+    )]
+    backend: String,
+    #[schemars(
+        description = "Connection target: Unix socket path for kd (default /tmp/ntoseye-kd.sock), host:port for gdb (default 127.0.0.1:1234). Ignored for memory backend."
+    )]
+    connect: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct EvalArgs {
+    #[schemars(
+        description = "Debugger expression to evaluate (symbol name, hex address, register, arithmetic, or poi())"
+    )]
+    expression: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ReadPointerArgs {
+    #[schemars(description = "Address expression to read a pointer-sized (8-byte) value from")]
+    address: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct WaitArgs {
     #[schemars(
         range(min = 0, max = 20000),
@@ -461,6 +635,7 @@ impl From<Error> for ToolError {
         let msg = e.to_string();
         match e {
             Error::BadVirtualAddress(_)
+            | Error::AddressNotInDump(_)
             | Error::BadPhysicalAddress(_)
             | Error::PartialRead(_)
             | Error::PartialWrite(_)
@@ -589,19 +764,28 @@ fn continue_outcome_json(ctx: &Session, outcome: ContinueOutcome) -> Value {
             symbol,
             temporary,
             rip,
-        } => serde_json::json!({
-            "stop": "breakpoint",
-            "id": id,
-            "address": hex(address),
-            "symbol": symbol.or_else(|| symbol_at(rip)),
-            "temporary": temporary,
-            "rip": hex(rip),
-            "process": process,
-        }),
+            condition_error,
+        } => {
+            let bp = ctx.breakpoint(id);
+            let watch_access = bp.and_then(|bp| bp.watch_access_name());
+            serde_json::json!({
+                "stop": if watch_access.is_some() { "watchpoint" } else { "breakpoint" },
+                "id": id,
+                "address": hex(address),
+                "symbol": symbol.or_else(|| symbol_at(rip)),
+                "temporary": temporary,
+                "rip": hex(rip),
+                "process": process,
+                "watch_access": watch_access,
+                "watch_length": bp.and_then(|bp| bp.watch_length()),
+                "condition_error": condition_error,
+            })
+        }
         ContinueOutcome::Bugcheck { rip, info } => {
             let analysis = info
                 .map(|i| analyze_bugcheck(&ctx.target, &i))
-                .or_else(|| current_bugcheck(&ctx.target));
+                .or_else(|| current_bugcheck(&ctx.target))
+                .or_else(|| bugcheck_from_dump_info(&ctx.target));
             serde_json::json!({
                 "stop": "bugcheck",
                 "rip": rip.map(hex),
@@ -690,7 +874,7 @@ fn hex_of(slice: &[u8]) -> String {
 /// Rejects odd length and non-hex digits as invalid params.
 fn bytes_of_hex(s: &str) -> Result<Vec<u8>, ToolError> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(invalid_request("hex must have an even number of digits"));
     }
     (0..s.len())
@@ -759,12 +943,219 @@ fn json_result(v: Value) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::structured(v))
 }
 
+fn run_status_json(s: RunStatus) -> Value {
+    let process = s.process.map(|(pid, name, eprocess)| {
+        serde_json::json!({ "pid": pid, "name": name, "eprocess": hex(eprocess) })
+    });
+    serde_json::json!({
+        "running": s.running,
+        "current_thread": s.current_thread,
+        "rip": s.rip.map(hex),
+        "symbol": s.symbol,
+        "process": process,
+        "coherent": s.coherent,
+        "kernel_base": hex(s.kernel_base),
+    })
+}
+
+fn status_json(ctx: &mut Session) -> Value {
+    run_status_json(ctx.run_status())
+}
+
+fn frame_json(f: &StackFrame) -> Value {
+    serde_json::json!({
+        "ip": hex(f.ip),
+        "sp": hex(f.sp),
+        "symbol": f.symbol,
+        "source": f.source.as_str(),
+    })
+}
+
+fn module_json(m: &ModuleInfo) -> Value {
+    let mut v = serde_json::json!({
+        "name": m.name,
+        "short_name": m.short_name,
+        "base": hex(m.base_address.0),
+        "end": hex(m.end_address().0),
+        "size": m.size,
+    });
+    if let Some(tds) = m.time_date_stamp {
+        v["time_date_stamp"] = hex(tds as u64).into();
+    }
+    if let Some(cs) = m.checksum {
+        v["checksum"] = hex(cs as u64).into();
+    }
+    if let Some(ref fv) = m.file_version {
+        v["file_version"] = fv.clone().into();
+    }
+    if let Some(ref pv) = m.product_version {
+        v["product_version"] = pv.clone().into();
+    }
+    v
+}
+
+fn exception_json(exc: &DmpException) -> Value {
+    serde_json::json!({
+        "code": exc.code,
+        "code_hex": hex(exc.code as u64),
+        "code_name": exception_code_name(exc.code),
+        "flags": exc.flags,
+        "address": hex(exc.address),
+        "parameters": exc.parameters.iter().map(|p| hex(*p)).collect::<Vec<_>>(),
+    })
+}
+
+fn exception_code_name(code: u32) -> &'static str {
+    match code {
+        0xC0000005 => "STATUS_ACCESS_VIOLATION",
+        0xC000001D => "STATUS_ILLEGAL_INSTRUCTION",
+        0xC0000094 => "STATUS_INTEGER_DIVIDE_BY_ZERO",
+        0xC0000095 => "STATUS_INTEGER_OVERFLOW",
+        0xC0000096 => "STATUS_PRIVILEGED_INSTRUCTION",
+        0xC00000FD => "STATUS_STACK_OVERFLOW",
+        0xC0000006 => "STATUS_IN_PAGE_ERROR",
+        0x80000003 => "STATUS_BREAKPOINT",
+        0x80000004 => "STATUS_SINGLE_STEP",
+        0xC000008E => "STATUS_FLOAT_DIVIDE_BY_ZERO",
+        0xC0000090 => "STATUS_FLOAT_INVALID_OPERATION",
+        0xC0000091 => "STATUS_FLOAT_OVERFLOW",
+        0xC000008D => "STATUS_FLOAT_DENORMAL_OPERAND",
+        0xC0000092 => "STATUS_FLOAT_STACK_CHECK",
+        0xC0000093 => "STATUS_FLOAT_UNDERFLOW",
+        0xC000008F => "STATUS_FLOAT_INEXACT_RESULT",
+        _ => "unknown",
+    }
+}
+
+fn system_info_json(info: &DmpSystemInfo) -> Value {
+    let product = match info.product_type {
+        1 => "Workstation",
+        2 => "DomainController",
+        3 => "Server",
+        _ => "Unknown",
+    };
+    let system_time = if info.system_time != 0 {
+        filetime_to_iso(info.system_time as u64)
+    } else {
+        None
+    };
+    let machine = match info.machine_image_type {
+        0x014c => "I386",
+        0x8664 => "AMD64",
+        0xAA64 => "ARM64",
+        _ => "Unknown",
+    };
+    serde_json::json!({
+        "major_version": info.major_version,
+        "build": info.minor_version,
+        "service_pack_build": info.service_pack_build,
+        "machine_image_type": hex(info.machine_image_type as u64),
+        "machine": machine,
+        "system_time": system_time,
+        "system_up_time_secs": if info.system_up_time != 0 {
+            Some(info.system_up_time / 10_000_000)
+        } else {
+            None
+        },
+        "product_type": product,
+        "suite_mask": hex(info.suite_mask as u64),
+    })
+}
+
+/// Crash context extracted from the triage EPROCESS/ETHREAD snapshots,
+/// shared by `open_dump` and `triage`.
+fn crash_context_json(ci: &TriageCrashInfo) -> Value {
+    let mut v = serde_json::json!({
+        "process_name": ci.process_name,
+        "process_id": ci.process_id,
+        "thread_id": ci.thread_id,
+    });
+    let obj = v.as_object_mut().unwrap();
+    if let Some(ppid) = ci.parent_process_id {
+        obj.insert("parent_process_id".into(), serde_json::json!(ppid));
+    }
+    if let Some(es) = ci.exit_status {
+        obj.insert("exit_status".into(), hex(es as u64).into());
+    }
+    if let Some(ct) = ci.create_time {
+        obj.insert("create_time".into(), filetime_to_iso(ct).into());
+    }
+    if let Some(es) = ci.thread_exit_status {
+        obj.insert("thread_exit_status".into(), hex(es as u64).into());
+    }
+    v
+}
+
+/// Crashing processor's PRCB summary, shared by `open_dump` and `triage`.
+fn prcb_json(p: &TriagePrcbInfo) -> Value {
+    serde_json::json!({
+        "current_thread": hex(p.current_thread),
+        "processor_number": p.processor_number,
+        "mhz": p.mhz,
+        "cpu_type": p.cpu_type,
+        "vendor_string": p.vendor_string,
+    })
+}
+
+fn filetime_to_iso(ft: u64) -> Option<String> {
+    // Windows FILETIME: 100-ns intervals since 1601-01-01 UTC.
+    // Unix epoch is 11644473600 seconds after that.
+    const EPOCH_DIFF: i64 = 11_644_473_600;
+    let secs = (ft / 10_000_000) as i64 - EPOCH_DIFF;
+    if !(0..=253_402_300_799).contains(&secs) {
+        return None;
+    }
+    let s = secs % 60;
+    let total_m = secs / 60;
+    let m = total_m % 60;
+    let total_h = total_m / 60;
+    let h = total_h % 24;
+    let days = total_h / 24;
+    // Approximate date from days since epoch (good enough for display)
+    let (y, mo, d) = days_to_ymd(days);
+    Some(format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z"))
+}
+
+fn days_to_ymd(mut days: i64) -> (i64, i64, i64) {
+    // Civil days since 1970-01-01 to (year, month, day)
+    days += 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let doe = days - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+fn unloaded_driver_json(d: &UnloadedDriver) -> Value {
+    serde_json::json!({
+        "name": d.name,
+        "start_address": hex(d.start_address),
+        "end_address": hex(d.end_address),
+    })
+}
+
+fn read_virt_bytes(ctx: &mut Session, addr: u64, buf: &mut [u8]) -> Result<(), ToolError> {
+    let process = ctx.target.current_process()?;
+    process
+        .memory()
+        .read_bytes(VirtAddr(addr), buf)
+        .map_err(ToolError::from)?;
+    ctx.breakpoints
+        .mask_breakpoint_bytes(VirtAddr(addr), buf, process.dtb());
+    Ok(())
+}
+
 #[tool_router]
 impl NtoseyeMcp {
-    fn new(tx: mpsc::UnboundedSender<Command>, interrupt: Arc<AtomicBool>) -> Self {
+    fn new(session: SharedSession, interrupt: Arc<AtomicBool>) -> Self {
         let tool_router = Self::tool_router();
         Self {
-            tx,
+            session,
             tool_router,
             interrupt,
         }
@@ -775,13 +1166,30 @@ impl NtoseyeMcp {
     where
         F: FnOnce(&mut Session) -> Result<Value, ToolError> + Send + 'static,
     {
+        let tx = {
+            let guard = self.session.lock().unwrap();
+            match &*guard {
+                SessionSlot::Active(tx) => tx.clone(),
+                SessionSlot::Opening(_) => {
+                    return Err(McpError::invalid_request(
+                        "a debugger session is still opening; retry shortly",
+                        None,
+                    ));
+                }
+                SessionSlot::Vacant => {
+                    return Err(McpError::invalid_request(
+                        "no debugger session is active; call open_dump or open to attach",
+                        None,
+                    ));
+                }
+            }
+        };
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(Command::Run {
-                job: Box::new(job),
-                reply: reply_tx,
-            })
-            .map_err(|_| McpError::internal_error("debugger session is gone", None))?;
+        tx.send(Command::Run {
+            job: Box::new(job),
+            reply: reply_tx,
+        })
+        .map_err(|_| McpError::internal_error("debugger session is gone", None))?;
         reply_rx
             .await
             .map_err(|_| McpError::internal_error("debugger session dropped the request", None))?
@@ -828,7 +1236,7 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "List loaded kernel modules (optional name filter; paged via offset/limit) as {total, offset, returned, has_more, next_offset?, modules:[{name, short_name, base, end, size}]}"
+        description = "List loaded kernel modules (optional name filter; paged via offset/limit) as {total, offset, returned, has_more, next_offset?, modules:[{name, short_name, base, end, size, time_date_stamp?, checksum?, file_version?, product_version?}]}"
     )]
     async fn kernel_modules(
         &self,
@@ -844,8 +1252,7 @@ impl NtoseyeMcp {
             .run(move |ctx| {
                 let mods = ctx
                     .target
-                    .guest
-                    .kernel_modules()
+                    .kernel_modules_with_versions()
                     .map_err(|e| enumeration_error(ctx, e))?;
                 let f = filter.as_deref().map(str::to_ascii_lowercase);
                 let matched: Vec<_> = mods
@@ -862,15 +1269,7 @@ impl NtoseyeMcp {
                     .iter()
                     .skip(offset)
                     .take(limit)
-                    .map(|m| {
-                        serde_json::json!({
-                            "name": m.name,
-                            "short_name": m.short_name,
-                            "base": hex(m.base_address.0),
-                            "end": hex(m.end_address().0),
-                            "size": m.size,
-                        })
-                    })
+                    .map(|m| module_json(m))
                     .collect();
                 Ok(paged(total, offset, "modules", items))
             })
@@ -1031,13 +1430,7 @@ impl NtoseyeMcp {
                 let addr = eval_addr(ctx, &address)?;
                 let len = length;
                 let mut buf = vec![0u8; len];
-                let process = ctx.target.current_process();
-                process
-                    .memory()
-                    .read_bytes(VirtAddr(addr), &mut buf)
-                    .map_err(ToolError::from)?;
-                ctx.breakpoints
-                    .mask_breakpoint_bytes(VirtAddr(addr), &mut buf, process.dtb());
+                read_virt_bytes(ctx, addr, &mut buf)?;
                 Ok(serde_json::json!({
                     "address": hex(addr),
                     "length": len,
@@ -1049,7 +1442,7 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "Disassemble 1-128 instructions at an address in the current address space; returns {ip, hex, asm, comment} rows"
+        description = "Disassemble 1-128 instructions at an address in the current address space; returns {instructions:[{ip, hex, asm, comment}]}"
     )]
     async fn disassemble(
         &self,
@@ -1062,25 +1455,25 @@ impl NtoseyeMcp {
                 let rows = ctx
                     .disassemble(VirtAddr(addr), count)
                     .map_err(ToolError::from)?;
-                let arr = rows
+                let arr: Vec<Value> = rows
                     .iter()
                     .map(|r| {
                         serde_json::json!({
                             "ip": hex(r.ip),
                             "hex": r.hex,
-                            "asm": r.asm,
+                            "asm": r.asm(),
                             "comment": r.comment,
                         })
                     })
                     .collect();
-                Ok(Value::Array(arr))
+                Ok(serde_json::json!({ "instructions": arr }))
             })
             .await?;
         json_result(v)
     }
 
     #[tool(
-        description = "Walk the current thread's call stack; limit default 64, range 1-256. Returns {ip, sp, symbol, source} frames (source: current/unwind/scan). Requires the VM halted (call interrupt first, or be stopped at a breakpoint)."
+        description = "Walk the current thread's call stack; limit default 64, range 1-256. Returns {frames:[{ip, sp, symbol, source}]} (source: current/unwind/scan). Requires the VM halted (call interrupt first, or be stopped at a breakpoint)."
     )]
     async fn backtrace(
         &self,
@@ -1091,19 +1484,8 @@ impl NtoseyeMcp {
             .run(move |ctx| {
                 require_halted(ctx, "backtrace")?;
                 let trace = ctx.backtrace(limit).map_err(ToolError::from)?;
-                let arr = trace
-                    .frames
-                    .iter()
-                    .map(|f| {
-                        serde_json::json!({
-                            "ip": hex(f.ip),
-                            "sp": hex(f.sp),
-                            "symbol": f.symbol,
-                            "source": f.source.as_str(),
-                        })
-                    })
-                    .collect();
-                Ok(Value::Array(arr))
+                let arr: Vec<Value> = trace.frames.iter().map(frame_json).collect();
+                Ok(serde_json::json!({ "frames": arr }))
             })
             .await?;
         json_result(v)
@@ -1238,7 +1620,7 @@ impl NtoseyeMcp {
         let limit = optional_limit("limit", limit, LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT)?;
         let v = self
             .run(move |ctx| {
-                let dtb = ctx.target.guest.ntoskrnl.dtb();
+                let dtb = ctx.target.kernel_dtb();
                 let cbs = ctx
                     .target
                     .enumerate_notify_callbacks()
@@ -1371,7 +1753,9 @@ impl NtoseyeMcp {
                     .symbols
                     .find_type_across_modules(dtb, &type_name)
                     .ok_or_else(|| {
-                        ToolError::Request(ctx.target.symbols.unresolved_type_message(dtb, &type_name))
+                        ToolError::Request(
+                            ctx.target.symbols.unresolved_type_message(dtb, &type_name),
+                        )
                     })?;
                 let fields: Vec<Value> = {
                     let mut fields: Vec<_> = info.fields.iter().collect();
@@ -1528,14 +1912,12 @@ impl NtoseyeMcp {
                     .symbols
                     .find_type_across_modules(dtb, &type_name)
                     .ok_or_else(|| {
-                        ToolError::Request(ctx.target.symbols.unresolved_type_message(dtb, &type_name))
+                        ToolError::Request(
+                            ctx.target.symbols.unresolved_type_message(dtb, &type_name),
+                        )
                     })?;
                 let mut buf = vec![0u8; info.size];
-                ctx.target
-                    .current_process()
-                    .memory()
-                    .read_bytes(VirtAddr(addr), &mut buf)
-                    .map_err(ToolError::from)?;
+                read_virt_bytes(ctx, addr, &mut buf)?;
                 Ok(serde_json::json!({
                     "type": type_name,
                     "address": hex(addr),
@@ -1564,7 +1946,7 @@ impl NtoseyeMcp {
             .run(move |ctx| {
                 let process = ctx
                     .target
-                    .guest
+                    .guest()?
                     .enumerate_processes()
                     .map_err(|e| enumeration_error(ctx, e))?
                     .into_iter()
@@ -1622,15 +2004,43 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "Analyze the current bugcheck (BSOD): {code, code_hex, name, description, driver, args:[{index, value, description}], fault:{ip, symbol, driver}, source}, or null if the guest is not bugchecking"
+        description = "Analyze the current bugcheck (BSOD): {code, code_hex, name, description, driver, args:[{index, value, description}], fault:{ip, symbol, driver}, trap_frames:[{address, rip_symbol, frame:{rax..r11, rip, rsp, cs, ss, eflags, error_code, previous_mode, previous_irql}|null, error:string|null}], source}, or {} if the guest is not bugchecking"
     )]
     async fn bugcheck(&self) -> Result<CallToolResult, McpError> {
         let v = self
             .run(|ctx| {
-                Ok(match current_bugcheck(&ctx.target) {
-                    Some(analysis) => view::to_json(&view::bugcheck(&analysis)),
-                    None => Value::Null,
-                })
+                Ok(
+                    match current_bugcheck(&ctx.target)
+                        .or_else(|| bugcheck_from_dump_info(&ctx.target))
+                    {
+                        Some(analysis) => view::to_json(&view::bugcheck(&analysis)),
+                        None => serde_json::json!({}),
+                    },
+                )
+            })
+            .await?;
+        json_result(v)
+    }
+
+    #[tool(
+        description = "Decode an x64 _KTRAP_FRAME at an address, or the current Windows thread's saved trap frame when address is omitted. Returns {address, rip_symbol, frame:{rax..r11, rip, rsp, cs, ss, eflags, error_code, previous_mode, previous_irql}}."
+    )]
+    async fn inspect_trap_frame(
+        &self,
+        Parameters(TrapFrameArgs { address }): Parameters<TrapFrameArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let v = self
+            .run(move |ctx| {
+                let address = address
+                    .as_deref()
+                    .map(|address| eval_addr(ctx, address).map(VirtAddr))
+                    .transpose()?;
+                let frame = read_ktrap_frame_at_or_current(&ctx.target, address)
+                    .map_err(ToolError::from)?;
+                let rip_symbol = ctx
+                    .target
+                    .closest_symbol_current_context(VirtAddr(frame.rip));
+                Ok(view::to_json(&view::trap_frame(&frame, rip_symbol)))
             })
             .await?;
         json_result(v)
@@ -1669,12 +2079,12 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "List the backend's capability matrix - which debug operations the current transport (kd/gdb/memory) supports - as [{capability, label, supported}]. Check before a state-changing op (e.g. usermode breakpoints)."
+        description = "List the backend's capability matrix - which debug operations the current transport (kd/gdb/memory/dump) supports - as {capabilities:[{capability, label, supported}]}. Check before a state-changing op (e.g. usermode breakpoints)."
     )]
     async fn capabilities(&self) -> Result<CallToolResult, McpError> {
         let v = self
             .run(|ctx| {
-                let arr = ctx
+                let arr: Vec<Value> = ctx
                     .capabilities()
                     .iter()
                     .map(|c| {
@@ -1685,14 +2095,14 @@ impl NtoseyeMcp {
                         })
                     })
                     .collect();
-                Ok(Value::Array(arr))
+                Ok(serde_json::json!({ "capabilities": arr }))
             })
             .await?;
         json_result(v)
     }
 
     #[tool(
-        description = "List loaded modules for the current inspection scope: the attached process's user-mode modules when attached (attach_process), otherwise the kernel module list. Optional name filter; paged via offset/limit. Returns {total, offset, returned, has_more, next_offset?, modules:[{name, short_name, base, end, size}]}. Use kernel_modules to list kernel modules regardless of attach state."
+        description = "List loaded modules for the current inspection scope: the attached process's user-mode modules when attached (attach_process), otherwise the kernel module list. Optional name filter; paged via offset/limit. Returns {total, offset, returned, has_more, next_offset?, modules:[{name, short_name, base, end, size, time_date_stamp?, checksum?, file_version?, product_version?}]}. Use kernel_modules to list kernel modules regardless of attach state."
     )]
     async fn modules(
         &self,
@@ -1708,7 +2118,7 @@ impl NtoseyeMcp {
             .run(move |ctx| {
                 let mods = ctx
                     .target
-                    .modules()
+                    .modules_with_versions()
                     .map_err(|e| enumeration_error(ctx, e))?;
                 let f = filter.as_deref().map(str::to_ascii_lowercase);
                 let matched: Vec<_> = mods
@@ -1725,15 +2135,7 @@ impl NtoseyeMcp {
                     .iter()
                     .skip(offset)
                     .take(limit)
-                    .map(|m| {
-                        serde_json::json!({
-                            "name": m.name,
-                            "short_name": m.short_name,
-                            "base": hex(m.base_address.0),
-                            "end": hex(m.end_address().0),
-                            "size": m.size,
-                        })
-                    })
+                    .map(|m| module_json(m))
                     .collect();
                 Ok(paged(total, offset, "modules", items))
             })
@@ -1918,7 +2320,46 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "Remove a breakpoint by id. Requires the VM halted (call interrupt first, or be stopped at a breakpoint)."
+        description = "Watch a data address globally across guest address spaces for write or read/write access. length is 1, 2, 4, or 8 bytes and the address must be naturally aligned. Requires the VM halted and a backend with data-watch support (currently KD). Returns {id, address, access, length, condition}."
+    )]
+    async fn set_watchpoint(
+        &self,
+        Parameters(SetWatchpointArgs {
+            address,
+            access,
+            length,
+            condition,
+        }): Parameters<SetWatchpointArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let v = self
+            .run(move |ctx| {
+                require_halted(ctx, "set_watchpoint")?;
+                let addr = eval_addr(ctx, &address)?;
+                let access = WatchpointAccess::from(access);
+                let symbol = ctx.target.closest_symbol_current_context(VirtAddr(addr));
+                let id = ctx
+                    .add_watchpoint_with_symbol_condition(
+                        VirtAddr(addr),
+                        access,
+                        length,
+                        symbol,
+                        condition.clone(),
+                    )
+                    .map_err(ToolError::from)?;
+                Ok(serde_json::json!({
+                    "id": id,
+                    "address": hex(addr),
+                    "access": access.name(),
+                    "length": length,
+                    "condition": condition,
+                }))
+            })
+            .await?;
+        json_result(v)
+    }
+
+    #[tool(
+        description = "Remove a breakpoint or watchpoint by id. Requires the VM halted (call interrupt first, or be stopped at a breakpoint/watchpoint)."
     )]
     async fn clear_breakpoint(
         &self,
@@ -1935,7 +2376,7 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "Re-arm a disabled breakpoint by id (re-patch its int3). Requires the VM halted (call interrupt first, or be stopped at a breakpoint)."
+        description = "Re-arm a disabled breakpoint or watchpoint by id. Requires the VM halted (call interrupt first, or be stopped at one)."
     )]
     async fn enable_breakpoint(
         &self,
@@ -1952,7 +2393,7 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "Disable a breakpoint by id (restore the original byte) without forgetting it, so it can be re-enabled later. Requires the VM halted (call interrupt first, or be stopped at a breakpoint)."
+        description = "Disable a breakpoint or watchpoint by id without forgetting it, so it can be re-enabled later. Requires the VM halted."
     )]
     async fn disable_breakpoint(
         &self,
@@ -1969,27 +2410,17 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "List breakpoints as {id, address, enabled, symbol, scope, condition, temporary} objects (scope is \"global\" for kernel-wide or \"name (pid)\" for a process-scoped breakpoint)"
+        description = "List code breakpoints and data watchpoints as {id, address, enabled, symbol, scope, condition, temporary, watch_access, watch_length} objects. watch_access/watch_length are null for code breakpoints."
     )]
     async fn list_breakpoints(&self) -> Result<CallToolResult, McpError> {
         let v = self
             .run(|ctx| {
-                let arr = ctx
+                let arr: Vec<Value> = ctx
                     .list_breakpoints()
                     .iter()
-                    .map(|b| {
-                        serde_json::json!({
-                            "id": b.id,
-                            "address": hex(b.address.0),
-                            "enabled": b.enabled,
-                            "symbol": b.symbol,
-                            "scope": b.scope.label(),
-                            "condition": b.condition,
-                            "temporary": b.temporary,
-                        })
-                    })
+                    .map(|b| view::to_json(&view::breakpoint(b)))
                     .collect();
-                Ok(Value::Array(arr))
+                Ok(serde_json::json!({ "breakpoints": arr }))
             })
             .await?;
         json_result(v)
@@ -2018,7 +2449,7 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "Wait up to timeout_ms for the next stop WITHOUT resuming (default 10000, max 20000; 0 = default). Returns {stop:\"breakpoint\"|\"exception\"|\"bugcheck\"|\"target_reloaded\"} with context, {stop:\"running\"} if the wait elapsed (call again to keep waiting; no stops lost between calls), or {stop:\"halted\"} immediately if the VM is already parked with nothing pending. Does not resume; call resume to advance. Use short timeouts and poll; there is no indefinite wait."
+        description = "Wait up to timeout_ms for the next stop WITHOUT resuming (default 10000, max 20000; 0 = default). Returns {stop:\"breakpoint\"|\"watchpoint\"|\"exception\"|\"bugcheck\"|\"target_reloaded\"} with context, {stop:\"running\"} if the wait elapsed (call again to keep waiting; no stops lost between calls), or {stop:\"halted\"} immediately if the VM is already parked with nothing pending. Breakpoint/watchpoint stops include condition_error when condition evaluation failed; the stop is surfaced rather than skipped. Does not resume; call resume to advance. Use short timeouts and poll; there is no indefinite wait."
     )]
     async fn wait_for_stop(
         &self,
@@ -2079,23 +2510,7 @@ impl NtoseyeMcp {
         description = "Read-only run-control state (where am I): {running, current_thread, rip, symbol, process:{pid,name,eprocess}|null, coherent}. rip/symbol are null while running. coherent=false means the guest rebooted and rediscovery is still in progress, so process/module enumeration is not yet meaningful; resume + wait_for_stop to advance rather than reading stale state."
     )]
     async fn status(&self) -> Result<CallToolResult, McpError> {
-        let v = self
-            .run(|ctx| {
-                let s = ctx.run_status();
-                let process = s.process.map(|(pid, name, eprocess)| {
-                    serde_json::json!({ "pid": pid, "name": name, "eprocess": hex(eprocess) })
-                });
-                Ok(serde_json::json!({
-                    "running": s.running,
-                    "current_thread": s.current_thread,
-                    "rip": s.rip.map(hex),
-                    "symbol": s.symbol,
-                    "process": process,
-                    "coherent": s.coherent,
-                    "kernel_base": hex(s.kernel_base),
-                }))
-            })
-            .await?;
+        let v = self.run(|ctx| Ok(status_json(ctx))).await?;
         json_result(v)
     }
 
@@ -2215,7 +2630,7 @@ impl NtoseyeMcp {
                 }
                 let addr = eval_addr(ctx, &address)?;
                 ctx.target
-                    .current_process()
+                    .current_process()?
                     .memory()
                     .write_bytes(VirtAddr(addr), &bytes)
                     .map_err(ToolError::from)?;
@@ -2239,33 +2654,288 @@ impl NtoseyeMcp {
             .run(move |ctx| {
                 require_halted(ctx, "set_register")?;
                 let value = eval_addr(ctx, &value)?;
-                ctx.write_register(&name, value)
-                    .map_err(ToolError::from)?;
+                ctx.write_register(&name, value).map_err(ToolError::from)?;
                 Ok(serde_json::json!({ "name": name, "value": hex(value) }))
             })
             .await?;
         json_result(v)
+    }
+
+    #[tool(
+        description = "Open a Windows kernel crash dump (.dmp) file for offline analysis. Must be called before any other tool when the server was started without --dump/--connect. Only one session can be active at a time. Returns {status, path, processors, bugcheck, exception:{code, code_hex, code_name, flags, address, parameters}, system_info:{major_version, build, service_pack_build, machine_image_type, machine, system_time, system_up_time_secs, product_type, suite_mask}, crash_context, prcb, broken_driver, triage_overflowed}."
+    )]
+    async fn open_dump(
+        &self,
+        Parameters(OpenDumpArgs { path }): Parameters<OpenDumpArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let opening = OpeningGuard::claim(&self.session)?;
+
+        let dump_path = PathBuf::from(&path);
+        let (tx, _service_pending) = tokio::task::spawn_blocking(move || {
+            spawn_session(String::new(), None, Some(dump_path))
+        })
+        .await
+        .map_err(|e| McpError::internal_error(format!("spawn_blocking failed: {e}"), None))?
+        .map_err(|e| McpError::internal_error(format!("failed to open dump: {e}"), None))?;
+
+        opening.promote(tx)?;
+
+        let v = self
+            .run(move |ctx| {
+                let processors = ctx.backend.thread_list().map(|t| t.len()).unwrap_or(1);
+                let bc =
+                    current_bugcheck(&ctx.target).or_else(|| bugcheck_from_dump_info(&ctx.target));
+                let dmp = ctx.target.phys.dmp_info();
+                let crash_context = ctx.backend.triage_crash_info().map(crash_context_json);
+                let prcb = dmp.and_then(|d| d.triage_prcb_info.as_ref()).map(prcb_json);
+                Ok(serde_json::json!({
+                    "status": "opened",
+                    "path": path,
+                    "processors": processors,
+                    "bugcheck": bc.map(|a| view::to_json(&view::bugcheck(&a))),
+                    "exception": dmp.and_then(|d| d.exception.as_ref().map(exception_json)),
+                    "system_info": dmp.and_then(|d| d.system_info.as_ref().map(system_info_json)),
+                    "crash_context": crash_context,
+                    "prcb": prcb,
+                    "broken_driver": dmp.and_then(|d| d.broken_driver.clone()),
+                    "triage_overflowed": dmp.map(|d| d.triage_overflowed),
+                }))
+            })
+            .await?;
+        json_result(v)
+    }
+
+    #[tool(
+        description = "Connect to a live Windows VM. Supported backends: \"kd\" (KD over Unix socket, default /tmp/ntoseye-kd.sock), \"gdb\" (GDB remote stub, default 127.0.0.1:1234), \"memory\" (physical memory only, no debug transport). Must be called before any other tool when the server was started without --backend/--connect/--dump. Only one session can be active at a time."
+    )]
+    async fn open(
+        &self,
+        Parameters(OpenArgs { backend, connect }): Parameters<OpenArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        match backend.as_str() {
+            "kd" | "gdb" => {}
+            "memory" => {
+                if connect.is_some() {
+                    return Err(invalid_params(
+                        "memory backend does not use 'connect'".to_string(),
+                    ));
+                }
+            }
+            other => {
+                return Err(invalid_params(format!(
+                    "unknown backend \"{other}\": must be \"kd\", \"gdb\", or \"memory\""
+                )));
+            }
+        }
+
+        let opening = OpeningGuard::claim(&self.session)?;
+
+        let backend_name = backend.clone();
+        let connect_str = connect.clone();
+        let (tx, service_pending) =
+            tokio::task::spawn_blocking(move || spawn_session(backend_name, connect_str, None))
+                .await
+                .map_err(|e| McpError::internal_error(format!("spawn_blocking failed: {e}"), None))?
+                .map_err(|e| {
+                    McpError::internal_error(format!("failed to connect ({backend}): {e}"), None)
+                })?;
+
+        let tx_for_ticker = tx.clone();
+        opening.promote(tx)?;
+        if backend != "memory" {
+            spawn_service_ticker(tx_for_ticker, service_pending);
+        }
+
+        let v = self
+            .run(move |ctx| {
+                let processors = ctx.backend.thread_list().map(|t| t.len()).unwrap_or(1);
+                Ok(serde_json::json!({
+                    "status": "connected",
+                    "backend": backend,
+                    "connect": connect,
+                    "processors": processors,
+                }))
+            })
+            .await?;
+        json_result(v)
+    }
+
+    #[tool(
+        description = "One-shot overview for crash/debug triage: bundles status, bugcheck analysis, exception record, system info, backtrace, loaded/unloaded kernel modules into a single response. backtrace is null when the VM is running. Returns {status, bugcheck, exception, system_info, backtrace, modules, modules_total, unloaded_drivers, crash_context, prcb, broken_driver, triage_overflowed}."
+    )]
+    async fn triage(&self) -> Result<CallToolResult, McpError> {
+        let v = self
+            .run(|ctx| {
+                let s = ctx.run_status();
+                let running = s.running;
+                let status = run_status_json(s);
+
+                let bc = current_bugcheck(&ctx.target)
+                    .or_else(|| bugcheck_from_dump_info(&ctx.target))
+                    .map(|a| view::to_json(&view::bugcheck(&a)));
+
+                let bt = if !running {
+                    ctx.backtrace(BACKTRACE_DEFAULT_LIMIT)
+                        .ok()
+                        .map(|trace| Value::Array(trace.frames.iter().map(frame_json).collect()))
+                } else {
+                    None
+                };
+
+                let all_mods = ctx.target.kernel_modules_with_versions().unwrap_or_default();
+                let modules_total = all_mods.len();
+                let mods: Vec<Value> = all_mods.iter().take(200).map(module_json).collect();
+
+                let dmp = ctx.target.phys.dmp_info();
+                let exception = dmp.and_then(|d| d.exception.as_ref().map(exception_json));
+                let system_info = dmp.and_then(|d| d.system_info.as_ref().map(system_info_json));
+                let unloaded: Vec<Value> = dmp
+                    .map(|d| {
+                        d.unloaded_drivers
+                            .iter()
+                            .map(unloaded_driver_json)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let crash_context = ctx.backend.triage_crash_info().map(crash_context_json);
+                let prcb = dmp.and_then(|d| d.triage_prcb_info.as_ref()).map(prcb_json);
+
+                Ok(serde_json::json!({
+                    "status": status,
+                    "bugcheck": bc,
+                    "exception": exception,
+                    "system_info": system_info,
+                    "backtrace": bt,
+                    "modules": mods,
+                    "modules_total": modules_total,
+                    "unloaded_drivers": unloaded,
+                    "crash_context": crash_context,
+                    "prcb": prcb,
+                    "broken_driver": dmp.and_then(|d| d.broken_driver.clone()),
+                    "triage_overflowed": dmp.map(|d| d.triage_overflowed),
+                }))
+            })
+            .await?;
+        json_result(v)
+    }
+
+    #[tool(
+        description = "Evaluate a debugger expression (symbol, hex address, register, arithmetic, poi()) and return its numeric result. Returns {expression, value}."
+    )]
+    async fn eval(
+        &self,
+        Parameters(EvalArgs { expression }): Parameters<EvalArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let v = self
+            .run(move |ctx| {
+                let result = eval_addr(ctx, &expression)?;
+                Ok(serde_json::json!({
+                    "expression": expression,
+                    "value": hex(result),
+                }))
+            })
+            .await?;
+        json_result(v)
+    }
+
+    #[tool(
+        description = "Read a pointer-sized (8-byte little-endian) value at the given address. Shorthand for read_memory + byte reversal. Returns {address, value}."
+    )]
+    async fn read_pointer(
+        &self,
+        Parameters(ReadPointerArgs { address }): Parameters<ReadPointerArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let v = self
+            .run(move |ctx| {
+                let addr = eval_addr(ctx, &address)?;
+                let mut buf = [0u8; 8];
+                read_virt_bytes(ctx, addr, &mut buf)?;
+                let val = u64::from_le_bytes(buf);
+                Ok(serde_json::json!({
+                    "address": hex(addr),
+                    "value": hex(val),
+                }))
+            })
+            .await?;
+        json_result(v)
+    }
+
+    #[tool(
+        description = "Close the active debugger session so a new one can be opened with open_dump or open. Returns {status:\"closed\"} on clean shutdown, {status:\"closed\", warning:\"...\"} if the shutdown timed out. Cancels an in-progress open if one is pending."
+    )]
+    async fn close(&self) -> Result<CallToolResult, McpError> {
+        let tx = {
+            let mut guard = self.session.lock().unwrap();
+            match &*guard {
+                SessionSlot::Active(tx) => tx.clone(),
+                SessionSlot::Opening(_) => {
+                    *guard = SessionSlot::Vacant;
+                    return json_result(serde_json::json!({
+                        "status": "closed",
+                        "note": "cancelled a pending open; the old connection may take a moment to release — retry if the next open reports AlreadyRunning",
+                    }));
+                }
+                SessionSlot::Vacant => {
+                    return Err(McpError::invalid_request(
+                        "no debugger session is active; nothing to close",
+                        None,
+                    ));
+                }
+            }
+        };
+
+        self.interrupt.store(true, Ordering::Relaxed);
+        let _interrupt_guard = InterruptResetGuard(self.interrupt.clone());
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let clean = if tx.send(Command::Shutdown { ack: ack_tx }).is_ok() {
+            tokio::time::timeout(Duration::from_secs(5), ack_rx)
+                .await
+                .is_ok_and(|r| r.is_ok())
+        } else {
+            true
+        };
+        drop(tx);
+
+        if clean {
+            // Vacate only after the actor has acked (and released its
+            // InstanceGuard), so a subsequent open() can acquire the same
+            // target.
+            *self.session.lock().unwrap() = SessionSlot::Vacant;
+            drop(_interrupt_guard);
+            json_result(serde_json::json!({ "status": "closed" }))
+        } else {
+            // The actor is still running (and still holds the InstanceGuard),
+            // so leave the slot as Active — vacating now would let a
+            // concurrent open() past OpeningGuard::claim only to fail inside
+            // acquire_instance_guard with AlreadyRunning.
+            drop(_interrupt_guard);
+            json_result(serde_json::json!({
+                "status": "pending",
+                "warning": "shutdown timed out; the session is still closing — retry close shortly",
+            }))
+        }
     }
 }
 
 #[tool_handler]
 impl rmcp::ServerHandler for NtoseyeMcp {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2025_06_18,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: env!("CARGO_PKG_NAME").to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                ..Implementation::from_build_env()
-            },
-            instructions: Some(
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::LATEST)
+            .with_server_info(Implementation::new(
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
                 "ntoseye: introspect and control a live Windows kernel running under \
                  KVM/QEMU. Read-only tools for process/thread/module/driver \
                  enumeration, memory and struct reads, disassembly, backtraces, \
-                 page-table walks, and symbol/type lookup. State-changing tools: \
-                 attach_process/detach (scope the context to a process), \
-                 set_breakpoint/clear_breakpoint/list_breakpoints, run-control \
+                 trap-frame decoding, page-table walks, and symbol/type lookup. \
+                 State-changing tools: attach_process/detach (scope the context \
+                 to a process), set_breakpoint/set_watchpoint and shared \
+                 clear/enable/disable/list breakpoint lifecycle, run-control \
                  (resume, wait_for_stop, interrupt, step, step_over, step_out, \
                  set_current_thread), and guest writes \
                  (write_memory, set_register). Run-control is split: resume goes \
@@ -2276,17 +2946,16 @@ impl rmcp::ServerHandler for NtoseyeMcp {
                  (poll until stop:\"breakpoint\"). \
                  The guest runs freely by default (memory/process/struct reads work \
                  live). registers/backtrace need the CPU halted: call interrupt \
-                 first (or be stopped at a breakpoint), inspect, then resume to let \
-                 the guest run again. Breakpoint mutation, step, and set_register \
-                 require the VM halted; write_memory works live. After a reboot, \
+                 first (or be stopped at a breakpoint/watchpoint), inspect, then \
+                 resume to let the guest run again. Stop-point mutation, step, \
+                 and set_register require the VM halted; write_memory works live. \
+                 After a reboot, \
                  status reports coherent:false until rediscovery finishes; \
                  wait_for_stop for it rather than enumerating stale state. \
                  Tools that take an address accept a debugger expression (symbol, \
                  register, hex, arithmetic). Addresses in tool output are 0x hex \
-                 strings (JSON has no hex numbers); ids/pids/sizes stay decimal."
-                    .to_string(),
-            ),
-        }
+                 strings (JSON has no hex numbers); ids/pids/sizes stay decimal.",
+            )
     }
 }
 
@@ -2359,6 +3028,7 @@ fn check_http_bind_policy(addr: &str, unsafe_http: bool) -> anyhow::Result<()> {
 pub fn run(
     backend: String,
     connect: Option<String>,
+    dump: Option<PathBuf>,
     http: Option<String>,
     unsafe_http: bool,
 ) -> anyhow::Result<()> {
@@ -2367,53 +3037,55 @@ pub fn run(
     }
 
     // The stdio transport speaks MCP on stdout, so all logging goes to stderr.
-    eprintln!("ntoseye-mcp: attaching ({backend})...");
-    let (tx, service_pending) = spawn_session(backend, connect)?;
-    // A sender kept aside so we can drive teardown even after the service (which
-    // owns its own sender) is dropped.
-    let shutdown_tx = tx.clone();
+    let session: SharedSession = Arc::new(std::sync::Mutex::new(SessionSlot::Vacant));
+    let eager = dump.is_some() || connect.is_some() || backend == "memory";
+
+    if eager {
+        let is_dump = dump.is_some();
+        let needs_ticker = !is_dump && backend != "memory";
+        let label = if is_dump { "dump" } else { &backend };
+        eprintln!("ntoseye-mcp: attaching ({label})...");
+        let (tx, service_pending) = spawn_session(backend, connect, dump)?;
+        *session.lock().unwrap() = SessionSlot::Active(tx.clone());
+        if needs_ticker {
+            spawn_service_ticker(tx, service_pending);
+        }
+    } else {
+        if backend == "kd" {
+            eprintln!(
+                "ntoseye-mcp: note: pass --connect {default_kd} to auto-attach at startup, \
+                 or use the 'open' tool after launch",
+                default_kd = DEFAULT_KD_SOCKET,
+            );
+        } else {
+            eprintln!(
+                "ntoseye-mcp: note: --backend {backend} has no effect without --connect; \
+                 use the 'open' tool to attach, or pass --connect to auto-attach at startup"
+            );
+        }
+        eprintln!("ntoseye-mcp: starting without a session (use open_dump or open to attach)");
+    }
+
     // Shared with the handlers so shutdown can interrupt an in-flight
     // `wait_for_stop` (otherwise the actor stays busy and never reaches
     // cleanup, leaving the VM frozen).
     let interrupt = Arc::new(AtomicBool::new(false));
     let interrupt_for_signal = interrupt.clone();
+    // Slot kept aside so we can drive teardown of whichever session is active
+    // by then (eager or opened later via open_dump/open).
+    let session_for_shutdown = session.clone();
 
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async move {
-        // Background servicing ticker: periodically nudge the actor to service the
-        // guest while idle (see `Command::Service`), so a wrong-process hit on a
-        // shared-page breakpoint doesn't leave it frozen between tool calls.
-        // `Skip` keeps it from flooding the queue if the actor is busy; the task
-        // exits once the actor's channel closes (send fails).
-        let service_tx = tx.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(SERVICE_TICK);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tick.tick().await;
-                // Only enqueue when none is outstanding (the actor clears the flag
-                // as it services), so at most one `Service` is ever queued even if
-                // the actor is busy in a long wait.
-                if service_pending.swap(true, Ordering::AcqRel) {
-                    continue;
-                }
-                if service_tx.send(Command::Service).is_err() {
-                    break;
-                }
-            }
-        });
-
+    let result = runtime.block_on(async move {
         let serve = async {
             match http {
                 Some(addr) => {
-                    eprintln!(
-                        "ntoseye-mcp: attached; serving Streamable HTTP at http://{addr}/mcp"
-                    );
-                    serve_http(tx, addr, unsafe_http, interrupt).await
+                    eprintln!("ntoseye-mcp: serving Streamable HTTP at http://{addr}/mcp");
+                    serve_http(session, addr, unsafe_http, interrupt).await
                 }
                 None => {
-                    eprintln!("ntoseye-mcp: attached; serving over stdio");
-                    let service = NtoseyeMcp::new(tx, interrupt).serve(stdio()).await?;
+                    eprintln!("ntoseye-mcp: serving over stdio");
+                    let service = NtoseyeMcp::new(session, interrupt).serve(stdio()).await?;
                     service.waiting().await?;
                     Ok(())
                 }
@@ -2431,17 +3103,46 @@ pub fn run(
         };
 
         // Ask the actor to remove our breakpoints and resume the VM before we
-        // exit, so Ctrl+C doesn't leave the guest frozen with int3s installed.
-        // Set the interrupt first so any in-flight wait returns and the actor is
-        // free to process the Shutdown.
-        eprintln!("ntoseye-mcp: resuming VM and cleaning up...");
+        // exit, so Ctrl+C doesn't leave a live guest frozen with int3s
+        // installed (a no-op for dumps). Set the interrupt first so any
+        // in-flight wait returns and the actor is free to process the Shutdown.
+        eprintln!("ntoseye-mcp: cleaning up...");
         interrupt_for_signal.store(true, Ordering::Relaxed);
-        let (ack_tx, ack_rx) = oneshot::channel();
-        if shutdown_tx.send(Command::Shutdown { ack: ack_tx }).is_ok() {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await;
+        // Clone the sender out so the slot's mutex isn't held across the await
+        let shutdown_tx = match &*session_for_shutdown.lock().unwrap() {
+            SessionSlot::Active(tx) => Some(tx.clone()),
+            _ => None,
+        };
+        if let Some(tx) = shutdown_tx {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            if tx.send(Command::Shutdown { ack: ack_tx }).is_ok() {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await;
+            }
         }
         result
-    })
+    });
+    runtime.shutdown_background();
+    result
+}
+
+/// Background servicing ticker: periodically nudge the actor to service the
+/// guest while idle (see [`Command::Service`]), so a wrong-process hit on a
+/// shared-page breakpoint doesn't leave it frozen between tool calls.
+/// `service_pending` keeps at most one `Service` queued even if the actor is
+/// busy in a long wait; the thread exits once the actor's channel closes
+/// (send fails).
+fn spawn_service_ticker(tx: mpsc::UnboundedSender<Command>, service_pending: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(SERVICE_TICK);
+            if service_pending.swap(true, Ordering::AcqRel) {
+                continue;
+            }
+            if tx.send(Command::Service).is_err() {
+                break;
+            }
+        }
+    });
 }
 
 /// Serve the Streamable HTTP transport on `addr`, mounting the MCP service at
@@ -2449,7 +3150,7 @@ pub fn run(
 /// the actor's channel sender), so all connections funnel to the one live
 /// debugger session.
 async fn serve_http(
-    tx: mpsc::UnboundedSender<Command>,
+    session: SharedSession,
     addr: String,
     unsafe_http: bool,
     interrupt: Arc<AtomicBool>,
@@ -2458,7 +3159,7 @@ async fn serve_http(
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
-    let template = NtoseyeMcp::new(tx, interrupt);
+    let template = NtoseyeMcp::new(session, interrupt);
     let service = StreamableHttpService::new(
         move || Ok(template.clone()),
         LocalSessionManager::default().into(),
@@ -2471,9 +3172,7 @@ async fn serve_http(
     let allow_origin = if unsafe_http {
         AllowOrigin::any()
     } else {
-        AllowOrigin::predicate(|origin, _parts| {
-            origin.to_str().is_ok_and(is_loopback_origin)
-        })
+        AllowOrigin::predicate(|origin, _parts| origin.to_str().is_ok_and(is_loopback_origin))
     };
     let cors = CorsLayer::new()
         .allow_origin(allow_origin)
@@ -2492,6 +3191,32 @@ async fn serve_http(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_mcp() -> NtoseyeMcp {
+        NtoseyeMcp::new(
+            Arc::new(std::sync::Mutex::new(SessionSlot::Vacant)),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    fn fake_active_mcp() -> NtoseyeMcp {
+        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
+        NtoseyeMcp::new(
+            Arc::new(std::sync::Mutex::new(SessionSlot::Active(tx))),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    #[test]
+    fn structured_trap_frame_and_watchpoint_tools_are_registered() {
+        let mcp = empty_mcp();
+        for name in ["inspect_trap_frame", "set_watchpoint", "list_breakpoints"] {
+            assert!(
+                mcp.tool_router.get(name).is_some(),
+                "missing MCP tool {name}"
+            );
+        }
+    }
 
     #[test]
     fn loopback_origins_are_trusted() {
@@ -2513,5 +3238,256 @@ mod tests {
         // Malformed / no scheme.
         assert!(!is_loopback_origin("127.0.0.1"));
         assert!(!is_loopback_origin(""));
+    }
+
+    #[tokio::test]
+    async fn open_dump_rejects_when_session_active() {
+        let mcp = fake_active_mcp();
+        let err = mcp
+            .open_dump(Parameters(OpenDumpArgs {
+                path: "/tmp/fake.dmp".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("already active"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_rejects_when_session_active() {
+        let mcp = fake_active_mcp();
+        let err = mcp
+            .open(Parameters(OpenArgs {
+                backend: "kd".into(),
+                connect: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("already active"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_rejects_unknown_backend() {
+        let mcp = empty_mcp();
+        let err = mcp
+            .open(Parameters(OpenArgs {
+                backend: "nope".into(),
+                connect: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("unknown backend"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_memory_rejects_connect() {
+        let mcp = empty_mcp();
+        let err = mcp
+            .open(Parameters(OpenArgs {
+                backend: "memory".into(),
+                connect: Some("127.0.0.1:1234".into()),
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("does not use"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_dump_nonexistent_file() {
+        let mcp = empty_mcp();
+        let err = mcp
+            .open_dump(Parameters(OpenDumpArgs {
+                path: "/tmp/ntoseye-test-does-not-exist.dmp".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("failed to open dump"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_kd_nonexistent_socket() {
+        let mcp = empty_mcp();
+        let err = mcp
+            .open(Parameters(OpenArgs {
+                backend: "kd".into(),
+                connect: Some("/tmp/ntoseye-test-does-not-exist.sock".into()),
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("failed to connect"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_kd_default_socket() {
+        let mcp = empty_mcp();
+        // Use a nonexistent socket so the test doesn't block on a real KD
+        // handshake when /tmp/ntoseye-kd.sock exists.
+        let err = mcp
+            .open(Parameters(OpenArgs {
+                backend: "kd".into(),
+                connect: Some("/tmp/ntoseye-test-default-does-not-exist.sock".into()),
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("failed to connect"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_when_no_session() {
+        let mcp = empty_mcp();
+        let err = mcp.close().await.unwrap_err();
+        assert!(
+            err.message.contains("no debugger session"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_active_session() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mcp = NtoseyeMcp::new(
+            Arc::new(std::sync::Mutex::new(SessionSlot::Active(tx))),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        // Simulate the actor: drain commands and ack shutdown.
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                if let Command::Shutdown { ack } = cmd {
+                    let _ = ack.send(());
+                    break;
+                }
+            }
+        });
+
+        let result = mcp.close().await.expect("close should succeed");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        assert!(text.contains("closed"), "unexpected result: {text}");
+        assert!(
+            matches!(&*mcp.session.lock().unwrap(), SessionSlot::Vacant),
+            "session should be vacant after close"
+        );
+        assert!(!mcp.interrupt.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn close_then_reopen_allowed() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mcp = NtoseyeMcp::new(
+            Arc::new(std::sync::Mutex::new(SessionSlot::Active(tx))),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                if let Command::Shutdown { ack } = cmd {
+                    let _ = ack.send(());
+                    break;
+                }
+            }
+        });
+
+        mcp.close().await.expect("close should succeed");
+
+        // After close, open should no longer reject with "already active".
+        // Use a nonexistent socket so the test doesn't block on a real KD
+        // handshake when /tmp/ntoseye-kd.sock exists.
+        let err = mcp
+            .open(Parameters(OpenArgs {
+                backend: "kd".into(),
+                connect: Some("/tmp/ntoseye-test-close-reopen-does-not-exist.sock".into()),
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            !err.message.contains("already active"),
+            "session should not be active after close: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_cancels_opening_session() {
+        let mcp = NtoseyeMcp::new(
+            Arc::new(std::sync::Mutex::new(SessionSlot::Opening(0))),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let result = mcp.close().await.expect("close of Opening should succeed");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        assert!(text.contains("closed"), "unexpected result: {text}");
+        assert!(
+            matches!(&*mcp.session.lock().unwrap(), SessionSlot::Vacant),
+            "session should be vacant after close"
+        );
+    }
+
+    #[tokio::test]
+    async fn triage_requires_session() {
+        let mcp = empty_mcp();
+        let err = mcp.triage().await.unwrap_err();
+        assert!(
+            err.message.contains("no debugger session"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn eval_requires_session() {
+        let mcp = empty_mcp();
+        let err = mcp
+            .eval(Parameters(EvalArgs {
+                expression: "0x1234".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("no debugger session"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_pointer_requires_session() {
+        let mcp = empty_mcp();
+        let err = mcp
+            .read_pointer(Parameters(ReadPointerArgs {
+                address: "0x1234".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("no debugger session"),
+            "unexpected error: {err:?}"
+        );
     }
 }

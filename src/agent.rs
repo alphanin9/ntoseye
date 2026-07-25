@@ -355,7 +355,7 @@ impl AgentSession<'_> {
         let mut bytes = vec![0u8; length];
         self.session
             .target
-            .current_process()
+            .current_process()?
             .memory()
             .read_bytes(address, &mut bytes)?;
         Ok(json!({
@@ -369,7 +369,7 @@ impl AgentSession<'_> {
         let data = hex::decode(required(request.data, "data")?)?;
         self.session
             .target
-            .current_process()
+            .current_process()?
             .memory()
             .write_bytes(address, &data)?;
         Ok(json!({
@@ -389,7 +389,7 @@ impl AgentSession<'_> {
         let mut bytes = vec![0u8; length];
         self.session
             .target
-            .current_process()
+            .current_process()?
             .memory()
             .read_bytes(address, &mut bytes)?;
 
@@ -433,7 +433,7 @@ impl AgentSession<'_> {
 
         self.session
             .target
-            .current_process()
+            .current_process()?
             .memory()
             .write_bytes(address, &bytes)?;
         Ok(json!({
@@ -449,7 +449,7 @@ impl AgentSession<'_> {
         let mut bytes = vec![0u8; length];
         self.session
             .target
-            .current_process()
+            .current_process()?
             .memory()
             .read_bytes(address, &mut bytes)?;
 
@@ -569,7 +569,7 @@ impl AgentSession<'_> {
     }
 
     fn read_typed_field_value(&self, address: VirtAddr, ty: &ParsedType) -> Result<Value> {
-        let mem = self.session.target.current_process().memory();
+        let mem = self.session.target.current_process()?.memory();
         match ty {
             ParsedType::Primitive(name) => {
                 let value = match name.as_str() {
@@ -791,7 +791,7 @@ impl AgentSession<'_> {
         let rows: Vec<_> = self
             .session
             .target
-            .guest
+            .guest()?
             .enumerate_processes()?
             .into_iter()
             .filter(|p| {
@@ -813,11 +813,9 @@ impl AgentSession<'_> {
 
     fn modules(&self, filter: Option<String>) -> Result<Value> {
         let filter = filter.map(|s| s.to_lowercase());
-        let modules = if let Some(process_info) = &self.session.target.current_process_info {
-            self.session.target.guest.process_modules(process_info)?
-        } else {
-            self.session.target.guest.kernel_modules()?
-        };
+        // Target::modules() is the shared scope rule (attached process's user-mode
+        // modules, else kernel), with the triage-dump fallback built in.
+        let modules = self.session.target.modules()?;
         Ok(json!({
             "modules": modules
                 .into_iter()
@@ -863,7 +861,6 @@ impl AgentSession<'_> {
         let regions = self
             .session
             .target
-            .guest
             .kernel_modules()?
             .into_iter()
             .filter(|module| {
@@ -1370,6 +1367,7 @@ impl AgentSession<'_> {
                 symbol,
                 temporary,
                 rip,
+                condition_error,
             } => {
                 let mut out = self.stopped_envelope("breakpoint")?;
                 out["rip"] = json!(fmt_addr(rip));
@@ -1377,6 +1375,9 @@ impl AgentSession<'_> {
                     "id": id,
                     "address": fmt_addr(address),
                     "symbol": symbol.or_else(|| self.format_symbol(VirtAddr(rip))),
+                    // Condition evaluation failed; the stop was surfaced rather
+                    // than skipped, so the client can tell the two apart.
+                    "condition_error": condition_error,
                 });
                 out["temporary"] = json!(temporary);
                 Ok(out)
@@ -1769,12 +1770,14 @@ fn completion_strategy_name(strategy: crate::repl::CompletionStrategy) -> &'stat
     match strategy {
         crate::repl::CompletionStrategy::None => "none",
         crate::repl::CompletionStrategy::Symbol => "symbol",
+        crate::repl::CompletionStrategy::Expression => "expression",
         crate::repl::CompletionStrategy::Type => "type",
         crate::repl::CompletionStrategy::Process => "process",
         crate::repl::CompletionStrategy::Thread => "thread",
         crate::repl::CompletionStrategy::Vcpu => "vcpu",
         crate::repl::CompletionStrategy::Breakpoint => "breakpoint",
         crate::repl::CompletionStrategy::Driver => "driver",
+        crate::repl::CompletionStrategy::Alias => "alias",
     }
 }
 

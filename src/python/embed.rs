@@ -1,8 +1,8 @@
 use std::ffi::CString;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule, PyString, PyTuple};
@@ -54,20 +54,20 @@ pub struct LoadReport {
     pub failed: Vec<(PathBuf, String)>,
 }
 
-/// Print a one-line load summary (and any failures). Quiet on startup when no
-/// scripts are installed.
-pub fn print_script_load_report(report: &LoadReport, startup_hint: bool) {
-    if report.loaded.is_empty() && report.failed.is_empty() {
-        if !startup_hint {
-            println!("python: 0 loaded");
-        }
-        return;
-    }
+/// Print a one-line load summary and any failures (used by `.reload`;
+/// startup calls [`print_script_load_failures`] directly).
+pub fn print_script_load_report(report: &LoadReport) {
     let mut summary = format!("python: {} loaded", report.loaded.len());
     if !report.failed.is_empty() {
         summary.push_str(&format!(", {} failed", report.failed.len()));
     }
     println!("{summary}");
+    print_script_load_failures(report);
+}
+
+/// Print per-file load failures, shared by the reload report and the startup
+/// summary line.
+pub fn print_script_load_failures(report: &LoadReport) {
     for (path, err) in &report.failed {
         diagnostics::print_error(format!("{}: {}", path.display(), err));
     }
@@ -122,6 +122,11 @@ fn install_repl_module<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyModule>> {
     ntoseye.add("Debugger", py.get_type::<Debugger>())?;
     ntoseye.add("Struct", py.get_type::<Struct>())?;
     ntoseye.add("Type", py.get_type::<Type>())?;
+    ntoseye.add("NtoseyeError", py.get_type::<super::NtoseyeError>())?;
+    ntoseye.add(
+        "MemoryAccessError",
+        py.get_type::<super::MemoryAccessError>(),
+    )?;
     ntoseye.add("__version__", env!("CARGO_PKG_VERSION"))?;
     ntoseye.setattr("__path__", PyList::empty(py))?;
 

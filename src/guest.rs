@@ -1,8 +1,8 @@
 use crate::{
     backend::MemoryOps,
     error::{Error, Result},
-    host::KvmHandle,
-    memory::{self, AddressSpace, PAGE_SIZE},
+    memory::{self, AddressSpace, DTB_IDENTITY, PAGE_SIZE},
+    phys::PhysMem,
     symbols::{
         DownloadJob, FieldInfo, ModuleSymbolDiscovery, ModuleSymbolLoad, ModuleSymbolSource,
         ModuleSymbolStatus, ParsedType, SymbolStore, TypeInfo, download_jobs_parallel,
@@ -34,6 +34,10 @@ pub struct ModuleInfo {
     pub short_name: String,
     pub base_address: VirtAddr,
     pub size: u32,
+    pub time_date_stamp: Option<u32>,
+    pub checksum: Option<u32>,
+    pub file_version: Option<String>,
+    pub product_version: Option<String>,
 }
 
 impl ModuleInfo {
@@ -44,7 +48,27 @@ impl ModuleInfo {
             short_name,
             base_address,
             size,
+            time_date_stamp: None,
+            checksum: None,
+            file_version: None,
+            product_version: None,
         }
+    }
+
+    pub fn with_time_date_stamp(mut self, tds: u32) -> Self {
+        self.time_date_stamp = Some(tds);
+        self
+    }
+
+    pub fn with_checksum(mut self, cs: u32) -> Self {
+        self.checksum = Some(cs);
+        self
+    }
+
+    pub fn with_version_info(mut self, file_ver: String, product_ver: String) -> Self {
+        self.file_version = Some(file_ver);
+        self.product_version = Some(product_ver);
+        self
     }
 
     pub fn derive_short_name(name: &str) -> String {
@@ -224,6 +248,174 @@ pub fn section_name_at<'a, B: MemoryOps<PhysAddr>>(
     None
 }
 
+/// Read VS_FIXEDFILEINFO from a PE image's resource section in guest memory.
+///
+/// Reads only the header page + the `.rsrc` section (not the full image) to
+/// extract file version and product version strings. Returns `None` if the
+/// image has no resources, the resource section is paged out, or no
+/// RT_VERSION resource is present.
+pub fn read_pe_version_info<B: MemoryOps<PhysAddr>>(
+    base: VirtAddr,
+    memory: &memory::AddressSpace<'_, B>,
+) -> Option<(String, String)> {
+    use pelite::image::IMAGE_DIRECTORY_ENTRY_RESOURCE;
+
+    let mut header_buf = [0u8; 0x1000];
+    memory.read_bytes(base, &mut header_buf).ok()?;
+    let view = PeView::from_bytes(&header_buf).ok()?;
+
+    let rsrc_dir = view.data_directory().get(IMAGE_DIRECTORY_ENTRY_RESOURCE)?;
+    let rsrc_rva = rsrc_dir.VirtualAddress;
+    let rsrc_size = (rsrc_dir.Size as usize).min(256 * 1024);
+    if rsrc_size < 16 {
+        return None;
+    }
+
+    let mut rsrc_buf = vec![0u8; rsrc_size];
+    memory
+        .read_bytes(VirtAddr(base.0 + rsrc_rva as u64), &mut rsrc_buf)
+        .ok()?;
+
+    let data_entry_rva = find_rt_version_data_entry(&rsrc_buf, rsrc_rva)?;
+
+    let ver_rva = read_u32_at(&rsrc_buf, data_entry_rva)?;
+    let ver_size = read_u32_at(&rsrc_buf, data_entry_rva + 4)? as usize;
+    if !(52..=32 * 1024).contains(&ver_size) {
+        return None;
+    }
+
+    let ver_offset_in_rsrc = (ver_rva as usize).checked_sub(rsrc_rva as usize)?;
+    let ver_data = rsrc_buf.get(ver_offset_in_rsrc..ver_offset_in_rsrc + ver_size)?;
+
+    parse_vs_fixedfileinfo(ver_data)
+}
+
+const RT_VERSION: u32 = 16;
+const VS_FIXEDFILEINFO_SIGNATURE: u32 = 0xFEEF04BD;
+
+/// Navigate the resource directory tree (3 levels) to find the
+/// IMAGE_RESOURCE_DATA_ENTRY for the first RT_VERSION resource.
+/// Returns the offset within `rsrc` of the data entry (which holds
+/// the RVA and size of the VS_VERSION_INFO blob).
+fn find_rt_version_data_entry(rsrc: &[u8], rsrc_rva: u32) -> Option<usize> {
+    // Level 0: root directory — find type entry for RT_VERSION
+    let type_entry = find_resource_id_entry(rsrc, 0, RT_VERSION)?;
+    // Level 1: name directory — take first entry
+    let name_entry = first_resource_entry(rsrc, type_entry)?;
+    // Level 2: language directory — take first entry
+    let lang_entry = first_resource_entry(rsrc, name_entry)?;
+
+    // lang_entry should point to a data entry (bit 31 clear)
+    if lang_entry & 0x8000_0000 != 0 {
+        return None;
+    }
+    let data_entry_off = lang_entry as usize;
+    if data_entry_off + 16 > rsrc.len() {
+        return None;
+    }
+
+    // Validate: the RVA should fall within the resource section
+    let rva = read_u32_at(rsrc, data_entry_off)?;
+    if rva < rsrc_rva || (rva as usize - rsrc_rva as usize) >= rsrc.len() {
+        return None;
+    }
+    Some(data_entry_off)
+}
+
+/// Scan an IMAGE_RESOURCE_DIRECTORY at `dir_off` for an entry with the
+/// given resource ID. Returns the OffsetToData/OffsetToDirectory value
+/// from the matching entry (with the high bit preserved).
+fn find_resource_id_entry(rsrc: &[u8], dir_off: usize, target_id: u32) -> Option<u32> {
+    if dir_off + 16 > rsrc.len() {
+        return None;
+    }
+    let num_named = read_u16_at(rsrc, dir_off + 12)? as usize;
+    let num_id = read_u16_at(rsrc, dir_off + 14)? as usize;
+    let entries_start = dir_off + 16;
+    for i in num_named..(num_named + num_id) {
+        let entry_off = entries_start + i * 8;
+        let id = read_u32_at(rsrc, entry_off)?;
+        if id == target_id {
+            return read_u32_at(rsrc, entry_off + 4);
+        }
+    }
+    None
+}
+
+/// Return the OffsetToData of the first entry in the directory at the
+/// offset encoded in `parent_entry` (which must have bit 31 set for a
+/// subdirectory).
+fn first_resource_entry(rsrc: &[u8], parent_entry: u32) -> Option<u32> {
+    if parent_entry & 0x8000_0000 == 0 {
+        return None;
+    }
+    let dir_off = (parent_entry & 0x7FFF_FFFF) as usize;
+    if dir_off + 16 > rsrc.len() {
+        return None;
+    }
+    let num_named = read_u16_at(rsrc, dir_off + 12)? as usize;
+    let num_id = read_u16_at(rsrc, dir_off + 14)? as usize;
+    if num_named + num_id == 0 {
+        return None;
+    }
+    let first_entry_off = dir_off + 16;
+    read_u32_at(rsrc, first_entry_off + 4)
+}
+
+fn parse_vs_fixedfileinfo(data: &[u8]) -> Option<(String, String)> {
+    // Search for VS_FIXEDFILEINFO signature
+    let sig_bytes = VS_FIXEDFILEINFO_SIGNATURE.to_le_bytes();
+    let pos = data.windows(4).position(|w| w == sig_bytes)?;
+    if pos + 52 > data.len() {
+        return None;
+    }
+    let info = &data[pos..];
+
+    // dwFileVersionMS: HIWORD = Major, LOWORD = Minor
+    // dwFileVersionLS: HIWORD = Build, LOWORD = Revision
+    let file_minor = u16::from_le_bytes([info[8], info[9]]);
+    let file_major = u16::from_le_bytes([info[10], info[11]]);
+    let file_revision = u16::from_le_bytes([info[12], info[13]]);
+    let file_build = u16::from_le_bytes([info[14], info[15]]);
+
+    let prod_minor = u16::from_le_bytes([info[16], info[17]]);
+    let prod_major = u16::from_le_bytes([info[18], info[19]]);
+    let prod_revision = u16::from_le_bytes([info[20], info[21]]);
+    let prod_build = u16::from_le_bytes([info[22], info[23]]);
+
+    let file_ver = format!(
+        "{}.{}.{}.{}",
+        file_major, file_minor, file_build, file_revision
+    );
+    let prod_ver = format!(
+        "{}.{}.{}.{}",
+        prod_major, prod_minor, prod_build, prod_revision
+    );
+    Some((file_ver, prod_ver))
+}
+
+fn read_u16_at(buf: &[u8], off: usize) -> Option<u16> {
+    buf.get(off..off + 2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+}
+
+fn read_u32_at(buf: &[u8], off: usize) -> Option<u32> {
+    buf.get(off..off + 4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn populate_module_versions<B: MemoryOps<PhysAddr>>(
+    modules: &mut [ModuleInfo],
+    memory: &memory::AddressSpace<'_, B>,
+) {
+    for module in modules.iter_mut() {
+        if let Some((file_ver, prod_ver)) = read_pe_version_info(module.base_address, memory) {
+            module.file_version = Some(file_ver);
+            module.product_version = Some(prod_ver);
+        }
+    }
+}
+
 /// Build a complete (hole-free) `PeImage` from an on-disk PE file by mapping its
 /// raw sections to their RVAs: the same layout `read_pe_image` produces from
 /// guest memory, but sourced from the full file. Used to recover read-only data
@@ -282,13 +474,13 @@ pub struct WinObject {
     dtb: Dtb,
     binary_snapshot: Vec<u8>,
     pub guid: Option<u128>,
-    kvm: Arc<KvmHandle>,
+    phys: Arc<PhysMem>,
     symbols: Arc<SymbolStore>,
 }
 
 impl WinObject {
     pub fn new(
-        kvm: Arc<KvmHandle>,
+        phys: Arc<PhysMem>,
         symbols: Arc<SymbolStore>,
         dtb: Dtb,
         base_address: VirtAddr,
@@ -298,16 +490,37 @@ impl WinObject {
             dtb,
             binary_snapshot: Vec::new(),
             guid: None,
-            kvm,
+            phys,
             symbols,
         }
     }
 
     pub fn load_symbols(mut self) -> Result<Self> {
         // Clone the Arc handles to a local so `load_from_binary` can take
-        // `&mut self` without aliasing the `self.symbols`/`self.kvm` fields.
+        // `&mut self` without aliasing the `self.symbols`/`self.phys` fields.
         let symbols = Arc::clone(&self.symbols);
-        self.guid = symbols.load_from_binary(&mut self)?;
+        self.guid = symbols.load_from_binary(&mut self, "ntoskrnl.exe")?;
+        Ok(self)
+    }
+
+    /// Fallback symbol loader for triage dumps where the PE header page isn't
+    /// in the dump.  Uses the module's TimeDateStamp + SizeOfImage from the
+    /// triage driver list to download the PE from Microsoft's symbol server,
+    /// extract the PDB GUID, and load the PDB.
+    pub fn load_symbols_from_module_info(
+        mut self,
+        name: &str,
+        time_date_stamp: u32,
+        size_of_image: u32,
+    ) -> Result<Self> {
+        let symbols = Arc::clone(&self.symbols);
+        self.guid = symbols.load_from_module_info(
+            name,
+            self.base_address,
+            self.dtb,
+            time_date_stamp,
+            size_of_image,
+        )?;
         Ok(self)
     }
 
@@ -332,7 +545,7 @@ impl WinObject {
     /// (`guid` is `None`); call [`load_symbols`](Self::load_symbols) to attach.
     pub fn sibling(&self, dtb: Dtb, base_address: VirtAddr) -> WinObject {
         WinObject::new(
-            Arc::clone(&self.kvm),
+            Arc::clone(&self.phys),
             Arc::clone(&self.symbols),
             dtb,
             base_address,
@@ -343,8 +556,8 @@ impl WinObject {
         self.base_address + rva.into()
     }
 
-    pub fn memory(&self) -> memory::AddressSpace<'_, Arc<KvmHandle>> {
-        memory::AddressSpace::new(&self.kvm, self.dtb)
+    pub fn memory(&self) -> memory::AddressSpace<'_, Arc<PhysMem>> {
+        memory::AddressSpace::new(&self.phys, self.dtb)
     }
 
     pub fn symbol<S>(&self, name: S) -> Result<SymbolRef<'_>>
@@ -375,8 +588,8 @@ impl WinObject {
     pub fn view(&mut self) -> Option<PeView<'_>> {
         if self.binary_snapshot.is_empty() {
             // Clone the Arc so the read borrow doesn't alias `&mut self`.
-            let kvm = Arc::clone(&self.kvm);
-            let memory = AddressSpace::new(&kvm, self.dtb);
+            let phys = Arc::clone(&self.phys);
+            let memory = AddressSpace::new(&phys, self.dtb);
             self.binary_snapshot = read_pe_image(self.base_address, &memory).ok()?.bytes;
         }
 
@@ -449,7 +662,7 @@ impl<'a> Types<'a> {
         let record_ti = self.layout(record_type)?;
         let link_offset = record_ti.field_offset(link_field)?;
 
-        let mut current: VirtAddr = AddressSpace::new(&obj.kvm, dtb).read(head)?;
+        let mut current: VirtAddr = AddressSpace::new(&obj.phys, dtb).read(head)?;
         let mut count = 0usize;
         const MAX: usize = 1000;
 
@@ -467,7 +680,7 @@ impl<'a> Types<'a> {
             };
 
             // Flink sits at offset 0 of the link's _LIST_ENTRY
-            match AddressSpace::new(&obj.kvm, dtb).read::<VirtAddr>(current) {
+            match AddressSpace::new(&obj.phys, dtb).read::<VirtAddr>(current) {
                 Ok(next) if next == current => current = head, // self-loop: stop after this
                 Ok(next) => current = next,
                 Err(e) => {
@@ -493,8 +706,8 @@ pub struct StructRef<'a> {
 }
 
 impl<'a> StructRef<'a> {
-    fn memory(&self) -> AddressSpace<'a, Arc<KvmHandle>> {
-        AddressSpace::new(&self.obj.kvm, self.dtb)
+    fn memory(&self) -> AddressSpace<'a, Arc<PhysMem>> {
+        AddressSpace::new(&self.obj.phys, self.dtb)
     }
 
     /// The address this cursor sits at (e.g. to test a followed pointer for
@@ -624,15 +837,22 @@ fn module_info_from_record(record: &StructRef<'_>) -> Result<Option<ModuleInfo>>
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "<unknown>".to_string());
-    Ok(Some(ModuleInfo::new(name, dll_base, size_of_image)))
+    let mut info = ModuleInfo::new(name, dll_base, size_of_image);
+    if let Ok(tds) = record.read_field::<u32>("TimeDateStamp") {
+        info = info.with_time_date_stamp(tds);
+    }
+    if let Ok(cs) = record.read_field::<u32>("CheckSum") {
+        info = info.with_checksum(cs);
+    }
+    Ok(Some(info))
 }
 
 pub struct Guest {
     pub ntoskrnl: WinObject,
 }
 
-fn is_valid_kernel_dtb(kvm: &KvmHandle, dtb: Dtb) -> Result<bool> {
-    let kernel_pml4 = kvm.read::<[PageTableEntry; 256]>(dtb + 8 * 256)?;
+fn is_valid_kernel_dtb(phys: &PhysMem, dtb: Dtb) -> Result<bool> {
+    let kernel_pml4 = phys.read::<[PageTableEntry; 256]>(dtb + 8 * 256)?;
 
     if kernel_pml4
         .into_iter()
@@ -646,7 +866,7 @@ fn is_valid_kernel_dtb(kvm: &KvmHandle, dtb: Dtb) -> Result<bool> {
     // Check if use KUSER_SHARED_DATA is mapped
     const KUSER_SHARED_DATA_VA: VirtAddr = VirtAddr::from_u64(0xfffff78000000000);
 
-    let addr_space = AddressSpace::new(kvm, dtb);
+    let addr_space = AddressSpace::new(phys, dtb);
 
     if let Some(xlat) = addr_space.virt_to_phys(KUSER_SHARED_DATA_VA)?
         && !xlat.user
@@ -658,9 +878,9 @@ fn is_valid_kernel_dtb(kvm: &KvmHandle, dtb: Dtb) -> Result<bool> {
     }
 }
 
-fn find_kernel_dtb(kvm: &KvmHandle) -> Result<Option<Dtb>> {
+fn find_kernel_dtb(phys: &PhysMem) -> Result<Option<Dtb>> {
     for dtb in (0x1000..0x1000000).step_by(PAGE_SIZE) {
-        if is_valid_kernel_dtb(kvm, dtb)? {
+        if is_valid_kernel_dtb(phys, dtb)? {
             return Ok(Some(dtb));
         }
     }
@@ -668,35 +888,28 @@ fn find_kernel_dtb(kvm: &KvmHandle) -> Result<Option<Dtb>> {
     Ok(None)
 }
 
-fn is_ntoskrnl_pte(kvm: &KvmHandle, pte: PageTableEntry) -> Result<bool> {
+fn is_ntoskrnl_header(header: &[u8]) -> bool {
+    header.len() >= 4
+        && header[..4] == [0x4d, 0x5a, 0x90, 0x00]
+        && header.chunks_exact(8).any(|c| c == b"POOLCODE")
+}
+
+fn is_ntoskrnl_pte(phys: &PhysMem, pte: PageTableEntry) -> Result<bool> {
     if pte.is_user() || !pte.is_nx() {
         return Ok(false);
     }
 
-    let header = kvm.read::<[u8; 0x1000]>(pte.page_frame())?;
-
-    if header[..4] != [0x4d, 0x5a, 0x90, 0x00] {
-        return Ok(false);
-    }
-
-    for chunk in header.chunks_exact(8) {
-        if chunk != b"POOLCODE" {
-            continue;
-        }
-
-        return Ok(true);
-    }
-
-    Ok(false)
+    let header = phys.read::<[u8; 0x1000]>(pte.page_frame())?;
+    Ok(is_ntoskrnl_header(&header))
 }
 
-fn find_ntoskrnl_va(kernel_dtb: Dtb, kvm: &KvmHandle) -> Result<Option<VirtAddr>> {
+fn find_ntoskrnl_va(kernel_dtb: Dtb, phys: &PhysMem) -> Result<Option<VirtAddr>> {
     const KERNEL_VA_MIN: VirtAddr = VirtAddr::from_u64(0xfffff80000000000);
     const KERNEL_VA_MAX: VirtAddr = VirtAddr::from_u64(0xfffff80800000000);
 
     let pml4e_count = KERNEL_VA_MAX.pml4_index() - KERNEL_VA_MIN.pml4_index() + 1;
 
-    let kernel_pml4 = kvm.read::<[PageTableEntry; 256]>(kernel_dtb + 8 * 256)?;
+    let kernel_pml4 = phys.read::<[PageTableEntry; 256]>(kernel_dtb + 8 * 256)?;
     for (rel_pml4_index, pml4e) in kernel_pml4
         .into_iter()
         .enumerate()
@@ -708,7 +921,7 @@ fn find_ntoskrnl_va(kernel_dtb: Dtb, kvm: &KvmHandle) -> Result<Option<VirtAddr>
         if !pml4e.is_present() {
             continue;
         }
-        let pdpt = kvm.read::<[PageTableEntry; 512]>(pml4e.page_frame())?;
+        let pdpt = phys.read::<[PageTableEntry; 512]>(pml4e.page_frame())?;
 
         let pdpte_count = if pml4_index == pml4e_count - 1 {
             KERNEL_VA_MAX.pdpt_index() + 1
@@ -723,14 +936,14 @@ fn find_ntoskrnl_va(kernel_dtb: Dtb, kvm: &KvmHandle) -> Result<Option<VirtAddr>
 
             if pdpte.is_large_page() {
                 // Unlikely but just making sure
-                if let Ok(true) = is_ntoskrnl_pte(kvm, pdpte) {
+                if let Ok(true) = is_ntoskrnl_pte(phys, pdpte) {
                     return Ok(Some(VirtAddr::construct(pml4_index, pdpt_index, 0, 0)));
                 }
 
                 continue;
             }
 
-            let pd = kvm.read::<[PageTableEntry; 512]>(pdpte.page_frame())?;
+            let pd = phys.read::<[PageTableEntry; 512]>(pdpte.page_frame())?;
 
             let pde_count = if pdpt_index == pdpte_count - 1 {
                 KERNEL_VA_MAX.pd_index() + 1
@@ -744,7 +957,7 @@ fn find_ntoskrnl_va(kernel_dtb: Dtb, kvm: &KvmHandle) -> Result<Option<VirtAddr>
                 }
 
                 if pde.is_large_page() {
-                    if let Ok(true) = is_ntoskrnl_pte(kvm, pde) {
+                    if let Ok(true) = is_ntoskrnl_pte(phys, pde) {
                         return Ok(Some(VirtAddr::construct(
                             pml4_index, pdpt_index, pd_index, 0,
                         )));
@@ -753,7 +966,7 @@ fn find_ntoskrnl_va(kernel_dtb: Dtb, kvm: &KvmHandle) -> Result<Option<VirtAddr>
                     continue;
                 }
 
-                let pt = kvm.read::<[PageTableEntry; 512]>(pde.page_frame())?;
+                let pt = phys.read::<[PageTableEntry; 512]>(pde.page_frame())?;
 
                 let pte_count = if pd_index == pde_count - 1 {
                     KERNEL_VA_MAX.pt_index() + 1
@@ -766,7 +979,7 @@ fn find_ntoskrnl_va(kernel_dtb: Dtb, kvm: &KvmHandle) -> Result<Option<VirtAddr>
                         continue;
                     }
 
-                    if let Ok(true) = is_ntoskrnl_pte(kvm, pte) {
+                    if let Ok(true) = is_ntoskrnl_pte(phys, pte) {
                         return Ok(Some(VirtAddr::construct(
                             pml4_index, pdpt_index, pd_index, pt_index,
                         )));
@@ -779,16 +992,66 @@ fn find_ntoskrnl_va(kernel_dtb: Dtb, kvm: &KvmHandle) -> Result<Option<VirtAddr>
     Ok(None)
 }
 
-fn find_ntoskrnl(kvm: Arc<KvmHandle>, symbols: Arc<SymbolStore>) -> Result<Option<WinObject>> {
-    let Some(kernel_dtb) = find_kernel_dtb(&kvm)? else {
+/// Scan captured virtual memory regions for the ntoskrnl PE header.
+///
+/// Triage dumps have no page tables, so we can't walk the PML4. Instead we
+/// probe the identity-mapped virtual memory for the MZ header + POOLCODE
+/// marker, the same heuristic `is_ntoskrnl_pte` uses but at the virtual
+/// layer.
+fn find_ntoskrnl_va_triage(kernel_dtb: Dtb, phys: &PhysMem) -> Result<Option<VirtAddr>> {
+    let space = AddressSpace::new(phys, kernel_dtb);
+
+    // Triage dumps include ntoskrnl's base in PsLoadedModuleList. We can
+    // read the PsLoadedModuleList VA from the header; the list entry itself
+    // is at nt!PsLoadedModuleList, which is inside ntoskrnl. The first
+    // entry in the list is ntoskrnl's own LDR_DATA_TABLE_ENTRY whose
+    // DllBase field gives us the base.
+    //
+    // But we don't have the offsets yet (no PDB). Instead, just try
+    // addresses from the data blocks that look like kernel-space PE headers.
+    if let Some(dmp_info) = phys.dmp_info() {
+        // Check triage driver base addresses first — ntoskrnl is typically
+        // the first entry and this avoids scanning up to 4096 pages.
+        let mut header = vec![0u8; 0x1000];
+        for driver in &dmp_info.triage_drivers {
+            let candidate = VirtAddr(driver.base);
+            if space.read_bytes(candidate, &mut header).is_err() {
+                continue;
+            }
+            if is_ntoskrnl_header(&header) {
+                return Ok(Some(candidate));
+            }
+        }
+
+        // Fallback: scan backwards from PsLoadedModuleList.
+        let ps_loaded = dmp_info.ps_loaded_module_list;
+        if ps_loaded >= 0xfffff80000000000 {
+            let page_base = ps_loaded & !0xFFF;
+            for offset in (0..0x100_0000u64).step_by(0x1000) {
+                let candidate = page_base - offset;
+                if space.read_bytes(VirtAddr(candidate), &mut header).is_err() {
+                    continue;
+                }
+                if is_ntoskrnl_header(&header) {
+                    return Ok(Some(VirtAddr(candidate)));
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn find_ntoskrnl(phys: Arc<PhysMem>, symbols: Arc<SymbolStore>) -> Result<Option<WinObject>> {
+    let Some(kernel_dtb) = find_kernel_dtb(&phys)? else {
         return Ok(None);
     };
 
-    let Some(ntoskrnl_va) = find_ntoskrnl_va(kernel_dtb, &kvm)? else {
+    let Some(ntoskrnl_va) = find_ntoskrnl_va(kernel_dtb, &phys)? else {
         return Ok(None);
     };
 
-    Ok(Some(WinObject::new(kvm, symbols, kernel_dtb, ntoskrnl_va)))
+    Ok(Some(WinObject::new(phys, symbols, kernel_dtb, ntoskrnl_va)))
 }
 
 impl Guest {
@@ -817,15 +1080,15 @@ impl Guest {
     }
 
     pub fn new_with_kernel_base_hint(
-        kvm: Arc<KvmHandle>,
+        phys: Arc<PhysMem>,
         symbols: Arc<SymbolStore>,
         kernel_base_hint: Option<VirtAddr>,
     ) -> Result<Self> {
         let ntoskrnl = if let Some(kernel_base) = kernel_base_hint {
-            let kernel_dtb = find_kernel_dtb(&kvm)?.ok_or(Error::NtoskrnlNotFound)?;
-            WinObject::new(kvm, symbols, kernel_dtb, kernel_base)
+            let kernel_dtb = find_kernel_dtb(&phys)?.ok_or(Error::NtoskrnlNotFound)?;
+            WinObject::new(phys, symbols, kernel_dtb, kernel_base)
         } else {
-            find_ntoskrnl(kvm, symbols)?.ok_or(Error::NtoskrnlNotFound)?
+            find_ntoskrnl(phys, symbols)?.ok_or(Error::NtoskrnlNotFound)?
         }
         .load_symbols()?;
 
@@ -837,8 +1100,65 @@ impl Guest {
         Ok(Self { ntoskrnl })
     }
 
-    pub fn new(kvm: Arc<KvmHandle>, symbols: Arc<SymbolStore>) -> Result<Self> {
-        Self::new_with_kernel_base_hint(kvm, symbols, None)
+    pub fn new(phys: Arc<PhysMem>, symbols: Arc<SymbolStore>) -> Result<Self> {
+        Self::new_with_kernel_base_hint(phys, symbols, None)
+    }
+
+    pub fn new_with_dtb(
+        phys: Arc<PhysMem>,
+        symbols: Arc<SymbolStore>,
+        kernel_dtb: Dtb,
+    ) -> Result<Self> {
+        let is_triage = kernel_dtb == DTB_IDENTITY;
+
+        let ntoskrnl_va = if is_triage {
+            find_ntoskrnl_va_triage(kernel_dtb, &phys)?
+        } else {
+            find_ntoskrnl_va(kernel_dtb, &phys)?
+        };
+
+        // For triage dumps, fall back to kern_base from KDDEBUGGER_DATA64
+        // when the PE header page isn't captured in the dump.
+        let ntoskrnl_va = match ntoskrnl_va {
+            Some(va) => va,
+            None if is_triage => phys
+                .dmp_info()
+                .and_then(|i| i.kern_base)
+                .map(VirtAddr)
+                .ok_or(Error::NtoskrnlNotFound)?,
+            None => return Err(Error::NtoskrnlNotFound),
+        };
+
+        let obj = WinObject::new(
+            Arc::clone(&phys),
+            Arc::clone(&symbols),
+            kernel_dtb,
+            ntoskrnl_va,
+        );
+
+        // Try normal symbol loading first; for triage dumps where the PE
+        // header isn't in memory, fall back to downloading by image metadata.
+        let ntoskrnl = match obj.load_symbols() {
+            Ok(loaded) => loaded,
+            Err(_) if is_triage => {
+                let driver = phys
+                    .dmp_info()
+                    .and_then(|info| info.triage_drivers.iter().find(|d| d.base == ntoskrnl_va.0))
+                    .cloned()
+                    .ok_or(Error::NtoskrnlNotFound)?;
+
+                WinObject::new(phys, symbols, kernel_dtb, ntoskrnl_va)
+                    .load_symbols_from_module_info(
+                        &driver.name,
+                        driver.time_date_stamp,
+                        driver.size,
+                    )?
+            }
+            Err(e) => return Err(e),
+        };
+
+        ntoskrnl.register_as_kernel();
+        Ok(Self { ntoskrnl })
     }
 
     pub fn enumerate_processes(&self) -> Result<Vec<ProcessInfo>> {
@@ -1045,14 +1365,28 @@ impl Guest {
         Ok(modules)
     }
 
+    pub fn populate_kernel_module_versions(&self, modules: &mut [ModuleInfo]) {
+        let memory = self.ntoskrnl.memory();
+        populate_module_versions(modules, &memory);
+    }
+
+    pub fn populate_process_module_versions(
+        &self,
+        modules: &mut [ModuleInfo],
+        info: &ProcessInfo,
+    ) {
+        let process_mem = self.ntoskrnl.sibling(info.dtb, VirtAddr(0));
+        let memory = process_mem.memory();
+        populate_module_versions(modules, &memory);
+    }
+
     fn is_session_space(addr: VirtAddr) -> bool {
         let prefix = addr.0 >> 44;
         prefix == 0xFFFF8 || prefix == 0xFFFF9 || prefix == 0xFFFFA
     }
 
-    fn load_module_symbols(
-        &self,
-        kvm: &KvmHandle,
+    pub fn load_module_symbols(
+        phys: &PhysMem,
         symbols: &SymbolStore,
         modules: Vec<ModuleInfo>,
         dtb: Dtb,
@@ -1075,7 +1409,7 @@ impl Guest {
                 continue;
             }
 
-            match SymbolStore::extract_download_job(kvm, dtb, &module.name, module.base_address) {
+            match SymbolStore::extract_download_job(phys, dtb, &module.name, module.base_address) {
                 Ok(ModuleSymbolDiscovery::Ready { job, guid, source }) => {
                     Self::queue_module_symbol_load(
                         symbols,
@@ -1086,6 +1420,19 @@ impl Guest {
                 }
                 Ok(ModuleSymbolDiscovery::NeedsImage { image_job }) => {
                     image_jobs.push((image_job, module));
+                }
+                Err(_e) if module.time_date_stamp.is_some() => {
+                    let tds = module.time_date_stamp.unwrap();
+                    match SymbolStore::build_image_download_job(&module.name, tds, module.size) {
+                        Ok(image_job) => image_jobs.push((image_job, module)),
+                        Err(e) => Self::apply_module_symbol_status(
+                            symbols,
+                            &mut report,
+                            dtb,
+                            &module,
+                            ModuleSymbolStatus::Failed(e.to_string()),
+                        ),
+                    }
                 }
                 Err(e) => {
                     Self::apply_module_symbol_status(
@@ -1211,7 +1558,7 @@ impl Guest {
 
     pub fn load_all_kernel_module_symbols(
         &self,
-        kvm: &KvmHandle,
+        phys: &PhysMem,
         symbols: &SymbolStore,
     ) -> Result<ModuleSymbolLoadReport> {
         let mut modules = self.kernel_modules()?;
@@ -1228,12 +1575,12 @@ impl Guest {
             }
         }
         let dtb = self.ntoskrnl.dtb();
-        self.load_module_symbols(kvm, symbols, modules, dtb, true)
+        Self::load_module_symbols(phys, symbols, modules, dtb, true)
     }
 
     pub fn load_missing_kernel_module_symbols(
         &self,
-        kvm: &KvmHandle,
+        phys: &PhysMem,
         symbols: &SymbolStore,
     ) -> Result<ModuleSymbolLoadReport> {
         let dtb = self.ntoskrnl.dtb();
@@ -1252,18 +1599,18 @@ impl Guest {
             })
             .collect::<Vec<_>>();
 
-        self.load_module_symbols(kvm, symbols, missing, dtb, true)
+        Self::load_module_symbols(phys, symbols, missing, dtb, true)
     }
 
     pub fn load_all_process_module_symbols(
         &self,
-        kvm: &KvmHandle,
+        phys: &PhysMem,
         symbols: &SymbolStore,
         info: &ProcessInfo,
     ) -> Result<ModuleSymbolLoadReport> {
         let modules = self.process_modules(info)?;
         let dtb = info.dtb;
-        self.load_module_symbols(kvm, symbols, modules, dtb, false)
+        Self::load_module_symbols(phys, symbols, modules, dtb, false)
     }
 
     /// Load symbols for an explicit set of modules under `dtb`. Used to lazily
@@ -1272,12 +1619,12 @@ impl Guest {
     /// modules; this loads whatever it is given.
     pub fn load_symbols_for_modules(
         &self,
-        kvm: &KvmHandle,
+        phys: &PhysMem,
         symbols: &SymbolStore,
         modules: Vec<ModuleInfo>,
         dtb: Dtb,
     ) -> Result<ModuleSymbolLoadReport> {
-        self.load_module_symbols(kvm, symbols, modules, dtb, false)
+        Self::load_module_symbols(phys, symbols, modules, dtb, false)
     }
 }
 

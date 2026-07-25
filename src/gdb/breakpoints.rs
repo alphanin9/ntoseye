@@ -1,14 +1,27 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use pelite::pe64::{Pe, PeView, image::IMAGE_SCN_MEM_EXECUTE};
 
 use crate::backend::MemoryOps;
-use crate::dbg_backend::DebugBackend;
+use crate::dbg_backend::{
+    DebugBackend, DebugCapability, HW_BREAKPOINT_SLOTS, HwBreakpointAccess, WatchpointAccess,
+    validate_hw_breakpoint,
+};
 use crate::error::{Error, Result};
+use crate::expr::Expr;
 use crate::guest::{ModuleInfo, ProcessInfo, read_pe_image};
 use crate::memory::AddressSpace;
 use crate::target::Target;
 use crate::types::{Dtb, VirtAddr};
+
+/// A hardware (debug-register) breakpoint's parameters: the access it traps on,
+/// the watch width in bytes, and which DR slot (0-3) it occupies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HardwareBreakpoint {
+    pub access: HwBreakpointAccess,
+    pub len: u8,
+    pub slot: u8,
+}
 
 #[derive(Debug, Clone)]
 pub struct Breakpoint {
@@ -18,8 +31,47 @@ pub struct Breakpoint {
     pub symbol: Option<String>,
     pub scope: BreakpointScope,
     pub condition: Option<String>,
+    pub condition_expr: Option<Arc<Expr>>,
     pub temporary: bool,
+    /// Transport-specific breakpoint state; hosts use [`Self::watchpoint`] for
+    /// the semantic data-watch metadata.
+    pub hardware: Option<HardwareBreakpoint>,
     backend: BreakpointBackend,
+}
+
+impl Breakpoint {
+    /// Data-watch semantics for this stop point. Execute-only debug-register
+    /// breakpoints remain code breakpoints and deliberately return `None`.
+    pub fn watchpoint(&self) -> Option<(WatchpointAccess, u8)> {
+        let hardware = self.hardware?;
+        let access = match hardware.access {
+            HwBreakpointAccess::Write => WatchpointAccess::Write,
+            HwBreakpointAccess::ReadWrite => WatchpointAccess::ReadWrite,
+            HwBreakpointAccess::Execute => return None,
+        };
+        Some((access, hardware.len))
+    }
+
+    /// The watched access name (`"write"`/`"read_write"`), or `None` for a
+    /// code breakpoint. Presentation surfaces share this instead of
+    /// destructuring [`Self::watchpoint`] themselves.
+    pub fn watch_access_name(&self) -> Option<&'static str> {
+        self.watchpoint().map(|(access, _)| access.name())
+    }
+
+    /// The watched byte width, or `None` for a code breakpoint.
+    pub fn watch_length(&self) -> Option<u8> {
+        self.watchpoint().map(|(_, length)| length)
+    }
+
+    /// Evaluate the condition compiled when this breakpoint was installed.
+    /// Unconditional breakpoints always hold.
+    pub fn evaluate_condition(&self, target: &Target) -> Result<bool> {
+        match &self.condition_expr {
+            Some(expr) => Ok(expr.resolve(target)?.0 != 0),
+            None => Ok(true),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,24 +113,33 @@ impl BreakpointScope {
 ///   is visible to every process mapping that frame. `check_breakpoint_hit`'s
 ///   CR3 filter discards wrong-process hits, but the kernel still pays for
 ///   the trap.
+/// * `Hardware`: an x86 debug-register watch (`ba`). No memory is modified —
+///   the CPU traps on the linear address — so there is no displaced byte and no
+///   step-over dance. The DR slot and watch parameters live on
+///   [`Breakpoint::hardware`]; hits are identified by DR6, not by RIP, so
+///   hardware breakpoints stay out of the int3-hit predicates.
 #[derive(Debug, Clone)]
 enum BreakpointBackend {
     Kernel { original_byte: u8 },
     GuestMemoryPatch { original_byte: u8 },
+    Hardware,
 }
 
 impl BreakpointBackend {
     /// The instruction byte we displaced with the int3, so display paths can
-    /// overlay it and never show our own breakpoint.
+    /// overlay it and never show our own breakpoint. Hardware breakpoints
+    /// displace nothing (they never reach the masking path).
     fn original_byte(&self) -> u8 {
         match self {
             Self::Kernel { original_byte } | Self::GuestMemoryPatch { original_byte } => {
                 *original_byte
             }
+            Self::Hardware => 0,
         }
     }
 }
 
+#[derive(Default)]
 pub struct BreakpointManager {
     breakpoints: HashMap<u32, Breakpoint>,
     next_id: u32,
@@ -90,6 +151,42 @@ impl BreakpointManager {
             breakpoints: HashMap::new(),
             next_id: 0,
         }
+    }
+
+    /// Test-only: register a breakpoint directly, bypassing backend
+    /// installation. `hardware: Some(..)` makes a DR breakpoint; `None` a
+    /// kernel int3 with a dummy displaced byte. Lets tests outside this
+    /// module (session run-control) stage manager state without a live
+    /// target.
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(
+        &mut self,
+        id: u32,
+        address: VirtAddr,
+        enabled: bool,
+        hardware: Option<HardwareBreakpoint>,
+    ) {
+        let backend = match hardware {
+            Some(_) => BreakpointBackend::Hardware,
+            None => BreakpointBackend::Kernel {
+                original_byte: 0x90,
+            },
+        };
+        self.breakpoints.insert(
+            id,
+            Breakpoint {
+                id,
+                address,
+                enabled,
+                symbol: None,
+                scope: BreakpointScope::Kernel,
+                condition: None,
+                condition_expr: None,
+                temporary: false,
+                hardware,
+                backend,
+            },
+        );
     }
 
     pub fn add(
@@ -121,9 +218,20 @@ impl BreakpointManager {
         condition: Option<String>,
         temporary: bool,
     ) -> Result<u32> {
+        let condition_expr = Self::compile_condition(condition.as_deref())?;
         let scope = Self::scope_for_current_context(debugger);
+        let caps = client.capabilities();
         if matches!(scope, BreakpointScope::Process { .. })
-            && !client.supports_user_mode_breakpoints()
+            && !caps
+                .iter()
+                .any(|c| c.capability == DebugCapability::UserModeBreakpoints && c.supported)
+        {
+            return Err(Error::NotSupported);
+        }
+        if matches!(scope, BreakpointScope::Kernel)
+            && !caps
+                .iter()
+                .any(|c| c.capability == DebugCapability::KernelBreakpoints && c.supported)
         {
             return Err(Error::NotSupported);
         }
@@ -140,12 +248,81 @@ impl BreakpointManager {
             symbol,
             scope,
             condition,
+            condition_expr,
             temporary,
+            hardware: None,
             backend,
         };
 
         self.breakpoints.insert(id, bp);
         Ok(id)
+    }
+
+    /// Set a hardware (debug-register) breakpoint: a global watch on `address`
+    /// for `access` over `len` bytes. Backends without DR support (everything
+    /// but KD) reject this with [`Error::NotSupported`]. Unlike software
+    /// breakpoints these are always global (DR matches a linear address in any
+    /// process) and modify no guest memory, so validation is alignment/width
+    /// only, not page executability.
+    pub fn add_hardware(
+        &mut self,
+        client: &mut dyn DebugBackend,
+        address: VirtAddr,
+        access: HwBreakpointAccess,
+        len: u8,
+        symbol: Option<String>,
+        condition: Option<String>,
+    ) -> Result<u32> {
+        let condition_expr = Self::compile_condition(condition.as_deref())?;
+        if !client.supports_watchpoints() {
+            return Err(Error::NotSupported);
+        }
+        validate_hw_breakpoint(access, len, address.0)?;
+
+        let slot = self.free_hardware_slot()?;
+        client.set_hardware_breakpoint(slot, address.0, access, len)?;
+
+        let id = self.next_id;
+        self.next_id += 1;
+        let bp = Breakpoint {
+            id,
+            address,
+            enabled: true,
+            symbol,
+            scope: BreakpointScope::Kernel,
+            condition,
+            condition_expr,
+            temporary: false,
+            hardware: Some(HardwareBreakpoint { access, len, slot }),
+            backend: BreakpointBackend::Hardware,
+        };
+        self.breakpoints.insert(id, bp);
+        Ok(id)
+    }
+
+    fn compile_condition(condition: Option<&str>) -> Result<Option<Arc<Expr>>> {
+        condition
+            .map(Expr::parse)
+            .transpose()
+            .map(|expr| expr.map(Arc::new))
+    }
+
+    /// The lowest DR slot (0-3) not already claimed by a hardware breakpoint,
+    /// or an error when all four are in use. Disabled hardware breakpoints keep
+    /// their slot reserved (matching WinDbg's fixed four).
+    fn free_hardware_slot(&self) -> Result<u8> {
+        (0..HW_BREAKPOINT_SLOTS)
+            .find(|slot| {
+                !self
+                    .breakpoints
+                    .values()
+                    .any(|bp| bp.hardware.is_some_and(|hw| hw.slot == *slot))
+            })
+            .ok_or_else(|| {
+                Error::Rsp(format!(
+                    "all {HW_BREAKPOINT_SLOTS} hardware breakpoint slots are in use"
+                ))
+            })
     }
 
     pub fn remove(
@@ -154,11 +331,24 @@ impl BreakpointManager {
         debugger: &Target,
         id: u32,
     ) -> Result<()> {
-        let bp = self.breakpoints.remove(&id).ok_or(Error::BPNotFound(id))?;
+        self.remove_if_uninstalled(id, |bp| Self::uninstall_breakpoint(client, debugger, bp))
+    }
+
+    fn remove_if_uninstalled(
+        &mut self,
+        id: u32,
+        uninstall: impl FnOnce(&Breakpoint) -> Result<()>,
+    ) -> Result<()> {
+        let bp = self
+            .breakpoints
+            .get(&id)
+            .cloned()
+            .ok_or(Error::BPNotFound(id))?;
 
         if bp.enabled {
-            let _ = Self::uninstall_breakpoint(client, debugger, &bp);
+            uninstall(&bp)?;
         }
+        self.breakpoints.remove(&id);
 
         if self.breakpoints.is_empty() {
             self.next_id = 0;
@@ -224,7 +414,7 @@ impl BreakpointManager {
 
         match bp.backend {
             BreakpointBackend::GuestMemoryPatch { original_byte } => {
-                let memory = AddressSpace::new(&debugger.kvm, dtb);
+                let memory = AddressSpace::new(&debugger.phys, dtb);
                 memory.write_bytes(bp.address, &[original_byte])?;
                 client.note_breakpoint_uninstalled(bp.address.0);
                 bp.enabled = false;
@@ -232,6 +422,9 @@ impl BreakpointManager {
             }
             BreakpointBackend::Kernel { .. } => Err(Error::Rsp(
                 "cannot address-space-disable a kernel breakpoint".into(),
+            )),
+            BreakpointBackend::Hardware => Err(Error::Rsp(
+                "cannot address-space-disable a hardware breakpoint".into(),
             )),
         }
     }
@@ -246,10 +439,45 @@ impl BreakpointManager {
         self.breakpoints.values().any(|bp| bp.enabled)
     }
 
+    /// Whether any enabled hardware (DR) breakpoint exists — the cheap gate the
+    /// stop path checks before reading DR6 on a single-step.
+    pub fn has_enabled_hardware_breakpoints(&self) -> bool {
+        self.breakpoints
+            .values()
+            .any(|bp| bp.enabled && bp.hardware.is_some())
+    }
+
+    /// The enabled hardware breakpoint occupying DR slot `slot`, if any — used
+    /// to map a DR6 status bit back to the breakpoint that fired.
+    pub fn hardware_breakpoint_for_slot(&self, slot: u8) -> Option<Breakpoint> {
+        self.breakpoints
+            .values()
+            .find(|bp| bp.enabled && bp.hardware.is_some_and(|hw| hw.slot == slot))
+            .cloned()
+    }
+
+    /// Best-effort release of every DR slot held by a hardware breakpoint
+    /// (enabled or not — disabled ones still reserve their slot). Used by the
+    /// target-reload path before it drops the manager: after a real reboot the
+    /// debug registers are reset anyway, but a reload without a machine reset
+    /// (kernel rediscovery) would otherwise leave orphaned watches raising
+    /// `#DB`s no manager entry can claim.
+    pub fn clear_hardware_slots(&self, client: &mut dyn DebugBackend) {
+        for bp in self.breakpoints.values() {
+            if let Some(hw) = bp.hardware {
+                let _ = client.clear_hardware_breakpoint(hw.slot);
+            }
+        }
+    }
+
     // NOTE refreshing ensures local breakpoint state matches target state in case they were cleared,
     // this should fix single stepping breaking every breakpoint proceeding the step..
     pub fn refresh_enabled(&self, client: &mut dyn DebugBackend, debugger: &Target) -> Result<()> {
-        let mut enabled: Vec<_> = self.breakpoints.values().filter(|bp| bp.enabled).collect();
+        let mut enabled: Vec<_> = self
+            .breakpoints
+            .values()
+            .filter(|bp| bp.enabled && bp.hardware.is_none())
+            .collect();
         enabled.sort_by_key(|bp| bp.id);
 
         for bp in enabled {
@@ -262,7 +490,11 @@ impl BreakpointManager {
 
     pub fn check_breakpoint_hit(&self, rip: u64, cr3: u64) -> BreakpointHitResult {
         for bp in self.breakpoints.values() {
-            if bp.address.0 == rip && bp.enabled && bp.scope.matches_cr3(cr3) {
+            if bp.hardware.is_none()
+                && bp.address.0 == rip
+                && bp.enabled
+                && bp.scope.matches_cr3(cr3)
+            {
                 return BreakpointHitResult::Hit(bp.clone());
             }
         }
@@ -276,9 +508,19 @@ impl BreakpointManager {
         address: VirtAddr,
     ) -> Option<u32> {
         let scope = Self::scope_for_current_context(debugger);
+        self.enabled_software_breakpoint_id(&scope, address)
+    }
+
+    fn enabled_software_breakpoint_id(
+        &self,
+        scope: &BreakpointScope,
+        address: VirtAddr,
+    ) -> Option<u32> {
         self.breakpoints
             .values()
-            .find(|bp| bp.enabled && bp.address == address && bp.scope == scope)
+            .find(|bp| {
+                bp.enabled && bp.hardware.is_none() && bp.address == address && &bp.scope == scope
+            })
             .map(|bp| bp.id)
     }
 
@@ -289,7 +531,7 @@ impl BreakpointManager {
     pub fn mask_breakpoint_bytes(&self, start: VirtAddr, buf: &mut [u8], cr3: u64) {
         let end = start.0.wrapping_add(buf.len() as u64);
         for bp in self.breakpoints.values() {
-            if !bp.enabled || !bp.scope.matches_cr3(cr3) {
+            if !bp.enabled || bp.hardware.is_some() || !bp.scope.matches_cr3(cr3) {
                 continue;
             }
             if bp.address.0 < start.0 || bp.address.0 >= end {
@@ -303,7 +545,7 @@ impl BreakpointManager {
     pub fn breakpoint_id_at_address(&self, rip: u64) -> Option<u32> {
         self.breakpoints
             .values()
-            .find(|bp| bp.enabled && bp.address.0 == rip)
+            .find(|bp| bp.enabled && bp.hardware.is_none() && bp.address.0 == rip)
             .map(|bp| bp.id)
     }
 
@@ -329,7 +571,7 @@ impl BreakpointManager {
                 // Capture the displaced byte before the kernel writes the int3,
                 // so display paths can mask it back out (the kernel owns the
                 // original byte but never hands it to us)
-                let memory = AddressSpace::new(&debugger.kvm, debugger.current_dtb());
+                let memory = AddressSpace::new(&debugger.phys, debugger.current_dtb());
                 let mut original = [0u8; 1];
                 memory.read_bytes(address, &mut original)?;
                 client.set_breakpoint(address.0)?;
@@ -338,7 +580,7 @@ impl BreakpointManager {
                 })
             }
             BreakpointScope::Process { dtb, .. } => {
-                let memory = AddressSpace::new(&debugger.kvm, *dtb);
+                let memory = AddressSpace::new(&debugger.phys, *dtb);
                 let mut original = [0u8; 1];
                 memory.read_bytes(address, &mut original)?;
                 memory.write_bytes(address, &[0xcc])?;
@@ -363,11 +605,17 @@ impl BreakpointManager {
                 client.set_breakpoint(bp.address.0)
             }
             (BreakpointScope::Process { dtb, .. }, BreakpointBackend::GuestMemoryPatch { .. }) => {
-                let memory = AddressSpace::new(&debugger.kvm, *dtb);
+                let memory = AddressSpace::new(&debugger.phys, *dtb);
                 memory.write_bytes(bp.address, &[0xcc])?;
                 client.note_breakpoint_installed(bp.address.0);
                 Ok(())
             }
+            (_, BreakpointBackend::Hardware) => match bp.hardware {
+                Some(hw) => {
+                    client.set_hardware_breakpoint(hw.slot, bp.address.0, hw.access, hw.len)
+                }
+                None => Err(Error::Rsp("hardware breakpoint missing parameters".into())),
+            },
             _ => Err(Error::Rsp("breakpoint backend/scope mismatch".into())),
         }
     }
@@ -385,18 +633,22 @@ impl BreakpointManager {
                 BreakpointScope::Process { dtb, .. },
                 BreakpointBackend::GuestMemoryPatch { original_byte },
             ) => {
-                let memory = AddressSpace::new(&debugger.kvm, *dtb);
+                let memory = AddressSpace::new(&debugger.phys, *dtb);
                 memory.write_bytes(bp.address, &[*original_byte])?;
                 client.note_breakpoint_uninstalled(bp.address.0);
                 Ok(())
             }
+            (_, BreakpointBackend::Hardware) => match bp.hardware {
+                Some(hw) => client.clear_hardware_breakpoint(hw.slot),
+                None => Err(Error::Rsp("hardware breakpoint missing parameters".into())),
+            },
             _ => Err(Error::Rsp("breakpoint backend/scope mismatch".into())),
         }
     }
 
     fn validate_breakpoint_target(debugger: &Target, address: VirtAddr) -> Result<()> {
         let module = Self::find_kernel_module_containing_address(debugger, address);
-        let memory = AddressSpace::new(&debugger.kvm, debugger.current_dtb());
+        let memory = AddressSpace::new(&debugger.phys, debugger.current_dtb());
         let translation = memory
             .virt_to_phys(address)?
             .ok_or(Error::BadVirtualAddress(address))?;
@@ -440,7 +692,6 @@ impl BreakpointManager {
         address: VirtAddr,
     ) -> Option<ModuleInfo> {
         debugger
-            .guest
             .kernel_modules()
             .ok()?
             .into_iter()
@@ -458,10 +709,61 @@ pub enum BreakpointHitResult {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
         Breakpoint, BreakpointBackend, BreakpointHitResult, BreakpointManager, BreakpointScope,
+        HardwareBreakpoint,
     };
+    use crate::dbg_backend::{DebugBackend, HwBreakpointAccess, StopEvent, WatchpointAccess};
+    use crate::error::{Error, Result};
+    use crate::expr::{Expr, ExprBinaryOp};
+    use crate::gdb::RegisterMap;
     use crate::types::VirtAddr;
+
+    #[test]
+    fn failed_uninstall_keeps_breakpoint_managed_for_retry() {
+        let mut manager = BreakpointManager::new();
+        manager.insert_for_test(
+            7,
+            VirtAddr(0x1000),
+            true,
+            Some(HardwareBreakpoint {
+                access: HwBreakpointAccess::Execute,
+                len: 1,
+                slot: 0,
+            }),
+        );
+
+        let result = manager.remove_if_uninstalled(7, |_| {
+            Err(Error::Kd("injected hardware clear failure".into()))
+        });
+        assert!(result.is_err());
+        assert_eq!(manager.list().len(), 1);
+        assert_eq!(manager.list()[0].id, 7);
+        assert!(manager.has_enabled_hardware_breakpoints());
+    }
+
+    #[test]
+    fn exposes_data_watches_without_transport_metadata() {
+        let mut manager = BreakpointManager::new();
+        manager.insert_for_test(
+            7,
+            VirtAddr(0x2000),
+            true,
+            Some(HardwareBreakpoint {
+                access: HwBreakpointAccess::ReadWrite,
+                len: 8,
+                slot: 2,
+            }),
+        );
+
+        let breakpoint = manager.list().into_iter().find(|bp| bp.id == 7).unwrap();
+        assert_eq!(
+            breakpoint.watchpoint(),
+            Some((WatchpointAccess::ReadWrite, 8))
+        );
+    }
 
     #[test]
     fn detects_breakpoint_hit_at_exact_rip() {
@@ -475,7 +777,9 @@ mod tests {
                 symbol: None,
                 scope: BreakpointScope::Kernel,
                 condition: None,
+                condition_expr: None,
                 temporary: false,
+                hardware: None,
                 backend: BreakpointBackend::Kernel {
                     original_byte: 0x90,
                 },
@@ -504,7 +808,9 @@ mod tests {
                     name: "user.exe".to_string(),
                 },
                 condition: None,
+                condition_expr: None,
                 temporary: false,
+                hardware: None,
                 backend: BreakpointBackend::GuestMemoryPatch {
                     original_byte: 0x90,
                 },
@@ -527,5 +833,254 @@ mod tests {
             manager.check_breakpoint_hit(0x7ff7_1234_1000, 0x1234_4000),
             BreakpointHitResult::NotBreakpoint
         ));
+    }
+
+    #[test]
+    fn hardware_breakpoint_is_ignored_by_int3_hit_predicates() {
+        let mut manager = BreakpointManager::new();
+        manager.insert_for_test(
+            0,
+            VirtAddr(0x2000),
+            true,
+            Some(HardwareBreakpoint {
+                access: HwBreakpointAccess::Write,
+                len: 4,
+                slot: 1,
+            }),
+        );
+
+        // A DR watch traps via DR6, not RIP, so it must never register as an
+        // int3 hit even when the faulting RIP equals its address.
+        assert!(matches!(
+            manager.check_breakpoint_hit(0x2000, 0),
+            BreakpointHitResult::NotBreakpoint
+        ));
+        assert_eq!(manager.breakpoint_id_at_address(0x2000), None);
+    }
+
+    #[test]
+    fn has_enabled_hardware_breakpoints_tracks_enabled_hw_bps() {
+        let mut manager = BreakpointManager::new();
+
+        // Software breakpoints do not count toward the DR6 gate.
+        manager.insert_for_test(0, VirtAddr(0x1000), true, None);
+        assert!(!manager.has_enabled_hardware_breakpoints());
+
+        // An enabled hardware breakpoint opens the gate.
+        manager.insert_for_test(
+            1,
+            VirtAddr(0x2000),
+            true,
+            Some(HardwareBreakpoint {
+                access: HwBreakpointAccess::Write,
+                len: 4,
+                slot: 1,
+            }),
+        );
+        assert!(manager.has_enabled_hardware_breakpoints());
+
+        // Disabling that same hardware breakpoint closes it again.
+        manager.breakpoints.get_mut(&1).unwrap().enabled = false;
+        assert!(!manager.has_enabled_hardware_breakpoints());
+    }
+
+    #[test]
+    fn hardware_breakpoint_for_slot_resolves_enabled_slot_only() {
+        let mut manager = BreakpointManager::new();
+        manager.insert_for_test(
+            7,
+            VirtAddr(0x3000),
+            true,
+            Some(HardwareBreakpoint {
+                access: HwBreakpointAccess::ReadWrite,
+                len: 8,
+                slot: 1,
+            }),
+        );
+
+        let found = manager
+            .hardware_breakpoint_for_slot(1)
+            .expect("slot 1 hw bp");
+        assert_eq!(found.id, 7);
+        assert_eq!(found.hardware.expect("hw params").slot, 1);
+
+        // Nothing occupies slot 0.
+        assert!(manager.hardware_breakpoint_for_slot(0).is_none());
+
+        // A disabled hw bp in slot 0 must not be resolved either.
+        manager.insert_for_test(
+            8,
+            VirtAddr(0x4000),
+            false,
+            Some(HardwareBreakpoint {
+                access: HwBreakpointAccess::Write,
+                len: 2,
+                slot: 0,
+            }),
+        );
+        assert!(manager.hardware_breakpoint_for_slot(0).is_none());
+    }
+
+    #[test]
+    fn software_and_hardware_breakpoint_coexist_at_same_address() {
+        let mut manager = BreakpointManager::new();
+        let addr = 0x5000;
+
+        // Software int3 and a DR watch pinned to the same linear address.
+        manager.insert_for_test(0, VirtAddr(addr), true, None);
+        manager.insert_for_test(
+            1,
+            VirtAddr(addr),
+            true,
+            Some(HardwareBreakpoint {
+                access: HwBreakpointAccess::Write,
+                len: 4,
+                slot: 1,
+            }),
+        );
+
+        // The int3 predicate resolves the software bp; the DR watch is skipped
+        // regardless of HashMap iteration order.
+        match manager.check_breakpoint_hit(addr, 0) {
+            BreakpointHitResult::Hit(bp) => {
+                assert_eq!(bp.id, 0);
+                assert!(bp.hardware.is_none());
+            }
+            other => panic!("expected software hit, got {:?}", other),
+        }
+        assert_eq!(manager.breakpoint_id_at_address(addr), Some(0));
+        assert_eq!(
+            manager.enabled_software_breakpoint_id(&BreakpointScope::Kernel, VirtAddr(addr)),
+            Some(0)
+        );
+
+        // A data watch alone cannot satisfy run-to-address: it fires on a data
+        // access, not when execution reaches the watched linear address.
+        manager.breakpoints.remove(&0);
+        assert_eq!(
+            manager.enabled_software_breakpoint_id(&BreakpointScope::Kernel, VirtAddr(addr)),
+            None
+        );
+    }
+
+    #[test]
+    fn condition_compiler_accepts_the_full_expression_grammar() {
+        let source = "$rax == 1 && ($rcx & 0xff) != 0";
+        let compiled = BreakpointManager::compile_condition(Some(source))
+            .unwrap()
+            .expect("compiled condition");
+        assert!(matches!(
+            compiled.as_ref(),
+            Expr::Binary(_, ExprBinaryOp::LogicalAnd, _)
+        ));
+
+        assert!(
+            BreakpointManager::compile_condition(None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(BreakpointManager::compile_condition(Some("$rax == ")).is_err());
+    }
+
+    /// Backend stub that records which DR slots `clear_hardware_breakpoint`
+    /// releases; every other operation is out of scope for these tests.
+    struct SlotRecorder {
+        register_map: RegisterMap,
+        cleared: Vec<u8>,
+    }
+
+    impl SlotRecorder {
+        fn new() -> Self {
+            Self {
+                register_map: RegisterMap::default(),
+                cleared: Vec::new(),
+            }
+        }
+    }
+
+    impl DebugBackend for SlotRecorder {
+        fn register_map(&self) -> &RegisterMap {
+            &self.register_map
+        }
+        fn read_registers(&mut self) -> Result<Vec<u8>> {
+            Err(Error::NotSupported)
+        }
+        fn write_registers(&mut self, _data: &[u8]) -> Result<()> {
+            Err(Error::NotSupported)
+        }
+        fn set_breakpoint(&mut self, _addr: u64) -> Result<()> {
+            Err(Error::NotSupported)
+        }
+        fn remove_breakpoint(&mut self, _addr: u64) -> Result<()> {
+            Err(Error::NotSupported)
+        }
+        fn clear_hardware_breakpoint(&mut self, slot: u8) -> Result<()> {
+            self.cleared.push(slot);
+            Ok(())
+        }
+        fn continue_execution(&mut self) -> Result<()> {
+            Err(Error::NotSupported)
+        }
+        fn step(&mut self) -> Result<()> {
+            Err(Error::NotSupported)
+        }
+        fn interrupt(&mut self) -> Result<StopEvent> {
+            Err(Error::NotSupported)
+        }
+        fn wait_for_stop(&mut self) -> Result<StopEvent> {
+            Err(Error::NotSupported)
+        }
+        fn try_wait_for_stop(&mut self, _timeout: Duration) -> Result<Option<StopEvent>> {
+            Ok(None)
+        }
+        fn thread_list(&mut self) -> Result<Vec<String>> {
+            Err(Error::NotSupported)
+        }
+        fn set_current_thread(&mut self, _thread_id: &str) -> Result<()> {
+            Err(Error::NotSupported)
+        }
+        fn stopped_thread_id(&mut self) -> Result<String> {
+            Err(Error::NotSupported)
+        }
+        fn is_running(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn clear_hardware_slots_releases_every_hw_slot_and_skips_software() {
+        let mut manager = BreakpointManager::new();
+        // Enabled DR watch occupying slot 2.
+        manager.insert_for_test(
+            0,
+            VirtAddr(0x1000),
+            true,
+            Some(HardwareBreakpoint {
+                access: HwBreakpointAccess::Write,
+                len: 4,
+                slot: 2,
+            }),
+        );
+        // A disabled DR watch still reserves slot 0 and must be released too.
+        manager.insert_for_test(
+            1,
+            VirtAddr(0x2000),
+            false,
+            Some(HardwareBreakpoint {
+                access: HwBreakpointAccess::Execute,
+                len: 1,
+                slot: 0,
+            }),
+        );
+        // Software int3: no DR slot, must never reach the backend.
+        manager.insert_for_test(2, VirtAddr(0x3000), true, None);
+
+        let mut backend = SlotRecorder::new();
+        manager.clear_hardware_slots(&mut backend);
+
+        // Exactly the two hardware slots, nothing for the software bp.
+        let mut cleared = backend.cleared.clone();
+        cleared.sort_unstable();
+        assert_eq!(cleared, vec![0, 2]);
     }
 }

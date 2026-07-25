@@ -11,7 +11,55 @@ use crate::unwind::{
 };
 
 pub fn print_section(title: &str) {
-    println!("\n{}", title.bold());
+    println!("\n{}", ui::label(title));
+}
+
+/// Begin a stop block: a blank line. The single seam marking every
+/// stop-output entry point, in case a heavier delimiter is ever wanted.
+pub fn print_stop_separator() {
+    println!();
+}
+
+/// Print the detail lines attached to an event banner: muted `├─` for middle
+/// children, `╰─` for the last. `indent` is 1 space below a badge banner,
+/// 4 spaces for a nested level; it is never derived from the badge width.
+///
+/// Children may contain `\n` (see [`wrap_prose`]): continuation lines get a
+/// `│` gutter while the branch continues, bare spaces after the last child.
+pub fn print_event_children(indent: &str, children: &[String]) {
+    for (idx, child) in children.iter().enumerate() {
+        let last = idx + 1 == children.len();
+        let glyph = if last { "╰─" } else { "├─" };
+        let mut lines = child.lines();
+        if let Some(first) = lines.next() {
+            println!("{indent}{} {}", ui::muted(glyph), first);
+        }
+        for continuation in lines {
+            if last {
+                println!("{indent}   {continuation}");
+            } else {
+                println!("{indent}{}  {continuation}", ui::muted("│"));
+            }
+        }
+    }
+}
+
+/// Wrap plain prose for display starting at terminal column `col`, capped at
+/// 100 columns of prose. Returns a single line when stdout is not a terminal
+/// (piped output wants one line per field) or the terminal is too narrow.
+/// Wrap before styling; width math over ANSI escapes miscounts.
+pub fn wrap_prose(text: &str, col: usize) -> Vec<String> {
+    let Some((terminal_size::Width(w), _)) = terminal_size::terminal_size() else {
+        return vec![text.to_string()];
+    };
+    let width = (w as usize).saturating_sub(col).min(100);
+    if width < 20 {
+        return vec![text.to_string()];
+    }
+    textwrap::wrap(text, width)
+        .into_iter()
+        .map(|line| line.into_owned())
+        .collect()
 }
 
 pub fn format_rflags(flags: u64) -> String {
@@ -56,15 +104,23 @@ pub fn format_rflags(flags: u64) -> String {
 }
 
 /// Print the general-purpose register grid. `embedded` is true inside the
-/// break/status dump (bold `registers` header, 2-space indent); standalone
+/// break/status dump (`registers` section header, 2-space indent); standalone
 /// `registers` passes false so it reads flush-left with no header, matching
 /// `disasm`.
 pub fn print_registers(register_map: &RegisterMap, regs: &[u8], embedded: bool) {
     let read_reg_value = |name: &str| register_map.read_u64(name, regs);
-    let read_reg = |name: &str| -> String {
-        read_reg_value(name)
-            .map(ui::addr)
-            .unwrap_or_else(|_| "N/A".to_string())
+    let styled_value = |name: &str| -> String {
+        match read_reg_value(name) {
+            Ok(value) => ui::addr(value),
+            Err(_) => ui::muted(&format!("{:<16}", "N/A")),
+        }
+    };
+    let cell = |name: &str| {
+        format!(
+            "{} {}",
+            ui::muted(&format!("{name:<3}")),
+            styled_value(name)
+        )
     };
     let rflags = read_reg_value("eflags").unwrap_or(0);
 
@@ -72,48 +128,33 @@ pub fn print_registers(register_map: &RegisterMap, regs: &[u8], embedded: bool) 
     if embedded {
         print_section("registers");
     }
+    for row in [
+        ["rax", "rbx", "rcx"],
+        ["rdx", "rsi", "rdi"],
+        ["rsp", "rbp", "rip"],
+        ["r8", "r9", "r10"],
+        ["r11", "r12", "r13"],
+    ] {
+        println!(
+            "{indent}{}   {}   {}",
+            cell(row[0]),
+            cell(row[1]),
+            cell(row[2])
+        );
+    }
     println!(
-        "{indent}rax {}   rbx {}   rcx {}",
-        read_reg("rax"),
-        read_reg("rbx"),
-        read_reg("rcx")
-    );
-    println!(
-        "{indent}rdx {}   rsi {}   rdi {}",
-        read_reg("rdx"),
-        read_reg("rsi"),
-        read_reg("rdi")
-    );
-    println!(
-        "{indent}rsp {}   rbp {}   rip {}",
-        read_reg("rsp"),
-        read_reg("rbp"),
-        read_reg("rip")
-    );
-    println!(
-        "{indent}r8  {}   r9  {}   r10 {}",
-        read_reg("r8"),
-        read_reg("r9"),
-        read_reg("r10")
-    );
-    println!(
-        "{indent}r11 {}   r12 {}   r13 {}",
-        read_reg("r11"),
-        read_reg("r12"),
-        read_reg("r13")
-    );
-    println!(
-        "{indent}r14 {}   r15 {}   rfl {}{}",
-        read_reg("r14"),
-        read_reg("r15"),
-        read_reg("eflags"),
+        "{indent}{}   {}   {} {}{}",
+        cell("r14"),
+        cell("r15"),
+        ui::muted("rfl"),
+        styled_value("eflags"),
         format_rflags(rflags)
     );
 }
 
 // Decoding lives in core; the REPL owns the *rendering*
 // (`format_disasm_line`/`render_rows` below).
-pub use crate::disasm::{DisasmRow, decode_rows, disasm_formatter};
+pub use crate::disasm::{AsmToken, DisasmRow, decode_rows, disasm_formatter};
 
 /// Width of the byte column for a listing: the longest hex string among the
 /// rows about to be printed, so the asm column always aligns and never gets
@@ -122,17 +163,16 @@ pub fn hex_column_width<'a>(hexes: impl Iterator<Item = &'a str>) -> usize {
     hexes.map(str::len).max().unwrap_or(0)
 }
 
-/// Render one disassembly line in the house style: yellow `>` for the current
-/// instruction, bright_white+bold address, dark-gray space-joined bytes, NASM
-/// asm, and a dimmed `; symbol` comment. The single source of truth for how a
-/// disassembled instruction looks, shared by both disassembly call sites.
+/// Render one disassembly line: yellow `>` cursor on the current
+/// instruction, dim bytes, dim `;` comment with symbol. The single source of
+/// truth for a disassembled instruction, shared by both call sites.
 ///
 /// `hex_width` is the byte column width, computed per listing via
 /// [`hex_column_width`] so the asm column stays aligned without overfilling.
 pub fn format_disasm_line(
     ip: u64,
     hex: &str,
-    asm: &str,
+    tokens: &[AsmToken],
     comment: Option<&str>,
     marker: Option<bool>,
     hex_width: usize,
@@ -140,13 +180,14 @@ pub fn format_disasm_line(
     // `marker` is None for a plain listing (no cursor column); Some(current) for
     // the break/status view, where the current instruction gets a yellow `>`
     let prefix = match marker {
-        Some(true) => format!(" {} ", ">".yellow()),
+        Some(true) => format!(" {} ", ">".yellow().bold()),
         Some(false) => "   ".to_string(),
         None => String::new(),
     };
     let bytes = format!("{hex:<hex_width$}").bright_black().to_string();
+    let asm = ui::disasm_asm(tokens);
     let comment = comment
-        .map(|sym| format!(" ; {}", ui::symbol(sym)))
+        .map(|sym| format!(" {} {}", ui::muted(";"), ui::symbol(sym)))
         .unwrap_or_default();
     format!("{}{}  {}  {}{}", prefix, ui::addr(ip), bytes, asm, comment)
 }
@@ -163,13 +204,31 @@ pub fn render_rows(rows: &[DisasmRow], marker_for: impl Fn(u64) -> Option<bool>)
             format_disasm_line(
                 row.ip,
                 &row.hex,
-                &row.asm,
+                &row.tokens,
                 row.comment.as_deref(),
                 marker_for(row.ip),
                 width,
             )
         );
     }
+}
+
+const DISASM_CONTEXT_BYTES: usize = 64;
+const DISASM_CONTEXT_INSTRUCTIONS: usize = 7;
+
+fn decode_disasm_context(
+    bytes_at_rip: &[u8],
+    rip: u64,
+    resolve: impl Fn(u64) -> String,
+) -> Vec<DisasmRow> {
+    let mut formatter = disasm_formatter();
+    decode_rows(
+        bytes_at_rip,
+        rip,
+        Some(DISASM_CONTEXT_INSTRUCTIONS),
+        &mut formatter,
+        resolve,
+    )
 }
 
 pub fn print_disasm_context(
@@ -180,63 +239,30 @@ pub fn print_disasm_context(
 ) {
     print_section("disasm");
 
-    let pre_bytes: u64 = 64;
-    let post_bytes: u64 = 64;
-    let start_addr = rip.saturating_sub(pre_bytes);
-    let total_len = (pre_bytes + post_bytes) as usize;
-    let active_memory = AddressSpace::new(&debugger.kvm, trace.active_dtb);
+    let active_memory = AddressSpace::new(&debugger.phys, trace.active_dtb);
     let code_dtb = preferred_code_dtb(trace, rip);
-    let code_memory = AddressSpace::new(&debugger.kvm, code_dtb);
+    let code_memory = AddressSpace::new(&debugger.phys, code_dtb);
+    let mut bytes = [0u8; DISASM_CONTEXT_BYTES];
 
-    let mut bytes = vec![0u8; total_len];
-    if active_memory
-        .read_bytes(VirtAddr(start_addr), &mut bytes)
-        .is_err()
+    if active_memory.read_bytes(VirtAddr(rip), &mut bytes).is_err()
         && (code_dtb == trace.active_dtb
-            || code_memory
-                .read_bytes(VirtAddr(start_addr), &mut bytes)
-                .is_err())
+            || code_memory.read_bytes(VirtAddr(rip), &mut bytes).is_err())
     {
         println!("{}", "  (could not read memory at RIP)".bright_black());
         return;
     }
-    breakpoints.mask_breakpoint_bytes(VirtAddr(start_addr), &mut bytes, trace.active_dtb);
+
+    breakpoints.mask_breakpoint_bytes(VirtAddr(rip), &mut bytes, trace.active_dtb);
 
     let resolve = |target: u64| format_symbol(debugger, trace, target);
-    let mut formatter = disasm_formatter();
-    let instructions = decode_rows(&bytes, start_addr, None, &mut formatter, resolve);
-
-    // find which instruction corresponds to RIP
-    let rip_idx = instructions.iter().position(|row| row.ip == rip);
-
-    if let Some(idx) = rip_idx {
-        let context_before = 5;
-        let context_after = 3;
-        let start = idx.saturating_sub(context_before);
-        let end = (idx + context_after + 1).min(instructions.len());
-        render_rows(&instructions[start..end], |ip| Some(ip == rip));
-    } else {
-        let mut forward_buf = vec![0u8; post_bytes as usize];
-        if active_memory
-            .read_bytes(VirtAddr(rip), &mut forward_buf)
-            .is_ok()
-            || (code_dtb != trace.active_dtb
-                && code_memory
-                    .read_bytes(VirtAddr(rip), &mut forward_buf)
-                    .is_ok())
-        {
-            breakpoints.mask_breakpoint_bytes(VirtAddr(rip), &mut forward_buf, trace.active_dtb);
-            let rows = decode_rows(&forward_buf, rip, Some(11), &mut formatter, resolve);
-            render_rows(&rows, |ip| Some(ip == rip));
-        } else {
-            println!("{}", "  (could not read memory at RIP)".bright_black());
-        }
-    }
+    let rows = decode_disasm_context(&bytes, rip, resolve);
+    render_rows(&rows, |ip| Some(ip == rip));
 }
 
-/// Print the stack frames. `embedded` is true inside the break/status dump
-/// (bold `stack` header, 2-space indent); standalone `k` passes false so it
-/// reads flush-left with no header, matching `disasm`.
+/// Print the stack frames. `embedded` is true inside the break/status dump:
+/// bold `stack` header, 2-space indent, and no child-SP column (the return
+/// address is the token you act on). Standalone `k` passes false:
+/// flush-left, full child-SP + retaddr columns.
 pub fn print_stacktrace(
     debugger: &Target,
     register_map: &RegisterMap,
@@ -264,13 +290,22 @@ pub fn print_stacktrace(
         } else {
             format!("  {}{}", ui::symbol(&frame.symbol), suffix)
         };
-        println!(
-            "{indent}#{:<2} {}  {}{}",
-            num,
-            ui::addr(frame.sp),
-            ui::addr(frame.ip),
-            symbol
-        );
+        if embedded {
+            println!(
+                "{indent}{} {}{}",
+                ui::muted(&format!("#{num:<2}")),
+                ui::addr(frame.ip),
+                symbol
+            );
+        } else {
+            println!(
+                "{indent}{} {}  {}{}",
+                ui::muted(&format!("#{num:<2}")),
+                ui::addr(frame.sp),
+                ui::addr(frame.ip),
+                symbol
+            );
+        }
     }
 
     let hidden = stacktrace.frames.len().saturating_sub(display_limit) + stacktrace.truncated;
@@ -279,5 +314,19 @@ pub fn print_stacktrace(
             "{indent}{}",
             format!("... {} more frames", hidden).bright_black()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_disassembly_starts_at_rip_and_only_looks_forward() {
+        let rip = 0xffff_f807_c0e1_3ae0;
+        let rows = decode_disasm_context(&[0x90; 8], rip, |_| String::new());
+        let ips = rows.iter().map(|row| row.ip).collect::<Vec<_>>();
+
+        assert_eq!(ips, (rip..rip + 7).collect::<Vec<_>>());
     }
 }

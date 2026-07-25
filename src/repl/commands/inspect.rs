@@ -4,11 +4,14 @@ use tabled::settings::{Alignment, Modify, Panel};
 
 use owo_colors::OwoColorize;
 
+use crate::bugchecks::bugcheck_from_dump_info;
 use crate::error::{Error, Result};
 use crate::expr::Expr;
 use crate::target::{irp_major_function_name, kthread_state_name, wait_reason_name};
+use crate::trapframe::read_ktrap_frame_at_or_current;
 use crate::types::VirtAddr;
 use crate::ui;
+use crate::unwind::{format_symbol, resolve_thread_trace_context};
 
 use crate::repl::*;
 
@@ -128,6 +131,21 @@ repl_command! {
     completion: Expression,
 }
 
+repl_command! {
+    cmd_trap;
+    names: ["trap", ".trap"],
+    usage: "trap [address-expression]",
+    summary: "Decode and display a _KTRAP_FRAME (defaults to the current thread's saved frame).",
+    completion: Expression,
+}
+
+repl_command! {
+    cmd_analyze();
+    names: ["analyze", "!analyze"],
+    usage: "analyze",
+    summary: "Analyze the current bugcheck (BSOD) from nt!KiBugCheckData.",
+}
+
 impl ReplState<'_> {
     fn cmd_pte(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
         let expr = require_arg!(invocation, 0, "pte");
@@ -171,6 +189,56 @@ impl ReplState<'_> {
             Err(e) => {
                 error!("{}\n", e);
             }
+        }
+
+        Ok(())
+    }
+
+    fn cmd_trap(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let address = match invocation.arg(0) {
+            Some(expr) => match Expr::eval(expr, &self.ctx.target) {
+                Ok(address) => Some(address),
+                Err(e) => {
+                    error!("{}", e);
+                    return Ok(());
+                }
+            },
+            None => None,
+        };
+        match read_ktrap_frame_at_or_current(&self.ctx.target, address) {
+            Ok(frame) => {
+                // Trap frames are kernel structures; resolve the interrupted
+                // rip against the kernel address space like the bugcheck
+                // analysis does.
+                let trace =
+                    resolve_thread_trace_context(&self.ctx.target, self.ctx.target.kernel_dtb());
+                let symbol = format_symbol(&self.ctx.target, &trace, frame.rip);
+                print_ktrap_frame(&frame, Some(&symbol));
+                println!();
+            }
+            Err(e) => {
+                error!("{}", e);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn cmd_analyze(&mut self) -> Result<()> {
+        // Same decode path the stop banner and the SDK/MCP use; on demand so an
+        // already-frozen guest (or a scrolled-away banner) can be re-analyzed.
+        // Dumps whose KiBugCheckData memory is not captured fall back to the
+        // dump header fields, mirroring the MCP/Python surfaces.
+        match current_bugcheck(&self.ctx.target)
+            .or_else(|| bugcheck_from_dump_info(&self.ctx.target))
+        {
+            Some(analysis) => {
+                print_bugcheck_analysis(&analysis);
+                println!();
+            }
+            None => println!(
+                "no bugcheck: nt!KiBugCheckData has no plausible code (guest is not bugchecking)\n"
+            ),
         }
 
         Ok(())
@@ -281,7 +349,7 @@ impl ReplState<'_> {
             self.ctx
                 .register_map
                 .read_u64(name, &regs)
-                .map(|v| format!("{:04x}", v).bright_white().bold().to_string())
+                .map(|v| format!("{:04x}", v))
                 .unwrap_or_else(|_| "N/A".to_string())
         };
 
@@ -357,6 +425,7 @@ impl ReplState<'_> {
                 error!("failed to select execution context: {:?}", e);
                 return Ok(());
             }
+            print_stop_separator();
             print_break_context(
                 &mut *self.ctx.backend,
                 &self.ctx.register_map,
@@ -484,7 +553,7 @@ impl ReplState<'_> {
     /// Render a kernel address as its nearest symbol (styled), falling back to
     /// the bare address when nothing resolves.
     fn fmt_kernel_symbol(&self, a: VirtAddr) -> String {
-        let dtb = self.ctx.target.guest.ntoskrnl.dtb();
+        let dtb = self.ctx.target.kernel_dtb();
         self.ctx
             .target
             .symbols
@@ -688,7 +757,7 @@ impl ReplState<'_> {
             }
         };
 
-        let dtb = self.ctx.target.guest.ntoskrnl.dtb();
+        let dtb = self.ctx.target.kernel_dtb();
         let mut printed = 0;
         let mut last_kind = "";
         for c in &callbacks {
@@ -797,7 +866,7 @@ impl ReplState<'_> {
             return Ok(());
         }
 
-        println!("  {:<16} {:<7} {}", "IRP", "Source", "Details");
+        println!("  {:<16} {:<7} Details", "IRP", "Source");
         for h in &hits {
             let details = if h.source == "thread" {
                 format!(

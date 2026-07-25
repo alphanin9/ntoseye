@@ -5,28 +5,34 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use pyo3::class::basic::CompareOp;
 use pyo3::IntoPyObjectExt;
+use pyo3::class::basic::CompareOp;
 use pyo3::exceptions::{PyAttributeError, PyKeyError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyList};
 
+type DisassemblyRow = (u64, String, String, Option<String>);
+
 use crate::backend::MemoryOps;
-use crate::bugchecks::{analyze_bugcheck, current_bugcheck};
-use crate::dbg_backend::DebugBackend;
+use crate::bugchecks::{analyze_bugcheck, bugcheck_from_dump_info, current_bugcheck};
+use crate::dbg_backend::{DebugBackend, WatchpointAccess};
+use crate::dmp::DmpBackend;
 use crate::error::Error;
 use crate::expr::Expr;
-use crate::gdb::breakpoints::Breakpoint as CoreBreakpoint;
 use crate::gdb::GdbClient;
+use crate::gdb::breakpoints::Breakpoint as CoreBreakpoint;
 use crate::kd::KdBackend;
 use crate::memory_backend::MemoryBackend;
+use crate::phys::PhysMem;
 use crate::repl::ReplState;
+use crate::resolve_target;
 use crate::session::{ContinueOutcome, Session};
 use crate::symbols::{FieldValue, ParsedType, TypeInfo, le_uint};
 use crate::target::{
     AddressModule as CoreAddressModule, MemoryRegionInfo,
     MemorySearchMatch as CoreMemorySearchMatch,
 };
+use crate::trapframe::read_ktrap_frame_at_or_current;
 use crate::types::VirtAddr;
 use crate::view;
 
@@ -51,6 +57,7 @@ fn err(e: Error) -> PyErr {
     let msg = e.to_string();
     match e {
         Error::BadVirtualAddress(_)
+        | Error::AddressNotInDump(_)
         | Error::BadPhysicalAddress(_)
         | Error::PartialRead(_)
         | Error::PartialWrite(_)
@@ -108,9 +115,9 @@ fn breakpoint_id_arg(value: &Bound<'_, PyAny>, session_id: usize) -> PyResult<u3
         }
         return Ok(bp.id());
     }
-    value.extract::<u32>().map_err(|_| {
-        PyTypeError::new_err("expected a breakpoint id or ntoseye.Breakpoint handle")
-    })
+    value
+        .extract::<u32>()
+        .map_err(|_| PyTypeError::new_err("expected a breakpoint id or ntoseye.Breakpoint handle"))
 }
 
 fn breakpoint_target_arg(
@@ -170,8 +177,7 @@ impl SessionHandle {
 }
 
 /// Panic message when a borrowed handle is used after its command returned.
-const STALE_BORROW: &str =
-    "ntoseye: use of a Debugger (or a Struct/Type derived from it) after the REPL command \
+const STALE_BORROW: &str = "ntoseye: use of a Debugger (or a Struct/Type derived from it) after the REPL command \
      that created it returned; borrowed handles are valid only inside that command and must \
      not be stashed across calls";
 
@@ -215,6 +221,8 @@ struct BreakpointSnapshot {
     scope: String,
     condition: Option<String>,
     temporary: bool,
+    watch_access: Option<String>,
+    watch_length: Option<u8>,
 }
 
 impl BreakpointSnapshot {
@@ -227,13 +235,15 @@ impl BreakpointSnapshot {
             scope: bp.scope.label(),
             condition: bp.condition.clone(),
             temporary: bp.temporary,
+            watch_access: bp.watch_access_name().map(str::to_string),
+            watch_length: bp.watch_length(),
         }
     }
 }
 
-/// A live breakpoint handle. Equality is debugger-session + breakpoint id, so
-/// a handle returned from `dbg.breakpoint(...)` compares equal to the handle
-/// surfaced later in `outcome.breakpoints`.
+/// A live code-breakpoint or data-watchpoint handle. Equality is debugger
+/// session + stop-point id, so a handle returned from `dbg.breakpoint(...)`
+/// compares equal to the handle surfaced later in `outcome.breakpoints`.
 #[pyclass(unsendable)]
 pub struct Breakpoint {
     dbg: Option<Py<Debugger>>,
@@ -252,16 +262,17 @@ impl Breakpoint {
             .map(BreakpointSnapshot::from_core)
     }
 
-    fn require_live_debugger<'py>(
-        &'py self,
-        py: Python<'py>,
-    ) -> PyResult<PyRefMut<'py, Debugger>> {
+    fn require_live_debugger<'py>(&'py self, py: Python<'py>) -> PyResult<PyRefMut<'py, Debugger>> {
         let Some(dbg) = &self.dbg else {
-            return Err(raise("breakpoint handle is not attached to a live debugger"));
+            return Err(raise(
+                "breakpoint handle is not attached to a live debugger",
+            ));
         };
         let dbg = dbg.borrow_mut(py);
         if dbg.session_id() != self.session_id {
-            return Err(raise("breakpoint handle belongs to a different debugger session"));
+            return Err(raise(
+                "breakpoint handle belongs to a different debugger session",
+            ));
         }
         Ok(dbg)
     }
@@ -299,6 +310,24 @@ impl Breakpoint {
         self.snapshot.temporary
     }
 
+    /// Whether this stop point watches data access rather than code execution.
+    #[getter]
+    fn watchpoint(&self) -> bool {
+        self.snapshot.watch_access.is_some()
+    }
+
+    /// Watched access (`"write"` or `"read_write"`), or `None` for a code breakpoint.
+    #[getter]
+    fn watch_access(&self) -> Option<String> {
+        self.snapshot.watch_access.clone()
+    }
+
+    /// Watched byte width, or `None` for a code breakpoint.
+    #[getter]
+    fn watch_length(&self) -> Option<u8> {
+        self.snapshot.watch_length
+    }
+
     #[getter]
     fn valid(&self, py: Python<'_>) -> bool {
         self.live_snapshot(py).is_some()
@@ -310,9 +339,7 @@ impl Breakpoint {
 
     #[getter]
     fn enabled(&self, py: Python<'_>) -> bool {
-        self.live_snapshot(py)
-            .map(|bp| bp.enabled)
-            .unwrap_or(false)
+        self.live_snapshot(py).map(|bp| bp.enabled).unwrap_or(false)
     }
 
     #[setter]
@@ -351,7 +378,7 @@ impl Breakpoint {
     }
 
     /// The flat mapping `{id, address, enabled, symbol, scope, condition,
-    /// temporary}` (the shape the breakpoint lister used to return directly).
+    /// temporary, watchpoint, watch_access, watch_length}`.
     /// `enabled` reflects the live state when the handle is still valid.
     fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let d = PyDict::new(py);
@@ -362,6 +389,9 @@ impl Breakpoint {
         d.set_item("scope", self.snapshot.scope.clone())?;
         d.set_item("condition", self.snapshot.condition.clone())?;
         d.set_item("temporary", self.snapshot.temporary)?;
+        d.set_item("watchpoint", self.watchpoint())?;
+        d.set_item("watch_access", self.snapshot.watch_access.clone())?;
+        d.set_item("watch_length", self.snapshot.watch_length)?;
         Ok(d)
     }
 
@@ -380,6 +410,11 @@ impl Breakpoint {
 
     fn __repr__(&self, py: Python<'_>) -> String {
         let state = if self.valid(py) { "valid" } else { "invalid" };
+        let kind = if self.watchpoint() {
+            "Watchpoint"
+        } else {
+            "Breakpoint"
+        };
         let symbol = self
             .snapshot
             .symbol
@@ -387,7 +422,7 @@ impl Breakpoint {
             .map(|s| format!(" {s}"))
             .unwrap_or_default();
         format!(
-            "<Breakpoint #{} at {:#x}{} {}>",
+            "<{kind} #{} at {:#x}{} {}>",
             self.snapshot.id, self.snapshot.address, symbol, state
         )
     }
@@ -396,6 +431,7 @@ impl Breakpoint {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StopKind {
     Breakpoint,
+    Watchpoint,
     Bugcheck,
     Exception,
     Step,
@@ -408,6 +444,7 @@ impl StopKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Breakpoint => "breakpoint",
+            Self::Watchpoint => "watchpoint",
             Self::Bugcheck => "bugcheck",
             Self::Exception => "exception",
             Self::Step => "step",
@@ -426,6 +463,7 @@ struct StopOutcomeData {
     breakpoints: Vec<BreakpointSnapshot>,
     address: Option<u64>,
     temporary: Option<bool>,
+    condition_error: Option<String>,
     exception_code: Option<u32>,
     bugcheck_info: Option<Py<PyAny>>,
     kernel_base: Option<u64>,
@@ -714,7 +752,12 @@ impl StopOutcome {
 
     #[getter]
     fn breakpoint_stop(&self) -> bool {
-        self.data.kind == StopKind::Breakpoint
+        matches!(self.data.kind, StopKind::Breakpoint | StopKind::Watchpoint)
+    }
+
+    #[getter]
+    fn watchpoint(&self) -> bool {
+        self.data.kind == StopKind::Watchpoint
     }
 
     #[getter]
@@ -797,6 +840,13 @@ impl StopOutcome {
         self.data.temporary
     }
 
+    /// Error from evaluating a breakpoint/watchpoint condition. Such a stop is
+    /// surfaced rather than silently skipped.
+    #[getter]
+    fn condition_error(&self) -> Option<String> {
+        self.data.condition_error.clone()
+    }
+
     #[getter]
     fn exception_code(&self) -> Option<u32> {
         self.data.exception_code
@@ -824,7 +874,7 @@ impl StopOutcome {
         let d = PyDict::new(py);
         d.set_item("stop", self.reason())?;
         match self.data.kind {
-            StopKind::Breakpoint => {
+            StopKind::Breakpoint | StopKind::Watchpoint => {
                 d.set_item("rip", self.data.rip)?;
                 if let Some(bp) = self.data.breakpoints.first() {
                     d.set_item("id", bp.id)?;
@@ -832,7 +882,10 @@ impl StopOutcome {
                     d.set_item("address", self.data.address.unwrap_or(bp.address))?;
                     d.set_item("symbol", self.data.symbol.clone())?;
                     d.set_item("temporary", self.data.temporary.unwrap_or(bp.temporary))?;
+                    d.set_item("watch_access", bp.watch_access.clone())?;
+                    d.set_item("watch_length", bp.watch_length)?;
                 }
+                d.set_item("condition_error", self.data.condition_error.clone())?;
                 d.set_item("process", self.data.process.clone())?;
             }
             StopKind::Bugcheck => {
@@ -909,7 +962,7 @@ impl Debugger {
             )));
         }
         let mut buf = vec![0u8; len];
-        let process = self.inner.target.current_process();
+        let process = self.inner.target.current_process().map_err(err)?;
         process
             .memory()
             .read_bytes(VirtAddr(addr), &mut buf)
@@ -950,7 +1003,12 @@ impl Debugger {
         self.inner
             .target
             .search_details(VirtAddr(start), pattern, length)
-            .map(|matches| matches.into_iter().map(MemorySearchMatch::from_core).collect())
+            .map(|matches| {
+                matches
+                    .into_iter()
+                    .map(MemorySearchMatch::from_core)
+                    .collect()
+            })
             .map_err(err)
     }
 
@@ -961,6 +1019,7 @@ impl Debugger {
         self.inner
             .target
             .current_process()
+            .map_err(err)?
             .memory()
             .write_bytes(VirtAddr(addr), data)
             .map_err(err)
@@ -1091,10 +1150,11 @@ impl Debugger {
     /// This is the scope-aware run-control loop shared with the REPL and MCP: it
     /// silently steps over and resumes past wrong-process int3 hits (a breakpoint
     /// scoped to one process whose `int3` lives on a shared page) and false
-    /// conditional breakpoints, so only the relevant hit surfaces. With
-    /// `timeout_ms` it returns an outcome with `running` true if nothing stopped
-    /// in that window (poll again); with `timeout_ms=None` it blocks until a
-    /// stop, checking for Ctrl+C between polls.
+    /// conditional breakpoints, so only the relevant hit surfaces. A condition
+    /// evaluation error surfaces the stop with [`StopOutcome::condition_error`].
+    /// With `timeout_ms` it returns an outcome with `running` true if nothing
+    /// stopped in that window (poll again); with `timeout_ms=None` it blocks until
+    /// a stop, checking for Ctrl+C between polls.
     #[pyo3(signature = (timeout_ms=None))]
     fn run<'py>(
         slf: Bound<'py, Self>,
@@ -1236,9 +1296,14 @@ impl Debugger {
     /// Analyze the current bugcheck (BSOD) by reading `nt!KiBugCheckData` from
     /// the frozen guest. Returns a dict `{code, code_hex, name, description,
     /// driver, args: [{index, value, description}], fault: {ip, symbol, driver},
-    /// source}`, or `None` if the guest is not bugchecking.
+    /// trap_frames: [{address, rip_symbol, frame, error}], source}` where each
+    /// `frame` is the decoded `_KTRAP_FRAME` registers, or `None` with `error`
+    /// explaining why decoding failed. Returns `None` if the guest is not
+    /// bugchecking.
     fn bugcheck<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
-        match current_bugcheck(&self.inner.target) {
+        match current_bugcheck(&self.inner.target)
+            .or_else(|| bugcheck_from_dump_info(&self.inner.target))
+        {
             Some(analysis) => Ok(Some(view_dict(py, &view::bugcheck(&analysis))?)),
             None => Ok(None),
         }
@@ -1389,6 +1454,7 @@ impl Debugger {
         self.inner
             .target
             .current_process()
+            .map_err(err)?
             .memory()
             .read_bytes(VirtAddr(addr), &mut buf)
             .map_err(err)?;
@@ -1467,16 +1533,32 @@ impl Debugger {
     /// Disassemble `count` instructions at `addr` in the current address space.
     /// Returns `(ip, hex_bytes, asm, comment)` tuples; our own breakpoint `int3`
     /// bytes are masked and branch/rip-relative targets get symbol comments.
-    fn disassemble(
-        &self,
-        addr: u64,
-        count: usize,
-    ) -> PyResult<Vec<(u64, String, String, Option<String>)>> {
+    fn disassemble(&self, addr: u64, count: usize) -> PyResult<Vec<DisassemblyRow>> {
         let rows = self.inner.disassemble(VirtAddr(addr), count).map_err(err)?;
         Ok(rows
             .into_iter()
-            .map(|r| (r.ip, r.hex, r.asm, r.comment))
+            .map(|r| {
+                let asm = r.asm();
+                (r.ip, r.hex, asm, r.comment)
+            })
             .collect())
+    }
+
+    /// Decode an x64 `_KTRAP_FRAME` at `address`, or the current Windows
+    /// thread's saved trap frame when omitted.
+    #[pyo3(signature = (address=None))]
+    fn inspect_trap_frame<'py>(
+        &self,
+        py: Python<'py>,
+        address: Option<u64>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let frame = read_ktrap_frame_at_or_current(&self.inner.target, address.map(VirtAddr))
+            .map_err(err)?;
+        let rip_symbol = self
+            .inner
+            .target
+            .closest_symbol_current_context(VirtAddr(frame.rip));
+        view_dict(py, &view::trap_frame(&frame, rip_symbol))
     }
 
     /// Walk the current thread's call stack. Returns up to `limit` frames
@@ -1612,7 +1694,7 @@ impl Debugger {
             .target
             .enumerate_notify_callbacks()
             .map_err(err)?;
-        let dtb = self.inner.target.guest.ntoskrnl.dtb();
+        let dtb = self.inner.target.guest().map_err(err)?.ntoskrnl.dtb();
         let rows: Vec<view::View> = cbs
             .iter()
             .map(|c| {
@@ -1713,7 +1795,7 @@ impl Debugger {
 
     /// Loaded kernel modules as `(name, base, size)` tuples.
     fn kernel_modules(&self) -> PyResult<Vec<(String, u64, u32)>> {
-        let mods = self.inner.target.guest.kernel_modules().map_err(err)?;
+        let mods = self.inner.target.kernel_modules().map_err(err)?;
         Ok(mods
             .into_iter()
             .map(|m| (m.name, m.base_address.0, m.size))
@@ -1822,9 +1904,9 @@ impl Debugger {
 
     // --- breakpoints ---
 
-    /// Set a code breakpoint at `addr` with an optional break `condition`
-    /// (re-evaluated each hit; the run loop steps over and keeps going when it's
-    /// false). Returns the breakpoint id.
+    /// Set a code breakpoint at `addr` with an optional break `condition`,
+    /// parsed with the normal expression grammar and re-evaluated each hit. The
+    /// run loop steps over and keeps going when the condition is false.
     #[pyo3(signature = (addr, condition=None))]
     fn set_breakpoint(&mut self, addr: u64, condition: Option<String>) -> PyResult<u32> {
         self.require_halted("set_breakpoint")?;
@@ -1863,33 +1945,75 @@ impl Debugger {
         })
     }
 
-    /// Remove a breakpoint by id or handle.
+    /// Watch data access at an address or debugger expression. `access` is
+    /// `"write"` or `"read_write"`; x86 cannot trap reads without also
+    /// trapping writes. `length` is 1, 2, 4, or 8 and requires natural
+    /// alignment. Watches are global across guest address spaces and currently
+    /// require KD. Returns a live stop-point handle.
+    #[pyo3(signature = (target, *, access="write", length=1, condition=None))]
+    fn watchpoint(
+        slf: Bound<'_, Self>,
+        target: &Bound<'_, PyAny>,
+        access: &str,
+        length: u8,
+        condition: Option<String>,
+    ) -> PyResult<Breakpoint> {
+        let (session_id, snapshot) = {
+            let mut dbg = slf.borrow_mut();
+            dbg.require_halted("watchpoint")?;
+            let access = access.parse::<WatchpointAccess>().map_err(err)?;
+            let (addr, symbol) = breakpoint_target_arg(&dbg, target)?;
+            let id = dbg
+                .inner
+                .add_watchpoint_with_symbol_condition(
+                    VirtAddr(addr),
+                    access,
+                    length,
+                    symbol,
+                    condition,
+                )
+                .map_err(err)?;
+            let snapshot = dbg
+                .inner
+                .breakpoint(id)
+                .map(BreakpointSnapshot::from_core)
+                .ok_or_else(|| raise(format!("watchpoint {id} disappeared after install")))?;
+            (dbg.session_id(), snapshot)
+        };
+        Ok(Breakpoint {
+            dbg: Some(slf.unbind()),
+            session_id,
+            snapshot,
+        })
+    }
+
+    /// Remove a breakpoint or watchpoint by id or handle.
     fn clear_breakpoint(&mut self, id: &Bound<'_, PyAny>) -> PyResult<()> {
         let id = breakpoint_id_arg(id, self.session_id())?;
         self.require_halted("clear_breakpoint")?;
         self.inner.remove_breakpoint(id).map_err(err)
     }
 
-    /// Re-arm a disabled breakpoint by id or handle (re-patch its `int3`).
+    /// Re-arm a disabled breakpoint or watchpoint by id or handle.
     fn enable_breakpoint(&mut self, id: &Bound<'_, PyAny>) -> PyResult<()> {
         let id = breakpoint_id_arg(id, self.session_id())?;
         self.require_halted("enable_breakpoint")?;
         self.inner.enable_breakpoint(id).map_err(err)
     }
 
-    /// Disable a breakpoint by id (restore the original byte) without forgetting
-    /// it, so it can be re-enabled later.
+    /// Disable a breakpoint or watchpoint by id without forgetting it, so it
+    /// can be re-enabled later.
     fn disable_breakpoint(&mut self, id: &Bound<'_, PyAny>) -> PyResult<()> {
         let id = breakpoint_id_arg(id, self.session_id())?;
         self.require_halted("disable_breakpoint")?;
         self.inner.disable_breakpoint(id).map_err(err)
     }
 
-    /// List the installed breakpoints as live [`Breakpoint`] handles (the same
-    /// handle type `breakpoint()` returns and `outcome.breakpoints` surfaces, so
-    /// the listed entries can be cleared/enabled/disabled directly). Inspect a
-    /// handle's `id`/`address`/`scope`/etc. properties, or `to_dict()` for the
-    /// flat mapping.
+    /// List installed code breakpoints and data watchpoints as live
+    /// [`Breakpoint`] handles. The same handle type is returned by
+    /// `breakpoint()`, `watchpoint()`, and `outcome.breakpoints`; entries can
+    /// be cleared/enabled/disabled directly. Inspect `watchpoint`,
+    /// `watch_access`, and `watch_length` to distinguish data watches.
     fn breakpoints(slf: Bound<'_, Self>) -> Vec<Breakpoint> {
         let dbg = slf.borrow();
         let session_id = dbg.session_id();
@@ -2015,6 +2139,7 @@ impl Debugger {
                 symbol,
                 temporary,
                 rip,
+                condition_error,
             } => {
                 let snapshot = self
                     .inner
@@ -2028,9 +2153,16 @@ impl Debugger {
                         scope: "unknown".to_string(),
                         condition: None,
                         temporary,
+                        watch_access: None,
+                        watch_length: None,
                     });
+                let kind = if snapshot.watch_access.is_some() {
+                    StopKind::Watchpoint
+                } else {
+                    StopKind::Breakpoint
+                };
                 StopOutcomeData {
-                    kind: StopKind::Breakpoint,
+                    kind,
                     rip: Some(rip),
                     symbol: snapshot
                         .symbol
@@ -2040,6 +2172,7 @@ impl Debugger {
                     breakpoints: vec![snapshot],
                     address: Some(address),
                     temporary: Some(temporary),
+                    condition_error,
                     exception_code: None,
                     bugcheck_info: None,
                     kernel_base: None,
@@ -2049,7 +2182,8 @@ impl Debugger {
             ContinueOutcome::Bugcheck { rip, info } => {
                 let analysis = info
                     .map(|i| analyze_bugcheck(&self.inner.target, &i))
-                    .or_else(|| current_bugcheck(&self.inner.target));
+                    .or_else(|| current_bugcheck(&self.inner.target))
+                    .or_else(|| bugcheck_from_dump_info(&self.inner.target));
                 let bugcheck_info = match analysis {
                     Some(a) => Some(view_dict(py, &view::bugcheck(&a))?.into_any().unbind()),
                     None => None,
@@ -2062,6 +2196,7 @@ impl Debugger {
                     breakpoints: Vec::new(),
                     address: None,
                     temporary: None,
+                    condition_error: None,
                     exception_code: None,
                     bugcheck_info,
                     kernel_base: None,
@@ -2079,6 +2214,7 @@ impl Debugger {
                 breakpoints: Vec::new(),
                 address: None,
                 temporary: None,
+                condition_error: None,
                 exception_code,
                 bugcheck_info: None,
                 kernel_base: None,
@@ -2092,6 +2228,7 @@ impl Debugger {
                 breakpoints: Vec::new(),
                 address: None,
                 temporary: None,
+                condition_error: None,
                 exception_code: None,
                 bugcheck_info: None,
                 kernel_base: None,
@@ -2108,6 +2245,7 @@ impl Debugger {
                 breakpoints: Vec::new(),
                 address: None,
                 temporary: None,
+                condition_error: None,
                 exception_code: None,
                 bugcheck_info: None,
                 kernel_base,
@@ -2121,6 +2259,7 @@ impl Debugger {
                 breakpoints: Vec::new(),
                 address: None,
                 temporary: None,
+                condition_error: None,
                 exception_code: None,
                 bugcheck_info: None,
                 kernel_base: None,
@@ -2134,6 +2273,7 @@ impl Debugger {
                 breakpoints: Vec::new(),
                 address: None,
                 temporary: None,
+                condition_error: None,
                 exception_code: None,
                 bugcheck_info: None,
                 kernel_base: None,
@@ -2150,6 +2290,7 @@ impl Debugger {
         self.inner
             .target
             .current_process()
+            .map_err(err)?
             .memory()
             .read_bytes(VirtAddr(addr), &mut buf)
             .map_err(err)?;
@@ -2293,7 +2434,7 @@ impl Struct {
             .ok_or_else(|| raise("unknown type: _UNICODE_STRING"))?;
         let len_off = us.field_offset("Length").map_err(err)?;
         let buf_off = us.field_offset("Buffer").map_err(err)?;
-        let process = dbg.inner.target.current_process();
+        let process = dbg.inner.target.current_process().map_err(err)?;
         let mem = process.memory();
 
         let mut b2 = [0u8; 2];
@@ -2329,7 +2470,7 @@ impl Struct {
             .ok_or_else(|| raise(format!("{} has no field '{}'", self.name, name)))?;
         let addr = self.base + field.offset as u64;
         let dbg = self.dbg.borrow(py);
-        let process = dbg.inner.target.current_process();
+        let process = dbg.inner.target.current_process().map_err(err)?;
         let mem = process.memory();
 
         match &field.type_data {
@@ -2343,7 +2484,7 @@ impl Struct {
                 let (pos, len) = (*pos as u32, *len as u32);
                 // Touch only the bytes the bitfield actually spans, so we never
                 // clobber neighbouring fields that share the storage unit.
-                let sz = (((pos + len + 7) / 8).clamp(1, 8)) as usize;
+                let sz = ((pos + len).div_ceil(8).clamp(1, 8)) as usize;
                 let mut buf = vec![0u8; sz];
                 mem.read_bytes(VirtAddr(addr), &mut buf).map_err(err)?;
                 let mask = if len >= 64 {
@@ -2366,11 +2507,11 @@ impl Struct {
             }
             _ => {
                 let sz = field.size as usize;
-                if matches!(sz, 1 | 2 | 4 | 8) {
-                    if let Ok(v) = value.extract::<u64>() {
-                        let bytes = v.to_le_bytes();
-                        return mem.write_bytes(VirtAddr(addr), &bytes[..sz]).map_err(err);
-                    }
+                if matches!(sz, 1 | 2 | 4 | 8)
+                    && let Ok(v) = value.extract::<u64>()
+                {
+                    let bytes = v.to_le_bytes();
+                    return mem.write_bytes(VirtAddr(addr), &bytes[..sz]).map_err(err);
                 }
                 let bytes: Vec<u8> = value.extract().map_err(|_| {
                     raise(format!(
@@ -2423,6 +2564,7 @@ impl Struct {
             dbg.inner
                 .target
                 .current_process()
+                .map_err(err)?
                 .memory()
                 .read_bytes(VirtAddr(addr), &mut buf)
                 .map_err(err)?;
@@ -2523,6 +2665,7 @@ impl Struct {
             dbg.inner
                 .target
                 .current_process()
+                .map_err(err)?
                 .memory()
                 .read_bytes(VirtAddr(addr), &mut b)
                 .map_err(err)?;
@@ -2645,31 +2788,48 @@ impl Struct {
 
 /// Attach to a guest and return a [`Debugger`].
 ///
-/// `backend` is one of `"kd"` (default), `"gdb"`, or `"memory"`. `connect` is
-/// the backend target (socket path / address); the per-backend default is used
-/// when omitted.
+/// `backend` is one of `"kd"` (default), `"gdb"`, `"memory"`, or `"dmp"`.
+/// `connect` is the backend target: socket path / address for kd/gdb, or
+/// dump file path for dmp; the per-backend default is used when omitted
+/// (except dmp, which requires a path).
+///
+/// kd/gdb take a per-target instance lock before building the backend, so a
+/// second live attach against the same target (here or against a running CLI)
+/// fails fast rather than racing on the handshake the first session owns;
+/// memory/dmp are passive and coexist with anything.
 #[pyfunction]
 #[pyo3(signature = (backend="kd", connect=None))]
 fn attach(backend: &str, connect: Option<&str>) -> PyResult<Debugger> {
-    // `connect` takes the single-instance lock before building the backend, so a
-    // second attach (here or against a running CLI) fails fast rather than racing
-    // on the handshake the first session owns.
-    let inner = Session::connect(|| {
-        let be: Box<dyn DebugBackend> = match backend {
-            "gdb" => Box::new(GdbClient::connect(connect.unwrap_or("127.0.0.1:1234"))?),
-            "kd" => Box::new(KdBackend::connect(
-                connect.unwrap_or("/tmp/ntoseye-kd.sock"),
-            )?),
-            "memory" => Box::new(MemoryBackend::new()),
-            other => {
-                return Err(Error::DebugInfo(format!(
-                    "unknown backend '{other}': expected 'kd', 'gdb', or 'memory'"
-                )));
-            }
-        };
-        Ok(be)
-    })
-    .map_err(err)?;
+    let inner = if backend == "dmp" {
+        let path = connect.ok_or_else(|| {
+            err(Error::DebugInfo(
+                "dmp backend requires a dump file path via connect=".into(),
+            ))
+        })?;
+        let phys = Arc::new(PhysMem::dmp(std::path::Path::new(path)).map_err(err)?);
+        let info = phys.dmp_info().expect("dmp_info for DMP").clone();
+        Session::connect(phys, None, || {
+            Ok(Box::new(DmpBackend::new(&info)) as Box<dyn DebugBackend>)
+        })
+        .map_err(err)?
+    } else {
+        let target = resolve_target(backend, connect);
+        let phys = Arc::new(PhysMem::kvm().map_err(err)?);
+        Session::connect(phys, target.as_deref(), || {
+            let be: Box<dyn DebugBackend> = match backend {
+                "gdb" => Box::new(GdbClient::connect(target.as_deref().unwrap())?),
+                "kd" => Box::new(KdBackend::connect(target.as_deref().unwrap())?),
+                "memory" => Box::new(MemoryBackend::new()),
+                other => {
+                    return Err(Error::DebugInfo(format!(
+                        "unknown backend '{other}': expected 'kd', 'gdb', 'memory', or 'dmp'"
+                    )));
+                }
+            };
+            Ok(be)
+        })
+        .map_err(err)?
+    };
     Ok(Debugger {
         inner: SessionHandle::Owned(Box::new(inner)),
     })
@@ -2735,6 +2895,8 @@ mod tests {
                         scope: "global".to_string(),
                         condition: None,
                         temporary: false,
+                        watch_access: None,
+                        watch_length: None,
                     },
                 },
             )
