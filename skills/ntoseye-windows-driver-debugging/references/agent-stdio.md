@@ -122,7 +122,9 @@ Stop responses carry `running`, `stopped`, a `stop` kind (`"breakpoint"`, `"bugc
 
 x86 rules are enforced up front: execute watches are always 1 byte, data widths are 1/2/4/8, and the address must be aligned to its own length — an unaligned debug register silently never fires, so this is rejected rather than accepted quietly. `length` is echoed in the response, since the default is the narrowest legal width rather than an inferred one.
 
-There are only four debug registers, so a fifth concurrent hardware breakpoint fails with "all 4 hardware breakpoint slots are in use". The response and `bp.list` report which `slot` (DR0-3) each occupies; hits are identified by DR6 rather than by RIP, so the slot is how a client correlates them.
+There are only four debug registers, so a fifth concurrent hardware breakpoint fails with "all 4 hardware breakpoint slots are in use". The response and `bp.list` report which `slot` (DR0-3) each occupies; hits are identified by DR6 rather than by RIP, so the slot is how a client correlates them. That matters for a data watch, where RIP is the *writing* instruction, not the watched address.
+
+Do not try to confirm a hit by reading `dr6` afterwards: the stop path maps the B0-B3 status bits to a slot and then clears them, because the CPU never does and a stale bit would make the next single-step re-report the same hit. By the time `registers` runs, `dr6` reads back with those bits clear (e.g. `0xffff0ff0`) even though the hit was attributed from them. Use the `breakpoint.id` in the stop envelope.
 
 ```json
 {"id":1,"command":"bp.set","address":"mydrv!g_Counter","kind":"hardware","access":"write","length":8}

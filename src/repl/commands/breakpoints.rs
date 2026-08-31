@@ -135,7 +135,7 @@ fn parse_hw_breakpoint_spec(spec: &str) -> Result<(HwBreakpointAccess, u8)> {
         Some('w') => HwBreakpointAccess::Write,
         Some('r') => HwBreakpointAccess::ReadWrite,
         _ => {
-            return Err(Error::Rsp(format!(
+            return Err(Error::Breakpoint(format!(
                 "invalid access in '{spec}' (use e=execute, r=read/write, w=write)"
             )));
         }
@@ -145,13 +145,13 @@ fn parse_hw_breakpoint_spec(spec: &str) -> Result<(HwBreakpointAccess, u8)> {
         // Execute watches are always a single byte; allow the bare `e`.
         "" if matches!(access, HwBreakpointAccess::Execute) => 1,
         "" => {
-            return Err(Error::Rsp(format!(
+            return Err(Error::Breakpoint(format!(
                 "missing size in '{spec}' (e.g. ba w4 <address>)"
             )));
         }
         other => other
             .parse()
-            .map_err(|_| Error::Rsp(format!("invalid size '{other}' (use 1, 2, 4, or 8)")))?,
+            .map_err(|_| Error::Breakpoint(format!("invalid size '{other}' (use 1, 2, 4, or 8)")))?,
     };
     Ok((access, len))
 }
@@ -177,7 +177,7 @@ impl ReplState<'_> {
             .or_else(|| value.strip_prefix("0X"))
             .unwrap_or(value);
         u64::from_str_radix(value, self.radix.value())
-            .map_err(|_| Error::Rsp(format!("invalid {what}: {value}")))
+            .map_err(|_| Error::Breakpoint(format!("invalid {what}: {value}")))
     }
 
     fn code_breakpoint_args(
@@ -197,7 +197,7 @@ impl ReplState<'_> {
                 "/p" => {
                     let pid_text = invocation
                         .arg(index + 1)
-                        .ok_or_else(|| Error::Rsp(format!("{command}: /p requires a PID")))?;
+                        .ok_or_else(|| Error::Breakpoint(format!("{command}: /p requires a PID")))?;
                     let pid = self.parse_radix_u64(pid_text, "PID")?;
                     let process = self
                         .ctx
@@ -208,12 +208,12 @@ impl ReplState<'_> {
                         .enumerate_processes()?
                         .into_iter()
                         .find(|process| process.pid == pid)
-                        .ok_or_else(|| Error::Rsp(format!("process {pid:#x} not found")))?;
+                        .ok_or_else(|| Error::Breakpoint(format!("process {pid:#x} not found")))?;
                     scope = Some(BreakpointScope::process(&process));
                     index += 2;
                 }
                 "/t" => {
-                    return Err(Error::Rsp(
+                    return Err(Error::Breakpoint(
                         "thread-scoped breakpoints are not supported by the current backends"
                             .into(),
                     ));
@@ -224,7 +224,7 @@ impl ReplState<'_> {
 
         let spec = invocation
             .arg(index)
-            .ok_or_else(|| Error::Rsp(format!("{command}: missing breakpoint target")))?
+            .ok_or_else(|| Error::Breakpoint(format!("{command}: missing breakpoint target")))?
             .to_string();
         index += 1;
 
@@ -251,7 +251,7 @@ impl ReplState<'_> {
                 .map(|offset| index + offset);
             let condition_end = action_index.unwrap_or(invocation.argv.len());
             if condition_end == index {
-                return Err(Error::Rsp("missing breakpoint condition after 'if'".into()));
+                return Err(Error::Breakpoint("missing breakpoint condition after 'if'".into()));
             }
             condition = Some(invocation.argv[index..condition_end].join(" "));
             index = condition_end;
@@ -269,7 +269,7 @@ impl ReplState<'_> {
         {
             index += 1;
             if index == invocation.argv.len() {
-                return Err(Error::Rsp("missing breakpoint commands after 'do'".into()));
+                return Err(Error::Breakpoint("missing breakpoint commands after 'do'".into()));
             }
             action = Some(invocation.argv[index..].join(" "));
         }

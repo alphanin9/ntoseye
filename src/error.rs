@@ -39,6 +39,11 @@ pub enum Error {
     #[error(transparent)]
     CtrlC(#[from] ctrlc::Error),
 
+    /// A failure of the GDB Remote Serial Protocol itself. Reserved for the
+    /// `gdb` client: backend-agnostic code (breakpoint management, hardware
+    /// breakpoint validation) must not use this, or a KD/KDNET session reports
+    /// "GDB protocol failure" for something GDB was never involved in. Use
+    /// [`Self::Breakpoint`] for breakpoint errors.
     #[error("GDB protocol failure: {0}")]
     Rsp(String),
 

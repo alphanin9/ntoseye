@@ -174,7 +174,7 @@ impl std::str::FromStr for ContinueDisposition {
         match value {
             "handled" => Ok(Self::Handled),
             "not_handled" | "not-handled" => Ok(Self::NotHandled),
-            _ => Err(Error::Rsp(format!(
+            _ => Err(Error::DebugInfo(format!(
                 "invalid continuation disposition '{value}' (use 'handled' or 'not_handled')"
             ))),
         }
@@ -287,7 +287,7 @@ impl std::str::FromStr for HwBreakpointAccess {
             "execute" | "e" | "x" => Ok(Self::Execute),
             "write" | "w" => Ok(Self::Write),
             "read_write" | "read/write" | "readwrite" | "r" => Ok(Self::ReadWrite),
-            other => Err(Error::Rsp(format!(
+            other => Err(Error::Breakpoint(format!(
                 "invalid hardware breakpoint access '{other}' (use 'execute', 'write', or 'read_write')"
             ))),
         }
@@ -324,7 +324,7 @@ impl std::str::FromStr for WatchpointAccess {
         match value {
             "write" => Ok(Self::Write),
             "read_write" | "read/write" => Ok(Self::ReadWrite),
-            _ => Err(Error::Rsp(format!(
+            _ => Err(Error::Breakpoint(format!(
                 "invalid watchpoint access '{value}' (use 'write' or 'read_write')"
             ))),
         }
@@ -349,17 +349,17 @@ pub const HW_BREAKPOINT_SLOTS: u8 = 4;
 /// address silently never fires). `Err` carries a user-facing reason.
 pub fn validate_hw_breakpoint(access: HwBreakpointAccess, len: u8, addr: u64) -> Result<()> {
     if matches!(access, HwBreakpointAccess::Execute) && len != 1 {
-        return Err(Error::Rsp(
+        return Err(Error::Breakpoint(
             "execute hardware breakpoints must be 1 byte".into(),
         ));
     }
     if !matches!(len, 1 | 2 | 4 | 8) {
-        return Err(Error::Rsp(format!(
+        return Err(Error::Breakpoint(format!(
             "invalid hardware breakpoint length {len} (use 1, 2, 4, or 8)"
         )));
     }
     if !addr.is_multiple_of(len as u64) {
-        return Err(Error::Rsp(format!(
+        return Err(Error::Breakpoint(format!(
             "hardware breakpoint address {addr:#x} must be {len}-byte aligned"
         )));
     }
