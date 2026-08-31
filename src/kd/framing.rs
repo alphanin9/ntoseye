@@ -19,6 +19,10 @@ pub const BREAKIN_BYTE: u8 = 0x62;
 const INITIAL_PACKET_ID: u32 = 0x80800000;
 const SYNC_PACKET_ID: u32 = 0x00000800;
 const KDNET_INITIAL_PACKET_ID: u32 = 0x80000000;
+/// How far a KDNET target's packet counter must fall below the high-water mark
+/// before it counts as a restarted stream rather than a retransmit or a
+/// reordered datagram. See [`KdFraming::accept_remote_packet`].
+const KDNET_RESTART_BACKSTEP: u32 = 0x100;
 
 const PACKET_MAX_SIZE: usize = 4000;
 const HEADER_SIZE: usize = 16;
@@ -323,23 +327,41 @@ impl<T: Read + Write> KdFraming<T> {
     }
 
     /// Decide whether an incoming data packet should be accepted, advancing
-    /// `remote_packet_id` if so. A packet with `SYNC_PACKET_ID` set means the
-    /// kernel reset its send-id stream (e.g. it re-entered the debugger after
-    /// thinking we were gone), so we realign to it unconditionally. A plain
-    /// id that doesn't match the expected one is a stale retransmit to skip
+    /// `remote_packet_id` if so. On KDCOM, a packet with `SYNC_PACKET_ID` set
+    /// means the kernel reset its send-id stream (e.g. it re-entered the
+    /// debugger after thinking we were gone), so we realign to it
+    /// unconditionally. A plain id that doesn't match the expected one is a
+    /// stale retransmit to skip.
+    ///
+    /// KDNET does not share that convention: its targets number packets with a
+    /// plain monotonically increasing counter (observed live: 0x2, 0x4, ... well
+    /// past 0x23d1e), so bit `SYNC_PACKET_ID` is an ordinary counter bit there
+    /// and testing it declares a resynchronisation on roughly every other packet
+    /// once the stream passes 0x800. That matters beyond framing: the flag rides
+    /// out as `StateChange::target_reloaded`, and `KdBackend::record_stop` reacts
+    /// by clearing `bp_handles`, which orphans breakpoints whose `int3` is still
+    /// patched into guest memory -- unclearable, and fatal (`0x7F` double fault)
+    /// once the guest executes one. So for KDNET only a counter that actually
+    /// restarted counts as a resynchronisation.
     fn accept_remote_packet(&mut self, packet_id: u32) -> bool {
         if self.kdnet_packet_ids {
-            let base = packet_id & !SYNC_PACKET_ID;
-            if packet_id & SYNC_PACKET_ID != 0 {
-                self.peer_reset_seen = true;
-                self.reset_outbound_packet_id();
-                self.kdnet_remote_high_water = base;
+            if packet_id > self.kdnet_remote_high_water {
+                self.kdnet_remote_high_water = packet_id;
                 return true;
             }
-            if base <= self.kdnet_remote_high_water {
+            // Below the high-water mark. A target that rebooted restarts its
+            // counter from the beginning, so it lands far back; a retransmit
+            // repeats the id we already took, and a reordered datagram is only
+            // slightly behind. Requiring a large backstep keeps those from
+            // being mistaken for a reboot -- the expensive direction, since a
+            // missed resync only costs a reattach while a false one orphans
+            // breakpoints in the guest.
+            if self.kdnet_remote_high_water - packet_id <= KDNET_RESTART_BACKSTEP {
                 return false;
             }
-            self.kdnet_remote_high_water = base;
+            self.peer_reset_seen = true;
+            self.reset_outbound_packet_id();
+            self.kdnet_remote_high_water = packet_id;
             return true;
         }
         let base = packet_id & !SYNC_PACKET_ID;
@@ -684,6 +706,55 @@ mod tests {
         assert_eq!(h.packet_id, INITIAL_PACKET_ID);
     }
 
+    /// Regression: a KDNET counter that has simply passed 0x800 has the
+    /// `SYNC_PACKET_ID` bit set as an ordinary counter bit. Treating that as a
+    /// resynchronisation made `target_reloaded` fire mid-session, which cleared
+    /// `bp_handles` and orphaned an `int3` in guest memory (guest then #DF'd).
+    #[test]
+    fn kdnet_counter_past_sync_bit_is_not_a_resynchronisation() {
+        let mut framing = KdFraming::new(Loopback::new(Vec::new()));
+        framing.use_kdnet_packet_ids();
+        framing.kdnet_remote_high_water = 0x7fe;
+
+        for id in [0x800u32, 0x802, 0x23cf2, 0x23cf4] {
+            assert!(framing.accept_remote_packet(id), "id {id:#x} must be taken");
+            assert!(
+                !framing.take_peer_reset_seen(),
+                "id {id:#x} is forward progress, not a reset"
+            );
+            assert_eq!(framing.kdnet_remote_high_water, id);
+        }
+    }
+
+    /// A retransmit repeats the id we already took, and a reordered datagram is
+    /// only slightly behind; neither is a restarted stream.
+    #[test]
+    fn kdnet_retransmit_and_small_backstep_are_dropped_without_reset() {
+        let mut framing = KdFraming::new(Loopback::new(Vec::new()));
+        framing.use_kdnet_packet_ids();
+        framing.kdnet_remote_high_water = 0x23cf4;
+
+        for id in [0x23cf4u32, 0x23cf2, 0x23c00] {
+            assert!(!framing.accept_remote_packet(id), "id {id:#x} must be dropped");
+            assert!(!framing.take_peer_reset_seen());
+        }
+        assert_eq!(framing.kdnet_remote_high_water, 0x23cf4);
+    }
+
+    /// A genuine restart drops the counter back to the start of the stream.
+    #[test]
+    fn kdnet_restarted_counter_is_a_resynchronisation() {
+        let mut framing = KdFraming::new(Loopback::new(Vec::new()));
+        framing.use_kdnet_packet_ids();
+        framing.current_packet_id = KDNET_INITIAL_PACKET_ID + 20;
+        framing.kdnet_remote_high_water = 0x23cf4;
+
+        assert!(framing.accept_remote_packet(2));
+        assert!(framing.take_peer_reset_seen());
+        assert_eq!(framing.current_packet_id, KDNET_INITIAL_PACKET_ID);
+        assert_eq!(framing.kdnet_remote_high_water, 2);
+    }
+
     #[test]
     fn recv_data_accepts_kdnet_monotonic_packet_ids() {
         let inbound = data_packet(PACKET_TYPE_KD_STATE_CHANGE64, 0xb6, b"kdnet");
@@ -704,12 +775,14 @@ mod tests {
 
     #[test]
     fn recv_data_resynchronizes_kdnet_and_echoes_sync_ack_exactly() {
+        // A KDNET target that restarted its stream resumes from the beginning,
+        // which is far below the high-water mark it had reached.
         let mut inbound = data_packet(PACKET_TYPE_KD_STATE_CHANGE64, SYNC_PACKET_ID, b"sync");
         inbound.extend(data_packet(PACKET_TYPE_KD_STATE_CHANGE64, 2, b"next"));
         let mut framing = KdFraming::new(Loopback::new(inbound));
         framing.use_kdnet_packet_ids();
         framing.current_packet_id = KDNET_INITIAL_PACKET_ID + 20;
-        framing.kdnet_remote_high_water = 0x100;
+        framing.kdnet_remote_high_water = 0x8000;
 
         assert_eq!(framing.recv_data().unwrap().payload, b"sync");
         assert!(framing.take_peer_reset_seen());
