@@ -27,7 +27,7 @@ def decode_field(obj, key):
 
 def main():
     parser = argparse.ArgumentParser(description="Run a command in a Windows VM through QEMU Guest Agent.")
-    parser.add_argument("--domain", default="Win11 Debug target", help="libvirt domain name")
+    parser.add_argument("--domain", default="win11", help="libvirt domain name")
     parser.add_argument("--connect", default="qemu:///system", help="libvirt connection URI")
     parser.add_argument("--timeout", type=float, default=30.0, help="seconds to wait for process exit")
     parser.add_argument("--interval", type=float, default=0.25, help="poll interval in seconds")

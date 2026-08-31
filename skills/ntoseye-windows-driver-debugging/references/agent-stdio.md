@@ -3,8 +3,10 @@
 Use the `agent` subcommand to run NTOSEYE as a newline-delimited JSON control process instead of the interactive REPL (the global `--backend`/`--connect` flags go before the subcommand):
 
 ```bash
-sudo /usr/local/bin/ntoseye --backend gdb --connect 127.0.0.1:1234 agent
+/usr/local/bin/ntoseye --backend kdnet --kdnet-key <KEY> agent
 ```
+
+No `sudo`: KD and KDNET carry memory as well as control over the debug transport, so they need no hypervisor-process access. See `SKILL.md` for how to read the current key out of the guest.
 
 The first stdout line is a `ready` event. Each request is one JSON object on one line. Each response is one JSON object on one line.
 
@@ -39,7 +41,7 @@ Addresses are expression strings and use the same parser as the REPL: symbols, `
 | `disasm` / `u` | `address`, optional `length` | Disassembles bytes at `address`; default length is 32 bytes. |
 | `dt` / `type.dump` | `type`, optional `address`, optional `field` | Dumps type layout and, when `address` is present, field values. Leading underscore on the type is optional. |
 | `trap-frame` / `tf` | optional `address`, optional `field` | Equivalent to `dt` with type `KTRAP_FRAME`. |
-| `k` / `stack` / `stack.trace` | optional `length` | Builds a stack trace for the current stopped thread; default limit is 64 frames. Each frame is `{sp, ip, symbol, source}` (`source` is `current`/`unwind`/`scan`). For a thread's trap frame use `threads` (`trap_frame` field) or `tf`. |
+| `k` / `stack` / `stack.trace` | optional `length` | Builds a stack trace for the current stopped thread; default limit is 64 frames. Each frame is `{sp, ip, symbol, source}` (`source` is `current`/`seed`/`unwind`/`scan`). For a thread's trap frame use `threads` (`trap_frame` field) or `tf`. |
 
 ## Memory
 
@@ -65,7 +67,7 @@ Addresses are expression strings and use the same parser as the REPL: symbols, `
 
 | Command | Fields | Notes |
 | --- | --- | --- |
-| `symbol.search` / `symbols.search` / `x` | `query` or `expr`, optional `limit` | Fuzzy-searches symbols. `module!query` restricts the search to one module. Addresses populate `$0..$N`. |
+| `symbol.search` / `symbols.search` / `x` | `query` or `expr`, optional `limit` | Fuzzy-searches symbols. `module!query` restricts the search to one module. Addresses populate `$0..$N`. Each hit carries `ambiguous:true` when the same name resolves in more than one module; the reported `address` is then the first location by module name. |
 | `symbol.nearest` / `symbols.nearest` / `ln` | `address` or `expr` | Returns the nearest symbol, base, and offset. The symbol base is stored in `$0`. |
 | `variable.set` / `set` | `name`, `expr` | Defines a convenience variable usable as `$name`. |
 | `variables` / `vars` | none | Lists user variables, result slots, their origin, and built-in variables. |
@@ -97,7 +99,7 @@ Addresses are expression strings and use the same parser as the REPL: symbols, `
 | `step.over` / `p` / `ni` | optional `timeout_ms` | Steps over a call (runs to its return site) or single-steps a non-call. Requires the VM halted. With `timeout_ms`, returns `{running:true, stopped:false}` if it doesn't complete in time (the VM is left running). |
 | `step.out` / `gu` / `finish` | optional `timeout_ms` | Runs to the caller's return address. Requires the VM halted. With `timeout_ms`, returns `{running:true, stopped:false}` if it doesn't complete in time. |
 
-Stop responses carry `running`, `stopped`, a `stop` kind (`"breakpoint"`, `"bugcheck"`, `"exception"`, `"step"`, `"halted"`, `"interrupt"`, or `"target_reloaded"`), `thread`, and — when halted with readable context — `rip`, `cr3`, and nearest `symbol`, plus the attached `process` (`{pid,name}`). Per kind: `breakpoint` adds `breakpoint:{id,address,symbol}` and `temporary`; `bugcheck` adds `is_bugcheck:true` and a structured `bugcheck`; `exception` adds `exception_code`; `target_reloaded` adds `kernel_base` and `coherent` (the guest rebooted — every prior address is stale, re-enumerate; reload classification, stale-breakpoint drop, and guest-state rebuild are handled inside the shared session core); `halted` adds `event:false` and `coherent`.
+Stop responses carry `running`, `stopped`, a `stop` kind (`"breakpoint"`, `"bugcheck"`, `"exception"`, `"step"`, `"halted"`, `"interrupt"`, or `"target_reloaded"`), `thread`, and — when halted with readable context — `rip`, `cr3`, and nearest `symbol`, plus the attached `process` (`{pid,name}`). Per kind: `breakpoint` adds `breakpoint:{id,address,symbol}` and `temporary`; `bugcheck` adds `is_bugcheck:true` and a structured `bugcheck`; `exception` adds `exception_code`, `first_chance`, and `exception_address` (the faulting address, which differs from `rip` when a second-chance report re-raises at the original site); `target_reloaded` adds `kernel_base` and `coherent` (the guest rebooted — every prior address is stale, re-enumerate; reload classification, stale-breakpoint drop, and guest-state rebuild are handled inside the shared session core); `halted` adds `event:false` and `coherent`.
 
 ## Breakpoints
 
@@ -109,7 +111,7 @@ Stop responses carry `running`, `stopped`, a `stop` kind (`"breakpoint"`, `"bugc
 | `bp.enable` / `breakpoint.enable` | `breakpoint` | Enables a breakpoint by ID. |
 | `bp.list` / `breakpoint.list` | none | Lists IDs, enabled state, `kind` (always `software`), address, symbol, scope, temporary flag, and condition. |
 
-> **Software breakpoints only.** The shared upstream breakpoint core does not (yet) expose hardware execution breakpoints; passing `kind:"hardware"`/`"hbp"` returns a "not supported" error. Re-adding the fork's gdbstub hardware-breakpoint path on top of the shared core is a tracked follow-up.
+> **Software breakpoints only, on this surface.** Passing `kind:"hardware"`/`"hbp"` returns a "not supported" error. This is an agent-surface gap, not a core one: the shared breakpoint manager does have `add_hardware`/`add_hardware_configured`, and KD/KDNET advertise `data watchpoints` under `capabilities`. Wiring `kind` through to them is a tracked follow-up; the REPL's `ba` already uses that path.
 
 ## QEMU and Scripts
 
