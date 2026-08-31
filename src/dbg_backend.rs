@@ -253,6 +253,17 @@ impl HwBreakpointAccess {
         }
     }
 
+    /// Stable machine-readable name for structured hosts (MCP, the agent
+    /// protocol). Unlike [`Self::label`] this never contains a slash, so it can
+    /// round-trip through [`std::str::FromStr`].
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Execute => "execute",
+            Self::Write => "write",
+            Self::ReadWrite => "read_write",
+        }
+    }
+
     /// The WinDbg-style access letter (`e`/`w`/`r`).
     pub fn letter(self) -> char {
         match self {
@@ -266,6 +277,23 @@ impl HwBreakpointAccess {
 /// Semantic data-watch access exposed by host APIs. The transport may
 /// implement this with x86 debug registers, but callers request a watchpoint,
 /// not a software-vs-hardware breakpoint implementation.
+impl std::str::FromStr for HwBreakpointAccess {
+    type Err = Error;
+
+    /// Accepts the long names and the WinDbg access letters `ba` uses, so a
+    /// structured host and the REPL agree on spelling.
+    fn from_str(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "execute" | "e" | "x" => Ok(Self::Execute),
+            "write" | "w" => Ok(Self::Write),
+            "read_write" | "read/write" | "readwrite" | "r" => Ok(Self::ReadWrite),
+            other => Err(Error::Rsp(format!(
+                "invalid hardware breakpoint access '{other}' (use 'execute', 'write', or 'read_write')"
+            ))),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WatchpointAccess {
     Write,
@@ -597,6 +625,35 @@ pub trait DebugBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hw_breakpoint_access_names_round_trip() {
+        for access in [
+            HwBreakpointAccess::Execute,
+            HwBreakpointAccess::Write,
+            HwBreakpointAccess::ReadWrite,
+        ] {
+            assert_eq!(access.name().parse::<HwBreakpointAccess>().unwrap(), access);
+        }
+    }
+
+    #[test]
+    fn hw_breakpoint_access_parses_letters_and_long_names() {
+        let cases = [
+            ("execute", HwBreakpointAccess::Execute),
+            ("e", HwBreakpointAccess::Execute),
+            ("EXECUTE", HwBreakpointAccess::Execute),
+            ("write", HwBreakpointAccess::Write),
+            ("w", HwBreakpointAccess::Write),
+            ("read_write", HwBreakpointAccess::ReadWrite),
+            ("read/write", HwBreakpointAccess::ReadWrite),
+            ("r", HwBreakpointAccess::ReadWrite),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(text.parse::<HwBreakpointAccess>().unwrap(), expected, "{text}");
+        }
+        assert!("sideways".parse::<HwBreakpointAccess>().is_err());
+    }
 
     #[test]
     fn debug_log_splits_lines_and_strips_crlf() {

@@ -25,7 +25,7 @@ use iced_x86::{
 };
 
 use crate::backend::MemoryOps;
-use crate::dbg_backend::DebugCapability;
+use crate::dbg_backend::{DebugCapability, HwBreakpointAccess};
 use crate::error::{Error, Result};
 use crate::expr::Expr;
 use crate::guest::{ModuleInfo, ModuleSymbolLoadReport};
@@ -97,6 +97,8 @@ struct AgentRequest {
     limit: Option<usize>,
     #[serde(default)]
     condition: Option<String>,
+    #[serde(default)]
+    access: Option<String>,
 }
 
 struct AgentSession<'a> {
@@ -1194,12 +1196,19 @@ impl AgentSession<'_> {
             return Err(Error::InvalidExpression("VM is running".into()));
         }
 
-        // Upstream's shared breakpoint manager is software/temporary only; the
-        // fork's hardware-breakpoint extension is a separate follow-up.
-        if let Some(kind) = request.kind.as_deref()
-            && matches!(kind, "hardware" | "hbp")
-        {
-            return Err(Error::NotSupported);
+        let hardware = match request.kind.as_deref() {
+            None | Some("software" | "bp") => false,
+            Some("hardware" | "hbp" | "ba") => true,
+            Some(other) => {
+                return Err(Error::InvalidExpression(format!(
+                    "unknown breakpoint kind '{other}' (use 'software' or 'hardware')"
+                )));
+            }
+        };
+        if !hardware && request.access.is_some() {
+            return Err(Error::InvalidExpression(
+                "'access' only applies to kind 'hardware'".into(),
+            ));
         }
 
         let address = self.eval_address(required(request.address, "address")?)?;
@@ -1216,6 +1225,53 @@ impl AgentSession<'_> {
                     format!("{module}!{sym}+0x{offset:x}")
                 }
             });
+
+        if hardware {
+            // Execute watches are one byte by definition; data watches default
+            // to the narrowest legal width rather than guessing wider, and the
+            // width used is echoed back so it is never silently assumed.
+            let access = match request.access.as_deref() {
+                Some(value) => value.parse::<HwBreakpointAccess>()?,
+                None => HwBreakpointAccess::Execute,
+            };
+            let len = match request.length {
+                Some(length) => u8::try_from(length).map_err(|_| {
+                    Error::InvalidExpression(format!(
+                        "invalid hardware breakpoint length {length} (use 1, 2, 4, or 8)"
+                    ))
+                })?,
+                None => 1,
+            };
+            let id = self.session.breakpoints.add_hardware(
+                self.session.backend.as_mut(),
+                &self.session.target,
+                address,
+                access,
+                len,
+                symbol.clone(),
+                request.condition.clone(),
+            )?;
+            let slot = self
+                .session
+                .breakpoints
+                .list()
+                .into_iter()
+                .find(|bp| bp.id == id)
+                .and_then(|bp| bp.hardware)
+                .map(|hw| hw.slot);
+            return Ok(json!({
+                "id": id,
+                "kind": "hardware",
+                "access": access.name(),
+                "length": len,
+                // Which debug register (DR0-3) the watch occupies; hits are
+                // identified by DR6, so this is how a client correlates them.
+                "slot": slot,
+                "address": fmt_addr(address.0),
+                "symbol": symbol,
+                "condition": request.condition,
+            }));
+        }
 
         let id = self.session.breakpoints.add(
             self.session.backend.as_mut(),
@@ -1257,8 +1313,13 @@ impl AgentSession<'_> {
             "breakpoints": self.session.breakpoints.list().into_iter().map(|bp| json!({
                 "id": bp.id,
                 "enabled": bp.enabled,
-                // Software-only on the shared core; kept for consumer compatibility.
-                "kind": "software",
+                "kind": if bp.hardware.is_some() { "hardware" } else { "software" },
+                // Present only on hardware breakpoints. Read from `hardware`
+                // rather than `watch_access_name`, which reports `None` for an
+                // execute watch because that is not a *watch*point.
+                "access": bp.hardware.map(|hw| hw.access.name()),
+                "length": bp.hardware.map(|hw| hw.len),
+                "slot": bp.hardware.map(|hw| hw.slot),
                 "address": fmt_addr(bp.address.0),
                 "symbol": bp.symbol,
                 "scope": bp.scope.label(),

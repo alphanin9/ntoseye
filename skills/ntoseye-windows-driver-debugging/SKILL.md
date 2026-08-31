@@ -172,7 +172,7 @@ Before changing debugger code, inspect the local checkout and current branch. Cu
 - KDNET, KDCOM, the QEMU gdbstub, and passive `memory` introspection are four separate backends behind one shared debugger core.
 - KD and KDNET report a strict superset of the gdbstub's capabilities: execution control, single step, register read/write, context enumeration/selection, kernel **and usermode** breakpoints, data watchpoints, reload detection, bugcheck stop detection and details, and debug output.
 - Software breakpoints patch `0xCC` for the AMD64 user-process path; kernel breakpoints go through the target's own debugger API.
-- Hardware watchpoints (`ba`) are AMD64-only and live in the debug registers, so they are identified by DR6 rather than by RIP.
+- Hardware breakpoints (`ba` in the REPL, `kind:"hardware"` in the agent protocol) are AMD64-only, live in the four debug registers, and patch no guest memory. Execute, write, and read/write access are all available; see `references/agent-stdio.md`.
 - `trap-frame` / `tf` decodes architectural trap frames.
 
 For VMM-layer breakpoint ideas, keep the boundary clear: nested page table behavior belongs below Windows in QEMU/KVM/VMM behavior, not in the guest kernel.

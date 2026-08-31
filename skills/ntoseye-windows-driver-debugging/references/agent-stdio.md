@@ -105,13 +105,31 @@ Stop responses carry `running`, `stopped`, a `stop` kind (`"breakpoint"`, `"bugc
 
 | Command | Fields | Notes |
 | --- | --- | --- |
-| `bp.set` / `breakpoint.set` | `address`, optional `condition` | Sets a software (`0xCC`) breakpoint scoped to the current inspection context. An optional `condition` is re-evaluated on each hit. |
+| `bp.set` / `breakpoint.set` | `address`, optional `kind`, `access`, `length`, `condition` | Sets a breakpoint scoped to the current inspection context. An optional `condition` is re-evaluated on each hit. `kind` is `software` (default, `0xCC` patch) or `hardware` (debug register, patches no memory). |
 | `bp.clear` / `breakpoint.clear` | `breakpoint` | Clears a breakpoint by numeric ID. |
 | `bp.disable` / `breakpoint.disable` | `breakpoint` | Disables a breakpoint by ID. |
 | `bp.enable` / `breakpoint.enable` | `breakpoint` | Enables a breakpoint by ID. |
-| `bp.list` / `breakpoint.list` | none | Lists IDs, enabled state, `kind` (always `software`), address, symbol, scope, temporary flag, and condition. |
+| `bp.list` / `breakpoint.list` | none | Lists IDs, enabled state, `kind`, address, symbol, scope, temporary flag, and condition. Hardware breakpoints also carry `access`, `length`, and `slot`; those three are `null` on software breakpoints. |
 
-> **Software breakpoints only, on this surface.** Passing `kind:"hardware"`/`"hbp"` returns a "not supported" error. This is an agent-surface gap, not a core one: the shared breakpoint manager does have `add_hardware`/`add_hardware_configured`, and KD/KDNET advertise `data watchpoints` under `capabilities`. Wiring `kind` through to them is a tracked follow-up; the REPL's `ba` already uses that path.
+### Hardware breakpoints
+
+`kind:"hardware"` (aliases `hbp`, `ba`) uses a debug register instead of patching `0xCC`, so it modifies no guest memory and traps data access as well as execution. Requires a backend advertising `data watchpoints` under `capabilities` — KD and KDNET do; the GDB stub does not, and returns "not supported".
+
+| Field | Values | Default |
+| --- | --- | --- |
+| `access` | `execute`, `write`, `read_write` (also `e`/`w`/`r`, `read/write`) | `execute` |
+| `length` | 1, 2, 4, 8 | 1 |
+
+x86 rules are enforced up front: execute watches are always 1 byte, data widths are 1/2/4/8, and the address must be aligned to its own length — an unaligned debug register silently never fires, so this is rejected rather than accepted quietly. `length` is echoed in the response, since the default is the narrowest legal width rather than an inferred one.
+
+There are only four debug registers, so a fifth concurrent hardware breakpoint fails with "all 4 hardware breakpoint slots are in use". The response and `bp.list` report which `slot` (DR0-3) each occupies; hits are identified by DR6 rather than by RIP, so the slot is how a client correlates them.
+
+```json
+{"id":1,"command":"bp.set","address":"mydrv!g_Counter","kind":"hardware","access":"write","length":8}
+{"id":2,"command":"bp.set","address":"mydrv!DriverEntry","kind":"hardware"}
+```
+
+Passing `access` without `kind:"hardware"` is an error rather than being silently ignored.
 
 ## QEMU and Scripts
 
