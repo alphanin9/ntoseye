@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use crate::backend::MemoryOps;
 use crate::error::{Error, Result};
 use crate::types::*;
@@ -5,6 +8,10 @@ use crate::types::*;
 // PageFrameNumber
 pub const PFN_MASK: u64 = (!0xFu64 << 8) & 0xFFFFFFFFFu64;
 pub const PAGE_SIZE: usize = 0x1000; // 4KiB
+/// AMD64 2 MiB PDE mapping / AArch64 level-2 block.
+pub const LARGE_PAGE_SIZE: u64 = 1 << 21;
+/// AMD64 1 GiB PDPTE mapping / AArch64 level-1 block.
+pub const HUGE_PAGE_SIZE: u64 = 1 << 30;
 pub const PAGE_SHIFT: u32 = 12;
 pub const PTE_SHIFT: u8 = 12;
 pub const PDE_SHIFT: u8 = 21;
@@ -27,11 +34,26 @@ pub struct AddressSpace<'a, B: MemoryOps<PhysAddr>> {
     /// where one CR3 covers both halves.
     kernel_dtb: Option<Dtb>,
     arm64: bool,
+    /// Page-table entries already read during this borrow, keyed by the
+    /// physical address of the entry itself.
+    ///
+    /// A walk re-reads the same upper-level entries for every page it
+    /// translates — reading one 2 MiB region 4 KiB at a time fetched the same
+    /// PDE 512 times — and over a KD transport each of those is a network round
+    /// trip. The entries cannot change underneath us: an `AddressSpace` borrows
+    /// its backend, and resuming the target needs `&mut Target`, so the
+    /// borrow checker already guarantees no cached entry outlives a stop.
+    pt_cache: RefCell<HashMap<u64, Option<PageTableEntry>>>,
 }
 
 pub struct Translation {
     pub address: PhysAddr,
     pub large: bool,
+    /// Size of the mapping this translation resolved to (4 KiB, 2 MiB or
+    /// 1 GiB). Readers advance by the remainder of *this* mapping rather than
+    /// of a 4 KiB page, so a large page is walked once instead of once per
+    /// 4 KiB inside it.
+    pub page_size: u64,
     pub writable: bool,
     pub user: bool,
     /// Effective execute-never for the selected address-space half: AMD64 NX,
@@ -45,6 +67,7 @@ pub struct Translation {
 impl Translation {
     pub const fn new_huge(pml4e: PageTableEntry, pdpte: PageTableEntry, va: VirtAddr) -> Self {
         Self {
+            page_size: HUGE_PAGE_SIZE,
             address: pdpte.page_frame() + va.huge_page_offset(),
             large: true,
             writable: pml4e.is_writable() && pdpte.is_writable(),
@@ -61,6 +84,7 @@ impl Translation {
         va: VirtAddr,
     ) -> Self {
         Self {
+            page_size: LARGE_PAGE_SIZE,
             address: pde.page_frame() + va.large_page_offset(),
             large: true,
             writable: pml4e.is_writable() && pdpte.is_writable() && pde.is_writable(),
@@ -78,6 +102,7 @@ impl Translation {
         va: VirtAddr,
     ) -> Self {
         Self {
+            page_size: PAGE_SIZE as u64,
             address: pte.page_frame() + va.page_offset(),
             large: false,
             writable: pml4e.is_writable()
@@ -95,6 +120,7 @@ impl Translation {
         let pxn = l0.arm64_table_is_pxn() || l1.arm64_is_pxn();
         let uxn = l0.arm64_table_is_uxn() || l1.arm64_is_uxn();
         Self {
+            page_size: HUGE_PAGE_SIZE,
             address: l1.arm64_page_frame() + va.huge_page_offset(),
             large: true,
             writable: l0.arm64_table_allows_write() && l1.arm64_is_writable(),
@@ -114,6 +140,7 @@ impl Translation {
         let pxn = l0.arm64_table_is_pxn() || l1.arm64_table_is_pxn() || l2.arm64_is_pxn();
         let uxn = l0.arm64_table_is_uxn() || l1.arm64_table_is_uxn() || l2.arm64_is_uxn();
         Self {
+            page_size: LARGE_PAGE_SIZE,
             address: l2.arm64_page_frame() + va.large_page_offset(),
             large: true,
             writable: l0.arm64_table_allows_write()
@@ -144,6 +171,7 @@ impl Translation {
             || l2.arm64_table_is_uxn()
             || l3.arm64_is_uxn();
         Self {
+            page_size: PAGE_SIZE as u64,
             address: l3.arm64_page_frame() + va.page_offset(),
             large: false,
             writable: l0.arm64_table_allows_write()
@@ -167,6 +195,7 @@ impl<'a, B: MemoryOps<PhysAddr>> AddressSpace<'a, B> {
             dtb,
             kernel_dtb: None,
             arm64: false,
+            pt_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -178,15 +207,24 @@ impl<'a, B: MemoryOps<PhysAddr>> AddressSpace<'a, B> {
             dtb: ttbr0,
             kernel_dtb: Some(ttbr1),
             arm64: true,
+            pt_cache: RefCell::new(HashMap::new()),
         }
     }
 
     fn read_pt_entry(&self, table_base: PhysAddr, index: usize) -> Result<Option<PageTableEntry>> {
-        match self.backend.read(table_base + 8 * index as u64) {
-            Ok(entry) => Ok(Some(entry)),
-            Err(Error::BadPhysicalAddress(_)) => Ok(None),
-            Err(e) => Err(e),
+        let entry_addr = table_base + 8 * index as u64;
+        if let Some(cached) = self.pt_cache.borrow().get(&entry_addr) {
+            return Ok(*cached);
         }
+        // A missing frame is cached as `None` too: it is a property of the
+        // table, so re-reading it would repeat the same failing round trip.
+        let entry = match self.backend.read(entry_addr) {
+            Ok(entry) => Some(entry),
+            Err(Error::BadPhysicalAddress(_)) => None,
+            Err(e) => return Err(e),
+        };
+        self.pt_cache.borrow_mut().insert(entry_addr, entry);
+        Ok(entry)
     }
 
     fn virt_to_phys_arm64(&self, va: VirtAddr) -> Result<Option<Translation>> {
@@ -194,6 +232,7 @@ impl<'a, B: MemoryOps<PhysAddr>> AddressSpace<'a, B> {
             return Ok(Some(Translation {
                 address: va.0,
                 large: false,
+                page_size: PAGE_SIZE as u64,
                 writable: false,
                 user: false,
                 nx: false,
@@ -255,6 +294,7 @@ impl<'a, B: MemoryOps<PhysAddr>> AddressSpace<'a, B> {
             return Ok(Some(Translation {
                 address: va.0,
                 large: false,
+                page_size: PAGE_SIZE as u64,
                 writable: false,
                 user: false,
                 nx: false,
@@ -319,7 +359,10 @@ impl<'a, B: MemoryOps<PhysAddr>> MemoryOps<VirtAddr> for AddressSpace<'a, B> {
                 None => return Err(Error::BadVirtualAddress(curr_vaddr)),
             };
 
-            let bytes_available = PAGE_SIZE - curr_vaddr.page_offset() as usize;
+            // Advance by the remainder of the mapping we actually resolved,
+            // not of a 4 KiB page: a 2 MiB mapping otherwise costs 512 walks.
+            let bytes_available =
+                (translation.page_size - (curr_vaddr.0 & (translation.page_size - 1))) as usize;
             let chunk_size = (buf.len() - offset).min(bytes_available);
 
             self.backend
@@ -347,7 +390,10 @@ impl<'a, B: MemoryOps<PhysAddr>> MemoryOps<VirtAddr> for AddressSpace<'a, B> {
                 }
             };
 
-            let bytes_available = PAGE_SIZE - curr_vaddr.page_offset() as usize;
+            // Advance by the remainder of the mapping we actually resolved,
+            // not of a 4 KiB page: a 2 MiB mapping otherwise costs 512 walks.
+            let bytes_available =
+                (translation.page_size - (curr_vaddr.0 & (translation.page_size - 1))) as usize;
             let chunk_size = (buf.len() - offset).min(bytes_available);
 
             self.backend
@@ -382,6 +428,121 @@ mod tests {
         fn write_bytes(&self, _addr: PhysAddr, _buf: &[u8]) -> Result<()> {
             Err(Error::BadPhysicalAddress(0))
         }
+    }
+
+    /// Physical backend that records every read, so tests can assert how many
+    /// round trips a walk actually costs.
+    struct CountingPhysMem {
+        data: Vec<u8>,
+        reads: std::cell::RefCell<Vec<(PhysAddr, usize)>>,
+    }
+
+    impl CountingPhysMem {
+        fn new(data: Vec<u8>) -> Self {
+            Self {
+                data,
+                reads: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        /// Reads of a single page-table entry (8 bytes), i.e. walk cost.
+        fn entry_reads(&self) -> usize {
+            self.reads.borrow().iter().filter(|(_, len)| *len == 8).count()
+        }
+    }
+
+    impl MemoryOps<PhysAddr> for CountingPhysMem {
+        fn read_bytes(&self, addr: PhysAddr, buf: &mut [u8]) -> Result<()> {
+            self.reads.borrow_mut().push((addr, buf.len()));
+            let start = addr as usize;
+            let end = start + buf.len();
+            if end > self.data.len() {
+                return Err(Error::BadPhysicalAddress(addr));
+            }
+            buf.copy_from_slice(&self.data[start..end]);
+            Ok(())
+        }
+
+        fn write_bytes(&self, _addr: PhysAddr, _buf: &[u8]) -> Result<()> {
+            Err(Error::BadPhysicalAddress(0))
+        }
+    }
+
+    /// PML4 at 0x1000 -> PDPT at 0x2000 -> PD at 0x3000, whose entry maps a
+    /// 2 MiB large page at physical `large_frame`. Mirrors how Windows maps
+    /// ntoskrnl: the walk terminates at the PDE with PS set.
+    fn large_page_tables(large_frame: u64) -> (Vec<u8>, Dtb) {
+        let mut data = vec![0u8; (large_frame + 2 * LARGE_PAGE_SIZE) as usize];
+        let present_writable = 0b11u64;
+        data[0x1000..0x1008].copy_from_slice(&(0x2000u64 | present_writable).to_le_bytes());
+        data[0x2000..0x2008].copy_from_slice(&(0x3000u64 | present_writable).to_le_bytes());
+        // PS (bit 7) set: this PDE *is* the mapping.
+        data[0x3000..0x3008]
+            .copy_from_slice(&(large_frame | present_writable | 0x80).to_le_bytes());
+        (data, 0x1000)
+    }
+
+    #[test]
+    fn large_page_mapping_is_walked_once_for_the_whole_mapping() {
+        let large_frame = 0x20_0000u64;
+        let (mut data, dtb) = large_page_tables(large_frame);
+        data[large_frame as usize..large_frame as usize + 8]
+            .copy_from_slice(&0xDEAD_BEEF_CAFE_BABEu64.to_le_bytes());
+        let mem = CountingPhysMem::new(data);
+        let space = AddressSpace::new(&mem, dtb);
+
+        // Span the full 2 MiB mapping in one read.
+        let mut buf = vec![0u8; LARGE_PAGE_SIZE as usize];
+        space.read_bytes(VirtAddr(0), &mut buf).unwrap();
+
+        assert_eq!(u64::from_le_bytes(buf[..8].try_into().unwrap()), 0xDEAD_BEEF_CAFE_BABE);
+        // Three levels, once -- not once per 4 KiB inside the mapping.
+        assert_eq!(mem.entry_reads(), 3, "large page must be walked once");
+        let data_reads = mem.reads.borrow().iter().filter(|(_, l)| *l != 8).count();
+        assert_eq!(data_reads, 1, "a 2 MiB mapping is one contiguous physical run");
+    }
+
+    #[test]
+    fn large_page_translation_reports_mapping_granularity() {
+        let large_frame = 0x20_0000u64;
+        let (data, dtb) = large_page_tables(large_frame);
+        let mem = CountingPhysMem::new(data);
+        let space = AddressSpace::new(&mem, dtb);
+
+        let translation = space.virt_to_phys(VirtAddr(0x1234)).unwrap().unwrap();
+
+        assert!(translation.large);
+        assert_eq!(translation.page_size, LARGE_PAGE_SIZE);
+        assert_eq!(translation.address, large_frame + 0x1234);
+    }
+
+    #[test]
+    fn repeated_translations_reuse_cached_page_table_entries() {
+        let large_frame = 0x20_0000u64;
+        let (data, dtb) = large_page_tables(large_frame);
+        let mem = CountingPhysMem::new(data);
+        let space = AddressSpace::new(&mem, dtb);
+
+        for offset in [0u64, 0x1000, 0x2000, 0x1f_f000] {
+            space.virt_to_phys(VirtAddr(offset)).unwrap().unwrap();
+        }
+
+        // Every one of those resolves through the same three entries.
+        assert_eq!(mem.entry_reads(), 3, "walk entries must be read once per borrow");
+    }
+
+    #[test]
+    fn walk_cache_is_scoped_to_one_address_space_borrow() {
+        let large_frame = 0x20_0000u64;
+        let (data, dtb) = large_page_tables(large_frame);
+        let mem = CountingPhysMem::new(data);
+
+        AddressSpace::new(&mem, dtb).virt_to_phys(VirtAddr(0)).unwrap();
+        assert_eq!(mem.entry_reads(), 3);
+        // A fresh borrow re-reads: nothing is cached across a stop, because an
+        // AddressSpace cannot outlive the &Target it borrows.
+        AddressSpace::new(&mem, dtb).virt_to_phys(VirtAddr(0)).unwrap();
+        assert_eq!(mem.entry_reads(), 6);
     }
 
     #[test]
