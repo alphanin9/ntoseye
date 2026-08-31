@@ -1,16 +1,18 @@
-#[cfg(not(target_os = "linux"))]
-compile_error!("This application only runs on Linux hosts.");
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("This application only runs on Linux and macOS hosts.");
 
 #[cfg(feature = "agent")]
 pub mod agent;
 
 pub const DEFAULT_GDB_ADDR: &str = "127.0.0.1:1234";
 pub const DEFAULT_KD_SOCKET: &str = "/tmp/ntoseye-kd.sock";
+pub const DEFAULT_KDNET_ADDR: &str = "0.0.0.0:50000";
 
 pub fn resolve_target(backend: &str, connect: Option<&str>) -> Option<String> {
     match backend {
         "gdb" => Some(connect.unwrap_or(DEFAULT_GDB_ADDR).to_string()),
         "kd" => Some(connect.unwrap_or(DEFAULT_KD_SOCKET).to_string()),
+        "kdnet" => Some(connect.unwrap_or(DEFAULT_KDNET_ADDR).to_string()),
         "memory" => None,
         other => {
             eprintln!(
@@ -26,7 +28,10 @@ pub mod backend;
 pub mod bugchecks;
 #[cfg(feature = "cli")]
 pub mod cli;
+#[cfg(feature = "cli")]
+pub mod configure;
 pub mod dbg_backend;
+pub mod debugger_data;
 pub mod diagnostics;
 pub mod disasm;
 pub mod dmp;
@@ -51,10 +56,9 @@ pub mod symbols;
 pub mod target;
 pub mod trapframe;
 pub mod triage;
+pub mod triage_report;
 pub mod types;
 pub mod ui;
 pub mod unwind;
 #[cfg(any(feature = "mcp", feature = "python", feature = "agent"))]
 pub mod view;
-#[cfg(feature = "cli")]
-pub mod virsh;

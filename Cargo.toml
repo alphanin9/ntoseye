@@ -2,14 +2,14 @@
 members = ["ntoseye-py"]
 
 [workspace.package]
-version = "0.20.1"
+version = "0.24.0"
 
 [package]
 name = "ntoseye"
 version.workspace = true
 edition = "2024"
 authors = [ "dmaivel" ]
-description = "Windows kernel debugger for Linux hosts running Windows under KVM/QEMU"
+description = "WinDbg-like kernel debugger for Windows VMs on Linux (KVM/QEMU, VMware) and macOS (UTM)"
 license = "MIT"
 repository = "https://github.com/dmaivel/ntoseye"
 readme = "README.md"
@@ -23,9 +23,9 @@ required-features = ["cli"]
 
 [dependencies]
 iced-x86 = "1.21.0"
+bad64 = "0.12"
 indicatif = "0.18.3"
 memmap2 = "0.9.9"
-nix = { version = "0.31.3", features = [ "process", "uio" ] }
 owo-colors = "4.2.3"
 pelite = "0.10.0"
 reqwest = { version = "0.13.4", default-features = false, features = [ "blocking", "rustls", "charset", "http2" ] }
@@ -44,6 +44,12 @@ winnow = "1.0"
 linkme = "0.3"
 textwrap = "0.16"
 terminal_size = "0.4"
+aes = "0.8"
+cbc = "0.1"
+getrandom = "0.3"
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2.6"
 
 pyo3 = { version = "0.29.0", features = ["abi3-py39"], optional = true }
 
@@ -62,7 +68,10 @@ tokio-util = { version = "0.7", default-features = false, optional = true }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"], optional = true }
 tower-http = { version = "0.7", default-features = false, features = ["cors"], optional = true }
 anyhow = { version = "1", optional = true }
-kdmp-parser = "0.8"
+kdmp-parser = "=0.8.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31.3", features = [ "process", "uio" ] }
 
 [features]
 # `python-embed` is on by default so a plain `cargo install ntoseye` / `cargo
@@ -86,6 +95,12 @@ agent = ["dep:serde", "dep:serde_json", "python-embed"]
 python = ["dep:pyo3"]
 python-embed = ["python", "pyo3/auto-initialize"]
 python-extension = ["python", "pyo3/extension-module"]
+
+[profile.dev.package.pdb2]
+debug-assertions = false
+
+[profile.test.package.pdb2]
+debug-assertions = false
 
 [profile.dist]
 inherits = "release"

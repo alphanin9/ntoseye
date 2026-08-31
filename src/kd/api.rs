@@ -5,8 +5,8 @@
 
 use std::io::{Read, Write};
 
+use crate::dbg_backend::ContinueDisposition;
 use crate::error::{Error, Result};
-use crate::kd::context;
 use crate::kd::{
     framing::{
         DataPacket, KdFraming, PACKET_TYPE_KD_DEBUG_IO, PACKET_TYPE_KD_FILE_IO,
@@ -19,22 +19,37 @@ use crate::kd::{
 pub const DBGKD_READ_VIRTUAL_MEMORY: u32 = 0x0000_3130;
 pub const DBGKD_WRITE_VIRTUAL_MEMORY: u32 = 0x0000_3131;
 pub const DBGKD_GET_CONTEXT: u32 = 0x0000_3132;
-pub const DBGKD_SET_CONTEXT: u32 = 0x0000_3133;
 pub const DBGKD_WRITE_BREAKPOINT: u32 = 0x0000_3134;
 pub const DBGKD_RESTORE_BREAKPOINT: u32 = 0x0000_3135;
 pub const DBGKD_READ_CONTROL_SPACE: u32 = 0x0000_3137;
 pub const DBGKD_WRITE_CONTROL_SPACE: u32 = 0x0000_3138;
 pub const DBGKD_CONTINUE_API2: u32 = 0x0000_313C;
+pub const DBGKD_READ_PHYSICAL_MEMORY: u32 = 0x0000_313D;
+pub const DBGKD_WRITE_PHYSICAL_MEMORY: u32 = 0x0000_313E;
 pub const DBGKD_GET_VERSION: u32 = 0x0000_3146;
 pub const DBGKD_SWITCH_PROCESSOR: u32 = 0x0000_3150;
+pub const DBGKD_READ_MACHINE_SPECIFIC_REGISTER: u32 = 0x0000_3152;
+pub const DBGKD_SET_CONTEXT_EX: u32 = 0x0000_3160;
+
+pub const DBGKD_VERS_FLAG_DATA: u16 = 0x0002;
 
 /// `DBGKD_MANIPULATE_STATE64` wire size
 pub const MANIPULATE_HEADER_SIZE: usize = 56;
 
+const CONTEXT_EX_CHUNK_SIZE: usize = 512;
+const CONTEXT_EX_MAX_SIZE: u32 = 0x3000;
 /// Per-API union offset in `DBGKD_MANIPULATE_STATE64`
 const UNION_OFFSET: usize = 16;
 
 pub const DBG_CONTINUE: u32 = 0x0001_0002;
+pub const DBG_EXCEPTION_NOT_HANDLED: u32 = 0x8001_0001;
+
+pub fn status_for_disposition(disposition: ContinueDisposition) -> u32 {
+    match disposition {
+        ContinueDisposition::Handled => DBG_CONTINUE,
+        ContinueDisposition::NotHandled => DBG_EXCEPTION_NOT_HANDLED,
+    }
+}
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
 
 /// Build a zeroed manipulate-state request header
@@ -188,29 +203,103 @@ pub fn get_version<T: Read + Write>(framing: &mut KdFraming<T>, processor: u16) 
     })
 }
 
-pub fn get_context<T: Read + Write>(framing: &mut KdFraming<T>, processor: u16) -> Result<Vec<u8>> {
+/// `DbgKdReadMachineSpecificRegister` (`rdmsr` in WinDbg).
+///
+/// On ARM64, `register` is the Windows KD encoding of an AArch64 system
+/// register rather than an x86 MSR number.
+pub fn read_machine_specific_register<T: Read + Write>(
+    framing: &mut KdFraming<T>,
+    processor: u16,
+    register: u32,
+) -> Result<u64> {
+    let mut header = make_header(DBGKD_READ_MACHINE_SPECIFIC_REGISTER, processor);
+    write_u32(&mut header, UNION_OFFSET, register);
+    let (parsed, reply_header, _) = send_manipulate(framing, &header, &[])?;
+    check_status(&parsed, DBGKD_READ_MACHINE_SPECIFIC_REGISTER)?;
+    let low = read_u32(&reply_header, UNION_OFFSET + 4) as u64;
+    let high = read_u32(&reply_header, UNION_OFFSET + 8) as u64;
+    Ok(low | high << 32)
+}
+
+pub fn get_context<T: Read + Write>(
+    framing: &mut KdFraming<T>,
+    processor: u16,
+    context_flags: u32,
+) -> Result<Vec<u8>> {
     let mut header = make_header(DBGKD_GET_CONTEXT, processor);
-    // Zero means "no register groups"; ask for the full AMD64 context
-    write_u32(&mut header, UNION_OFFSET, context::CONTEXT_ALL);
+    write_u32(&mut header, UNION_OFFSET, context_flags);
     let (parsed, _, data) = send_manipulate(framing, &header, &[])?;
     check_status(&parsed, DBGKD_GET_CONTEXT)?;
     Ok(data)
 }
 
-/// `DbgKdSetContextApi`: writes a CONTEXT byte buffer
-pub fn set_context<T: Read + Write>(
+/// Send one `DbgKdSetContextExApi` chunk.
+///
+/// Windows interprets `BytesCopied` in the request as the total staged context
+/// size, not the current transfer length. It commits the staged context only
+/// when `offset + data.len() == total_size`.
+fn set_context_ex_chunk<T: Read + Write>(
+    framing: &mut KdFraming<T>,
+    processor: u16,
+    offset: u32,
+    total_size: u32,
+    data: &[u8],
+) -> Result<()> {
+    let byte_count = u32::try_from(data.len())
+        .map_err(|_| Error::Kd("context chunk exceeds KD's 32-bit length field".into()))?;
+    let end = offset
+        .checked_add(byte_count)
+        .ok_or_else(|| Error::Kd("context chunk range overflow".into()))?;
+    if byte_count == 0
+        || offset >= total_size
+        || end > total_size
+        || total_size > CONTEXT_EX_MAX_SIZE
+    {
+        return Err(Error::Kd(format!(
+            "invalid context chunk: offset={offset:#x}, len={byte_count:#x}, total={total_size:#x}"
+        )));
+    }
+
+    let mut header = make_header(DBGKD_SET_CONTEXT_EX, processor);
+    write_u32(&mut header, UNION_OFFSET, offset);
+    write_u32(&mut header, UNION_OFFSET + 4, byte_count);
+    write_u32(&mut header, UNION_OFFSET + 8, total_size);
+    let (parsed, reply_header, _) = send_manipulate(framing, &header, data)?;
+    check_status(&parsed, DBGKD_SET_CONTEXT_EX).map_err(|error| {
+        Error::Kd(format!(
+            "context-chunk write offset={offset:#x} len={byte_count:#x} total={total_size:#x} failed: {error}"
+        ))
+    })?;
+    let bytes_copied = read_u32(&reply_header, UNION_OFFSET + 8);
+    if bytes_copied != byte_count {
+        return Err(Error::Kd(format!(
+            "short context-chunk write: wrote {bytes_copied} of {byte_count} bytes at {offset:#x}"
+        )));
+    }
+    Ok(())
+}
+
+/// Write a complete CONTEXT through bounded `DbgKdSetContextExApi` chunks.
+///
+/// Windows stages every chunk and atomically copies the context into the
+/// selected processor when the final chunk reaches `total_size`.
+pub fn set_context_chunked<T: Read + Write>(
     framing: &mut KdFraming<T>,
     processor: u16,
     context: &[u8],
 ) -> Result<()> {
-    let mut header = make_header(DBGKD_SET_CONTEXT, processor);
-    // The kernel reads ContextFlags from both the union and the CONTEXT
-    if context.len() >= 0x34 {
-        let flags = read_u32(context, 0x30);
-        write_u32(&mut header, UNION_OFFSET, flags);
+    let total_size = u32::try_from(context.len())
+        .map_err(|_| Error::Kd("CONTEXT exceeds KD's 32-bit length field".into()))?;
+    if context.is_empty() || total_size > CONTEXT_EX_MAX_SIZE {
+        return Err(Error::Kd(format!(
+            "invalid CONTEXT size for chunked write: {total_size:#x}"
+        )));
     }
-    let (parsed, _, _) = send_manipulate(framing, &header, context)?;
-    check_status(&parsed, DBGKD_SET_CONTEXT)?;
+    for (index, chunk) in context.chunks(CONTEXT_EX_CHUNK_SIZE).enumerate() {
+        let offset = u32::try_from(index * CONTEXT_EX_CHUNK_SIZE)
+            .map_err(|_| Error::Kd("context chunk offset exceeds 32 bits".into()))?;
+        set_context_ex_chunk(framing, processor, offset, total_size, chunk)?;
+    }
     Ok(())
 }
 
@@ -227,6 +316,51 @@ pub fn read_virtual_memory<T: Read + Write>(
     let (parsed, _, data) = send_manipulate(framing, &header, &[])?;
     check_status(&parsed, DBGKD_READ_VIRTUAL_MEMORY)?;
     Ok(data)
+}
+
+/// `DbgKdReadPhysicalMemoryApi`
+pub fn read_physical_memory<T: Read + Write>(
+    framing: &mut KdFraming<T>,
+    processor: u16,
+    addr: u64,
+    len: u32,
+) -> Result<Vec<u8>> {
+    let mut header = make_header(DBGKD_READ_PHYSICAL_MEMORY, processor);
+    write_u64(&mut header, UNION_OFFSET, addr);
+    write_u32(&mut header, UNION_OFFSET + 8, len);
+    let (parsed, reply_header, data) = send_manipulate(framing, &header, &[])?;
+    check_status(&parsed, DBGKD_READ_PHYSICAL_MEMORY)?;
+    let actual = read_u32(&reply_header, UNION_OFFSET + 12);
+    if actual > len || data.len() != actual as usize || (len != 0 && actual == 0) {
+        return Err(Error::Kd(format!(
+            "invalid physical-memory read at {addr:#x}: received {} bytes, target reported {actual} for request {len}",
+            data.len()
+        )));
+    }
+    Ok(data)
+}
+
+/// `DbgKdWritePhysicalMemoryApi`
+pub fn write_physical_memory<T: Read + Write>(
+    framing: &mut KdFraming<T>,
+    processor: u16,
+    addr: u64,
+    data: &[u8],
+) -> Result<u32> {
+    let len = u32::try_from(data.len())
+        .map_err(|_| Error::Kd("physical-memory write exceeds KD's length field".into()))?;
+    let mut header = make_header(DBGKD_WRITE_PHYSICAL_MEMORY, processor);
+    write_u64(&mut header, UNION_OFFSET, addr);
+    write_u32(&mut header, UNION_OFFSET + 8, len);
+    let (parsed, reply_header, _) = send_manipulate(framing, &header, data)?;
+    check_status(&parsed, DBGKD_WRITE_PHYSICAL_MEMORY)?;
+    let actual = read_u32(&reply_header, UNION_OFFSET + 12);
+    if actual > len || (len != 0 && actual == 0) {
+        return Err(Error::Kd(format!(
+            "invalid physical-memory write at {addr:#x}: target reported {actual} for request {len}"
+        )));
+    }
+    Ok(actual)
 }
 
 /// `DbgKdReadControlSpaceApi`
@@ -333,6 +467,28 @@ pub fn continue_api2<T: Read + Write>(
     Ok(())
 }
 
+/// `DbgKdContinueApi2` for ARM64 targets. `ARM64_DBGKD_CONTROL_SET` packs
+/// { ContinueStatus u32, TraceFlag u32, CurrentSymbolStart u64,
+///   CurrentSymbolEnd u64 } — there is no Dr7 field (AArch64 has no x86-style
+/// debug registers; watchpoints use DBGWCR/DBGWVR). The kernel performs
+/// single-stepping via MDSCR_EL1 when TraceFlag is set.
+pub fn continue_api2_arm64<T: Read + Write>(
+    framing: &mut KdFraming<T>,
+    processor: u16,
+    continue_status: u32,
+    trace: bool,
+) -> Result<()> {
+    let mut header = make_header(DBGKD_CONTINUE_API2, processor);
+    write_u32(&mut header, UNION_OFFSET, continue_status);
+    write_u32(&mut header, UNION_OFFSET + 4, if trace { 1 } else { 0 });
+    // CurrentSymbolStart/End stay zero.
+    let payload_len = MANIPULATE_HEADER_SIZE;
+    let mut payload = Vec::with_capacity(payload_len);
+    payload.extend_from_slice(&header);
+    framing.send_data(PACKET_TYPE_KD_STATE_MANIPULATE, &payload)?;
+    Ok(())
+}
+
 /// `DbgKdSwitchProcessor`: switch which processor subsequent register /
 /// memory operations target. The kernel does *not* send a reply; it expects
 /// the host to pick a different processor and resume the manipulate loop
@@ -347,9 +503,40 @@ mod tests {
     use super::*;
     use std::io::{Cursor, Read, Write};
 
+    use crate::kd::context;
     use crate::kd::framing::{
         KdFraming, PACKET_TYPE_KD_ACKNOWLEDGE, PACKET_TYPE_KD_STATE_MANIPULATE,
     };
+
+    #[test]
+    fn continuation_disposition_selects_distinct_kd_wire_status() {
+        for (disposition, expected_status) in [
+            (ContinueDisposition::Handled, DBG_CONTINUE),
+            (ContinueDisposition::NotHandled, DBG_EXCEPTION_NOT_HANDLED),
+        ] {
+            let ack = {
+                let outbound_id = (INITIAL_PACKET_ID | SYNC_PACKET_ID) & !SYNC_PACKET_ID;
+                let mut header = [0u8; 16];
+                header[0..4].copy_from_slice(&0x6969_6969u32.to_le_bytes());
+                header[4..6].copy_from_slice(&PACKET_TYPE_KD_ACKNOWLEDGE.to_le_bytes());
+                header[8..12].copy_from_slice(&outbound_id.to_le_bytes());
+                header.to_vec()
+            };
+            let mut framing = KdFraming::new(Loopback::new(ack));
+            continue_api2(
+                &mut framing,
+                0,
+                status_for_disposition(disposition),
+                false,
+                0,
+            )
+            .unwrap();
+
+            let outbound = &framing.transport_ref().outbound;
+            let request = &outbound[16..16 + MANIPULATE_HEADER_SIZE];
+            assert_eq!(read_u32(request, UNION_OFFSET), expected_status);
+        }
+    }
 
     struct Loopback {
         inbound: Cursor<Vec<u8>>,
@@ -482,6 +669,29 @@ mod tests {
     }
 
     #[test]
+    fn read_machine_specific_register_round_trip() {
+        let mut union_body = [0u8; 12];
+        write_u32(&mut union_body, 0, 0x0003_0201);
+        write_u32(&mut union_body, 4, 0x80d4_5800);
+        write_u32(&mut union_body, 8, 0x0040_0000);
+        let reply = build_reply(DBGKD_READ_MACHINE_SPECIFIC_REGISTER, 3, &union_body, &[]);
+        let stream = ack_then_reply(
+            (INITIAL_PACKET_ID | SYNC_PACKET_ID) & !SYNC_PACKET_ID,
+            INITIAL_PACKET_ID,
+            &reply,
+        );
+        let mut framing = KdFraming::new(Loopback::new(stream));
+
+        let value = read_machine_specific_register(&mut framing, 3, 0x0003_0201).unwrap();
+
+        assert_eq!(value, 0x0040_0000_80d4_5800);
+        let request = &framing.transport_ref().outbound[16..16 + MANIPULATE_HEADER_SIZE];
+        assert_eq!(read_u32(request, 0), DBGKD_READ_MACHINE_SPECIFIC_REGISTER);
+        assert_eq!(read_u16(request, 6), 3);
+        assert_eq!(read_u32(request, UNION_OFFSET), 0x0003_0201);
+    }
+
+    #[test]
     fn get_context_returns_reply_data() {
         let ctx_bytes: Vec<u8> = (0..1232u32).map(|i| (i & 0xff) as u8).collect();
         let reply = build_reply(DBGKD_GET_CONTEXT, 0, &[], &ctx_bytes);
@@ -492,12 +702,149 @@ mod tests {
         );
 
         let mut framing = KdFraming::new(Loopback::new(stream));
-        let ctx = get_context(&mut framing, 0).unwrap();
+        let ctx = get_context(&mut framing, 0, context::CONTEXT_ALL).unwrap();
         assert_eq!(ctx, ctx_bytes);
 
         let out = &framing.transport_ref().outbound;
         let req_header = &out[16..16 + MANIPULATE_HEADER_SIZE];
         assert_eq!(read_u32(req_header, UNION_OFFSET), context::CONTEXT_ALL);
+    }
+
+    #[test]
+    fn set_context_ex_chunk_encodes_transfer_and_total_sizes() {
+        let mut union_body = [0u8; 12];
+        write_u32(&mut union_body, 8, 8);
+        let reply = build_reply(DBGKD_SET_CONTEXT_EX, 1, &union_body, &[]);
+        let stream = ack_then_reply(
+            (INITIAL_PACKET_ID | SYNC_PACKET_ID) & !SYNC_PACKET_ID,
+            INITIAL_PACKET_ID,
+            &reply,
+        );
+        let mut framing = KdFraming::new(Loopback::new(stream));
+        let rip = 0xffff_f801_a732_a0a1u64.to_le_bytes();
+
+        set_context_ex_chunk(
+            &mut framing,
+            1,
+            context::OFFSET_RIP as u32,
+            context::CONTEXT_SIZE as u32,
+            &rip,
+        )
+        .unwrap();
+
+        let outbound = &framing.transport_ref().outbound;
+        assert_eq!(
+            read_u16(outbound, 6) as usize,
+            MANIPULATE_HEADER_SIZE + rip.len()
+        );
+        let request = &outbound[16..16 + MANIPULATE_HEADER_SIZE];
+        assert_eq!(read_u32(request, 0), DBGKD_SET_CONTEXT_EX);
+        assert_eq!(read_u16(request, 6), 1);
+        assert_eq!(read_u32(request, UNION_OFFSET), context::OFFSET_RIP as u32);
+        assert_eq!(read_u32(request, UNION_OFFSET + 4), rip.len() as u32);
+        assert_eq!(
+            read_u32(request, UNION_OFFSET + 8),
+            context::CONTEXT_SIZE as u32
+        );
+        assert_eq!(
+            &outbound[16 + MANIPULATE_HEADER_SIZE..16 + MANIPULATE_HEADER_SIZE + rip.len()],
+            &rip
+        );
+    }
+
+    #[test]
+    fn set_context_chunked_sends_ordered_chunks_and_commits_at_total_size() {
+        let context: Vec<u8> = (0..context::CONTEXT_SIZE)
+            .map(|index| (index & 0xff) as u8)
+            .collect();
+        let chunk_lengths: Vec<usize> = context
+            .chunks(CONTEXT_EX_CHUNK_SIZE)
+            .map(<[u8]>::len)
+            .collect();
+        let mut inbound = Vec::new();
+        for (index, &chunk_len) in chunk_lengths.iter().enumerate() {
+            let packet_id = INITIAL_PACKET_ID ^ (index as u32 & 1);
+            let mut union_body = [0u8; 12];
+            write_u32(&mut union_body, 8, chunk_len as u32);
+            let reply = build_reply(DBGKD_SET_CONTEXT_EX, 1, &union_body, &[]);
+            inbound.extend(ack_then_reply(packet_id, packet_id, &reply));
+        }
+        let mut framing = KdFraming::new(Loopback::new(inbound));
+
+        set_context_chunked(&mut framing, 1, &context).unwrap();
+
+        let outbound = &framing.transport_ref().outbound;
+        let mut cursor = 0usize;
+        let mut transferred = 0usize;
+        for &chunk_len in &chunk_lengths {
+            let request = &outbound[cursor + 16..cursor + 16 + MANIPULATE_HEADER_SIZE];
+            assert_eq!(read_u32(request, 0), DBGKD_SET_CONTEXT_EX);
+            assert_eq!(read_u32(request, UNION_OFFSET), transferred as u32);
+            assert_eq!(read_u32(request, UNION_OFFSET + 4), chunk_len as u32);
+            assert_eq!(read_u32(request, UNION_OFFSET + 8), context.len() as u32);
+            let data_start = cursor + 16 + MANIPULATE_HEADER_SIZE;
+            assert_eq!(
+                &outbound[data_start..data_start + chunk_len],
+                &context[transferred..transferred + chunk_len]
+            );
+            transferred += chunk_len;
+            cursor = data_start + chunk_len + 1 + 16;
+        }
+        assert_eq!(transferred, context.len());
+        assert_eq!(cursor, outbound.len());
+    }
+    #[test]
+    fn physical_memory_read_validates_and_returns_reply_data() {
+        let data = [0xde, 0xad, 0xbe, 0xef];
+        let mut union_body = [0u8; 16];
+        write_u64(&mut union_body, 0, 0x1234_5000);
+        write_u32(&mut union_body, 8, data.len() as u32);
+        write_u32(&mut union_body, 12, data.len() as u32);
+        let reply = build_reply(DBGKD_READ_PHYSICAL_MEMORY, 2, &union_body, &data);
+        let stream = ack_then_reply(
+            (INITIAL_PACKET_ID | SYNC_PACKET_ID) & !SYNC_PACKET_ID,
+            INITIAL_PACKET_ID,
+            &reply,
+        );
+        let mut framing = KdFraming::new(Loopback::new(stream));
+
+        let actual = read_physical_memory(&mut framing, 2, 0x1234_5000, data.len() as u32).unwrap();
+
+        assert_eq!(actual, data);
+        let request = &framing.transport_ref().outbound[16..16 + MANIPULATE_HEADER_SIZE];
+        assert_eq!(read_u32(request, 0), DBGKD_READ_PHYSICAL_MEMORY);
+        assert_eq!(read_u16(request, 6), 2);
+        assert_eq!(read_u64(request, UNION_OFFSET), 0x1234_5000);
+        assert_eq!(read_u32(request, UNION_OFFSET + 8), data.len() as u32);
+    }
+
+    #[test]
+    fn physical_memory_write_sends_data_and_checks_count() {
+        let data = [1, 2, 3, 4];
+        let mut union_body = [0u8; 16];
+        write_u64(&mut union_body, 0, 0x2000);
+        write_u32(&mut union_body, 8, data.len() as u32);
+        write_u32(&mut union_body, 12, data.len() as u32);
+        let reply = build_reply(DBGKD_WRITE_PHYSICAL_MEMORY, 1, &union_body, &[]);
+        let stream = ack_then_reply(
+            (INITIAL_PACKET_ID | SYNC_PACKET_ID) & !SYNC_PACKET_ID,
+            INITIAL_PACKET_ID,
+            &reply,
+        );
+        let mut framing = KdFraming::new(Loopback::new(stream));
+
+        write_physical_memory(&mut framing, 1, 0x2000, &data).unwrap();
+
+        let outbound = &framing.transport_ref().outbound;
+        let request = &outbound[16..16 + MANIPULATE_HEADER_SIZE];
+        assert_eq!(read_u32(request, 0), DBGKD_WRITE_PHYSICAL_MEMORY);
+        assert_eq!(read_u16(request, 6), 1);
+        assert_eq!(read_u64(request, UNION_OFFSET), 0x2000);
+        assert_eq!(read_u32(request, UNION_OFFSET + 8), data.len() as u32);
+        assert_eq!(
+            &outbound[16 + MANIPULATE_HEADER_SIZE..16 + MANIPULATE_HEADER_SIZE + data.len()],
+            &data
+        );
     }
 
     #[test]
@@ -632,7 +979,7 @@ mod tests {
         );
 
         let mut framing = KdFraming::new(Loopback::new(stream));
-        let err = get_context(&mut framing, 0).unwrap_err();
+        let err = get_context(&mut framing, 0, context::CONTEXT_ALL).unwrap_err();
         match err {
             Error::Kd(msg) => assert!(msg.contains("processor mismatch")),
             other => panic!("unexpected error: {other:?}"),

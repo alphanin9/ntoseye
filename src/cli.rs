@@ -9,22 +9,24 @@ use crate::agent;
 use crate::mcp;
 use crate::resolve_target;
 use crate::{
+    configure,
     dbg_backend::DebugBackend,
     diagnostics,
     dmp::DmpBackend,
     error::{Error, Result},
     gdb::GdbClient,
-    kd::KdBackend,
+    kd::{KdBackend, KdMemorySource},
     memory_backend::MemoryBackend,
     phys::PhysMem,
-    repl::start_repl,
-    session, symbols, virsh,
+    repl::{start_plain_repl, start_repl},
+    session, symbols,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BackendKind {
     Gdb,
     Kd,
+    KdNet,
     Memory,
 }
 
@@ -33,16 +35,18 @@ impl FromArgValue for BackendKind {
         match value {
             "gdb" => Ok(BackendKind::Gdb),
             "kd" => Ok(BackendKind::Kd),
+            "kdnet" => Ok(BackendKind::KdNet),
             "memory" => Ok(BackendKind::Memory),
             other => Err(format!(
-                "unknown backend '{other}': expected 'kd', 'gdb', or 'memory'"
+                "unknown backend '{other}': expected 'kd', 'kdnet', 'gdb', or 'memory'"
             )),
         }
     }
 }
 
 #[derive(FromArgs)]
-/// Windows kernel debugger for Linux hosts running Windows under KVM/QEMU
+/// Windows kernel debugger for Linux (KVM/QEMU, VMware) and macOS (UTM) hosts
+/// running Windows — WinDbg for Linux and macOS
 struct Args {
     /// print version information
     #[argh(switch, short = 'v', long = "version")]
@@ -66,14 +70,25 @@ struct Args {
     #[argh(switch, long = "kd-instructions")]
     kd_instructions: bool,
 
-    /// debugger backend: 'kd' (Windows KD over serial pipe, default), 'gdb' (QEMU gdbstub), or 'memory' (passive /dev/kvm introspection)
+    /// debugger backend: 'kd' (Windows KD over serial, default), 'kdnet' (Windows KD over UDP), 'gdb' (QEMU GDB stub), or 'memory' (passive live-VM introspection)
     #[argh(option, short = 'b', long = "backend", default = "BackendKind::Kd")]
     backend: BackendKind,
 
-    /// backend connection target. Defaults: '127.0.0.1:1234' for gdb, '/tmp/ntoseye-kd.sock' for kd; unused by memory.
+    /// backend target: GDB address, KD socket path, or KDNET listen address; unused by memory
     #[argh(option, long = "connect")]
     connect: Option<String>,
 
+    /// KDNET encryption key (four base-36 components); required by the kdnet backend
+    #[argh(option, long = "kdnet-key")]
+    kdnet_key: Option<String>,
+
+    /// KD/KDNET memory source: auto (validated host memory, then KD fallback), host, or kd
+    #[argh(option, long = "memory-source")]
+    memory_source: Option<KdMemorySource>,
+
+    /// use a line-oriented REPL without terminal cursor queries, completion, or history
+    #[argh(switch, long = "plain-repl")]
+    plain_repl: bool,
     /// open a Windows kernel crash dump (.dmp) for offline analysis instead of attaching to a live VM
     #[argh(option, long = "dump")]
     dump: Option<PathBuf>,
@@ -85,7 +100,8 @@ struct Args {
 #[derive(FromArgs)]
 #[argh(subcommand)]
 enum Command {
-    Virsh(VirshCommand),
+    Configure(ConfigureCommand),
+    Status(StatusCommand),
     #[cfg(feature = "mcp")]
     Mcp(McpCommand),
     #[cfg(feature = "agent")]
@@ -129,9 +145,14 @@ struct McpCommand {
 }
 
 #[derive(FromArgs)]
-#[argh(subcommand, name = "virsh")]
-/// interactively edit libvirt XML for ntoseye debug backends
-struct VirshCommand {}
+#[argh(subcommand, name = "configure")]
+/// interactively configure a supported hypervisor for ntoseye
+struct ConfigureCommand {}
+
+#[derive(FromArgs)]
+#[argh(subcommand, name = "status")]
+/// inspect configured hypervisor transports and recover launch commands
+struct StatusCommand {}
 
 static GDBSTUB_INSTRUCTIONS: &str = "The gdb backend talks to QEMU's gdbstub instead of Windows KD.
 It does not require Windows debug mode, but it loses Windows-native
@@ -217,7 +238,20 @@ ntoseye --connect /tmp/ntoseye-kd.sock
 ntoseye waits 8 seconds for the initial KD handshake by default.
 For unusually slow guests, override it with:
 
-NTOSEYE_KD_TIMEOUT=20 ntoseye";
+NTOSEYE_KD_TIMEOUT=20 ntoseye
+
+macOS (UTM): UTM sandboxes QEMU (even the unsigned build), so the
+socket must live inside UTM's QEMUHelper container instead of /tmp.
+In the VM settings, add to 'Arguments (QEMU)':
+
+-chardev socket,id=kd,path=/Users/YOU/Library/Containers/com.utmapp.QEMUHelper/Data/tmp/ntoseye-kd.sock,server=on,wait=off -serial chardev:kd
+
+then connect to that path as root:
+
+sudo ntoseye --backend kd --connect \"$HOME/Library/Containers/com.utmapp.QEMUHelper/Data/tmp/ntoseye-kd.sock\"
+
+Windows ARM64 is supported (machine 0xAA64). Secure Boot must be
+disabled for bcdedit /debug on to work.";
 
 pub fn main() {
     if let Err(e) = run() {
@@ -242,6 +276,27 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
+    if args.backend != BackendKind::KdNet && args.kdnet_key.is_some() {
+        return Err(Error::DebugInfo(
+            "--kdnet-key is only valid with --backend kdnet".to_string(),
+        ));
+    }
+    if !matches!(args.backend, BackendKind::Kd | BackendKind::KdNet) && args.memory_source.is_some()
+    {
+        return Err(Error::DebugInfo(
+            "--memory-source is only valid with --backend kd or --backend kdnet".to_string(),
+        ));
+    }
+    #[cfg(feature = "mcp")]
+    let may_defer_kdnet_key = matches!(&args.command, Some(Command::Mcp(_)));
+    #[cfg(not(feature = "mcp"))]
+    let may_defer_kdnet_key = false;
+    if args.backend == BackendKind::KdNet && args.kdnet_key.is_none() && !may_defer_kdnet_key {
+        return Err(Error::DebugInfo(
+            "--backend kdnet requires --kdnet-key <w.x.y.z>".to_string(),
+        ));
+    }
+
     print_home_migration();
 
     symbols::FORCE_DOWNLOADS
@@ -252,7 +307,10 @@ fn run() -> Result<()> {
 
     // Merge top-level and subcommand --pdb-server lists (the subcommand may
     // carry its own, e.g. `ntoseye mcp --pdb-server URL`).
+    #[cfg(feature = "mcp")]
     let mut pdb_servers = std::mem::take(&mut args.pdb_server);
+    #[cfg(not(feature = "mcp"))]
+    let pdb_servers = std::mem::take(&mut args.pdb_server);
     #[cfg(feature = "mcp")]
     if let Some(Command::Mcp(ref mcp_args)) = args.command {
         pdb_servers.extend(mcp_args.pdb_server.clone());
@@ -273,17 +331,21 @@ fn run() -> Result<()> {
     // `&args` to connect_session, which a partial move would forbid.
     if let Some(command) = args.command.take() {
         return match command {
-            Command::Virsh(_) => virsh::run_interactive(),
+            Command::Configure(_) => configure::run_interactive(),
+            Command::Status(_) => configure::print_status(),
             #[cfg(feature = "mcp")]
             Command::Mcp(mcp_args) => {
                 let backend = match args.backend {
                     BackendKind::Gdb => "gdb",
                     BackendKind::Kd => "kd",
+                    BackendKind::KdNet => "kdnet",
                     BackendKind::Memory => "memory",
                 };
                 mcp::run(
                     backend.to_string(),
                     args.connect.clone(),
+                    args.kdnet_key.clone(),
+                    args.memory_source.unwrap_or(KdMemorySource::Auto),
                     args.dump.clone(),
                     mcp_args.http.clone(),
                     mcp_args.unsafe_http,
@@ -299,7 +361,11 @@ fn run() -> Result<()> {
     }
 
     let mut ctx = connect_session(&args)?;
-    start_repl(&mut ctx)
+    if args.plain_repl {
+        start_plain_repl(&mut ctx)
+    } else {
+        start_repl(&mut ctx)
+    }
 }
 
 /// Open a dump or connect the selected live backend. Live backends take a
@@ -320,23 +386,40 @@ fn connect_session(args: &Args) -> Result<session::Session> {
         });
     }
 
-    // kd/gdb take a per-target instance lock so a second ntoseye can't
+    // kd/kdnet/gdb take a per-target instance lock so a second ntoseye can't
     // attach to the same backend resource; passive memory introspection
     // passes None and coexists with anything.
     let backend_str = match args.backend {
         BackendKind::Gdb => "gdb",
         BackendKind::Kd => "kd",
+        BackendKind::KdNet => "kdnet",
         BackendKind::Memory => "memory",
     };
     let target = resolve_target(backend_str, args.connect.as_deref());
-    let phys = Arc::new(PhysMem::kvm()?);
+    let memory_source = args.memory_source.unwrap_or(KdMemorySource::Auto);
+    if matches!(args.backend, BackendKind::Kd | BackendKind::KdNet) {
+        let endpoint = target
+            .as_deref()
+            .expect("KD/KDNET always resolves an endpoint");
+        return session::Session::connect_kd(endpoint, memory_source, || match args.backend {
+            BackendKind::Kd => KdBackend::connect(endpoint),
+            BackendKind::KdNet => KdBackend::connect_net(
+                endpoint,
+                args.kdnet_key.as_deref().ok_or_else(|| {
+                    Error::DebugInfo("--backend kdnet requires --kdnet-key <w.x.y.z>".to_string())
+                })?,
+            ),
+            _ => unreachable!("non-KD backend excluded above"),
+        });
+    }
+
+    let phys = Arc::new(PhysMem::live()?);
     session::Session::connect(
         phys,
         target.as_deref(),
         || -> Result<Box<dyn DebugBackend>> {
             Ok(match args.backend {
                 BackendKind::Gdb => Box::new(GdbClient::connect(target.as_deref().unwrap())?),
-                BackendKind::Kd => Box::new(KdBackend::connect(target.as_deref().unwrap())?),
                 BackendKind::Memory => {
                     if args.connect.is_some() {
                         return Err(Error::DebugInfo(
@@ -344,6 +427,9 @@ fn connect_session(args: &Args) -> Result<session::Session> {
                         ));
                     }
                     Box::new(MemoryBackend::new())
+                }
+                BackendKind::Kd | BackendKind::KdNet => {
+                    unreachable!("KD backends handled above")
                 }
             })
         },

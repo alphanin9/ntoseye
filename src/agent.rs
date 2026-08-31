@@ -50,7 +50,7 @@ use crate::target::{
     wait_reason_name,
 };
 use crate::types::VirtAddr;
-use crate::unwind::{FrameSource, build_stacktrace};
+use crate::unwind::build_stacktrace;
 use crate::view;
 use crate::bugchecks::{analyze_bugcheck, current_bugcheck};
 
@@ -319,7 +319,7 @@ impl AgentSession<'_> {
             "current_thread": self.session.current_thread,
             "current_dtb": fmt_addr(target.current_dtb()),
             "current_process": process,
-            "current_windows_thread": target.current_windows_thread.as_ref().map(
+            "current_windows_thread": target.windows_thread_selection.as_ref().map(
                 |thread| thread_json(thread, Some(&self.session.current_thread))
             ),
         })
@@ -766,11 +766,7 @@ impl AgentSession<'_> {
                 "sp": fmt_addr(frame.sp),
                 "ip": fmt_addr(frame.ip),
                 "symbol": frame.symbol,
-                "source": match frame.source {
-                    FrameSource::Current => "current",
-                    FrameSource::Unwind => "unwind",
-                    FrameSource::Scan => "scan",
-                },
+                "source": frame.source.as_str(),
             })).collect::<Vec<_>>()
         }))
     }
@@ -908,18 +904,26 @@ impl AgentSession<'_> {
                 .as_ref()
                 .map(|module| format!("{module}!{name}"))
                 .unwrap_or_else(|| name.clone());
-            if let Some((address, module)) = self
-                .session
-                .target
-                .symbols
-                .find_symbol_with_module(dtb, &lookup)
-            {
-                addresses.push(address.0);
+            // Deliberately not `find_symbol_with_module`: that reports a
+            // cross-module collision as an error, which is ordinary for a
+            // search listing. Take the first (module, address) location and
+            // flag the collision instead of dropping the hit.
+            let candidates = self.session.target.symbols.find_symbol_candidates(dtb, &lookup);
+            let mut locations = candidates
+                .iter()
+                .map(|candidate| (candidate.module.to_ascii_lowercase(), candidate.address.0))
+                .collect::<Vec<_>>();
+            locations.sort();
+            locations.dedup();
+            if let Some(candidate) = candidates.first() {
+                let module = &candidate.module;
+                addresses.push(candidate.address.0);
                 results.push(json!({
-                    "address": fmt_addr(address.0),
+                    "address": fmt_addr(candidate.address.0),
                     "module": module,
                     "name": name,
                     "symbol": format!("{module}!{name}"),
+                    "ambiguous": locations.len() > 1,
                 }));
             }
         }
@@ -1138,7 +1142,7 @@ impl AgentSession<'_> {
         let target_address = if target == "." {
             self.session
                 .target
-                .current_windows_thread
+                .windows_thread_selection
                 .as_ref()
                 .map(|thread| thread.ethread)
         } else {
@@ -1368,6 +1372,9 @@ impl AgentSession<'_> {
                 temporary,
                 rip,
                 condition_error,
+                // A frontend command action, which this protocol cannot attach
+                // and does not run. Ignored, as in the MCP host.
+                ..
             } => {
                 let mut out = self.stopped_envelope("breakpoint")?;
                 out["rip"] = json!(fmt_addr(rip));
@@ -1400,10 +1407,16 @@ impl AgentSession<'_> {
             ContinueOutcome::Stopped {
                 rip,
                 exception_code,
+                first_chance,
+                exception_address,
             } => {
                 let mut out = self.stopped_envelope("exception")?;
                 out["rip"] = json!(fmt_addr(rip));
                 out["exception_code"] = json!(exception_code.map(|code| format!("0x{code:08x}")));
+                // The faulting address can differ from `rip` (a second-chance
+                // report re-raises at the original site), so keep both.
+                out["first_chance"] = json!(first_chance);
+                out["exception_address"] = json!(exception_address.map(fmt_addr));
                 Ok(out)
             }
             ContinueOutcome::Step { rip } => {

@@ -9,7 +9,10 @@ use crate::error::{Error, Result};
 pub mod breakpoints;
 pub mod registers;
 
-pub use breakpoints::{BreakpointHitResult, BreakpointManager};
+pub use breakpoints::{
+    BreakpointConfig, BreakpointHitDisposition, BreakpointHitResult, BreakpointManager,
+    BreakpointSpec,
+};
 pub use registers::{RegisterInfo, RegisterMap};
 
 #[derive(Debug, Default, Clone)]
@@ -73,7 +76,7 @@ fn gdb_connect_error(addr: &str, err: io::Error) -> Error {
         io::ErrorKind::ConnectionRefused => format!(
             "GDB stub at '{addr}' is not accepting connections.\n\
              Start the VM with QEMU gdbstub enabled (-s -S), or pass --connect <addr> if the stub listens elsewhere.\n\
-             For libvirt guests, run `ntoseye virsh` and choose gdb.\n\
+             For supported hypervisors, run `ntoseye configure` and choose GDB.\n\
              If this guest is configured for Windows KD instead, use the default KD backend."
         ),
         io::ErrorKind::TimedOut => format!(
@@ -114,6 +117,7 @@ impl GdbClient {
         let _ = client.send_packet("?")?;
 
         client.register_map = client.fetch_register_map()?;
+        client.register_map.require_amd64_target()?;
 
         Ok(client)
     }
@@ -739,6 +743,8 @@ impl DebugBackend for GdbClient {
         Ok(StopEvent {
             thread_id: Self::parse_stop_reply_thread_id(&response),
             exception_code: None,
+            first_chance: None,
+            exception_address: None,
             program_counter: None,
             is_bugcheck: false,
             bugcheck: None,
@@ -753,6 +759,8 @@ impl DebugBackend for GdbClient {
         Ok(StopEvent {
             thread_id: Self::parse_stop_reply_thread_id(&response),
             exception_code: None,
+            first_chance: None,
+            exception_address: None,
             program_counter: None,
             is_bugcheck: false,
             bugcheck: None,
@@ -770,6 +778,8 @@ impl DebugBackend for GdbClient {
         Ok(result?.map(|response| StopEvent {
             thread_id: Self::parse_stop_reply_thread_id(&response),
             exception_code: None,
+            first_chance: None,
+            exception_address: None,
             program_counter: None,
             is_bugcheck: false,
             bugcheck: None,

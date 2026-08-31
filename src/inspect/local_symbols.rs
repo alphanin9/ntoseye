@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::guest::{ModuleInfo, ModuleSymbolLoadReport};
-use crate::symbols::{ModuleSymbolDiscovery, SymbolStore};
+use crate::symbols::ModuleSymbolDiscovery;
 use crate::target::Target;
 use crate::types::Dtb;
 
@@ -26,8 +26,13 @@ fn local_symbol_plan_for_module(
     dtb: Dtb,
     module: &ModuleInfo,
 ) -> Result<Option<(PathBuf, u128)>> {
-    match SymbolStore::extract_download_job(&debugger.phys, dtb, &module.name, module.base_address)?
-    {
+    match debugger.symbols.extract_download_job(
+        &debugger.phys,
+        dtb,
+        &module.name,
+        module.base_address,
+        debugger.arch(),
+    )? {
         ModuleSymbolDiscovery::Ready { job, guid, .. } => {
             Ok(find_file_case_insensitive(dir, &job.filename).map(|path| (path, guid)))
         }
@@ -35,7 +40,9 @@ fn local_symbol_plan_for_module(
             let Some(image_path) = find_file_case_insensitive(dir, &image_job.filename) else {
                 return Ok(None);
             };
-            let Some((job, guid)) = SymbolStore::extract_download_job_from_image_file(&image_path)?
+            let Some((job, guid)) = debugger
+                .symbols
+                .extract_download_job_from_image_file(&image_path)?
             else {
                 return Ok(None);
             };

@@ -371,10 +371,10 @@ pub fn classify_pool_region(
     ] {
         let s_addr = debugger
             .symbols
-            .find_symbol_across_modules(debugger.current_dtb(), start)?;
+            .find_symbol_across_modules(debugger.current_dtb(), start).ok()??;
         let e_addr = debugger
             .symbols
-            .find_symbol_across_modules(debugger.current_dtb(), stop)?;
+            .find_symbol_across_modules(debugger.current_dtb(), stop).ok()??;
         let mem = debugger.current_process().ok()?.memory();
         let s = VirtAddr(mem.read::<u64>(s_addr).ok()?);
         let e = VirtAddr(mem.read::<u64>(e_addr).ok()?);
@@ -449,12 +449,12 @@ pub fn find_big_pool(
 ) -> Option<BigPoolEntry> {
     let table_sym = debugger
         .symbols
-        .find_symbol_across_modules(debugger.current_dtb(), "PoolBigPageTable")?;
+        .find_symbol_across_modules(debugger.current_dtb(), "PoolBigPageTable").ok()??;
     let mem = debugger.current_process().ok()?.memory();
     let table_addr = VirtAddr(mem.read::<u64>(table_sym).ok()?);
     let count_sym = debugger
         .symbols
-        .find_symbol_across_modules(debugger.current_dtb(), "PoolBigPageTableSize")?;
+        .find_symbol_across_modules(debugger.current_dtb(), "PoolBigPageTableSize").ok()??;
     let count: u64 = mem.read(count_sym).ok()?;
     if count == 0 || count > 0x100000 {
         return None;
@@ -475,7 +475,7 @@ pub fn find_big_pool(
 pub fn segment_heap_hint(debugger: &Target) -> Option<&'static str> {
     debugger
         .symbols
-        .find_symbol_across_modules(debugger.current_dtb(), "RtlpHpHeapGlobals")?;
+        .find_symbol_across_modules(debugger.current_dtb(), "RtlpHpHeapGlobals").ok()??;
     Some("kernel has RtlpHpHeapGlobals; address may be segment heap instead of _POOL_HEADER")
 }
 

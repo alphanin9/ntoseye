@@ -31,13 +31,16 @@ use pelite::pe64::{
 
 use crate::{
     backend::MemoryOps,
+    bugchecks::looks_like_kernel_pointer,
+    error::{Error, Result},
     gdb::RegisterMap,
     guest::{Guest, ModuleInfo, PeImage, ProcessInfo, read_pe_image, read_pe_image_from_file},
     memory::{AddressSpace, DTB_IDENTITY},
     phys::PhysMem,
-    symbols::SymbolStore,
-    target::Target,
-    types::{Dtb, VirtAddr},
+    symbols::{SourceLocation, SymbolStore},
+    target::{SavedThreadRegisters, Target, ThreadInfo},
+    trapframe::{decode_kswitch_frame_seed, decode_ktrap_frame_for_thread},
+    types::{Arch, Dtb, VirtAddr},
 };
 
 const CR3_PAGE_MASK: u64 = 0x000F_FFFF_FFFF_F000;
@@ -72,6 +75,7 @@ pub struct ThreadTraceContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameSource {
     Current,
+    Seed,
     Unwind,
     Scan,
 }
@@ -83,6 +87,7 @@ impl FrameSource {
     pub fn as_str(self) -> &'static str {
         match self {
             FrameSource::Current => "current",
+            FrameSource::Seed => "seed",
             FrameSource::Unwind => "unwind",
             FrameSource::Scan => "scan",
         }
@@ -95,12 +100,34 @@ pub struct StackFrame {
     pub ip: u64,
     pub symbol: String,
     pub source: FrameSource,
+    pub source_location: Option<SourceLocation>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct StackTrace {
     pub frames: Vec<StackFrame>,
     pub truncated: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadStackSource {
+    TrapFrame { address: VirtAddr },
+    ContextSwitch { kernel_stack: VirtAddr },
+}
+
+impl ThreadStackSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TrapFrame { .. } => "ktrap-frame",
+            Self::ContextSwitch { .. } => "kernel-stack",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ThreadStackTrace {
+    pub source: ThreadStackSource,
+    pub stacktrace: StackTrace,
 }
 
 #[derive(Clone, Debug)]
@@ -253,29 +280,379 @@ pub fn preferred_code_dtb(trace: &ThreadTraceContext, addr: u64) -> Dtb {
         .unwrap_or(trace.active_dtb)
 }
 
+fn frame_source_location(
+    debugger: &Target,
+    trace: &ThreadTraceContext,
+    address: u64,
+) -> Option<SourceLocation> {
+    let module = trace.module_for_address(address)?;
+    debugger
+        .symbols
+        .source_location(module.dtb, VirtAddr(address))
+}
+fn image_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
+    ))
+}
+
+/// Decode an ARM64 `.pdata` entry's function length. Packed entries carry an
+/// 11-bit instruction count in the entry itself; unpacked entries point to an
+/// `.xdata` header whose low 18 bits carry the instruction count.
+fn arm64_function_length(image: &PeImage, unwind_data: u32) -> Option<u32> {
+    let instructions = match unwind_data & 0b11 {
+        0 => {
+            let xdata_rva = (unwind_data & !0b11) as usize;
+            let header = image_u32(image.present_slice(xdata_rva, 4)?, 0)?;
+            header & 0x3ffff
+        }
+        1 | 2 => (unwind_data >> 2) & 0x7ff,
+        _ => return None,
+    };
+    (instructions != 0).then(|| instructions * 4)
+}
+
+/// Find the ARM64 runtime-function entry containing `rva`. ARM64 `.pdata`
+/// records are sorted 8-byte `{BeginAddress, UnwindData}` pairs; unlike AMD64,
+/// the end address must be decoded from packed unwind data or the `.xdata`
+/// header.
+fn lookup_arm64_runtime_function(image: &PeImage, pdata: &[u8], rva: u32) -> Option<(u32, u32)> {
+    let count = pdata.len() / 8;
+    let mut low = 0usize;
+    let mut high = count;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let begin = image_u32(pdata, mid * 8)?;
+        if begin <= rva {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+
+    let index = low.checked_sub(1)?;
+    let begin = image_u32(pdata, index * 8)?;
+    let unwind_data = image_u32(pdata, index * 8 + 4)?;
+    let end = begin.checked_add(arm64_function_length(image, unwind_data)?)?;
+    (rva >= begin && rva < end).then_some((begin, end))
+}
+
+/// Resolve the runtime-function entry containing `address`.
+///
+/// PE exception metadata is the authoritative function boundary for `uf`: it
+/// remains correct when public symbols are sparse and avoids disassembling into
+/// the next function. A paged-out `.pdata` or `.xdata` range is retried against
+/// the matched on-disk image through the stack unwinder's image cache.
+pub fn function_range(
+    debugger: &Target,
+    trace: &ThreadTraceContext,
+    address: u64,
+) -> Option<(u64, u64)> {
+    fn range(image: &PeImage, base: u64, address: u64, arch: Arch) -> Option<(u64, u64)> {
+        let view = PeView::from_bytes(image.as_slice()).ok()?;
+        let rva = u32::try_from(address.checked_sub(base)?).ok()?;
+        let (begin, end) = match arch {
+            Arch::Amd64 => {
+                let functions = view.exception().ok()?;
+                let function = lookup_runtime_function(functions.image(), rva)?;
+                (function.BeginAddress, function.EndAddress)
+            }
+            Arch::Arm64 => {
+                let directory = view.data_directory().get(IMAGE_DIRECTORY_ENTRY_EXCEPTION)?;
+                let pdata = image
+                    .present_slice(directory.VirtualAddress as usize, directory.Size as usize)?;
+                lookup_arm64_runtime_function(image, pdata, rva)?
+            }
+        };
+        Some((base + u64::from(begin), base + u64::from(end)))
+    }
+
+    let mut tracer = StackTracer::new(debugger, trace);
+    let base = tracer.module_containing(address)?.info.base_address.0;
+    let arch = debugger.arch();
+    let image = tracer.module_image(address)?;
+    if let Some(found) = range(&image, base, address, arch) {
+        return Some(found);
+    }
+
+    if !image.is_complete() && tracer.upgrade_module_image(address) {
+        let image = tracer.module_image(address)?;
+        return range(&image, base, address, arch);
+    }
+
+    None
+}
+
+fn function_body_address(
+    debugger: &Target,
+    trace: &ThreadTraceContext,
+    address: u64,
+) -> Option<u64> {
+    let (_, end) = function_range(debugger, trace, address)?;
+    let mut tracer = StackTracer::new(debugger, trace);
+    let base = tracer.module_containing(address)?.info.base_address.0;
+    let mut image = tracer.module_image(address)?;
+    let mut resolved = resolve_function(&image, base, address);
+    if matches!(resolved, Resolve::Holed)
+        && !image.is_complete()
+        && tracer.upgrade_module_image(address)
+    {
+        image = tracer.module_image(address)?;
+        resolved = resolve_function(&image, base, address);
+    }
+
+    let Resolve::Function { unwind_data, begin } = resolved else {
+        return None;
+    };
+    let unwind = parse_unwind_info(&image, unwind_data)?;
+    let body = base
+        .checked_add(u64::from(begin))?
+        .checked_add(u64::from(unwind.size_of_prolog))?;
+    (body < end).then_some(body)
+}
+
+/// Recover the build-specific context-switch frame using the matching image's
+/// x64 unwind metadata. `KTHREAD.KernelStack` is the RSP saved inside
+/// `SwapContext`; no private `_KSWITCH_FRAME` layout or build table is needed.
+fn recover_context_switch_seed(
+    debugger: &Target,
+    process_dtb: Dtb,
+    kernel_stack: VirtAddr,
+) -> Result<RegisterContext> {
+    let ntoskrnl = &debugger.guest()?.ntoskrnl;
+    let swap_context = ntoskrnl.symbol("SwapContext")?.address().0;
+    let ki_swap_context = ntoskrnl.symbol("KiSwapContext")?.address().0;
+    let trace = resolve_thread_trace_context(debugger, process_dtb);
+    let body_rip = function_body_address(debugger, &trace, swap_context)
+        .ok_or_else(|| Error::DebugInfo("SwapContext has no usable PE unwind metadata".into()))?;
+    let ki_swap_range = function_range(debugger, &trace, ki_swap_context)
+        .ok_or_else(|| Error::DebugInfo("KiSwapContext has no usable PE unwind metadata".into()))?;
+
+    let mut tracer = StackTracer::new(debugger, &trace);
+    let mut seed = RegisterContext {
+        rip: body_rip,
+        rsp: kernel_stack.0,
+        regs: [None; 16],
+    };
+    if !matches!(
+        tracer.unwind_once(&mut seed),
+        Unwound::Frame {
+            stack_switch: false
+        }
+    ) {
+        return Err(Error::DebugInfo(
+            "failed to unwind the saved SwapContext frame".into(),
+        ));
+    }
+    if seed.rsp <= kernel_stack.0 || !(ki_swap_range.0..ki_swap_range.1).contains(&seed.rip) {
+        return Err(Error::DebugInfo(format!(
+            "SwapContext returned outside KiSwapContext ({:#x}, RSP {:#x})",
+            seed.rip, seed.rsp
+        )));
+    }
+
+    // Validate that the next unwind is coherent, but keep `seed` private to the
+    // stack walker. It is not a complete saved register context: x64 unwind data
+    // can recover nonvolatile registers while crossing KiSwapContext, but the
+    // volatile registers and RFLAGS were never preserved. Full parked-thread
+    // register display would need a real architecture-defined snapshot (for
+    // example matching KTRAP/KEXCEPTION frames), plus per-register provenance;
+    // splicing values recovered at different unwind phases is not such a snapshot.
+    let mut caller = seed.clone();
+    if !matches!(
+        tracer.unwind_once(&mut caller),
+        Unwound::Frame {
+            stack_switch: false
+        }
+    ) || caller.rsp <= seed.rsp
+        || !tracer.is_executable_address(caller.rip)
+    {
+        return Err(Error::DebugInfo(
+            "failed to validate the saved KiSwapContext frame".into(),
+        ));
+    }
+
+    Ok(seed)
+}
+
 pub fn build_stacktrace(
     debugger: &Target,
     register_map: &RegisterMap,
     regs: &[u8],
     limit: usize,
 ) -> StackTrace {
-    let limit = limit.max(1);
-    let rip = register_map.read_u64("rip", regs).unwrap_or(0);
-    let rsp = register_map.read_u64("rsp", regs).unwrap_or(0);
+    if debugger.arch() == Arch::Arm64 {
+        return build_stacktrace_arm64(debugger, register_map, regs, limit);
+    }
     let cr3 = register_map.read_u64("cr3", regs).unwrap_or(0);
-
     let trace = resolve_thread_trace_context(debugger, cr3);
+    build_stacktrace_seeded(
+        debugger,
+        &trace,
+        RegisterContext::from_registers(register_map, regs),
+        FrameSource::Current,
+        limit,
+    )
+}
 
-    // phase 1: walk the stack collecting raw frames (sp, ip, source). Symbols are
-    // formatted afterwards so we can first lazily load the modules they land in.
-    let mut raw: Vec<(u64, u64, FrameSource)> = vec![(rsp, rip, FrameSource::Current)];
-    let mut tracer = StackTracer::new(debugger, &trace);
-    let mut context = RegisterContext::from_registers(register_map, regs);
-    let mut seen = HashSet::from([rip]);
+/// Strip AArch64 pointer-authentication bits (bits 63:56) from a return
+/// address: sign-extend the 56-bit canonical address back to 64 bits.
+fn strip_pac(addr: u64) -> u64 {
+    ((addr << 8) as i64 >> 8) as u64
+}
 
-    // bound on unwind iterations: rsp normally advances every step, but a stack
-    // switch across a trap frame relaxes that guard, so cap the walk to stay safe
-    // against cyclic/corrupt data
+/// ARM64 backtrace via the frame-pointer (x29) chain: each frame stores the
+/// previous FP at `[fp]` and the return address at `[fp+8]`. Windows ARM64
+/// kernel code keeps frame pointers enabled, so this is reliable; PAC-signed
+/// return addresses are stripped.
+fn build_stacktrace_arm64(
+    debugger: &Target,
+    register_map: &RegisterMap,
+    regs: &[u8],
+    limit: usize,
+) -> StackTrace {
+    let cr3 = register_map.read_u64("cr3", regs).unwrap_or(0);
+    let trace = resolve_thread_trace_context(debugger, cr3);
+    let seed_pc = register_map.read_u64("rip", regs).unwrap_or(0);
+    let seed_sp = register_map.read_u64("rsp", regs).unwrap_or(0);
+    let mut raw: Vec<(u64, u64, FrameSource)> = vec![(seed_sp, seed_pc, FrameSource::Current)];
+
+    let memory = debugger.address_space(trace.active_dtb);
+    let mut fp = register_map.read_u64("fp", regs).unwrap_or(0);
+    for _ in 0..MAX_UNWIND_FRAMES {
+        let mut buf = [0u8; 16];
+        if memory.read_bytes(VirtAddr(fp), &mut buf).is_err() {
+            break;
+        }
+        let next_fp = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let ra = strip_pac(u64::from_le_bytes(buf[8..16].try_into().unwrap()));
+        if ra == 0 || next_fp == 0 || next_fp <= fp {
+            break;
+        }
+        raw.push((fp + 16, ra, FrameSource::Unwind));
+        fp = next_fp;
+    }
+
+    ensure_frame_module_symbols(debugger, &trace, raw.iter().map(|(_, ip, _)| *ip));
+
+    let mut stacktrace = StackTrace::default();
+    for (sp, ip, source) in raw {
+        record_stack_frame(
+            &mut stacktrace,
+            limit,
+            StackFrame {
+                sp,
+                ip,
+                symbol: format_symbol(debugger, &trace, ip),
+                source,
+                source_location: frame_source_location(debugger, &trace, ip),
+            },
+        );
+    }
+    stacktrace
+}
+
+fn switch_seed_is_plausible(thread: &ThreadInfo, seed: &RegisterContext) -> bool {
+    let (Some(kernel_stack), Some(stack_limit), Some(stack_base)) =
+        (thread.kernel_stack, thread.stack_limit, thread.stack_base)
+    else {
+        return false;
+    };
+    thread.kernel_stack_resident != Some(false)
+        && looks_like_kernel_pointer(seed.rip)
+        && kernel_stack >= stack_limit
+        && kernel_stack < stack_base
+        && seed.rsp >= stack_limit.0
+        && seed.rsp <= stack_base.0
+}
+
+/// Build a non-running Windows thread's kernel stack without manufacturing a
+/// persistent register context. A real KTRAP_FRAME is preferred; otherwise the
+/// context-switch bootstrap remains private to this stack walk.
+pub fn build_parked_thread_stack(
+    debugger: &Target,
+    thread: &ThreadInfo,
+    limit: usize,
+) -> Result<ThreadStackTrace> {
+    let process_dtb = debugger.thread_process_dtb(thread).ok_or_else(|| {
+        Error::DebugInfo("parked thread owning process DTB is unavailable".into())
+    })?;
+    let trace = resolve_thread_trace_context(debugger, process_dtb);
+    let mut failures = Vec::new();
+
+    if let Some(address) = thread.trap_frame {
+        match decode_ktrap_frame_for_thread(debugger, process_dtb, address)
+            .ok()
+            .and_then(|registers| RegisterContext::from_saved(&registers))
+        {
+            Some(seed) if seed.rip != 0 && seed.rsp != 0 => {
+                return Ok(ThreadStackTrace {
+                    source: ThreadStackSource::TrapFrame { address },
+                    stacktrace: build_stacktrace_seeded(
+                        debugger,
+                        &trace,
+                        seed,
+                        FrameSource::Seed,
+                        limit,
+                    ),
+                });
+            }
+            _ => failures.push("KTHREAD.TrapFrame is absent or unusable".to_string()),
+        }
+    } else {
+        failures.push("KTHREAD.TrapFrame is not present".to_string());
+    }
+
+    if let Some(kernel_stack) = thread.kernel_stack {
+        let pdb_seed = decode_kswitch_frame_seed(debugger, process_dtb, kernel_stack)
+            .ok()
+            .and_then(|registers| RegisterContext::from_saved(&registers));
+        let seed = match pdb_seed {
+            Some(seed) => Ok(seed),
+            None => recover_context_switch_seed(debugger, process_dtb, kernel_stack),
+        };
+        match seed {
+            Ok(seed) if switch_seed_is_plausible(thread, &seed) => {
+                return Ok(ThreadStackTrace {
+                    source: ThreadStackSource::ContextSwitch { kernel_stack },
+                    stacktrace: build_stacktrace_seeded(
+                        debugger,
+                        &trace,
+                        seed,
+                        FrameSource::Seed,
+                        limit,
+                    ),
+                });
+            }
+            Ok(_) => failures.push(
+                "context-switch seed is outside the captured resident kernel stack".to_string(),
+            ),
+            Err(error) => failures.push(format!("context-switch seed is unavailable: {error}")),
+        }
+    } else {
+        failures.push("KTHREAD.KernelStack is not present".to_string());
+    }
+
+    Err(Error::DebugInfo(format!(
+        "parked thread stack unavailable: {}",
+        failures.join("; ")
+    )))
+}
+
+fn build_stacktrace_seeded(
+    debugger: &Target,
+    trace: &ThreadTraceContext,
+    mut context: RegisterContext,
+    initial_source: FrameSource,
+    limit: usize,
+) -> StackTrace {
+    let limit = limit.max(1);
+    let mut raw: Vec<(u64, u64, FrameSource)> = vec![(context.rsp, context.rip, initial_source)];
+    let mut tracer = StackTracer::new(debugger, trace);
+    let mut seen = HashSet::from([context.rip]);
+
+    // RSP normally advances every step. A trap/interrupt frame can switch to a
+    // different stack, so the hard frame cap remains the final corruption guard.
     for _ in 0..MAX_UNWIND_FRAMES {
         let previous_rip = context.rip;
         let previous_rsp = context.rsp;
@@ -288,8 +665,6 @@ pub fn build_stacktrace(
         if context.rip == 0 || context.rip == previous_rip {
             break;
         }
-        // rsp must advance within a stack; a trap/interrupt frame can switch to
-        // another stack, where the new rsp is unrelated to the previous one
         if !stack_switch && context.rsp <= previous_rsp {
             break;
         }
@@ -302,12 +677,8 @@ pub fn build_stacktrace(
         raw.push((sp, ip, FrameSource::Scan));
     }
 
-    // phase 2: lazily load symbols for the modules these frames land in, so
-    // user-mode frames (e.g. ntdll in a process we never attached to) resolve to
-    // `module!symbol` instead of `module+offset`
-    ensure_frame_module_symbols(debugger, &trace, raw.iter().map(|(_, ip, _)| *ip));
+    ensure_frame_module_symbols(debugger, trace, raw.iter().map(|(_, ip, _)| *ip));
 
-    // phase 3: format each frame, honouring the display limit
     let mut stacktrace = StackTrace::default();
     for (sp, ip, source) in raw {
         record_stack_frame(
@@ -316,12 +687,12 @@ pub fn build_stacktrace(
             StackFrame {
                 sp,
                 ip,
-                symbol: format_symbol(debugger, &trace, ip),
+                symbol: format_symbol(debugger, trace, ip),
                 source,
+                source_location: frame_source_location(debugger, trace, ip),
             },
         );
     }
-
     stacktrace
 }
 
@@ -354,7 +725,14 @@ fn ensure_frame_module_symbols(
         let _ = if let Some(g) = debugger.guest.as_ref() {
             g.load_symbols_for_modules(&debugger.phys, &debugger.symbols, modules, dtb)
         } else {
-            Guest::load_module_symbols(&debugger.phys, &debugger.symbols, modules, dtb, false)
+            Guest::load_module_symbols(
+                &debugger.phys,
+                &debugger.symbols,
+                modules,
+                dtb,
+                false,
+                debugger.arch(),
+            )
         };
     }
 }
@@ -389,6 +767,20 @@ impl RegisterContext {
             rsp: register_map.read_u64("rsp", regs).unwrap_or(0),
             regs: register_values,
         }
+    }
+
+    fn from_saved(registers: &SavedThreadRegisters) -> Option<Self> {
+        let rip = registers.rip?;
+        let rsp = registers.rsp?;
+        let mut values = [None; 16];
+        for (index, name) in UNWIND_REG_NAMES.iter().enumerate() {
+            values[index] = registers.get(name);
+        }
+        Some(Self {
+            rip,
+            rsp,
+            regs: values,
+        })
     }
 
     fn get(&self, register: u8) -> Option<u64> {
@@ -438,7 +830,7 @@ impl<'a> StackTracer<'a> {
             trace,
             phys: &debugger.phys,
             symbols: &debugger.symbols,
-            memory: AddressSpace::new(&debugger.phys, trace.active_dtb),
+            memory: debugger.address_space(trace.active_dtb),
             modules: HashMap::new(),
         }
     }
@@ -1021,9 +1413,11 @@ fn slot_u16(codes: &[UnwindCodeSlot], index: usize) -> Option<u16> {
 mod tests {
     use super::{
         FrameSource, ParsedUnwindInfo, PeImage, RUNTIME_FUNCTION, RegisterContext, StackFrame,
-        StackTrace, UnwindCodeSlot, frame_base, lookup_runtime_function, parse_unwind_info,
-        record_stack_frame, slot_u16, unwind_slot_count,
+        StackTrace, UnwindCodeSlot, frame_base, lookup_arm64_runtime_function,
+        lookup_runtime_function, parse_unwind_info, record_stack_frame, slot_u16,
+        unwind_slot_count,
     };
+    use crate::target::SavedThreadRegisters;
 
     #[test]
     fn lookup_runtime_function_resolves_across_a_large_sorted_table() {
@@ -1055,6 +1449,33 @@ mod tests {
         assert!(lookup_runtime_function(&funcs, 0x350).is_none());
         // past the end of the table
         assert!(lookup_runtime_function(&funcs, 0x10000).is_none());
+    }
+
+    #[test]
+    fn lookup_arm64_runtime_function_decodes_packed_and_xdata_lengths() {
+        let mut image_bytes = vec![0u8; 0x2100];
+        // Full .xdata header: low 18 bits are a 0x80-byte function in 4-byte units.
+        image_bytes[0x2000..0x2004].copy_from_slice(&(0x80u32 / 4).to_le_bytes());
+        let image = PeImage::complete(image_bytes);
+
+        let mut pdata = Vec::new();
+        // Packed entry: flag 1 and a 0x40-byte function length.
+        pdata.extend_from_slice(&0x1000u32.to_le_bytes());
+        pdata.extend_from_slice(&(((0x40u32 / 4) << 2) | 1).to_le_bytes());
+        // Unpacked entry: flag 0 and an RVA to the .xdata header above.
+        pdata.extend_from_slice(&0x1100u32.to_le_bytes());
+        pdata.extend_from_slice(&0x2000u32.to_le_bytes());
+
+        assert_eq!(
+            lookup_arm64_runtime_function(&image, &pdata, 0x103c),
+            Some((0x1000, 0x1040))
+        );
+        assert!(lookup_arm64_runtime_function(&image, &pdata, 0x1040).is_none());
+        assert_eq!(
+            lookup_arm64_runtime_function(&image, &pdata, 0x117c),
+            Some((0x1100, 0x1180))
+        );
+        assert!(lookup_arm64_runtime_function(&image, &pdata, 0x1180).is_none());
     }
 
     #[test]
@@ -1146,11 +1567,33 @@ mod tests {
                     ip,
                     symbol: String::new(),
                     source: FrameSource::Current,
+                    source_location: None,
                 },
             );
         }
 
         assert_eq!(stacktrace.frames.len(), 2);
         assert_eq!(stacktrace.truncated, 1);
+    }
+
+    #[test]
+    fn saved_register_context_preserves_missing_values() {
+        let registers = SavedThreadRegisters {
+            rip: Some(0xffff_f800_1000),
+            rsp: Some(0xffff_a000_2000),
+            rbp: Some(0xffff_a000_2100),
+            ..SavedThreadRegisters::default()
+        };
+        let context = RegisterContext::from_saved(&registers).unwrap();
+        assert_eq!(context.rip, 0xffff_f800_1000);
+        assert_eq!(context.rsp, 0xffff_a000_2000);
+        assert_eq!(context.get(5), Some(0xffff_a000_2100));
+        assert_eq!(context.get(3), None);
+
+        let missing_rsp = SavedThreadRegisters {
+            rip: Some(0xffff_f800_1000),
+            ..SavedThreadRegisters::default()
+        };
+        assert!(RegisterContext::from_saved(&missing_rsp).is_none());
     }
 }

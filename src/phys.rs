@@ -3,25 +3,31 @@ use std::path::Path;
 use crate::backend::MemoryOps;
 use crate::dmp::{DmpInfo, DmpMem};
 use crate::error::Result;
-use crate::host::KvmHandle;
+use crate::host::VmHandle;
+use crate::kd::KdMemory;
 use crate::types::PhysAddr;
 
-/// Guest physical memory, backed either by a live VM (via /dev/kvm) or by a
-/// crash dump file. Built once at attach and shared via `Arc`; everything above
-/// (address spaces, symbol loading, unwinding) reads through it. `Dmp` is boxed
-/// for the variant size imbalance, not that it matters for a one-off.
+/// Guest physical memory backed by a live VM process, KD transport, or crash
+/// dump. Built once at attach and shared via `Arc`; everything above (address
+/// spaces, symbol loading, unwinding) reads through it. `Dmp` is boxed because
+/// it is much larger than the live handle.
 pub enum PhysMem {
-    Kvm(KvmHandle),
+    Live(VmHandle),
     Dmp(Box<DmpMem>),
+    Remote(KdMemory),
 }
 
 impl PhysMem {
-    pub fn kvm() -> Result<Self> {
-        Ok(Self::Kvm(KvmHandle::new()?))
+    pub fn live() -> Result<Self> {
+        Ok(Self::Live(VmHandle::new()?))
     }
 
     pub fn dmp(path: &Path) -> Result<Self> {
         Ok(Self::Dmp(Box::new(DmpMem::open(path)?)))
+    }
+
+    pub fn remote(memory: KdMemory) -> Self {
+        Self::Remote(memory)
     }
 
     pub fn dmp_info(&self) -> Option<&DmpInfo> {
@@ -30,20 +36,39 @@ impl PhysMem {
             _ => None,
         }
     }
+
+    /// Guest-physical address where RAM starts (below is firmware/MMIO):
+    /// x86 QEMU/VMware: 0; aarch64 QEMU `virt`: 0x4000_0000 (1 GiB).
+    pub fn ram_base(&self) -> u64 {
+        match self {
+            Self::Live(h) => h.ram_base(),
+            Self::Dmp(_) | Self::Remote(_) => 0,
+        }
+    }
+
+    /// Total mapped guest RAM size.
+    pub fn ram_size(&self) -> u64 {
+        match self {
+            Self::Live(h) => h.ram_size(),
+            Self::Dmp(_) | Self::Remote(_) => 0,
+        }
+    }
 }
 
 impl MemoryOps<PhysAddr> for PhysMem {
     fn read_bytes(&self, addr: PhysAddr, buf: &mut [u8]) -> Result<()> {
         match self {
-            Self::Kvm(h) => h.read_bytes(addr, buf),
+            Self::Live(h) => h.read_bytes(addr, buf),
             Self::Dmp(d) => d.read_bytes(addr, buf),
+            Self::Remote(kd) => kd.read_bytes(addr, buf),
         }
     }
 
     fn write_bytes(&self, addr: PhysAddr, buf: &[u8]) -> Result<()> {
         match self {
-            Self::Kvm(h) => h.write_bytes(addr, buf),
+            Self::Live(h) => h.write_bytes(addr, buf),
             Self::Dmp(d) => d.write_bytes(addr, buf),
+            Self::Remote(kd) => kd.write_bytes(addr, buf),
         }
     }
 }
@@ -64,10 +89,12 @@ mod tests {
             is_triage: false,
             ps_loaded_module_list: 0,
             ps_active_process_head: 0,
+            debugger_data_block: None,
             triage_drivers: Vec::new(),
             exception: None,
             system_info: None,
             unloaded_drivers: Vec::new(),
+            blackbox_streams: Vec::new(),
             triage_process_snapshot: None,
             triage_thread_snapshot: None,
             triage_prcb_info: None,

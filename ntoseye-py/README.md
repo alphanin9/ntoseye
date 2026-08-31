@@ -26,20 +26,13 @@ maturin build --release --out dist
 pip install dist/ntoseye-*.whl
 ```
 
-## Releasing (portable wheel)
+## Releasing portable wheels
 
-A plain `maturin build` tags the wheel against the build host's glibc, so on a rolling-release distro it can demand a glibc newer than most users have. Build against an old glibc floor with [zig](https://www.maturin.rs/distribution#cross-compile-using-zig) so the wheel installs everywhere.
+Release wheels are built by `.github/workflows/release.yml` on native GitHub runners:
 
-Run `./build-wheel.sh` to do it in one step (it provisions a local `.venv` with the build tools if no virtualenv is active, builds into a clean `dist/`, and runs `twine check`). The equivalent manual steps:
+- Linux x86-64 uses Zig and targets `manylinux_2_17`.
+- Apple Silicon uses the native ARM64 `macos-14` runner.
 
-```sh
-pip install ziglang
-cd ntoseye-py
-rm -rf dist
-maturin build --release --zig --compatibility manylinux_2_17 --out dist
-```
+Both wheels are smoke-tested, attached to the GitHub Release, and published to PyPI with Trusted Publishing.
 
-```sh
-twine check dist/*
-twine upload dist/*
-```
+For local reproduction, `./build-wheel.sh` provisions a local `.venv`, builds into `dist/`, runs `twine check`, and installs/import-tests the wheel in a throwaway virtual environment. It does not publish.
