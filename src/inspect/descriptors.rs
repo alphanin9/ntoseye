@@ -1,13 +1,19 @@
 //! Shared IDT/GDT/TSS descriptor-table parsing.
 //!
-//! These helpers extract architectural descriptor tables from guest memory and
-//! the QEMU monitor register dump. They return plain structs; the REPL renders
-//! them as tables and the agent serializes them as JSON.
+//! These helpers extract architectural descriptor tables from guest memory.
+//! The table registers themselves (IDTR/GDTR/TR) come from the target: the
+//! halting processor's `_KPRCB.ProcessorState.SpecialRegisters`, then the
+//! `_KPCR` copies, then the backend's register file, and only as a last resort
+//! the QEMU monitor dump. They return plain structs; the REPL renders them as
+//! tables and the agent serializes them as JSON.
 
 use crate::backend::MemoryOps;
+use crate::cpu_state;
 use crate::error::{Error, Result};
 use crate::gdb::RegisterMap;
+use crate::guest::WinObject;
 use crate::memory::AddressSpace;
+use crate::symbols::TypeInfo;
 use crate::target::Target;
 use crate::types::VirtAddr;
 
@@ -58,6 +64,141 @@ pub struct TssStackBases {
     pub rsp: [VirtAddr; 3],
     pub ist: [VirtAddr; 7],
     pub io_map_base: u16,
+}
+
+/// IDTR, GDTR, and the task register for one processor.
+#[derive(Debug, Clone, Copy)]
+pub struct TableRegisters {
+    pub idtr: Idtr,
+    pub gdtr: Gdtr,
+    /// TR selector; `None` when the source that supplied the tables has no
+    /// copy of it (the `_KPCR` fallback stores the TSS base, not the selector).
+    pub tr: Option<u16>,
+}
+
+/// Resolve the descriptor-table registers of `processor` from the target
+/// itself, so KD, KDNET, and crash dumps work without a hypervisor monitor.
+///
+/// Sources, in order: `_KPRCB.ProcessorState.SpecialRegisters` (the kernel
+/// saves it on entering the debugger, so it is exact for the halting
+/// processor), the `_KPCR` base/limit copies, and finally the backend's
+/// register file when it names `idtr` (KD's control-space read does).
+pub fn table_registers(
+    target: &Target,
+    register_map: &RegisterMap,
+    regs: &[u8],
+    processor: u16,
+) -> Result<TableRegisters> {
+    let from_target = special_registers(target, processor)
+        .or_else(|prcb_error| kpcr_tables(target, processor).map_err(|_| prcb_error));
+    match from_target {
+        Ok(tables) => Ok(tables),
+        Err(error) => backend_tables(register_map, regs).ok_or(error),
+    }
+}
+
+fn kernel(target: &Target) -> Result<&WinObject> {
+    Ok(&target.guest()?.ntoskrnl)
+}
+
+fn field_offset(layout: &TypeInfo, names: &[&str]) -> Result<u64> {
+    names
+        .iter()
+        .find_map(|name| layout.fields.get(*name))
+        .map(|field| u64::from(field.offset))
+        .ok_or_else(|| Error::FieldNotFound(names.first().copied().unwrap_or("<unknown>").into()))
+}
+
+/// Read a `_KDESCRIPTOR` embedded at `base`. Some public PDBs describe it as
+/// an opaque aggregate; its AMD64 wire layout is stable regardless (`Pad[3]`,
+/// `Limit` at +6, `Base` at +8).
+fn read_kdescriptor(nt: &WinObject, base: VirtAddr) -> Result<(VirtAddr, u16)> {
+    let (limit_offset, base_offset) = match nt.types().layout("_KDESCRIPTOR") {
+        Ok(layout) => (
+            field_offset(&layout, &["Limit"]).unwrap_or(6),
+            field_offset(&layout, &["Base"]).unwrap_or(8),
+        ),
+        Err(_) => (6, 8),
+    };
+    let memory = nt.memory();
+    let limit: u16 = memory.read(base + limit_offset)?;
+    let table_base: u64 = memory.read(base + base_offset)?;
+    Ok((VirtAddr(table_base), limit))
+}
+
+fn special_registers(target: &Target, processor: u16) -> Result<TableRegisters> {
+    let nt = kernel(target)?;
+    let prcb = cpu_state::kprcb_for_processor(target, processor)?;
+    let prcb_layout = nt.types().layout("_KPRCB")?;
+    let processor_state = field_offset(&prcb_layout, &["ProcessorState"])?;
+    let state_layout = nt.types().layout("_KPROCESSOR_STATE")?;
+    let special = field_offset(&state_layout, &["SpecialRegisters"])?;
+    let special_layout = nt.types().layout("_KSPECIAL_REGISTERS")?;
+    let base = prcb + processor_state + special;
+    let (idt_base, idt_limit) =
+        read_kdescriptor(nt, base + field_offset(&special_layout, &["Idtr", "IDTR"])?)?;
+    let (gdt_base, gdt_limit) =
+        read_kdescriptor(nt, base + field_offset(&special_layout, &["Gdtr", "GDTR"])?)?;
+    let tr = field_offset(&special_layout, &["Tr", "TR"])
+        .ok()
+        .and_then(|offset| nt.memory().read::<u16>(base + offset).ok());
+    Ok(TableRegisters {
+        idtr: Idtr {
+            base: idt_base,
+            limit: idt_limit,
+        },
+        gdtr: Gdtr {
+            base: gdt_base,
+            limit: gdt_limit,
+        },
+        tr,
+    })
+}
+
+fn kpcr_tables(target: &Target, processor: u16) -> Result<TableRegisters> {
+    let nt = kernel(target)?;
+    let kpcr = cpu_state::kpcr_for_processor(target, processor)?;
+    let layout = nt.types().layout("_KPCR")?;
+    let memory = nt.memory();
+    let read_u64 =
+        |names: &[&str]| -> Result<u64> { memory.read(kpcr + field_offset(&layout, names)?) };
+    let read_u16 =
+        |names: &[&str]| -> Result<u16> { memory.read(kpcr + field_offset(&layout, names)?) };
+    Ok(TableRegisters {
+        idtr: Idtr {
+            base: VirtAddr(read_u64(&["IdtBase", "IDTBase"])?),
+            limit: read_u16(&["IdtLimit", "IDTLimit"])?,
+        },
+        gdtr: Gdtr {
+            base: VirtAddr(read_u64(&["GdtBase", "GDTBase"])?),
+            limit: read_u16(&["GdtLimit", "GDTLimit"])?,
+        },
+        tr: None,
+    })
+}
+
+fn backend_tables(register_map: &RegisterMap, regs: &[u8]) -> Option<TableRegisters> {
+    let names = register_map.names();
+    let has = |name: &str| {
+        names
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(name))
+    };
+    if !has("idtr") || !has("gdtr") {
+        return None;
+    }
+    let read = |name: &str| register_map.read_u64(name, regs).ok();
+    Some(TableRegisters {
+        idtr: Idtr {
+            base: VirtAddr(read("idtr")?),
+            limit: read("idtr_limit")? as u16,
+        },
+        gdtr: Gdtr {
+            base: VirtAddr(read("gdtr")?),
+            limit: read("gdtr_limit")? as u16,
+        },
+        tr: read("tr").map(|value| value as u16),
+    })
 }
 
 fn parse_hex_u64(token: &str) -> Option<u64> {

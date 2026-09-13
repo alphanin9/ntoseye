@@ -30,9 +30,9 @@ use crate::error::{Error, Result};
 use crate::expr::Expr;
 use crate::guest::{ModuleInfo, ModuleSymbolLoadReport};
 use crate::inspect::descriptors::{
-    GdtEntry, gdt_type_label, parse_gdtr_from_qemu_registers, parse_idtr_from_qemu_registers,
-    parse_selector_arg, parse_tr_selector_from_qemu_registers, read_gdt_entries, read_idt_entries,
-    read_tss_stack_bases,
+    GdtEntry, TableRegisters, gdt_type_label, parse_gdtr_from_qemu_registers,
+    parse_idtr_from_qemu_registers, parse_selector_arg, parse_tr_selector_from_qemu_registers,
+    read_gdt_entries, read_idt_entries, read_tss_stack_bases, table_registers,
 };
 use crate::inspect::local_symbols::load_symbols_from_directory;
 use crate::inspect::pool::{
@@ -49,7 +49,7 @@ use crate::target::{
     AttachReport, DriverObjectInfo, MemoryRegionInfo, ThreadInfo, UserVar, kthread_state_name,
     wait_reason_name,
 };
-use crate::types::VirtAddr;
+use crate::types::{Arch, VirtAddr};
 use crate::unwind::build_stacktrace;
 use crate::view;
 use crate::bugchecks::{analyze_bugcheck, current_bugcheck};
@@ -645,16 +645,47 @@ impl AgentSession<'_> {
         Ok(regs)
     }
 
-    fn qemu_register_descriptors(&mut self) -> Result<String> {
-        self.session.backend.monitor_command("info registers")
+    /// Descriptor-table registers for the selected processor, plus the register
+    /// file they were resolved against. The target's own copies come first; the
+    /// QEMU monitor is only consulted for a backend (the gdb stub) whose
+    /// register file carries no IDTR/GDTR.
+    fn table_registers(&mut self) -> Result<(Vec<u8>, TableRegisters)> {
+        if self.session.target.arch() == Arch::Arm64 {
+            return Err(Error::InvalidExpression(
+                "descriptor tables are not defined on ARM64 targets".into(),
+            ));
+        }
+        let regs = self.current_regs()?;
+        let processor =
+            processor_index_from_backend_thread_id(&self.session.current_thread).unwrap_or(0);
+        let tables = match table_registers(
+            &self.session.target,
+            &self.session.register_map,
+            &regs,
+            processor,
+        ) {
+            Ok(tables) => tables,
+            Err(error) => self.qemu_table_registers().ok_or(error)?,
+        };
+        Ok((regs, tables))
+    }
+
+    fn qemu_table_registers(&mut self) -> Option<TableRegisters> {
+        let output = self
+            .session
+            .backend
+            .monitor_command("info registers")
+            .ok()?;
+        Some(TableRegisters {
+            idtr: parse_idtr_from_qemu_registers(&output)?,
+            gdtr: parse_gdtr_from_qemu_registers(&output)?,
+            tr: parse_tr_selector_from_qemu_registers(&output),
+        })
     }
 
     fn idt(&mut self, max_entries: Option<usize>) -> Result<Value> {
-        let regs = self.current_regs()?;
-        let monitor_output = self.qemu_register_descriptors()?;
-        let idtr = parse_idtr_from_qemu_registers(&monitor_output).ok_or_else(|| {
-            Error::InvalidExpression("QEMU monitor output did not contain IDT".into())
-        })?;
+        let (regs, tables) = self.table_registers()?;
+        let idtr = tables.idtr;
         let entries = read_idt_entries(
             &self.session.target,
             &self.session.register_map,
@@ -679,11 +710,8 @@ impl AgentSession<'_> {
     }
 
     fn gdt(&mut self, max_entries: Option<usize>) -> Result<Value> {
-        let regs = self.current_regs()?;
-        let monitor_output = self.qemu_register_descriptors()?;
-        let gdtr = parse_gdtr_from_qemu_registers(&monitor_output).ok_or_else(|| {
-            Error::InvalidExpression("QEMU monitor output did not contain GDT".into())
-        })?;
+        let (regs, tables) = self.table_registers()?;
+        let gdtr = tables.gdtr;
         let entries = read_gdt_entries(
             &self.session.target,
             &self.session.register_map,
@@ -699,17 +727,16 @@ impl AgentSession<'_> {
     }
 
     fn tss(&mut self, selector_arg: Option<String>) -> Result<Value> {
-        let regs = self.current_regs()?;
-        let monitor_output = self.qemu_register_descriptors()?;
-        let gdtr = parse_gdtr_from_qemu_registers(&monitor_output).ok_or_else(|| {
-            Error::InvalidExpression("QEMU monitor output did not contain GDT".into())
-        })?;
+        let (regs, tables) = self.table_registers()?;
+        let gdtr = tables.gdtr;
         let selector = match selector_arg {
             Some(selector) => parse_selector_arg(&selector).ok_or_else(|| {
                 Error::InvalidExpression(format!("invalid TSS selector: {selector}"))
             })?,
-            None => parse_tr_selector_from_qemu_registers(&monitor_output).ok_or_else(|| {
-                Error::InvalidExpression("QEMU monitor output did not contain TR".into())
+            None => tables.tr.ok_or_else(|| {
+                Error::InvalidExpression(
+                    "task register unavailable from the target; pass a selector".into(),
+                )
             })?,
         };
         let (entry, stacks) = read_tss_stack_bases(

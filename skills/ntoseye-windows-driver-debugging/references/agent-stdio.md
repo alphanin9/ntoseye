@@ -57,9 +57,9 @@ Addresses are expression strings and use the same parser as the REPL: symbols, `
 | Command | Fields | Notes |
 | --- | --- | --- |
 | `pte` | `address` | Returns page-table traversal entries and flags for the virtual address. |
-| `idt` | optional `length` | Reads IDT entries using stopped CPU register state plus QEMU monitor register descriptors. |
-| `gdt` | optional `length` | Reads GDT entries using stopped CPU register state plus QEMU monitor register descriptors. |
-| `tss` | optional `selector` | Dumps the TSS descriptor and stack bases. If omitted, selector comes from QEMU monitor TR output. |
+| `idt` | optional `length` | Reads IDT entries for the selected processor. IDTR comes from the target (`_KPRCB.ProcessorState.SpecialRegisters`, then `_KPCR`, then the backend's register file), so it works over KD/KDNET and on dumps; the QEMU monitor is only a fallback for the gdb backend. |
+| `gdt` | optional `length` | Reads GDT entries for the selected processor; GDTR is resolved the same way as `idt`. |
+| `tss` | optional `selector` | Dumps the TSS descriptor and stack bases. If omitted, the selector is the target's saved TR (unavailable only when the `_KPCR` fallback supplied the tables; pass one then). |
 | `pool` | `address` or `expr` | Classifies nearby pool metadata and big-pool state for a target address. |
 | `vmmap` | optional `filter` or `expr` | Lists VAD regions for the attached process, or kernel module ranges when detached. A resolvable expression filters by containing address. |
 
