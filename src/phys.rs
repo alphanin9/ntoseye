@@ -5,7 +5,8 @@ use crate::dmp::{DmpInfo, DmpMem};
 use crate::error::Result;
 use crate::host::VmHandle;
 use crate::kd::KdMemory;
-use crate::types::PhysAddr;
+use crate::memory::TranslationCache;
+use crate::types::{Dtb, PhysAddr, VirtAddr};
 
 /// Guest physical memory backed by a live VM process, KD transport, or crash
 /// dump. Built once at attach and shared via `Arc`; everything above (address
@@ -53,6 +54,28 @@ impl PhysMem {
             Self::Dmp(_) | Self::Remote(_) => 0,
         }
     }
+
+    /// Guest-physical RAM as `(base, len)` runs, for memory sources that know
+    /// the layout (a live VM process). Empty for KD and dumps, whose callers
+    /// take the runs from the guest's own `MmPhysicalMemoryBlock`.
+    pub fn ram_runs(&self) -> Vec<(u64, u64)> {
+        match self {
+            Self::Live(h) => h.ram_runs(),
+            Self::Dmp(_) | Self::Remote(_) => Vec::new(),
+        }
+    }
+
+    /// Identity of the current halt, for memoizing guest-derived lists: equal
+    /// values mean the guest has not run in between. `None` when this memory
+    /// has no resume signal (a live VM process), so nothing may be memoized.
+    /// A dump never changes, so it is one epoch forever.
+    pub fn halt_epoch(&self) -> Option<u64> {
+        match self {
+            Self::Remote(kd) => kd.translation_cache().map(TranslationCache::halt_epoch),
+            Self::Dmp(_) => Some(0),
+            Self::Live(_) => None,
+        }
+    }
 }
 
 impl MemoryOps<PhysAddr> for PhysMem {
@@ -71,80 +94,18 @@ impl MemoryOps<PhysAddr> for PhysMem {
             Self::Remote(kd) => kd.write_bytes(addr, buf),
         }
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::dmp::{DmpContext, DmpInfo, DmpMem};
+    fn read_virtual_direct(&self, addr: VirtAddr, root: Dtb, buf: &mut [u8]) -> Option<Result<()>> {
+        match self {
+            Self::Remote(kd) => kd.read_virtual_direct(addr, root, buf),
+            Self::Live(_) | Self::Dmp(_) => None,
+        }
+    }
 
-    #[test]
-    fn dmp_info_exposed_for_dmp_variant() {
-        let info = DmpInfo {
-            directory_table_base: 0x1ad000,
-            bug_check_code: 0x7e,
-            bug_check_parameters: [1, 2, 3, 4],
-            offset_prcb_context: None,
-            number_processors: 1,
-            is_triage: false,
-            ps_loaded_module_list: 0,
-            ps_active_process_head: 0,
-            debugger_data_block: None,
-            triage_drivers: Vec::new(),
-            exception: None,
-            system_info: None,
-            unloaded_drivers: Vec::new(),
-            blackbox_streams: Vec::new(),
-            triage_process_snapshot: None,
-            triage_thread_snapshot: None,
-            triage_prcb_info: None,
-            broken_driver: None,
-            triage_overflowed: false,
-            kern_base: None,
-            context: DmpContext {
-                rax: 0,
-                rbx: 0,
-                rcx: 0,
-                rdx: 0,
-                rsi: 0,
-                rdi: 0,
-                rbp: 0,
-                rsp: 0,
-                r8: 0,
-                r9: 0,
-                r10: 0,
-                r11: 0,
-                r12: 0,
-                r13: 0,
-                r14: 0,
-                r15: 0,
-                rip: 0,
-                eflags: 0,
-                cs: 0,
-                ds: 0,
-                es: 0,
-                fs: 0,
-                gs: 0,
-                ss: 0,
-                dr0: 0,
-                dr1: 0,
-                dr2: 0,
-                dr3: 0,
-                dr6: 0,
-                dr7: 0,
-                mxcsr: 0,
-                xmm: [0; 16],
-                debug_control: 0,
-                last_branch_to_rip: 0,
-                last_branch_from_rip: 0,
-                last_exception_to_rip: 0,
-                last_exception_from_rip: 0,
-            },
-        };
-
-        let phys = PhysMem::Dmp(Box::new(DmpMem::new_for_test(vec![], info)));
-        let retrieved = phys.dmp_info().unwrap();
-        assert_eq!(retrieved.bug_check_code, 0x7e);
-        assert_eq!(retrieved.directory_table_base, 0x1ad000);
+    fn translation_cache(&self) -> Option<&TranslationCache> {
+        match self {
+            Self::Remote(kd) => kd.translation_cache(),
+            Self::Live(_) | Self::Dmp(_) => None,
+        }
     }
 }

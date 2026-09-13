@@ -1,7 +1,74 @@
 use iced_x86::{
-    Code, Decoder, DecoderOptions, Formatter, FormatterOutput, FormatterTextKind, Instruction,
-    MemorySizeOptions, NasmFormatter,
+    Code, Decoder, DecoderOptions, FlowControl, Formatter, FormatterOutput, FormatterTextKind,
+    Instruction, MemorySizeOptions, Mnemonic, NasmFormatter,
 };
+
+use crate::types::Arch;
+
+/// Control-flow class for the instruction at the start of a byte buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlFlow {
+    Call,
+    Ret,
+    Branch,
+    Other,
+}
+
+/// Classify the first instruction in `bytes` for the target architecture.
+/// Invalid or incomplete instructions are treated as [`ControlFlow::Other`].
+pub fn classify(bytes: &[u8], arch: Arch) -> ControlFlow {
+    if bytes.is_empty() {
+        return ControlFlow::Other;
+    }
+    match arch {
+        Arch::Amd64 => {
+            let mut decoder = Decoder::with_ip(64, bytes, 0, DecoderOptions::NONE);
+            let instruction = decoder.decode();
+            if instruction.code() == Code::INVALID {
+                return ControlFlow::Other;
+            }
+            if instruction.mnemonic() == Mnemonic::Call {
+                ControlFlow::Call
+            } else if instruction.mnemonic() == Mnemonic::Ret {
+                ControlFlow::Ret
+            } else if instruction.flow_control() != FlowControl::Next {
+                ControlFlow::Branch
+            } else {
+                ControlFlow::Other
+            }
+        }
+        Arch::Arm64 => {
+            if bytes.len() < 4 {
+                return ControlFlow::Other;
+            }
+            let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            let Ok(instruction) = bad64::decode(word, 0) else {
+                return ControlFlow::Other;
+            };
+            let mnemonic = instruction.op().mnem();
+            // `blraa`/`blrab`/`blraaz`/`blrabz` are pointer-authenticated
+            // `blr`; Windows ARM64 kernels emit them.
+            if mnemonic == "bl" || mnemonic.starts_with("blr") {
+                ControlFlow::Call
+            } else if mnemonic.starts_with("ret") {
+                ControlFlow::Ret
+            } else if mnemonic == "b"
+                || mnemonic.starts_with("b.")
+                // `br`, `braa`, `brab`, `braaz`, `brabz`; never `brk`/SVE `brk*`.
+                || mnemonic == "br"
+                || mnemonic.starts_with("bra")
+                || mnemonic == "cbz"
+                || mnemonic == "cbnz"
+                || mnemonic == "tbz"
+                || mnemonic == "tbnz"
+            {
+                ControlFlow::Branch
+            } else {
+                ControlFlow::Other
+            }
+        }
+    }
+}
 
 /// NASM formatter configured for ntoseye's disassembly, so every call site
 /// decodes identically.
@@ -424,9 +491,9 @@ fn arm64_operand_tokens(op: &bad64::Operand) -> Vec<AsmToken> {
         bad64::Operand::Cond(c) => t.push(&c.to_string(), AsmKind::Keyword),
         bad64::Operand::Name(_) => t.push(&op.to_string(), AsmKind::Text),
         bad64::Operand::StrImm { str, imm } => {
-            let name = unsafe { std::ffi::CStr::from_ptr(str.as_ptr() as _) }
-                .to_str()
-                .unwrap();
+            // A NUL-padded ASCII name from the C decoder.
+            let end = str.iter().position(|&b| b == 0).unwrap_or(str.len());
+            let name = std::str::from_utf8(&str[..end]).unwrap_or("?");
             t.push(name, AsmKind::Text);
             t.space();
             t.push(&format!("#{imm:#x}"), AsmKind::Number);
@@ -460,13 +527,40 @@ fn arm64_pcrel_comment(
 mod tests {
     use super::*;
 
+    #[test]
+    fn classify_control_flow_instructions() {
+        assert_eq!(
+            classify(&[0xe8, 0, 0, 0, 0], Arch::Amd64),
+            ControlFlow::Call
+        );
+        assert_eq!(classify(&[0xc3], Arch::Amd64), ControlFlow::Ret);
+        assert_eq!(classify(&[0xeb, 0], Arch::Amd64), ControlFlow::Branch);
+        assert_eq!(classify(&[0x90], Arch::Amd64), ControlFlow::Other);
+
+        assert_eq!(
+            classify(&0x94000000u32.to_le_bytes(), Arch::Arm64),
+            ControlFlow::Call
+        );
+        assert_eq!(
+            classify(&0xd65f03c0u32.to_le_bytes(), Arch::Arm64),
+            ControlFlow::Ret
+        );
+        assert_eq!(
+            classify(&0x14000000u32.to_le_bytes(), Arch::Arm64),
+            ControlFlow::Branch
+        );
+        assert_eq!(
+            classify(&0xd503201fu32.to_le_bytes(), Arch::Arm64),
+            ControlFlow::Other
+        );
+    }
+
     /// The joined token text must reproduce bad64's Display exactly — the
     /// plain form is what the Python SDK and MCP consume.
     #[test]
     fn arm64_rows_reproduce_bad64_display() {
         let mut checked = 0;
 
-        // Real instructions from the live session.
         let real = [
             0xd43e0000u32, // brk #0xf000
             0xd65f03c0,    // ret
@@ -487,7 +581,6 @@ mod tests {
             checked += 1;
         }
 
-        // Deterministic pseudo-random sweep: check every decodable word.
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
         for i in 0..65536u64 {
             state = state
@@ -520,26 +613,23 @@ mod tests {
     /// get none.
     #[test]
     fn arm64_pcrel_comments_resolve_targets() {
-        // b -0x2d8 at 0xfffff8009bb34ff8 → 0xfffff8009bb34498 (live session).
+        // b -0x2d8
         let ins = bad64::decode(0x17fffd28, 0xfffff8009bb34ff8).unwrap();
         let comment = arm64_pcrel_comment(&ins, |t| format!("SYM:{t:#x}"));
         assert_eq!(comment.as_deref(), Some("SYM:0xfffff8009bb34498"));
 
-        // cbnz w10, label (live session: the unlabeled break-message case).
+        // cbnz w10, label
         let ins = bad64::decode(0x35ffffca, 0xfffff8009b40c998).unwrap();
         let comment = arm64_pcrel_comment(&ins, |t| format!("SYM:{t:#x}"));
         assert_eq!(comment.as_deref(), Some("SYM:0xfffff8009b40c990"));
 
-        // adrp x0, page → page-aligned absolute target.
         let ins = bad64::decode(0x90000000, 0x1000).unwrap(); // adrp x0, #0
         let comment = arm64_pcrel_comment(&ins, |t| format!("{t:#x}"));
         assert_eq!(comment.as_deref(), Some("0x1000"));
 
-        // ret carries no PC-relative comment.
         let ins = bad64::decode(0xd65f03c0, 0x1000).unwrap();
         assert!(arm64_pcrel_comment(&ins, |_| String::new()).is_none());
 
-        // bl is a branch too (offset 5 << 2 from 0x2000 → 0x2014).
         let ins = bad64::decode(0x94000005, 0x2000).unwrap();
         let comment = arm64_pcrel_comment(&ins, |t| format!("{t:#x}"));
         assert_eq!(comment.as_deref(), Some("0x2014"));

@@ -7,37 +7,38 @@ use owo_colors::OwoColorize;
 use crate::error::{Error, Result};
 use crate::expr::Expr;
 use crate::symbols::LocalVariableLocation;
-use crate::target::{irp_major_function_name, kthread_state_name, wait_reason_name};
-use crate::trapframe::read_ktrap_frame_at_or_current;
-use crate::triage_report::{
-    BlackboxState, FailureSignatureSource, TriageReport, WheaRecordState, exception_code_name,
-    filetime_to_iso,
+use crate::target::{
+    irp_major_function_name, kthread_state_name, lookup_register, wait_reason_name,
 };
+use crate::trapframe::read_ktrap_frame_at_or_current;
 use crate::types::VirtAddr;
 use crate::ui;
-use crate::unwind::{StackTrace, build_stacktrace, format_symbol, resolve_thread_trace_context};
+use crate::unwind::{
+    RecoveredStackTrace, StackTrace, build_stacktrace_with_context,
+    build_stacktrace_with_register_values, format_symbol, resolve_thread_trace_context,
+};
 
 use crate::repl::*;
 
 repl_command! {
     cmd_pte;
-    names: ["pte", "!pte"],
-    usage: "pte <address>",
+    names: ["!pte", "pte"],
+    usage: "!pte <address>",
     summary: "Display page table entries for an address.",
     completion: Expression,
 }
 
 repl_command! {
     cmd_pool;
-    names: ["pool", "!pool"],
-    usage: "pool <address-expression>",
+    names: ["!pool", "pool"],
+    usage: "!pool <address-expression>",
     summary: "Inspect the pool page containing an address.",
     completion: Expression,
 }
 
 repl_command! {
     cmd_registers;
-    names: ["registers", "r"],
+    names: ["r", "registers"],
     usage: "r [register[=expression]]",
     summary: "Display CPU registers or assign one register.",
     run_state: Halted,
@@ -45,8 +46,8 @@ repl_command! {
 
 repl_command! {
     cmd_k;
-    names: ["k", "kb", "kp", "kv"],
-    usage: "k|kb|kp|kv [count]",
+    names: ["kn", "k", "kb", "kp", "kv"],
+    usage: "kn|k|kb|kp|kv [count]",
     summary: "Display a stack; kp adds PDB parameter locations and kv provenance.",
     run_state: Halted,
 }
@@ -74,8 +75,8 @@ repl_command! {
 
 repl_command! {
     cmd_irp;
-    names: ["irp", "!irp"],
-    usage: "irp <address-expression>",
+    names: ["!irp", "irp"],
+    usage: "!irp <address-expression>",
     summary: "Inspect an IRP and its current IO_STACK_LOCATION.",
     completion: Expression,
 }
@@ -90,24 +91,24 @@ repl_command! {
 
 repl_command! {
     cmd_drvobj;
-    names: ["drvobj", "!drvobj"],
-    usage: "drvobj <driver-object-expression-or-name>",
+    names: ["!drvobj", "drvobj"],
+    usage: "!drvobj <driver-object-expression-or-name>",
     summary: "Inspect a DRIVER_OBJECT, its device chain and dispatch table.",
     completion: Driver,
 }
 
 repl_command! {
     cmd_devobj;
-    names: ["devobj", "!devobj"],
-    usage: "devobj <device-object-expression>",
+    names: ["!devobj", "devobj"],
+    usage: "!devobj <device-object-expression>",
     summary: "Inspect a DEVICE_OBJECT and its attached stack.",
     completion: Expression,
 }
 
 repl_command! {
     cmd_object;
-    names: ["object", "!object"],
-    usage: "object <object-expression>",
+    names: ["!object", "object"],
+    usage: "!object <object-expression>",
     summary: "Inspect an executive object header and body.",
     completion: Expression,
 }
@@ -137,419 +138,10 @@ repl_command! {
 
 repl_command! {
     cmd_trap;
-    names: ["trap", ".trap"],
-    usage: "trap [address-expression]",
+    names: [".trap", "trap"],
+    usage: ".trap [address-expression]",
     summary: "Decode and display a _KTRAP_FRAME (defaults to the current thread's saved frame).",
     completion: Expression,
-}
-
-repl_command! {
-    cmd_analyze();
-    names: ["analyze", "!analyze"],
-    usage: "analyze",
-    summary: "Display a coherent first-pass crash triage report.",
-}
-
-const ANALYZE_STACK_LIMIT: usize = 16;
-const ANALYZE_MODULE_LIMIT: usize = 16;
-const ANALYZE_UNLOADED_LIMIT: usize = 12;
-
-fn print_triage_report(report: &TriageReport) {
-    println!("{}", ui::label("crash analysis"));
-
-    match &report.bugcheck {
-        Some(analysis) => {
-            println!();
-            print_bugcheck_analysis(analysis);
-        }
-        None => println!("{}", ui::muted("no recorded bugcheck")),
-    }
-
-    if let Some(exception) = &report.exception {
-        print_section("exception");
-        println!(
-            "  {} {} ({:#010x})",
-            ui::muted("code   "),
-            exception_code_name(exception.code),
-            exception.code
-        );
-        println!("  {} {}", ui::muted("address"), ui::addr(exception.address));
-        println!("  {} {:#x}", ui::muted("flags  "), exception.flags);
-        for (index, parameter) in exception.parameters.iter().enumerate() {
-            println!(
-                "  {} {}",
-                ui::muted(&format!("param {} ", index + 1)),
-                ui::addr(*parameter)
-            );
-        }
-    }
-
-    print_section("faulting context");
-    println!(
-        "  {} {}",
-        ui::muted("state  "),
-        if report.status.running {
-            "running"
-        } else {
-            "halted"
-        }
-    );
-    println!(
-        "  {} {}",
-        ui::muted("thread "),
-        ui::thread_id(&report.status.current_thread)
-    );
-    if let Some(rip) = report.status.rip {
-        let symbol = report
-            .status
-            .symbol
-            .as_deref()
-            .map(|symbol| format!("  {}", ui::symbol(symbol)))
-            .unwrap_or_default();
-        println!("  {} {}{}", ui::muted("rip    "), ui::addr(rip), symbol);
-    }
-    if let Some((pid, name, eprocess)) = &report.status.process {
-        println!(
-            "  {} {} (pid {}, eprocess {})",
-            ui::muted("scope  "),
-            name,
-            pid,
-            ui::addr(*eprocess)
-        );
-    }
-    if !report.status.coherent {
-        println!(
-            "  {}",
-            ui::muted("target metadata is still being rebuilt after reload")
-        );
-    }
-    if let Some(context) = &report.crash_context {
-        let process = context.process_name.as_deref().unwrap_or("unknown");
-        let pid = context
-            .process_id
-            .map(|pid| pid.to_string())
-            .unwrap_or_else(|| "unknown".into());
-        let tid = context
-            .thread_id
-            .map(|tid| tid.to_string())
-            .unwrap_or_else(|| "unknown".into());
-        println!(
-            "  {} {} (pid {}, tid {})",
-            ui::muted("crash  "),
-            process,
-            pid,
-            tid
-        );
-        if let Some(parent) = context.parent_process_id {
-            println!("  {} {}", ui::muted("parent "), parent);
-        }
-        if let Some(status) = context.exit_status {
-            println!("  {} {:#x}", ui::muted("process exit"), status as u32);
-        }
-        if let Some(status) = context.thread_exit_status {
-            println!("  {} {:#x}", ui::muted("thread exit "), status as u32);
-        }
-        if let Some(time) = context.create_time
-            && let Some(time) = filetime_to_iso(time)
-        {
-            println!("  {} {}", ui::muted("created"), time);
-        }
-    }
-    if let Some(prcb) = &report.prcb {
-        println!(
-            "  {} #{} thread {}  {} MHz  {}",
-            ui::muted("processor"),
-            prcb.processor_number,
-            ui::addr(prcb.current_thread),
-            prcb.mhz,
-            prcb.vendor_string
-        );
-    }
-
-    match &report.backtrace {
-        Some(trace) => print_stacktrace_data(trace, ANALYZE_STACK_LIMIT, true),
-        None if report.status.running => {
-            print_section("stack");
-            println!("  {}", ui::muted("unavailable while target is running"));
-        }
-        None => {
-            print_section("stack");
-            println!("  {}", ui::muted("unavailable from captured context"));
-        }
-    }
-    if !report.warnings.is_empty() {
-        print_section("warnings");
-        for warning in &report.warnings {
-            println!("  {}", ui::muted(warning));
-        }
-    }
-
-    print_crash_intelligence(report);
-    print_report_modules(report);
-    print_dump_metadata(report);
-}
-
-fn print_crash_intelligence(report: &TriageReport) {
-    if let Some(signature) = &report.failure_signature {
-        print_section("failure signature");
-        println!("  {}", signature.bucket);
-        let source = match signature.source {
-            FailureSignatureSource::BugcheckFault => "bugcheck fault",
-            FailureSignatureSource::ExceptionAddress => "exception address",
-            FailureSignatureSource::CurrentInstruction => "current instruction",
-            FailureSignatureSource::TopFrame => "top frame",
-            FailureSignatureSource::CodeOnly => "code only",
-        };
-        println!("  {}", ui::muted(&format!("source: {source}")));
-    }
-
-    if let Some(culprit) = &report.culprit {
-        print_section("culprit attribution");
-        println!(
-            "  {}  {}",
-            ui::symbol(&culprit.module),
-            ui::muted(&format!("{:?} confidence", culprit.confidence).to_ascii_lowercase())
-        );
-        for evidence in &culprit.evidence {
-            match evidence.address {
-                Some(address) => println!(
-                    "  {} {}  {}",
-                    ui::muted(&format!("{:?}", evidence.kind)),
-                    ui::addr(address),
-                    evidence.detail
-                ),
-                None => println!(
-                    "  {}  {}",
-                    ui::muted(&format!("{:?}", evidence.kind)),
-                    evidence.detail
-                ),
-            }
-        }
-    }
-
-    if let Some(verifier) = &report.verifier {
-        print_section("driver verifier");
-        println!(
-            "  {} ({:#x}) subcode {:#x}: {}",
-            verifier.bugcheck_name,
-            verifier.bugcheck_code,
-            verifier.subcode,
-            verifier.subcode_description
-        );
-        if let Some(driver) = &verifier.associated_driver {
-            println!("  {} {}", ui::muted("driver"), ui::symbol(driver));
-        }
-        for address in &verifier.addresses {
-            println!(
-                "  {} {}",
-                ui::muted(&address.role),
-                ui::addr(address.address)
-            );
-        }
-        for argument in &verifier.arguments {
-            println!("  {}  {}", ui::addr(argument.value), argument.description);
-        }
-    }
-
-    if let Some(whea) = &report.whea {
-        print_section("WHEA");
-        if let Some(address) = whea.record_address {
-            println!("  {} {}", ui::muted("record"), ui::addr(address));
-        }
-        match &whea.state {
-            WheaRecordState::Decoded(record) => {
-                println!(
-                    "  revision {:#x}, severity {:#x}, length {:#x}, {} sections",
-                    record.revision,
-                    record.severity,
-                    record.length,
-                    record.sections.len()
-                );
-                for section in &record.sections {
-                    println!(
-                        "  +{:#x} len {:#x} severity {:#x}  {}",
-                        section.offset, section.length, section.severity, section.section_type
-                    );
-                }
-            }
-            WheaRecordState::Unavailable { reason } => {
-                println!("  {}", ui::muted(&format!("unavailable: {reason}")));
-            }
-        }
-    }
-
-    if !report.blackboxes.is_empty() {
-        print_section("blackbox streams");
-        for blackbox in &report.blackboxes {
-            let size = blackbox
-                .size
-                .map(|size| format!(", {size:#x} bytes"))
-                .unwrap_or_default();
-            match &blackbox.state {
-                BlackboxState::PresentUnparsed => {
-                    println!(
-                        "  {}{}  {}",
-                        blackbox.name,
-                        size,
-                        ui::muted("present, unparsed")
-                    );
-                }
-                BlackboxState::Unavailable { reason } => {
-                    println!("  {}{}  {}", blackbox.name, size, ui::muted(reason));
-                }
-            }
-        }
-    }
-}
-
-fn print_report_modules(report: &TriageReport) {
-    print_section("loaded modules");
-    let relevant_count = report
-        .modules
-        .iter()
-        .filter(|module| report.loaded_module_is_relevant(module))
-        .count();
-    if relevant_count == 0 {
-        println!(
-            "  {}",
-            ui::muted(&format!(
-                "{} loaded; none contain a recorded fault or stack address",
-                report.modules.len()
-            ))
-        );
-    } else {
-        for module in report
-            .modules
-            .iter()
-            .filter(|module| report.loaded_module_is_relevant(module))
-            .take(ANALYZE_MODULE_LIMIT)
-        {
-            println!(
-                "  {:<24} {}-{}  {:#x} bytes",
-                module.name,
-                ui::addr(module.base_address.0),
-                ui::addr(module.end_address().0),
-                module.size
-            );
-        }
-        if relevant_count > ANALYZE_MODULE_LIMIT {
-            println!(
-                "  {}",
-                ui::muted(&format!(
-                    "... {} more address-matched modules",
-                    relevant_count - ANALYZE_MODULE_LIMIT
-                ))
-            );
-        }
-        println!(
-            "  {}",
-            ui::muted(&format!("{} loaded modules total", report.modules.len()))
-        );
-    }
-
-    if report.unloaded_drivers.is_empty() {
-        return;
-    }
-    print_section("unloaded modules");
-    let mut shown = 0;
-    for driver in report
-        .unloaded_drivers
-        .iter()
-        .filter(|driver| report.unloaded_driver_is_relevant(driver))
-        .take(ANALYZE_UNLOADED_LIMIT)
-    {
-        println!(
-            "  {:<24} {}-{}  {}",
-            driver.name,
-            ui::addr(driver.start_address),
-            ui::addr(driver.end_address),
-            ui::muted("recorded address/name match")
-        );
-        shown += 1;
-    }
-    for driver in report
-        .unloaded_drivers
-        .iter()
-        .filter(|driver| !report.unloaded_driver_is_relevant(driver))
-        .take(ANALYZE_UNLOADED_LIMIT - shown)
-    {
-        println!(
-            "  {:<24} {}-{}",
-            driver.name,
-            ui::addr(driver.start_address),
-            ui::addr(driver.end_address)
-        );
-        shown += 1;
-    }
-    if report.unloaded_drivers.len() > shown {
-        println!(
-            "  {}",
-            ui::muted(&format!(
-                "... {} more unloaded modules",
-                report.unloaded_drivers.len() - shown
-            ))
-        );
-    }
-}
-
-fn print_dump_metadata(report: &TriageReport) {
-    if report.system_info.is_none()
-        && report.broken_driver.is_none()
-        && report.triage_overflowed.is_none()
-    {
-        return;
-    }
-
-    print_section("dump metadata");
-    if let Some(info) = &report.system_info {
-        let machine = match info.machine_image_type {
-            0x014c => "I386",
-            0x8664 => "AMD64",
-            0xAA64 => "ARM64",
-            _ => "Unknown",
-        };
-        println!(
-            "  {} Windows {}.{}  {}  service-pack build {}",
-            ui::muted("system "),
-            info.major_version,
-            info.minor_version,
-            machine,
-            info.service_pack_build
-        );
-        if info.system_up_time > 0 {
-            println!(
-                "  {} {} seconds",
-                ui::muted("uptime "),
-                info.system_up_time / 10_000_000
-            );
-        }
-        if info.system_time > 0
-            && let Some(time) = filetime_to_iso(info.system_time as u64)
-        {
-            println!("  {} {}", ui::muted("time   "), time);
-        }
-        println!(
-            "  {} {}  suite {:#x}",
-            ui::muted("product"),
-            match info.product_type {
-                1 => "Workstation",
-                2 => "DomainController",
-                3 => "Server",
-                _ => "Unknown",
-            },
-            info.suite_mask
-        );
-    }
-    if let Some(driver) = &report.broken_driver {
-        println!("  {} {}", ui::muted("recorded broken driver"), driver);
-    }
-    if let Some(overflowed) = report.triage_overflowed {
-        println!(
-            "  {} {}",
-            ui::muted("triage overflow"),
-            if overflowed { "yes" } else { "no" }
-        );
-    }
 }
 
 impl ReplState<'_> {
@@ -590,7 +182,7 @@ impl ReplState<'_> {
                     .with(Modify::new(Rows::first()).with(Alignment::center()))
                     .with(tabled::settings::Style::empty());
 
-                println!("{}\n", table);
+                outln!("{}\n", table);
             }
             Err(e) => {
                 error!("{}\n", e);
@@ -611,6 +203,17 @@ impl ReplState<'_> {
             },
             None => None,
         };
+        if address.is_none()
+            && self
+                .ctx
+                .target
+                .current_thread_pseudo_register("trapframe")
+                .is_none()
+        {
+            self.clear_selected_frame();
+            outln!("selected context reset\n");
+            return Ok(());
+        }
         match read_ktrap_frame_at_or_current(&self.ctx.target, address) {
             Ok(frame) => {
                 // Trap frames are kernel structures; resolve the interrupted
@@ -618,9 +221,12 @@ impl ReplState<'_> {
                 // analysis does.
                 let trace =
                     resolve_thread_trace_context(&self.ctx.target, self.ctx.target.kernel_dtb());
-                let symbol = format_symbol(&self.ctx.target, &trace, frame.rip);
+                let symbol = format_symbol(&self.ctx.target, &trace, frame.instruction_pointer());
                 print_ktrap_frame(&frame, Some(&symbol));
-                println!();
+                let registers = super::frames::registers_from_trap_frame(&frame);
+                let selected = self.select_register_values(0, registers);
+                outln!("selected trap context frame 00 at {}", ui::addr(selected));
+                outln!();
             }
             Err(e) => {
                 error!("{}", e);
@@ -630,16 +236,9 @@ impl ReplState<'_> {
         Ok(())
     }
 
-    fn cmd_analyze(&mut self) -> Result<()> {
-        let report = TriageReport::build(self.ctx);
-        print_triage_report(&report);
-        println!();
-        Ok(())
-    }
-
     fn cmd_pool(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
         let Some(expr) = invocation.arg(0) else {
-            println!("{}\n", command_help("pool"));
+            outln!("{}\n", command_help("pool"));
             return Ok(());
         };
 
@@ -668,10 +267,10 @@ impl ReplState<'_> {
 
         let region = classify_pool_region(&self.ctx.target, target);
         let (blocks, idx, base) = locate_pool_block_in_page(&self.ctx.target, &layout, target);
-        println!("pool page {}", ui::addr(base.0));
-        println!("  target        : {}", ui::addr(target.0));
+        outln!("pool page {}", ui::addr(base.0));
+        outln!("  target        : {}", ui::addr(target.0));
         if let Some((name, start, end)) = region {
-            println!(
+            outln!(
                 "  region        : {} [{} - {}]",
                 name,
                 ui::addr(start.0),
@@ -679,28 +278,28 @@ impl ReplState<'_> {
             );
         }
         if let Some(idx) = idx {
-            println!(
+            outln!(
                 "  blocks in run : {} (target is #{})",
                 blocks.len(),
                 idx + 1
             );
         }
-        println!();
+        outln!();
         print_pool_page_listing(&blocks, idx, target);
 
         if idx.is_none() {
             if let Some(big) = find_big_pool(&self.ctx.target, &layout, target) {
-                println!();
+                outln!();
                 print_big_pool(target, &big);
                 return Ok(());
             }
-            println!("  address does not lie inside a recognizable _POOL_HEADER block.");
-            println!("  it may be segment heap, special pool, a mapped view, or image/stack.");
+            outln!("  address does not lie inside a recognizable _POOL_HEADER block.");
+            outln!("  it may be segment heap, special pool, a mapped view, or image/stack.");
             if let Some(hint) = segment_heap_hint(&self.ctx.target) {
-                println!("  hint          : {}", hint);
+                outln!("  hint          : {}", hint);
             }
             if let Some(near) = annotate_near_symbol(&self.ctx.target, target) {
-                println!("  near symbol   : {}", near);
+                outln!("  near symbol   : {}", near);
             }
         }
 
@@ -708,6 +307,41 @@ impl ReplState<'_> {
     }
 
     fn cmd_registers(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        if let Some(frame) = self.ctx.target.selected_frame.as_ref() {
+            let tail = invocation.raw_tail.trim();
+            if tail.contains('=') {
+                error!(
+                    "cannot assign registers while frame {} is selected; use `.cxr`/`.frame` reset first",
+                    frame.index
+                );
+                return Ok(());
+            }
+            if !tail.is_empty() && tail.split_whitespace().count() != 1 {
+                outln!("{}\n", command_help(invocation.name));
+                return Ok(());
+            }
+            outln!("registers (frame {})", frame.index);
+            if !tail.is_empty() {
+                let name = tail.trim_start_matches('@');
+                let lowered_name = name.to_ascii_lowercase();
+                let requested = match lowered_name.as_str() {
+                    "efl" | "rflags" => "eflags",
+                    name => name,
+                };
+                if let Some(value) = lookup_register(&frame.registers, requested) {
+                    outln!("{}={}", requested, ui::addr(value));
+                } else {
+                    error!(
+                        "register not recovered in frame {}: {}",
+                        frame.index, requested
+                    );
+                }
+            } else {
+                print_selected_registers(&frame.registers);
+            }
+            outln!();
+            return Ok(());
+        }
         if self.ctx.parked_windows_thread().is_some() {
             error!(
                 "selected Windows thread is parked and has no coherent register context; use `vcpu <id>`"
@@ -736,7 +370,7 @@ impl ReplState<'_> {
             let tail = invocation.raw_tail.trim();
             let Some((name, expression)) = tail.split_once('=') else {
                 if tail.split_whitespace().count() != 1 {
-                    println!("{}\n", command_help(invocation.name));
+                    outln!("{}\n", command_help(invocation.name));
                     return Ok(());
                 }
                 let requested_name = tail.trim_start_matches('@').to_ascii_lowercase();
@@ -745,7 +379,7 @@ impl ReplState<'_> {
                     name => name,
                 };
                 match self.ctx.register_map.read_u64(name, &regs) {
-                    Ok(value) => println!("{name}={}", ui::addr(value)),
+                    Ok(value) => outln!("{name}={}", ui::addr(value)),
                     Err(e) => error!("{e}"),
                 }
                 return Ok(());
@@ -757,7 +391,7 @@ impl ReplState<'_> {
             };
             let expression = expression.trim();
             if name.is_empty() || expression.is_empty() {
-                println!("{}\n", command_help(invocation.name));
+                outln!("{}\n", command_help(invocation.name));
                 return Ok(());
             }
             let value = match Expr::eval_with_radix(expression, &self.ctx.target, self.radix) {
@@ -779,7 +413,7 @@ impl ReplState<'_> {
                 }
             };
             self.ctx.target.registers = Some(self.ctx.register_map.to_hashmap(&regs));
-            println!("@{name} = {}\n", ui::addr(value));
+            outln!("@{name} = {}\n", ui::addr(value));
         }
 
         print_registers(&self.ctx.register_map, &regs, false);
@@ -801,44 +435,38 @@ impl ReplState<'_> {
                 .unwrap_or_else(|_| "N/A".to_string())
         };
 
-        println!();
-        println!(
+        outln!();
+        outln!(
             "  cr0 {}   cr2 {}   cr3 {}",
             read_cr("cr0"),
             read_cr("cr2"),
             read_cr("cr3")
         );
-        println!("  cr4 {}   cr8 {}", read_cr("cr4"), read_cr("cr8"));
-        println!();
+        outln!("  cr4 {}   cr8 {}", read_cr("cr4"), read_cr("cr8"));
+        outln!();
 
-        println!(
+        outln!(
             "  cs  {}   ds  {}   es  {}",
             read_seg("cs"),
             read_seg("ds"),
             read_seg("es")
         );
-        println!(
+        outln!(
             "  fs  {}   gs  {}   ss  {}",
             read_seg("fs"),
             read_seg("gs"),
             read_seg("ss")
         );
-        println!();
+        outln!();
 
         Ok(())
     }
 
-    fn print_stack_parameters(&self, trace: &StackTrace) -> Result<()> {
+    fn print_stack_parameters(&self, trace: &StackTrace, frame_offset: usize) -> Result<()> {
         let mut printed_header = false;
         for (index, frame) in trace.frames.iter().enumerate() {
             let address = VirtAddr(frame.ip);
-            let symbol_dtb = self.ctx.target.symbol_dtb_for_address(address);
-            let Some(locals) = self
-                .ctx
-                .target
-                .symbols
-                .procedure_locals(symbol_dtb, address)?
-            else {
+            let Some(locals) = self.ctx.target.procedure_locals(address)? else {
                 continue;
             };
             let parameters: Vec<_> = locals
@@ -849,7 +477,7 @@ impl ReplState<'_> {
                 continue;
             }
             if !printed_header {
-                println!("{}", ui::label("parameters (PDB locations)"));
+                outln!("{}", ui::label("parameters (PDB locations)"));
                 printed_header = true;
             }
             for parameter in parameters {
@@ -873,14 +501,17 @@ impl ReplState<'_> {
                         format!("unavailable: {reason}")
                     }
                 };
-                println!(
-                    "  #{}  {:<24} {:<20} {}",
-                    index, parameter.name, parameter.type_name, location
+                outln!(
+                    "  #{:02}  {:<24} {:<20} {}",
+                    index + frame_offset,
+                    parameter.name,
+                    parameter.type_name,
+                    location
                 );
             }
         }
         if !printed_header {
-            println!(
+            outln!(
                 "{}",
                 ui::muted("parameter locations unavailable from loaded private symbols")
             );
@@ -899,7 +530,6 @@ impl ReplState<'_> {
             },
             None => 64,
         };
-
         if self.ctx.parked_windows_thread().is_some() {
             let trace = match self.ctx.backtrace(frame_limit) {
                 Ok(trace) => trace,
@@ -908,66 +538,81 @@ impl ReplState<'_> {
                     return Ok(());
                 }
             };
-            match invocation.name {
-                "kv" => print_stacktrace_data_with_provenance(&trace, frame_limit, false),
-                "kp" => {
-                    print_stacktrace_data_with_provenance(&trace, frame_limit, false);
-                    self.print_stack_parameters(&trace)?;
-                }
-                _ => print_stacktrace_data(&trace, frame_limit, false),
+            if invocation.name.eq_ignore_ascii_case("kv") {
+                print_stacktrace_data_with_provenance(&trace, frame_limit, false);
+            } else {
+                print_stacktrace_data(&trace, frame_limit, false);
             }
-            println!();
+            if invocation.name.eq_ignore_ascii_case("kp") {
+                self.print_stack_parameters(&trace, 0)?;
+            }
+            outln!();
             return Ok(());
         }
 
-        if let Err(e) = self
-            .ctx
-            .backend
-            .set_current_thread(&self.ctx.current_thread)
-        {
-            error!("failed to select execution context: {:?}", e);
-            return Ok(());
-        }
-
-        let regs = match self.ctx.read_registers() {
-            Ok(r) => r,
-            Err(e) => {
-                error!("failed to read registers: {:?}", e);
+        let trace = if let Some(selected) = self.ctx.target.selected_frame.as_ref() {
+            build_stacktrace_with_register_values(
+                &self.ctx.target,
+                &self.ctx.register_map,
+                &selected.registers,
+                frame_limit,
+            )
+        } else {
+            if let Err(e) = self
+                .ctx
+                .backend
+                .set_current_thread(&self.ctx.current_thread)
+            {
+                error!("failed to select execution context: {:?}", e);
                 return Ok(());
             }
+            let regs = match self.ctx.read_registers() {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("failed to read registers: {:?}", e);
+                    return Ok(());
+                }
+            };
+            build_stacktrace_with_context(
+                &self.ctx.target,
+                &self.ctx.register_map,
+                &regs,
+                frame_limit,
+            )
         };
-
-        match invocation.name {
-            "kv" => print_stacktrace_verbose(
-                &self.ctx.target,
-                &self.ctx.register_map,
-                &regs,
-                frame_limit,
-                frame_limit,
-            ),
-            "kp" => {
-                let trace =
-                    build_stacktrace(&self.ctx.target, &self.ctx.register_map, &regs, frame_limit);
-                print_stacktrace_data_with_provenance(&trace, frame_limit, false);
-                self.print_stack_parameters(&trace)?;
-            }
-            _ => print_stacktrace(
-                &self.ctx.target,
-                &self.ctx.register_map,
-                &regs,
-                frame_limit,
-                frame_limit,
-                false,
-            ),
+        let offset = self
+            .ctx
+            .target
+            .selected_frame
+            .as_ref()
+            .map(|frame| frame.index)
+            .unwrap_or(0);
+        print_indexed_stacktrace(
+            &trace,
+            frame_limit,
+            offset,
+            invocation.name.eq_ignore_ascii_case("kv"),
+            self.ctx.target.selected_frame.as_ref().map(|_| offset),
+        );
+        if invocation.name.eq_ignore_ascii_case("kp") {
+            let plain = StackTrace {
+                frames: trace
+                    .frames
+                    .iter()
+                    .map(|frame| frame.frame.clone())
+                    .collect(),
+                truncated: trace.truncated,
+            };
+            self.print_stack_parameters(&plain, offset)?;
         }
-        println!();
+        outln!();
 
         Ok(())
     }
 
     fn cmd_status(&mut self) -> Result<()> {
         if self.ctx.backend.is_running() {
-            println!("VM is running\n");
+            outln!("VM is running\n");
         } else {
             if let Err(e) = self
                 .ctx
@@ -1010,7 +655,7 @@ impl ReplState<'_> {
 
         let page = self.ctx.read_debug_output(0);
         if page.lines.is_empty() {
-            println!("{}\n", ui::muted("no debug output captured"));
+            outln!("{}\n", ui::muted("no debug output captured"));
             return Ok(());
         }
 
@@ -1020,19 +665,19 @@ impl ReplState<'_> {
             page.lines.len().saturating_sub(count)
         };
         for line in &page.lines[start..] {
-            println!(
+            outln!(
                 "{} {}",
                 ui::muted(&fmt_timestamp(line.timestamp_ms)),
                 line.text
             );
         }
-        println!();
+        outln!();
 
         Ok(())
     }
     fn cmd_irp(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
         let Some(expr) = invocation.arg(0) else {
-            println!("{}\n", command_help("irp"));
+            outln!("{}\n", command_help("irp"));
             return Ok(());
         };
 
@@ -1058,46 +703,46 @@ impl ReplState<'_> {
             "UserMode"
         };
 
-        println!("irp {}", ui::addr(irp.address.0));
-        println!("  type          : {:#x}", irp.irp_type);
-        println!("  size          : {:#x}", irp.size);
-        println!("  stack count   : {}", irp.stack_count);
-        println!("  current loc   : {}", irp.current_location);
-        println!(
+        outln!("irp {}", ui::addr(irp.address.0));
+        outln!("  type          : {:#x}", irp.irp_type);
+        outln!("  size          : {:#x}", irp.size);
+        outln!("  stack count   : {}", irp.stack_count);
+        outln!("  current loc   : {}", irp.current_location);
+        outln!(
             "  pending       : {}",
             if irp.pending_returned { "yes" } else { "no" }
         );
-        println!("  requestor mode: {} ({:#x})", mode, irp.requestor_mode);
+        outln!("  requestor mode: {} ({:#x})", mode, irp.requestor_mode);
         if let Some(status) = irp.io_status {
-            println!("  io status     : {:#x}", status);
+            outln!("  io status     : {:#x}", status);
         }
-        println!("  user event    : {}", ui::addr(irp.user_event.0));
-        println!("  user buffer   : {}", ui::addr(irp.user_buffer.0));
-        println!("  mdl           : {}", ui::addr(irp.mdl_address.0));
-        println!("  thread        : {}", ui::addr(irp.thread.0));
+        outln!("  user event    : {}", ui::addr(irp.user_event.0));
+        outln!("  user buffer   : {}", ui::addr(irp.user_buffer.0));
+        outln!("  mdl           : {}", ui::addr(irp.mdl_address.0));
+        outln!("  thread        : {}", ui::addr(irp.thread.0));
 
         match irp.current_stack {
             Some(ios) => {
-                println!("  current stack : {}", ui::addr(ios.address.0));
-                println!(
+                outln!("  current stack : {}", ui::addr(ios.address.0));
+                outln!(
                     "    major       : IRP_MJ_{} ({:#x})",
                     irp_major_function_name(ios.major_function),
                     ios.major_function
                 );
-                println!("    minor       : {:#x}", ios.minor_function);
-                println!("    device      : {}", ui::addr(ios.device_object.0));
-                println!("    file        : {}", ui::addr(ios.file_object.0));
+                outln!("    minor       : {:#x}", ios.minor_function);
+                outln!("    device      : {}", ui::addr(ios.device_object.0));
+                outln!("    file        : {}", ui::addr(ios.file_object.0));
                 let completion = self
                     .ctx
                     .target
                     .closest_symbol_current_context(ios.completion_routine)
                     .unwrap_or_else(|| format!("{:#x}", ios.completion_routine.0));
-                println!("    completion  : {}", completion);
-                println!("    context     : {}", ui::addr(ios.context.0));
+                outln!("    completion  : {}", completion);
+                outln!("    context     : {}", ui::addr(ios.context.0));
             }
-            None => println!("  current stack : {}", "unavailable".bright_black()),
+            None => outln!("  current stack : {}", "unavailable".bright_black()),
         }
-        println!();
+        outln!();
 
         Ok(())
     }
@@ -1133,7 +778,7 @@ impl ReplState<'_> {
 
     fn cmd_drvobj(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
         let Some(expr) = invocation.arg(0) else {
-            println!("{}\n", command_help("drvobj"));
+            outln!("{}\n", command_help("drvobj"));
             return Ok(());
         };
 
@@ -1156,24 +801,24 @@ impl ReplState<'_> {
         };
 
         let mode = if drv.via_pointer { "pointer" } else { "direct" };
-        println!("driver object {} ({})", ui::addr(drv.object.0), mode);
+        outln!("driver object {} ({})", ui::addr(drv.object.0), mode);
         if let Some(name) = &drv.name {
-            println!("  name          : {}", name);
+            outln!("  name          : {}", name);
         }
-        println!("  driver start  : {}", ui::addr(drv.driver_start.0));
-        println!("  driver size   : {:#x}", drv.driver_size);
-        println!("  driver section: {}", ui::addr(drv.driver_section.0));
-        println!(
+        outln!("  driver start  : {}", ui::addr(drv.driver_start.0));
+        outln!("  driver size   : {:#x}", drv.driver_size);
+        outln!("  driver section: {}", ui::addr(drv.driver_section.0));
+        outln!(
             "  driver unload : {}",
             self.fmt_kernel_symbol(drv.driver_unload)
         );
 
-        println!("  devices:");
+        outln!("  devices:");
         if drv.device_chain.is_empty() {
-            println!("    {}", "(none)".bright_black());
+            outln!("    {}", "(none)".bright_black());
         } else {
             for d in &drv.device_chain {
-                println!(
+                outln!(
                     "    {} type={:#x} flags={:#x} characteristics={:#x} attached={} next={}",
                     ui::addr(d.device.0),
                     d.device_type,
@@ -1185,22 +830,22 @@ impl ReplState<'_> {
             }
         }
 
-        println!("  dispatch table:");
+        outln!("  dispatch table:");
         for (i, fn_ptr) in drv.dispatch.iter().enumerate() {
-            println!(
+            outln!(
                 "    IRP_MJ_{:<28} {}",
                 irp_major_function_name(i as u8),
                 self.fmt_kernel_symbol(*fn_ptr)
             );
         }
-        println!();
+        outln!();
 
         Ok(())
     }
 
     fn cmd_devobj(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
         let Some(expr) = invocation.arg(0) else {
-            println!("{}\n", command_help("devobj"));
+            outln!("{}\n", command_help("devobj"));
             return Ok(());
         };
 
@@ -1220,20 +865,20 @@ impl ReplState<'_> {
             }
         };
 
-        println!("device object {}", ui::addr(dev.object.0));
-        println!("    type            : {:#x}", dev.device_type);
-        println!("    flags           : {:#x}", dev.flags);
-        println!("    characteristics : {:#x}", dev.characteristics);
-        println!("    driver object   : {}", ui::addr(dev.driver_object.0));
-        println!("    attached device : {}", ui::addr(dev.attached_device.0));
-        println!("    next device     : {}", ui::addr(dev.next_device.0));
-        println!("    current irp     : {}", ui::addr(dev.current_irp.0));
-        println!("    device extension: {}", ui::addr(dev.device_extension.0));
+        outln!("device object {}", ui::addr(dev.object.0));
+        outln!("    type            : {:#x}", dev.device_type);
+        outln!("    flags           : {:#x}", dev.flags);
+        outln!("    characteristics : {:#x}", dev.characteristics);
+        outln!("    driver object   : {}", ui::addr(dev.driver_object.0));
+        outln!("    attached device : {}", ui::addr(dev.attached_device.0));
+        outln!("    next device     : {}", ui::addr(dev.next_device.0));
+        outln!("    current irp     : {}", ui::addr(dev.current_irp.0));
+        outln!("    device extension: {}", ui::addr(dev.device_extension.0));
 
         if !dev.attached_stack.is_empty() {
-            println!("attached stack:");
+            outln!("attached stack:");
             for (i, e) in dev.attached_stack.iter().enumerate() {
-                println!(
+                outln!(
                     "  #{} {} driver={} type={:#x} flags={:#x}",
                     i + 1,
                     ui::addr(e.device.0),
@@ -1243,14 +888,14 @@ impl ReplState<'_> {
                 );
             }
         }
-        println!();
+        outln!();
 
         Ok(())
     }
 
     fn cmd_object(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
         let Some(expr) = invocation.arg(0) else {
-            println!("{}\n", command_help("object"));
+            outln!("{}\n", command_help("object"));
             return Ok(());
         };
 
@@ -1270,30 +915,30 @@ impl ReplState<'_> {
             }
         };
 
-        println!("object {}", ui::addr(o.body.0));
-        println!("  input         : {} ({})", ui::addr(o.input.0), o.mode);
-        println!("  header        : {}", ui::addr(o.header.0));
-        println!("  pointer count : {}", o.pointer_count);
-        println!("  handle count  : {}", o.handle_count);
+        outln!("object {}", ui::addr(o.body.0));
+        outln!("  input         : {} ({})", ui::addr(o.input.0), o.mode);
+        outln!("  header        : {}", ui::addr(o.header.0));
+        outln!("  pointer count : {}", o.pointer_count);
+        outln!("  handle count  : {}", o.handle_count);
         if let Some(ti) = o.type_index {
-            println!("  type index    : {:#x}", ti);
+            outln!("  type index    : {:#x}", ti);
         }
         if let Some(to) = o.type_object {
-            println!("  type object   : {}", ui::addr(to.0));
+            outln!("  type object   : {}", ui::addr(to.0));
         }
         if let Some(tn) = &o.type_name {
-            println!("  type name     : {}", tn);
+            outln!("  type name     : {}", tn);
         }
         if let Some(mask) = o.info_mask {
-            println!("  info mask     : {:#x}", mask);
+            outln!("  info mask     : {:#x}", mask);
         }
         if let Some(ni) = o.name_info {
-            println!("  name info     : {}", ui::addr(ni.0));
+            outln!("  name info     : {}", ui::addr(ni.0));
         }
         if let Some(name) = &o.name {
-            println!("  name          : {}", name);
+            outln!("  name          : {}", name);
         }
-        println!();
+        outln!();
 
         Ok(())
     }
@@ -1325,10 +970,10 @@ impl ReplState<'_> {
                 continue;
             }
             if c.kind != last_kind {
-                println!("{} callbacks:", c.kind);
+                outln!("{} callbacks:", c.kind);
                 last_kind = c.kind;
             }
-            println!(
+            outln!(
                 "  [{:02}] fn={}  block={}  raw={}  ctx={}",
                 c.index,
                 ui::symbol(&target),
@@ -1341,11 +986,11 @@ impl ReplState<'_> {
 
         if printed == 0 {
             match invocation.arg(0) {
-                Some(f) => println!("no callbacks matching '{}'", f),
-                None => println!("no registered callbacks found"),
+                Some(f) => outln!("no callbacks matching '{}'", f),
+                None => outln!("no registered callbacks found"),
             }
         }
-        println!();
+        outln!();
 
         Ok(())
     }
@@ -1361,9 +1006,9 @@ impl ReplState<'_> {
 
         for (i, t) in tables.iter().enumerate() {
             if i > 0 {
-                println!();
+                outln!();
             }
-            println!("{}: base={} limit={}", t.label, ui::addr(t.base.0), t.limit);
+            outln!("{}: base={} limit={}", t.label, ui::addr(t.base.0), t.limit);
             let expected = if t.label.contains("win32k") {
                 "win32k"
             } else {
@@ -1387,13 +1032,13 @@ impl ReplState<'_> {
                 } else {
                     String::new()
                 };
-                println!("  [{:4}] {}{}", e.index, display, mark);
+                outln!("  [{:4}] {}{}", e.index, display, mark);
             }
             if hooks > 0 {
-                println!("  {} hook(s) detected", hooks);
+                outln!("  {} hook(s) detected", hooks);
             }
         }
-        println!();
+        outln!();
 
         Ok(())
     }
@@ -1411,14 +1056,14 @@ impl ReplState<'_> {
 
         if hits.is_empty() {
             match filter {
-                Some(f) => println!("  {}", format!("no IRPs found for '{}'", f).bright_black()),
-                None => println!("  {}", "no IRPs found".bright_black()),
+                Some(f) => outln!("  {}", format!("no IRPs found for '{}'", f).bright_black()),
+                None => outln!("  {}", "no IRPs found".bright_black()),
             }
-            println!();
+            outln!();
             return Ok(());
         }
 
-        println!("  {:<16} {:<7} Details", "IRP", "Source");
+        outln!("  {:<16} {:<7} Details", "IRP", "Source");
         for h in &hits {
             let details = if h.source == "thread" {
                 format!(
@@ -1440,7 +1085,7 @@ impl ReplState<'_> {
                         .unwrap_or_else(|| "?".into()),
                 )
             };
-            println!(
+            outln!(
                 "  {} {:<7} stack={:<2} current={:<2} {}",
                 ui::addr(h.irp.0),
                 h.source,
@@ -1449,13 +1094,13 @@ impl ReplState<'_> {
                 details
             );
         }
-        println!();
+        outln!();
 
         Ok(())
     }
     fn cmd_address(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
         let Some(expr) = invocation.arg(0) else {
-            println!("{}\n", command_help("address"));
+            outln!("{}\n", command_help("address"));
             return Ok(());
         };
 
@@ -1475,10 +1120,10 @@ impl ReplState<'_> {
             }
         };
 
-        println!("address {}", ui::addr(d.address.0));
-        println!("  kind    : {}", d.kind);
+        outln!("address {}", ui::addr(d.address.0));
+        outln!("  kind    : {}", d.kind);
         if let Some(m) = &d.module {
-            println!(
+            outln!(
                 "  module  : {}+{:#x}  (base {}, size {:#x})",
                 m.name,
                 m.offset,
@@ -1487,39 +1132,97 @@ impl ReplState<'_> {
             );
         }
         if let Some(s) = &d.section {
-            println!("  section : {}", s);
+            outln!("  section : {}", s);
         }
         if let Some(va) = &d.va_type {
-            println!("  region  : {}", va);
+            outln!("  region  : {}", va);
         }
         if let Some(r) = &d.region {
-            println!(
+            outln!(
                 "  region  : {} - {}",
                 ui::addr(r.start.0),
                 ui::addr(r.end.0)
             );
             if let Some(p) = r.protection {
-                println!("    protection : {:#x}", p);
+                outln!("    protection : {:#x}", p);
             }
             if let Some(t) = r.vad_type {
-                println!("    vad type   : {:#x}", t);
+                outln!("    vad type   : {:#x}", t);
             }
             if let Some(pm) = r.private_memory {
-                println!("    private    : {}", pm);
+                outln!("    private    : {}", pm);
             }
             if let Some(det) = &r.details {
-                println!("    details    : {}", det);
+                outln!("    details    : {}", det);
             }
         }
         if d.module.is_none() && d.region.is_none() && d.va_type.is_none() {
-            println!(
+            outln!(
                 "  {}",
                 "not inside any loaded module, kernel region, or VAD".bright_black()
             );
         }
-        println!();
+        outln!();
 
         Ok(())
+    }
+}
+
+fn print_selected_registers(registers: &std::collections::HashMap<String, u64>) {
+    let mut names: Vec<_> = registers.keys().collect();
+    names.sort();
+    for name in names {
+        outln!("  {:<8} {}", name, ui::addr(registers[name]));
+    }
+}
+
+fn print_indexed_stacktrace(
+    trace: &RecoveredStackTrace,
+    display_limit: usize,
+    frame_offset: usize,
+    show_provenance: bool,
+    selected_index: Option<usize>,
+) {
+    for (index, recovered) in trace.frames.iter().take(display_limit).enumerate() {
+        let frame = &recovered.frame;
+        let global_index = frame_offset + index;
+        let marker = if selected_index == Some(global_index) {
+            "*"
+        } else {
+            " "
+        };
+        let symbol = if frame.symbol.starts_with("0x") {
+            frame.symbol.clone()
+        } else {
+            ui::symbol(&frame.symbol)
+        };
+        let provenance = if show_provenance {
+            format!("  [{}]", frame.source.as_str())
+        } else {
+            String::new()
+        };
+        let location = frame
+            .source_location
+            .as_ref()
+            .map(|location| format!("  [{}:{}]", location.file, location.line))
+            .unwrap_or_default();
+        outln!(
+            "{}{:02} {}  {}{}{}",
+            marker,
+            global_index,
+            ui::addr(frame.sp),
+            ui::addr(frame.ip),
+            if symbol.is_empty() {
+                "".to_string()
+            } else {
+                format!("  {symbol}")
+            },
+            format!("{provenance}{location}")
+        );
+    }
+    let hidden = trace.frames.len().saturating_sub(display_limit) + trace.truncated;
+    if hidden > 0 {
+        outln!("{}", format!("... {} more frames", hidden).bright_black());
     }
 }
 

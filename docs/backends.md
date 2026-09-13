@@ -1,16 +1,20 @@
 # Choosing a backend
 
-`ntoseye` can talk to the guest four ways. Pick with `--backend kd` (default), `--backend kdnet`, `--backend gdb`, or `--backend memory`.
+`ntoseye` can talk to a live target four ways. Pick with `--backend kd` (default), `--backend kdnet`, `--backend gdb`, or `--backend memory`. Crash-dump mode is a separate offline attach mode selected with `--dump <file>`.
 
-| Capability | `kd` (default) | `kdnet` | `gdb` | `memory` |
-| --- | --- | --- | --- | --- |
-| Transport | Windows KD over a serial pipe (KDCOM) | Windows KD over encrypted UDP | Hypervisor GDB stub | Direct VM-process memory |
-| Guest configuration | Kernel debugging enabled | Kernel network debugging enabled | None | None |
-| Host VM configuration | Serial socket | Reachable virtual NIC | Listening GDB stub | None |
-| Execution control | Yes | Yes | Yes | No |
-| Kernel breakpoints | Yes | Yes | Yes | No |
-| Usermode breakpoints | AMD64 only | AMD64 only | No | No |
-| Hardware watchpoints | AMD64 only | AMD64 only | No | No |
+| Capability | `kd` (default) | `kdnet` | `gdb` | `memory` | `--dump` |
+| --- | --- | --- | --- | --- | --- |
+| Transport | Windows KD over a serial pipe (KDCOM) | Windows KD over encrypted UDP | Hypervisor GDB stub | Direct VM-process memory | Offline crash-dump file |
+| Guest configuration | Kernel debugging enabled | Kernel network debugging enabled | None | None | None |
+| Host VM configuration | Serial socket | Reachable virtual NIC | Listening GDB stub | None | None |
+| Execution control | Yes | Yes | Yes | No | No |
+| Registers | Yes | Yes | Yes | No | Yes (crash context) |
+| Memory reads | Yes | Yes | Yes | Yes | Yes |
+| Kernel breakpoints | Yes | Yes | Yes | No | No |
+| Usermode breakpoints | Yes | Yes | No | No | No |
+| Hardware watchpoints | Yes | Yes | No | No | No |
+| Model-specific registers | Yes | Yes | No | No | No |
+| Reboot / forced crash | Yes | Yes | No | No | No |
 
 ## Hypervisor setup
 
@@ -22,7 +26,7 @@ Host-side configuration is specific to the hypervisor:
 
 ## Supported live environments
 
-Live support depends on the host OS, hypervisor, and guest architecture. The currently supported combinations are:
+Any Windows 10/11 target reachable over the network is debuggable with `kdnet` (see the [KDNET guide](kdnet.md)); that path has nothing hypervisor-specific in it. The combinations below are where `ntoseye` additionally reads VM memory directly, sets the VM up with `ntoseye configure`, and offers the `gdb` and `memory` backends:
 
 | Host OS | Hypervisor | Guest architecture | `kd` | `kdnet` | `gdb` | `memory` |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -30,35 +34,13 @@ Live support depends on the host OS, hypervisor, and guest architecture. The cur
 | Linux | VMware Workstation | AMD64 | Yes | Yes | Yes | Yes |
 | macOS | UTM (QEMU/HVF) | ARM64 | Yes | Yes | No | Yes |
 
-Combinations not listed above are untested. Crash-dump analysis is currently AMD64-only.
+Other hypervisors are untested with these integrations. Crash-dump analysis supports AMD64 and ARM64 dumps.
 
 The initial KD handshake timeout is 8 seconds by default. For unusually slow guests, override it with `NTOSEYE_KD_TIMEOUT=<seconds>`.
 
 ## KDNET
 
-`ntoseye configure` prompts for the host IPv4 address, applies any required hypervisor changes, and prints the guest and launch commands.
-
-Hypervisor-specific requirements:
-
-- [KVM/QEMU](kvm-qemu.md#kdnet): set the libvirt Hyper-V vendor ID to `KVMKVMKVM`, then completely power off and restart the VM; a Windows reboot is insufficient. `ntoseye configure` applies the vendor override automatically.
-- [VMware Workstation](vmware.md#kdnet): no additional virtual hardware configuration is needed, but the guest's bridged, NAT, or host-only NIC must be able to reach the selected host address.
-- [UTM](utm.md#kdnet): disable Secure Boot before changing the Windows BCD debug settings and ensure the guest NIC can reach the selected macOS address. Use `--memory-source kd` for a fully remote session that needs no root or UTM-process access.
-
-For manual setup, the Windows steps are common to every hypervisor. From an elevated guest prompt, prefer Microsoft's `kdnet.exe <host-ip> 50000` utility. It validates the debug NIC, configures its PCI `busparams`, and prints the four-part encryption key. The equivalent manual setup is:
-
-```powershell
-bcdedit /debug on
-bcdedit /dbgsettings net hostip:<host-ip> port:50000
-bcdedit /set "{dbgsettings}" busparams <bus>.<device>.<function>
-```
-
-Use the host address described by the applicable [hypervisor setup guide](#hypervisor-setup), permit inbound UDP on the selected port, and reboot Windows. Then start `ntoseye` with the printed key:
-
-```bash
-ntoseye --backend kdnet --kdnet-key 1.2.3.4
-```
-
-KDNET listens on `0.0.0.0:50000` by default. Use `--connect <listen-address>:<port>` to select another listener.
+Guest, host, and per-hypervisor setup for the `kdnet` backend is in the [KDNET guide](kdnet.md). In the guest, `kdnet.exe <host-ip> 50000` does the whole configuration and prints the key; on the host, `ntoseye --backend kdnet --kdnet-key <key>`.
 
 ## KD and KDNET memory sources
 
@@ -66,9 +48,14 @@ KD and KDNET accept `--memory-source auto|host|kd`:
 
 - `auto` (default) uses direct VM-process memory only after its kernel PE header and live module-list links match the KD target; otherwise it falls back to KD.
 - `host` requires matching direct VM-process memory and fails on mismatch.
-- `kd` forces authenticated `DbgKdReadPhysicalMemory` and `DbgKdWritePhysicalMemory` requests.
+- `kd` forces target-mediated reads: kernel-space addresses, and user-space addresses of the process the current processor is running (AMD64), go through `DbgKdReadVirtualMemory`; everything else through `DbgKdReadPhysicalMemory` behind a host page walk whose translations are cached until the target next runs. Writes use `DbgKdWritePhysicalMemory`.
 
-The `kd` source needs no hypervisor or VM-process access, so AMD64 and ARM64 Windows VMs or physical machines can be debugged across any routable network. Memory-backed commands require the target to be halted; remote latency also makes large scans slower than direct host memory.
+The `kd` source needs no hypervisor or VM-process access, so AMD64 and ARM64 Windows VMs or physical machines can be debugged across any routable network. Memory-backed commands require the target to be halted; remote latency also makes large scans slower than direct host memory. Every read is a request/reply round trip. Over KDCOM on an emulated UART the request alone costs about 3 ms before the target sees it: QEMU's 16550 hands the guest one byte per main-loop iteration at the FIFO trigger level KDCOM programs, and a KD request plus its ACK is ~90 bytes host-to-guest. The reply direction is cheap (~5 µs/byte), and KDNET has no such floor. So over KDCOM what matters is how many reads a step needs, not how many bytes; prefer `--memory-source host` (the `auto` default) whenever the VM is local:
+
+- Module images are never copied whole. Attach reads each module's headers with one probe; the unwinder fetches 2 KiB blocks of `.pdata`/`.rdata` as its lookups touch them and keeps them for the session, and a stack walk reads the stack a page at a time.
+- A module's PDB is remembered by the image identity the symbol server uses (`~/.ntoseye/symbols/identities`, keyed by file name, `TimeDateStamp`, and `SizeOfImage`, all of which the loader's module list already carries). A module seen in an earlier session is identified with no reads from the target; `lm` shows such modules' symbol source as `cached`. A remembered PDB that fails to load is forgotten and the module rediscovered from the target.
+
+Process, kernel-module, and driver-object lists are walked only when something needs them (a listing command, a tab completion, a break context in a user-mode process) and the first walk per halt serves every later use until the target runs again. The process walk reads one span per `_EPROCESS` and consults the PEB only for names the kernel's 15-byte `ImageFileName` may have truncated, so the prompt after attach and each stop no longer waits on a full process walk.
 
 ## Memory introspection
 

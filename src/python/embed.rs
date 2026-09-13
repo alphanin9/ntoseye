@@ -61,7 +61,7 @@ pub fn print_script_load_report(report: &LoadReport) {
     if !report.failed.is_empty() {
         summary.push_str(&format!(", {} failed", report.failed.len()));
     }
-    println!("{summary}");
+    outln!("{summary}");
     print_script_load_failures(report);
 }
 
@@ -388,7 +388,6 @@ mod tests {
                    register_command('pytest_hi', 'a help string', hi)\n";
         assert!(exec_script(src, "test.py").is_err());
 
-        // A syntactically broken script surfaces a stringified error, not a panic.
         assert!(exec_script("def (:\n", "bad.py").is_err());
         clear_commands();
     }

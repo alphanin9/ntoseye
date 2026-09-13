@@ -374,11 +374,8 @@ impl GdbClient {
         Ok(bytes)
     }
 
-    #[allow(dead_code)]
     fn write_registers(&mut self, data: &[u8]) -> Result<()> {
-        let hex_data: String = data.iter().map(|b| format!("{:02x}", b)).collect();
-
-        let response = self.send_packet(&format!("G{}", hex_data))?;
+        let response = self.send_packet(&format!("G{}", hex::encode(data)))?;
 
         if response == "OK" {
             Ok(())
@@ -396,16 +393,8 @@ impl GdbClient {
     }
 
     fn continue_execution(&mut self) -> Result<()> {
-        // set continue thread to -1 (all threads)
         let _ = self.send_packet("Hc-1")?;
         self.send_command_no_reply("c")?;
-        self.is_running = true;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn continue_at(&mut self, addr: u64) -> Result<()> {
-        self.send_command_no_reply(&format!("c{:x}", addr))?;
         self.is_running = true;
         Ok(())
     }
@@ -414,19 +403,6 @@ impl GdbClient {
         self.send_command_no_reply("s")?;
         self.is_running = true;
         Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn step_at(&mut self, addr: u64) -> Result<()> {
-        self.send_command_no_reply(&format!("s{:x}", addr))?;
-        self.is_running = true;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn step_and_wait(&mut self) -> Result<String> {
-        self.step()?;
-        self.wait_for_stop()
     }
 
     fn wait_for_stop(&mut self) -> Result<String> {
@@ -630,11 +606,9 @@ impl GdbClient {
             let href = RegisterMap::extract_attr(element, "href");
 
             if let Some(filename) = href {
-                // fetch the included file
                 let included_xml = self.fetch_feature_file(filename)?;
                 result = format!("{}{}{}", &result[..start], included_xml, &result[end..]);
             } else {
-                // no href, just remove the include element
                 result = format!("{}{}", &result[..start], &result[end..]);
             }
         }
@@ -773,7 +747,6 @@ impl DebugBackend for GdbClient {
     fn try_wait_for_stop(&mut self, timeout: Duration) -> Result<Option<StopEvent>> {
         self.stream.set_read_timeout(Some(timeout))?;
         let result = GdbClient::try_wait_for_stop(self);
-        // restore blocking mode regardless of outcome
         let _ = self.stream.set_read_timeout(None);
         Ok(result?.map(|response| StopEvent {
             thread_id: Self::parse_stop_reply_thread_id(&response),

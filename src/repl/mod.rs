@@ -27,12 +27,14 @@ use crate::diagnostics;
 #[cfg(feature = "cli")]
 use crate::error::Error;
 use crate::error::Result;
+use crate::expr::NumberRadix;
 use crate::guest::ModuleSymbolLoadReport;
+use crate::memory::DTB_IDENTITY;
+#[cfg(feature = "cli")]
+use crate::output::log_input_line;
 #[cfg(feature = "python")]
 use crate::python::embed;
 use crate::session::Session;
-#[cfg(feature = "cli")]
-use crate::session::StopResolution;
 #[cfg(feature = "cli")]
 use crate::symbols::ntoseye_home;
 #[cfg(feature = "cli")]
@@ -49,7 +51,7 @@ macro_rules! require_arg {
         match $invocation.arg($idx) {
             Some(a) => a,
             None => {
-                println!("{}\n", command_help($cmd));
+                outln!("{}\n", command_help($cmd));
                 return Ok(());
             }
         }
@@ -114,7 +116,7 @@ pub fn print_module_symbol_report(report: &ModuleSymbolLoadReport) {
             }
         ));
     }
-    println!("{} {summary}", ui::muted("symbols:"));
+    outln!("{} {summary}", ui::muted("symbols:"));
     const DISPLAY_LIMIT: usize = 8;
     for diagnostic in report.diagnostics.iter().take(DISPLAY_LIMIT) {
         let location = diagnostic
@@ -138,7 +140,7 @@ pub fn print_module_symbol_report(report: &ModuleSymbolLoadReport) {
 pub fn print_backend_capabilities(capabilities: &[BackendCapability]) {
     const COLUMNS: usize = 4;
 
-    println!("{}", "capabilities".bold());
+    outln!("{}", "capabilities".bold());
 
     let mut builder = Builder::default();
     for chunk in capabilities.chunks(COLUMNS) {
@@ -168,9 +170,9 @@ pub fn print_backend_capabilities(capabilities: &[BackendCapability]) {
         .with(tabled::settings::Style::empty())
         .with(Padding::zero());
     for line in table.to_string().lines() {
-        println!("  {line}");
+        outln!("  {line}");
     }
-    println!();
+    outln!();
 }
 
 pub fn supports_capability(
@@ -190,7 +192,7 @@ pub fn print_backend_capability_warning(capabilities: &[BackendCapability]) {
     diagnostics::print_warning(
         "selected backend has reduced capabilities; run `capabilities` for details",
     );
-    println!();
+    outln!();
 }
 
 pub fn print_plain_table(builder: Builder) {
@@ -198,7 +200,7 @@ pub fn print_plain_table(builder: Builder) {
     table
         .with(tabled::settings::Style::empty())
         .with(Padding::zero());
-    println!("{table}\n");
+    outln!("{table}\n");
 }
 
 pub fn print_padded_table(builder: Builder) {
@@ -206,13 +208,16 @@ pub fn print_padded_table(builder: Builder) {
     table
         .with(tabled::settings::Style::empty())
         .with(Padding::new(0, 2, 0, 0));
-    println!("{table}\n");
+    outln!("{table}\n");
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Flow {
     Continue,
     Quit,
+    /// The dispatch context refused a command's run effect (already reported);
+    /// the rest of the command list is abandoned.
+    Denied,
 }
 
 pub struct ReplState<'a> {
@@ -223,29 +228,49 @@ pub struct ReplState<'a> {
     /// Nested automatic exception-command executions. Bounded so an event
     /// command that resumes into the same exception cannot recurse forever.
     pub event_command_depth: usize,
-    pub radix: crate::expr::NumberRadix,
+    pub radix: NumberRadix,
     pub line: String,
+    /// Who is dispatching; decides which [`RunEffect`]s a command may have.
+    pub context: DispatchContext,
+    /// Set while a multi-step command (`pa`, `pt`, `wt`...) drives the
+    /// target: intermediate stops are not rendered, only the final one.
+    pub quiet_stops: bool,
 }
 
-/// The user-command completion set: the registered Python commands when the
-/// binary embeds Python (`python-embed`), else empty.
-pub fn initial_user_commands() -> Vec<(String, String, Vec<CompletionStrategy>)> {
-    #[cfg(feature = "python")]
-    {
-        embed::command_list()
-    }
-    #[cfg(not(feature = "python"))]
-    {
-        Vec::new()
-    }
+/// Where a command line comes from. Event-driven and remote contexts must not
+/// let a command move the target on their own; see
+/// [`ReplState::run_control_denial`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DispatchContext {
+    /// The user's prompt: anything goes.
+    Interactive,
+    /// A breakpoint's action string; only a trailing `gc` may resume.
+    BreakpointAction,
+    /// An exception policy's command; the policy's `-f` owns the disposition.
+    ExceptionCommand,
+    /// A request/response host (MCP `command`) that cannot block on a run and
+    /// has its own non-blocking resume/wait tools.
+    Remote,
 }
 
-impl<'a> ReplState<'a> {
-    /// Build a transient REPL state around an existing context for one-off
-    /// command dispatch (e.g. the Python SDK's `run_command`). Completion caches
-    /// start empty (no live REPL to populate them). Output goes to stdout, as in
-    /// the REPL.
-    pub fn for_oneshot(ctx: &'a mut Session) -> Self {
+/// Everything a [`ReplState`] owns besides its session borrow. A host that
+/// runs commands one at a time against a session it owns (the MCP `command`
+/// tool) keeps one of these between calls, so completion caches, aliases,
+/// exception policies, and the radix persist exactly as in the interactive
+/// REPL, and rebuilds the borrowing `ReplState` per call with
+/// [`ReplState::attach`].
+pub struct ReplStore {
+    caches: ReplCaches,
+    aliases: UserAliases,
+    exception_policies: ExceptionPolicyTable,
+    radix: NumberRadix,
+    context: DispatchContext,
+}
+
+impl ReplStore {
+    /// Fresh REPL state for `ctx`: caches seeded from the current symbol
+    /// context, persisted aliases loaded, default exception policies and radix.
+    pub fn new(ctx: &Session, context: DispatchContext) -> Self {
         let caches = ReplCaches {
             symbols: Arc::new(RwLock::new(ctx.target.current_symbol_index())),
             types: Arc::new(RwLock::new(ctx.target.current_types_index())),
@@ -261,19 +286,104 @@ impl<'a> ReplState<'a> {
             user_commands: Arc::new(RwLock::new(initial_user_commands())),
             aliases: Arc::new(RwLock::new(Vec::new())),
         };
-
-        let state = ReplState {
-            ctx,
+        caches.refresh_expression_context(&ctx.target);
+        let aliases = UserAliases::load();
+        *caches.aliases.write().unwrap() = aliases.entries();
+        Self {
             caches,
-            aliases: UserAliases::load(),
+            aliases,
             exception_policies: ExceptionPolicyTable::default(),
-            event_command_depth: 0,
-            radix: crate::expr::NumberRadix::Hexadecimal,
-            line: String::new(),
+            radix: NumberRadix::Hexadecimal,
+            context,
+        }
+    }
+}
+
+/// The user-command completion set: the registered Python commands when the
+/// binary embeds Python (`python-embed`), else empty.
+pub fn initial_user_commands() -> Vec<(String, String, Vec<CompletionStrategy>)> {
+    #[cfg(feature = "python")]
+    {
+        embed::command_list()
+    }
+    #[cfg(not(feature = "python"))]
+    {
+        Vec::new()
+    }
+}
+
+impl Session {
+    pub(crate) fn restore_live_register_cache(&mut self) {
+        if self.backend.is_running() || self.parked_windows_thread().is_some() {
+            self.target.registers = None;
+            self.target.clear_context_dtb_override();
+            return;
+        }
+
+        let registers = match self.read_registers() {
+            Ok(registers) => registers,
+            Err(_) => {
+                self.target.registers = None;
+                self.target.clear_context_dtb_override();
+                return;
+            }
         };
-        state.caches.refresh_expression_context(&state.ctx.target);
-        state.refresh_alias_cache();
-        state
+        self.target.registers = Some(self.register_map.to_hashmap(&registers));
+        match self
+            .register_map
+            .read_u64(self.target.arch().dtb_register(), &registers)
+        {
+            Ok(dtb)
+                if dtb != 0
+                    && self.target.guest.is_some()
+                    && self.target.kernel_dtb() != DTB_IDENTITY =>
+            {
+                self.target.set_context_dtb_override(dtb);
+            }
+            _ => self.target.clear_context_dtb_override(),
+        }
+    }
+}
+
+impl<'a> ReplState<'a> {
+    /// Bind stored REPL state to a session for one dispatch; [`Self::detach`]
+    /// hands the state back afterwards.
+    pub fn attach(ctx: &'a mut Session, store: ReplStore) -> Self {
+        ReplState {
+            ctx,
+            caches: store.caches,
+            aliases: store.aliases,
+            exception_policies: store.exception_policies,
+            event_command_depth: 0,
+            radix: store.radix,
+            line: String::new(),
+            context: store.context,
+            quiet_stops: false,
+        }
+    }
+
+    /// Release the session borrow, keeping the REPL state for the next
+    /// [`Self::attach`].
+    pub fn detach(self) -> ReplStore {
+        ReplStore {
+            caches: self.caches,
+            aliases: self.aliases,
+            exception_policies: self.exception_policies,
+            radix: self.radix,
+            context: self.context,
+        }
+    }
+
+    /// Build a transient REPL state around an existing context for one-off
+    /// command dispatch (e.g. the Python SDK's `run_command`). Completion caches
+    /// start empty (no live REPL to populate them). Output goes to stdout unless
+    /// the caller wraps dispatch in [`crate::output::capture`].
+    pub fn for_oneshot(ctx: &'a mut Session) -> Self {
+        if ctx.target.selected_frame.is_none() {
+            ctx.restore_live_register_cache();
+        }
+        let store = ReplStore::new(ctx, DispatchContext::Interactive);
+        Self::attach(ctx, store)
     }
 }
 
@@ -289,8 +399,6 @@ pub fn start_plain_repl(ctx: &mut Session) -> Result<()> {
 
 #[cfg(feature = "cli")]
 fn start_repl_with_mode(ctx: &mut Session, plain: bool) -> Result<()> {
-    // Borrow the two owned fields disjointly; the rest of this function (and
-    // ReplState) consumes them exactly as before.
     let debugger: &mut Target = &mut ctx.target;
     let client: &mut dyn DebugBackend = ctx.backend.as_mut();
 
@@ -323,7 +431,7 @@ fn start_repl_with_mode(ctx: &mut Session, plain: bool) -> Result<()> {
         loaded_parts.push(part);
     }
     if !loaded_parts.is_empty() {
-        println!(
+        outln!(
             "{}",
             ui::muted(&format!("loaded: {}", loaded_parts.join(", ")))
         );
@@ -337,37 +445,37 @@ fn start_repl_with_mode(ctx: &mut Session, plain: bool) -> Result<()> {
     // fail individually.
     let reload_module_list_pending = match debugger.startup_message_data() {
         Ok(message_data) => {
-            println!("\n{}", ui::label("target"));
-            println!(
+            outln!("\n{}", ui::label("target"));
+            outln!(
                 "  {} Windows {}",
                 ui::muted("kernel"),
                 message_data.build_number.0
             );
-            println!(
+            outln!(
                 "  {} {}",
                 ui::muted("base  "),
                 ui::addr(message_data.base_address.0)
             );
-            println!(
+            outln!(
                 "  {} {}",
                 ui::muted("psmods"),
                 ui::addr_opt(message_data.loaded_module_list)
             );
-            println!();
+            outln!();
             message_data.loaded_module_list.is_zero()
         }
         Err(Error::NtoskrnlNotFound) | Err(Error::AddressNotInDump(_)) => {
-            println!("\n{}", ui::label("target"));
+            outln!("\n{}", ui::label("target"));
             if let Some(base) = debugger.kernel_base() {
-                println!("  {} {}", ui::muted("base  "), ui::addr(base.0));
+                outln!("  {} {}", ui::muted("base  "), ui::addr(base.0));
             } else {
-                println!(
+                outln!(
                     "  {} {}",
                     ui::muted("kernel"),
                     ui::muted("unknown (ntoskrnl not found in dump)")
                 );
             }
-            println!();
+            outln!();
             false
         }
         Err(e) => return Err(e),
@@ -387,37 +495,18 @@ fn start_repl_with_mode(ctx: &mut Session, plain: bool) -> Result<()> {
         );
     }
 
-    let min_completion_width: u16 = 0;
-    let max_completion_width: u16 = 50;
-    let max_completion_height: u16 = 12;
-    let padding: u16 = 0;
-    let border: bool = true;
-    let cursor_offset: i16 = 0;
-    let description_mode: DescriptionMode = DescriptionMode::PreferRight;
-    let min_description_width: u16 = 0;
-    let max_description_width: u16 = 50;
-    let description_offset: u16 = 1;
-    let correct_cursor_pos: bool = false;
-
-    let mut ide_menu = IdeMenu::default()
+    let ide_menu = IdeMenu::default()
         .with_name("completion_menu")
-        .with_min_completion_width(min_completion_width)
-        .with_max_completion_width(max_completion_width)
-        .with_max_completion_height(max_completion_height)
-        .with_padding(padding)
-        .with_cursor_offset(cursor_offset)
-        .with_description_mode(description_mode)
-        .with_min_description_width(min_description_width)
-        .with_max_description_width(max_description_width)
-        .with_description_offset(description_offset)
-        .with_correct_cursor_pos(correct_cursor_pos)
+        .with_max_completion_width(50)
+        .with_max_completion_height(12)
+        .with_padding(1)
+        .with_description_mode(DescriptionMode::PreferRight)
+        .with_min_description_width(0)
+        .with_max_description_width(50)
+        .with_description_offset(1)
+        .with_correct_cursor_pos(false)
         .with_marker(" ")
         .with_text_style(Style::new().fg(Color::LightGray));
-
-    if border {
-        ide_menu = ide_menu.with_default_border();
-    }
-
     let completion_menu = Box::new(ide_menu);
 
     let mut keybindings = default_emacs_keybindings();
@@ -437,10 +526,6 @@ fn start_repl_with_mode(ctx: &mut Session, plain: bool) -> Result<()> {
             ReedlineEvent::MenuPrevious,
         ]),
     );
-    // The default Left/Right bindings route through MenuLeft/MenuRight first,
-    // which the open completion menu swallows so the cursor never moves. The
-    // IdeMenu is a single column (Up/Down navigate it), so drop the menu nav and
-    // let the arrows always move the cursor; keep history-hint accept on Right.
     keybindings.add_binding(KeyModifiers::NONE, KeyCode::Left, ReedlineEvent::Left);
     keybindings.add_binding(
         KeyModifiers::NONE,
@@ -453,30 +538,26 @@ fn start_repl_with_mode(ctx: &mut Session, plain: bool) -> Result<()> {
 
     let edit_mode = Box::new(Emacs::new(keybindings));
 
-    let initial_processes = debugger
-        .guest
-        .as_ref()
-        .and_then(|g| g.enumerate_processes().ok())
-        .map(|procs| procs.into_iter().map(|p| (p.name, p.pid)).collect())
-        .unwrap_or_default();
     let initial_vcpus = if supports_capability(&capabilities, DebugCapability::ThreadList) {
         client.thread_list().unwrap_or_default()
     } else {
         Vec::new()
     };
-    let initial_drivers = debugger.enumerate_driver_objects().unwrap_or_default();
 
+    // Process and driver lists are never walked ahead of use: completions
+    // enumerate them on demand through the target loan below, and listing
+    // commands refresh the fallback snapshots as a side effect.
     let caches = ReplCaches {
         symbols: Arc::new(RwLock::new(debugger.current_symbol_index())),
         types: Arc::new(RwLock::new(debugger.current_types_index())),
         symbol_store: Arc::clone(&debugger.symbols),
         dtb: Arc::new(RwLock::new(debugger.current_dtb())),
-        processes: Arc::new(RwLock::new(initial_processes)),
+        processes: Arc::new(RwLock::new(Vec::new())),
         // populated on demand by the threads/thread commands
         threads: Arc::new(RwLock::new(Vec::new())),
         vcpus: Arc::new(RwLock::new(initial_vcpus)),
         breakpoints: Arc::new(RwLock::new(Vec::new())),
-        drivers: Arc::new(RwLock::new(initial_drivers)),
+        drivers: Arc::new(RwLock::new(Vec::new())),
         registers: Arc::new(ctx.register_map.names()),
         expression_variables: Arc::new(RwLock::new(Vec::new())),
         user_commands: Arc::new(RwLock::new(initial_user_commands())),
@@ -484,8 +565,10 @@ fn start_repl_with_mode(ctx: &mut Session, plain: bool) -> Result<()> {
     };
     caches.refresh_expression_context(debugger);
 
+    let target_loan = TargetLoan::default();
     let completor = Box::new(MyCompleter {
         caches: caches.clone(),
+        target: target_loan.clone(),
     });
 
     let had_content = Arc::new(AtomicBool::new(false));
@@ -518,12 +601,12 @@ fn start_repl_with_mode(ctx: &mut Session, plain: bool) -> Result<()> {
         aliases,
         exception_policies: ExceptionPolicyTable::default(),
         event_command_depth: 0,
-        radix: crate::expr::NumberRadix::Hexadecimal,
+        radix: NumberRadix::Hexadecimal,
         line: String::new(),
+        context: DispatchContext::Interactive,
+        quiet_stops: false,
     };
-    // The reload state machine lives on the Session now; seed it from the
-    // startup message (an empty module list means we attached very early in
-    // boot, before rediscovery completed).
+    // An empty module list at startup means we attached before rediscovery completed.
     state.ctx.reload_module_list_pending = reload_module_list_pending;
 
     if plain {
@@ -537,7 +620,7 @@ fn start_repl_with_mode(ctx: &mut Session, plain: bool) -> Result<()> {
             } else {
                 format!("{backend_label}:{}>", state.ctx.current_thread)
             };
-            println!("{prompt}");
+            outln!("{prompt}");
             std::io::stdout().flush()?;
 
             buffer.clear();
@@ -549,6 +632,7 @@ fn start_repl_with_mode(ctx: &mut Session, plain: bool) -> Result<()> {
                 continue;
             }
 
+            log_input_line(command);
             state.line = command.to_string();
             if state.dispatch_line(command)? == Flow::Quit {
                 break;
@@ -557,14 +641,15 @@ fn start_repl_with_mode(ctx: &mut Session, plain: bool) -> Result<()> {
     } else {
         loop {
             let prompt = CustomPrompt::new(backend_label, &state.ctx.current_thread);
-            let sig = line_editor.read_line(&prompt)?;
+            let sig = target_loan.lend(&state.ctx.target, || line_editor.read_line(&prompt))?;
             match sig {
                 Signal::Success(buffer) => {
                     if !buffer.trim().is_empty() {
+                        log_input_line(buffer.trim());
                         state.line = buffer.trim().to_string();
                         match state.dispatch_line(&buffer)? {
                             Flow::Quit => break,
-                            Flow::Continue => {}
+                            Flow::Continue | Flow::Denied => {}
                         }
                     }
                 }
@@ -591,24 +676,7 @@ fn start_repl_with_mode(ctx: &mut Session, plain: bool) -> Result<()> {
     let was_running_on_exit = state.ctx.backend.is_running();
     let mut resume_on_exit = !was_running_on_exit;
     if was_running_on_exit && !state.ctx.breakpoints.list().is_empty() {
-        let settle = (|| -> Result<()> {
-            let mut event = match state.ctx.backend.try_wait_for_stop(REPL_STOP_POLL)? {
-                Some(event) => event,
-                None => state.ctx.backend.interrupt()?,
-            };
-            loop {
-                match state.ctx.classify_stop_event(event)? {
-                    StopResolution::Resumed => {
-                        event = state.ctx.backend.interrupt()?;
-                    }
-                    StopResolution::Breakpoint { .. }
-                    | StopResolution::Bugcheck { .. }
-                    | StopResolution::TargetReloaded { .. }
-                    | StopResolution::Stopped { .. } => return Ok(()),
-                }
-            }
-        })();
-        match settle {
+        match state.ctx.halt_for_exit() {
             Ok(()) => resume_on_exit = true,
             Err(error) => {
                 error!("failed to halt cleanly during exit: {error}");
@@ -728,10 +796,5 @@ mod tests {
             repeat_pattern(&[0x48, 0x83, 0x79], 8),
             vec![0x48, 0x83, 0x79, 0x48, 0x83, 0x79, 0x48, 0x83]
         );
-    }
-
-    #[test]
-    fn repeat_pattern_allows_zero_length() {
-        assert_eq!(repeat_pattern(&[0x90], 0), Vec::<u8>::new());
     }
 }

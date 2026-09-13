@@ -1,28 +1,34 @@
 <picture>
   <source media="(prefers-color-scheme: light)" srcset="media/logo_light.svg">
-  <img align="right" width="24%" src="media/logo_dark.svg" alt="logo">
+  <img align="right" width="18%" src="media/logo_dark.svg" alt="logo">
 </picture>
 
 # ntoseye ![license](https://img.shields.io/badge/license-MIT-blue) [![crates.io](https://img.shields.io/crates/v/ntoseye.svg)](https://crates.io/crates/ntoseye)
 
-WinDbg-like kernel debugger for Windows VMs on Linux (KVM/QEMU, VMware) and macOS (UTM).
+WinDbg-like kernel debugger for Windows, from Linux and macOS.
 
 ## Features
 
-- WinDbg-compatible REPL commands and hexadecimal expression radix
+- WinDbg-compatible REPL commands
 - Kernel and usermode debugging
-- Remote debugging over encrypted KDNET
+- Remote debugging
 - Public/private PDB symbols, source lines, and scoped local-variable metadata
 - Deferred, conditional, pass-count, one-shot, and command-action breakpoints
-- AMD64 hardware watchpoints
-- Integrated bugcheck, exception, verifier, WHEA, and crash-dump analysis
+- Hardware watchpoints
+- Crash-dump analysis
 - [Four backends](docs/backends.md): Windows KDCOM and KDNET, QEMU's GDB stub, and passive memory introspection
 - [Python SDK and custom commands](docs/sdk.md)
 - [MCP integration](docs/mcp.md)
 
 ### Supported Windows
 
-`ntoseye` supports 64-bit AMD64 and ARM64 Windows 10 and 11 guests.
+`ntoseye` supports 64-bit AMD64 and ARM64 Windows 10 and 11 targets.
+
+### Supported hypervisors
+
+`ntoseye` supports any hypervisor, cloud VM, or physical machine reachable over [KDNET](docs/kdnet.md).
+
+KVM/QEMU, VMware Workstation, and UTM guests additionally get the [GDB and memory-only backends](docs/backends.md).
 
 ### Disclaimer
 
@@ -46,7 +52,7 @@ WinDbg-like kernel debugger for Windows VMs on Linux (KVM/QEMU, VMware) and macO
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dmaivel/ntoseye/releases/latest/download/ntoseye-installer.sh | sh
 ```
 
-Prebuilt release binaries include the CLI and MCP server but omit embedded Python for portability. Use a Cargo or source build for [in-REPL Python commands](docs/sdk.md).
+Prebuilt release binaries include the CLI and MCP server but omit embedded Python for portability. Use a Cargo or source build for [in-REPL Python commands](docs/sdk.md); the standalone `pip install ntoseye` SDK needs neither.
 
 ## Install via cargo
 
@@ -100,6 +106,8 @@ Run `ntoseye status` at any time to inspect configured transports, assigned gues
 
 `ntoseye configure` handles automatic setup for supported libvirt, VMware Workstation, and UTM guests. For plain QEMU or manual configuration, see the [KVM/QEMU](docs/kvm-qemu.md), [VMware](docs/vmware.md), and [UTM](docs/utm.md) setup guides.
 
+For any other hypervisor, a cloud VM, or a physical machine, follow the [KDNET guide](docs/kdnet.md) instead; `configure` is not needed.
+
 ### Not sure which backend to use?
 
 See the [backend comparison table](docs/backends.md).
@@ -111,6 +119,7 @@ The debugger is self-documented: run `ntoseye --help` for command-line arguments
 - [REPL usage](docs/usage.md): expressions, radix, breakpoints, watchpoints, aliases
 - [Symbols and source](docs/symbols.md): private PDBs, `.sympath`/`.srcpath`, source breakpoints
 - [Choosing a backend](docs/backends.md): kd/kdnet/gdb/memory comparison, per-hypervisor setup for [KVM/QEMU](docs/kvm-qemu.md), [VMware](docs/vmware.md), and [UTM](docs/utm.md)
+- [KDNET](docs/kdnet.md): `kdnet.exe` guest setup, host launch, reboot behaviour
 - [Crash dumps](docs/dumps.md): offline dump analysis, generating dumps, guest tweaks
 - [Python SDK and custom commands](docs/sdk.md)
 - [MCP integration](docs/mcp.md)

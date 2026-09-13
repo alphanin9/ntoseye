@@ -6,6 +6,8 @@
 
 use crate::backend::MemoryOps;
 use crate::error::{Error, Result};
+use std::sync::Arc;
+
 use crate::symbols::{ParsedType, TypeInfo};
 use crate::target::Target;
 use crate::types::VirtAddr;
@@ -39,11 +41,11 @@ pub struct BigPoolEntry {
 }
 
 pub struct PoolLayout {
-    pool_header: TypeInfo,
+    pool_header: Arc<TypeInfo>,
     header_size: u64,
     pool_tag_offset: u64,
     pool_header_uses_struct: bool,
-    big_pool_type: Option<TypeInfo>,
+    big_pool_type: Option<Arc<TypeInfo>>,
     big_pool_uses_struct: bool,
     big_pool_has_pool_type: bool,
     big_pool_has_slush: bool,

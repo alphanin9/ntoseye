@@ -4,7 +4,7 @@ use std::os::unix::net::UnixStream;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use owo_colors::OwoColorize;
@@ -18,14 +18,14 @@ use crate::debugger_data::{DebuggerDataCandidate, MetadataSource};
 use crate::error::{Error, Result};
 use crate::gdb::RegisterMap;
 use crate::kd::framing::{BREAKIN_BYTE, KdFraming};
-use crate::memory::AddressSpace;
+use crate::memory::{AddressSpace, PAGE_SIZE, TranslationCache};
 use crate::session::clear_trap_flag;
 use crate::types::{Arch, Dtb, PhysAddr, VirtAddr};
 
 macro_rules! kd_trace {
     ($($arg:tt)*) => {
         if $crate::kd::trace_enabled() {
-            eprintln!($($arg)*);
+            eprintln!("[{:>9.3}] {}", $crate::kd::trace_elapsed().as_secs_f64(), format_args!($($arg)*));
         }
     };
 }
@@ -41,6 +41,13 @@ macro_rules! kd_trace_bytes {
 pub fn trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("NTOSEYE_KD_TRACE").is_some())
+}
+
+/// Seconds since the first trace line, so a trace shows what each request
+/// costs on the wire.
+pub fn trace_elapsed() -> Duration {
+    static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+    START.elapsed()
 }
 
 pub fn trace_bytes_enabled() -> bool {
@@ -100,6 +107,9 @@ const DBG_KD_LOAD_SYMBOLS_STATE_CHANGE: u32 = 0x0000_3031;
 const DBG_KD_COMMAND_STRING_STATE_CHANGE: u32 = 0x0000_3032;
 
 const AMD64_DEBUG_CONTROL_SPACE_KSPECIAL: u64 = 2;
+/// Control-space bases are selectors: 0 returns a KPCR pointer, 2 selects
+/// `KARM64_SPECIAL_REGISTERS` (160 bytes in the public WoA definition).
+const ARM64_DEBUG_CONTROL_SPACE_KSPECIAL: u64 = 2;
 
 fn detect_arch(machine_type: u16) -> Result<Arch> {
     match Arch::from_machine_type(machine_type) {
@@ -125,8 +135,20 @@ const KSPECIAL_REGISTERS_DR2_OFFSET: usize = 0x30;
 const KSPECIAL_REGISTERS_DR3_OFFSET: usize = 0x38;
 const KSPECIAL_REGISTERS_DR6_OFFSET: usize = 0x40;
 const KSPECIAL_REGISTERS_DR7_OFFSET: usize = 0x48;
+// KDESCRIPTOR has Pad[3], Limit, and Base, so its Base is eight bytes into
+// the descriptor even though the descriptor itself starts at these offsets.
+const KSPECIAL_REGISTERS_GDTR_OFFSET: usize = 0x50;
+const KSPECIAL_REGISTERS_IDTR_OFFSET: usize = 0x60;
+const KSPECIAL_REGISTERS_TR_OFFSET: usize = 0x70;
+const KSPECIAL_REGISTERS_LDTR_OFFSET: usize = 0x72;
 const KSPECIAL_REGISTERS_CR8_OFFSET: usize = 0xA0;
 const KSPECIAL_REGISTERS_MIN_SIZE: usize = KSPECIAL_REGISTERS_CR8_OFFSET + 8;
+const ARM64_KSPECIAL_REGISTERS_BVR0_OFFSET: usize = 0x28;
+const ARM64_KSPECIAL_REGISTERS_BCR0_OFFSET: usize = 0x68;
+const ARM64_KSPECIAL_REGISTERS_WVR0_OFFSET: usize = 0x88;
+const ARM64_KSPECIAL_REGISTERS_WCR0_OFFSET: usize = 0x98;
+const ARM64_KSPECIAL_REGISTERS_MIN_SIZE: usize = 0xA0;
+const MSR_EFER: u32 = 0xC000_0080;
 const STATUS_BREAKPOINT: u32 = 0x8000_0003;
 const STATUS_SINGLE_STEP: u32 = 0x8000_0004;
 const KD_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -145,11 +167,9 @@ const KD_REFRESH_MESSAGE: &[u8] = b"KDTARGET: Refreshing KD connection";
 const KD_INITIAL_TIMEOUT_ENV: &str = "NTOSEYE_KD_TIMEOUT";
 const KD_INITIAL_TIMEOUT_DEFAULT: Duration = Duration::from_secs(8);
 const KD_INITIAL_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
-const KD_REFRESH_BREAKIN_INTERVAL: Duration = Duration::from_millis(250);
-const KD_REFRESH_BREAKIN_TRACE_EVERY: u32 = 8;
-const BUGCHECK_REFRESH_ASSIST_GRACE: Duration = Duration::from_secs(2);
+const KD_RECONNECT_BREAKIN_INTERVAL: Duration = Duration::from_millis(250);
+const KD_RECONNECT_BREAKIN_TRACE_EVERY: u32 = 8;
 const POST_BUGCHECK_RECONNECT_ASSIST_DELAY: Duration = Duration::from_secs(20);
-const BUGCHECK_MANUALLY_INITIATED_CRASH: u32 = 0x0000_00e2;
 const KD_EXIT_STOP_POLL: Duration = Duration::from_secs(1);
 const KD_EXIT_MAX_CONTINUES: u32 = 8;
 /// How long the background pump blocks on a socket read before looping back to
@@ -158,21 +178,96 @@ const KD_EXIT_MAX_CONTINUES: u32 = 8;
 /// burst, so a timeout this size only ever fires in the idle gap between packets.
 const PUMP_POLL: Duration = Duration::from_millis(100);
 const KD_REMOTE_MEMORY_CHUNK: usize = 0x800;
-const AMD64_DTB_MASK: u64 = 0x000F_FFFF_FFFF_F000;
-const ARM64_TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 /// Windows KD encoding of `TTBR1_EL1`: op0=3, op1=0, CRn=2, CRm=0, op2=1.
 const ARM64_WINDBG_TTBR1_EL1: u32 = 0x0003_0201;
+/// Windows KD encodings of ARM64 system registers (op0/op1/CRn/CRm/op2).
+const ARM64_WINDBG_TTBR0_EL1: u32 = 0x0003_0200;
+const ARM64_WINDBG_ESR_EL1: u32 = 0x0003_0520;
+const ARM64_WINDBG_FAR_EL1: u32 = 0x0003_0600;
+
+const ARM64_DEBUG_REGISTER_OFFSETS: &[(usize, usize, usize, usize)] = &[
+    (
+        ARM64_KSPECIAL_REGISTERS_BVR0_OFFSET,
+        context_arm64::OFFSET_BVR0,
+        8,
+        hwbp::ARM64_MAX_BREAKPOINTS as usize,
+    ),
+    (
+        ARM64_KSPECIAL_REGISTERS_BCR0_OFFSET,
+        context_arm64::OFFSET_BCR0,
+        4,
+        hwbp::ARM64_MAX_BREAKPOINTS as usize,
+    ),
+    (
+        ARM64_KSPECIAL_REGISTERS_WVR0_OFFSET,
+        context_arm64::OFFSET_WVR0,
+        8,
+        hwbp::ARM64_MAX_WATCHPOINTS as usize,
+    ),
+    (
+        ARM64_KSPECIAL_REGISTERS_WCR0_OFFSET,
+        context_arm64::OFFSET_WCR0,
+        4,
+        hwbp::ARM64_MAX_WATCHPOINTS as usize,
+    ),
+];
 
 fn normalize_kernel_dtb(arch: Arch, register_value: u64) -> Dtb {
+    register_value & arch.dtb_page_mask()
+}
+
+fn kspecial_control_space(arch: Arch) -> (u64, usize) {
     match arch {
-        Arch::Amd64 => register_value & AMD64_DTB_MASK,
-        // Strip the 16-bit ASID and the possible upper-table 0x800 offset.
-        Arch::Arm64 => register_value & ARM64_TTBR_BADDR_MASK,
+        Arch::Amd64 => (
+            AMD64_DEBUG_CONTROL_SPACE_KSPECIAL,
+            KSPECIAL_REGISTERS_MIN_SIZE,
+        ),
+        Arch::Arm64 => (
+            ARM64_DEBUG_CONTROL_SPACE_KSPECIAL,
+            ARM64_KSPECIAL_REGISTERS_MIN_SIZE,
+        ),
     }
 }
 
+fn arm64_slot_offsets(slot: u8) -> Result<(usize, usize)> {
+    if hwbp::ARM64_WATCHPOINT_SLOTS.contains(&slot) {
+        Ok((
+            ARM64_KSPECIAL_REGISTERS_WVR0_OFFSET + slot as usize * 8,
+            ARM64_KSPECIAL_REGISTERS_WCR0_OFFSET + slot as usize * 4,
+        ))
+    } else if hwbp::ARM64_BREAKPOINT_SLOTS.contains(&slot) {
+        let index = (slot - hwbp::ARM64_BREAKPOINT_SLOTS.start) as usize;
+        Ok((
+            ARM64_KSPECIAL_REGISTERS_BVR0_OFFSET + index * 8,
+            ARM64_KSPECIAL_REGISTERS_BCR0_OFFSET + index * 4,
+        ))
+    } else {
+        Err(Error::Kd(format!(
+            "invalid ARM64 hardware breakpoint slot {slot} (expected 0-{})",
+            hwbp::ARM64_BREAKPOINT_SLOTS.end - 1
+        )))
+    }
+}
+
+fn arm64_slot_offsets_for_access(slot: u8, access: HwBreakpointAccess) -> Result<(usize, usize)> {
+    let slots = hwbp::arm64_slot_range(access);
+    if slots.contains(&slot) {
+        return arm64_slot_offsets(slot);
+    }
+    let kind = if matches!(access, HwBreakpointAccess::Execute) {
+        "execute"
+    } else {
+        "watchpoint"
+    };
+    Err(Error::Kd(format!(
+        "ARM64 {kind} slot {slot} is outside slots {}-{}",
+        slots.start,
+        slots.end - 1
+    )))
+}
+
 fn thread_id_for(processor: u16) -> String {
-    format!("p1.{:x}", processor + 1)
+    format!("p1.{:x}", u32::from(processor) + 1)
 }
 
 fn parse_thread_id(tid: &str) -> Result<u16> {
@@ -201,6 +296,30 @@ fn parse_thread_id_for_processor_count(tid: &str, processor_count: u16) -> Resul
 
 fn should_advance_pc_before_continue(exception_code: u32, managed_breakpoint_stop: bool) -> bool {
     exception_code == STATUS_BREAKPOINT && !managed_breakpoint_stop
+}
+
+/// Whether the instruction at `pc` is the KD breakpoint instruction (`int3`
+/// on AMD64, `BRK #0xF000` on ARM64), read through the target so it reflects
+/// what will execute on resume. An unreadable PC returns `true` to preserve
+/// hard-coded breaks in unmapped-looking places.
+fn breakpoint_instruction_at(
+    framing: &mut KdFraming<KdTransport>,
+    arch: Arch,
+    processor: u16,
+    pc: u64,
+) -> bool {
+    const INT3: [u8; 1] = [0xcc];
+    const BRK_F000: [u8; 4] = 0xD43E_0000u32.to_le_bytes();
+    let expected: &[u8] = match arch {
+        Arch::Amd64 => &INT3,
+        Arch::Arm64 => &BRK_F000,
+    };
+    match with_framing_read_timeout(framing, KD_REQUEST_TIMEOUT, |framing| {
+        api::read_virtual_memory(framing, processor, pc, expected.len() as u32)
+    }) {
+        Ok(bytes) => bytes == expected,
+        Err(_) => true,
+    }
 }
 
 /// Whether a stop seen during exit is a stray single-step: `STATUS_SINGLE_STEP`
@@ -241,6 +360,30 @@ fn append_control_registers_from_special(ctx: &mut Vec<u8>, special: &[u8]) -> R
     copy_reg(ctx, context::OFFSET_DR6, KSPECIAL_REGISTERS_DR6_OFFSET);
     copy_reg(ctx, context::OFFSET_DR7, KSPECIAL_REGISTERS_DR7_OFFSET);
     copy_reg(ctx, context::OFFSET_CR8, KSPECIAL_REGISTERS_CR8_OFFSET);
+    // KDESCRIPTOR layout is Pad[3] (6 bytes), Limit (2 bytes), Base (8
+    // bytes). The register map stores each value in a synthetic 8-byte slot;
+    // only the descriptor's meaningful bytes are copied for the limits.
+    ctx[context::OFFSET_GDTR_LIMIT..context::OFFSET_GDTR_LIMIT + 2].copy_from_slice(
+        &special[KSPECIAL_REGISTERS_GDTR_OFFSET + 6..KSPECIAL_REGISTERS_GDTR_OFFSET + 8],
+    );
+    copy_reg(
+        ctx,
+        context::OFFSET_GDTR_BASE,
+        KSPECIAL_REGISTERS_GDTR_OFFSET + 8,
+    );
+    ctx[context::OFFSET_IDTR_LIMIT..context::OFFSET_IDTR_LIMIT + 2].copy_from_slice(
+        &special[KSPECIAL_REGISTERS_IDTR_OFFSET + 6..KSPECIAL_REGISTERS_IDTR_OFFSET + 8],
+    );
+    copy_reg(
+        ctx,
+        context::OFFSET_IDTR_BASE,
+        KSPECIAL_REGISTERS_IDTR_OFFSET + 8,
+    );
+    ctx[context::OFFSET_TR..context::OFFSET_TR + 2]
+        .copy_from_slice(&special[KSPECIAL_REGISTERS_TR_OFFSET..KSPECIAL_REGISTERS_TR_OFFSET + 2]);
+    ctx[context::OFFSET_LDTR..context::OFFSET_LDTR + 2].copy_from_slice(
+        &special[KSPECIAL_REGISTERS_LDTR_OFFSET..KSPECIAL_REGISTERS_LDTR_OFFSET + 2],
+    );
     Ok(())
 }
 
@@ -266,6 +409,41 @@ fn update_special_debug_registers_from_context(special: &mut [u8], ctx: &[u8]) -
             .copy_from_slice(&ctx[ctx_offset..ctx_offset + 8]);
     }
     Ok(())
+}
+
+fn update_arm64_debug_registers_from_context(special: &mut [u8], ctx: &[u8]) -> Result<()> {
+    if special.len() < ARM64_KSPECIAL_REGISTERS_MIN_SIZE {
+        return Err(Error::Kd(format!(
+            "ARM64 KSPECIAL_REGISTERS buffer too short: {} bytes, expected at least {}",
+            special.len(),
+            ARM64_KSPECIAL_REGISTERS_MIN_SIZE
+        )));
+    }
+    if ctx.len() < context_arm64::CONTEXT_SIZE {
+        return Err(Error::Kd(format!(
+            "ARM64 CONTEXT buffer too short: {} bytes, expected {}",
+            ctx.len(),
+            context_arm64::CONTEXT_SIZE
+        )));
+    }
+    copy_arm64_debug_registers(special, ctx, false);
+    Ok(())
+}
+
+fn copy_arm64_debug_registers(dst: &mut [u8], src: &[u8], to_context: bool) {
+    for &(special_base, context_base, width, count) in ARM64_DEBUG_REGISTER_OFFSETS {
+        let (dst_base, src_base) = if to_context {
+            (context_base, special_base)
+        } else {
+            (special_base, context_base)
+        };
+        for index in 0..count {
+            let dst_offset = dst_base + index * width;
+            let src_offset = src_base + index * width;
+            dst[dst_offset..dst_offset + width]
+                .copy_from_slice(&src[src_offset..src_offset + width]);
+        }
+    }
 }
 
 fn context_payload(data: &[u8]) -> Result<&[u8]> {
@@ -301,19 +479,85 @@ struct DebugRegisterSlotState {
     dr7: u64,
 }
 
+#[derive(Clone, Copy)]
+struct Arm64DebugRegisterSlotState {
+    address: u64,
+    control: u32,
+}
+
+/// Who holds the transport, which is the same question as what the target
+/// is doing: only a halted target answers requests, so the foreground holds
+/// the framing exactly while it may issue them.
+enum Link {
+    /// Halted; the foreground issues requests.
+    Halted(KdFraming<KdTransport>),
+    /// Running, but only until a stop the foreground reads itself: a single
+    /// step, or the resume on exit.
+    RunningInline(KdFraming<KdTransport>),
+    /// Running; the pump owns the framing, services the socket and reports
+    /// the next stop.
+    RunningPumped(PumpHandle),
+    /// The pump thread panicked and the socket went with it.
+    Lost,
+}
+
+impl Link {
+    fn framing(&mut self) -> Result<&mut KdFraming<KdTransport>> {
+        match self {
+            Self::Halted(framing) | Self::RunningInline(framing) => Ok(framing),
+            Self::RunningPumped(_) => Err(Error::Kd("KD transport is busy: VM is running".into())),
+            Self::Lost => Err(Error::Kd(
+                "KD transport lost: the servicing thread panicked".into(),
+            )),
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        matches!(self, Self::RunningInline(_) | Self::RunningPumped(_))
+    }
+
+    /// Take the pump handle, leaving the link lost until the framing comes
+    /// back from the joined thread. Any other state is left untouched.
+    fn take_pump(&mut self) -> Option<PumpHandle> {
+        if !matches!(self, Self::RunningPumped(_)) {
+            return None;
+        }
+        match std::mem::replace(self, Self::Lost) {
+            Self::RunningPumped(pump) => Some(pump),
+            _ => unreachable!("checked above"),
+        }
+    }
+
+    /// Move to `running` (true) or halted (false) while the foreground keeps
+    /// the framing; a pumped or lost link is left alone.
+    fn set_inline_running(&mut self, running: bool) {
+        let framing = match std::mem::replace(self, Self::Lost) {
+            Self::Halted(framing) | Self::RunningInline(framing) => framing,
+            other => {
+                *self = other;
+                return;
+            }
+        };
+        *self = if running {
+            Self::RunningInline(framing)
+        } else {
+            Self::Halted(framing)
+        };
+    }
+}
+
 pub struct KdBackend {
-    framing: Option<KdFraming<KdTransport>>,
+    link: Link,
     breakin_clone: KdTransport,
     backend_name: &'static str,
-    pump: Option<PumpHandle>,
     register_map: RegisterMap,
     arch: Arch,
-    /// ARM64 kernel page-table root (TTBR1_EL1), resolved from KD or validated
-    /// host-memory discovery; fills the synthetic `cr3` register slot.
+    /// Kernel page-table root, first read from the target at attach and
+    /// later confirmed by the session: selects KD virtual reads for kernel
+    /// space and, on ARM64, fills the synthetic `cr3` register slot.
     kernel_dtb_override: u64,
     processor_count: u16,
     current_processor: u16,
-    pending_stop: Option<StateChange>,
     last_stop_processor: u16,
     last_exception_code: u32,
     last_rip: u64,
@@ -324,7 +568,9 @@ pub struct KdBackend {
     breakin_addresses: HashSet<u64>,
     pending_write_breakpoint: Option<PendingWriteBreakpoint>,
     special_register_cache: HashMap<u16, Vec<u8>>,
-    is_running: bool,
+    /// Avoid repeated round trips or timeouts after an ARM64 control-space read fails.
+    special_registers_unsupported: bool,
+    efer_cache: HashMap<u16, u64>,
     /// Set after an explicit frontend cleanup. Prevents `Drop` from overriding
     /// a deliberate halted exit after breakpoint restoration failed.
     exit_prepared: bool,
@@ -332,6 +578,9 @@ pub struct KdBackend {
     /// which is the sole socket reader (and so the primary capture point) while
     /// the VM runs.
     debug_log: DebugLog,
+    /// Page translations valid while the target is halted; shared with
+    /// [`KdMemory`] and cleared on every resume and every write.
+    translations: Arc<TranslationCache>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -370,6 +619,7 @@ pub struct KdTargetHints {
 #[derive(Clone)]
 pub struct KdMemory {
     inner: Arc<Mutex<KdBackend>>,
+    translations: Arc<TranslationCache>,
 }
 
 pub struct KdBackendHandle {
@@ -401,6 +651,14 @@ impl MemoryOps<PhysAddr> for KdMemory {
 
     fn write_bytes(&self, addr: PhysAddr, buf: &[u8]) -> Result<()> {
         self.lock().write_physical_bytes(addr, buf)
+    }
+
+    fn read_virtual_direct(&self, addr: VirtAddr, root: Dtb, buf: &mut [u8]) -> Option<Result<()>> {
+        self.lock().read_virtual_direct(addr, root, buf)
+    }
+
+    fn translation_cache(&self) -> Option<&TranslationCache> {
+        Some(&self.translations)
     }
 }
 
@@ -441,10 +699,10 @@ impl KdBackend {
         waiting_message: &str,
         backend_name: &'static str,
     ) -> Result<Self> {
-        let is_network = matches!(&transport, KdTransport::Network(_));
+        let network_generation = transport.network_session_generation();
         let mut framing = KdFraming::new(transport);
-        if is_network {
-            framing.use_kdnet_packet_ids();
+        if let Some(generation) = network_generation {
+            framing.use_kdnet_packet_ids(generation);
         }
         let initial_timeout = kd_initial_timeout()?;
 
@@ -486,18 +744,42 @@ impl KdBackend {
         // A second handle on the same transport lets the foreground send an
         // unframed break-in byte while the pump owns `framing` for reading.
         let breakin_clone = framing.transport_mut().try_clone()?;
+
+        // A target left waiting on a debugger that died mid-breakpoint reports
+        // its stop again to us, at the breakpoint's address. The kernel has
+        // dropped that table entry and its `int3` by the time the RESET
+        // handshake completes, so the byte at PC tells the two cases apart: a
+        // hard-coded break (`cc`, a break-in site to remember) or a stale
+        // breakpoint hit (resume in place; never treat that address as a
+        // break-in, or later real hits there would be absorbed as noise).
+        let mut stopped_on_stale_breakpoint = false;
+        if initial_stop.exception_code == STATUS_BREAKPOINT {
+            stopped_on_stale_breakpoint = !breakpoint_instruction_at(
+                &mut framing,
+                arch,
+                initial_stop.processor,
+                initial_stop.program_counter,
+            );
+            if stopped_on_stale_breakpoint {
+                kd_trace!(
+                    "kd: initial stop at {:#x} was a stale breakpoint; resuming in place",
+                    initial_stop.program_counter
+                );
+            }
+        }
+
         let mut breakin_addresses = HashSet::new();
         if initial_stop.new_state == DBG_KD_EXCEPTION_STATE_CHANGE
             && initial_stop.exception_code == STATUS_BREAKPOINT
+            && !stopped_on_stale_breakpoint
         {
             breakin_addresses.insert(initial_stop.program_counter);
         }
 
         Ok(Self {
-            framing: Some(framing),
+            link: Link::Halted(framing),
             breakin_clone,
             backend_name,
-            pump: None,
             register_map,
             arch,
             kernel_dtb_override: 0,
@@ -506,18 +788,20 @@ impl KdBackend {
             last_stop_processor: initial_stop.processor,
             last_exception_code: initial_stop.exception_code,
             last_rip: initial_stop.program_counter,
-            // Don't let a stale initial stop surface later via try_wait.
-            pending_stop: None,
             bp_handles: HashMap::new(),
             managed_bp_addresses: HashSet::new(),
             breakin_addresses,
             pending_write_breakpoint: None,
-            last_stop_was_managed_breakpoint: false,
+            // A restored stale breakpoint reads like one of ours for resume:
+            // the `int3` is gone, so the PC must not be advanced.
+            last_stop_was_managed_breakpoint: stopped_on_stale_breakpoint,
             reconnect_assist_after_continue: None,
             special_register_cache: HashMap::new(),
-            is_running: false,
+            special_registers_unsupported: false,
+            efer_cache: HashMap::new(),
             exit_prepared: false,
             debug_log: DebugLog::new(DEBUG_LOG_CAPACITY),
+            translations: Arc::new(TranslationCache::default()),
         })
     }
 
@@ -534,21 +818,25 @@ impl KdBackend {
     /// breakpoint completion path may use this, since it exists precisely to
     /// drain that outstanding reply
     fn framing_unchecked(&mut self) -> Result<&mut KdFraming<KdTransport>> {
-        self.framing
-            .as_mut()
-            .ok_or_else(|| Error::Kd("KD transport is busy: VM is running".into()))
+        self.link.framing()
     }
 
-    /// Hand the framing to a freshly spawned background pump. Caller must have
-    /// already confirmed the VM is running (see [`record_running`])
-    fn start_pump(&mut self, reconnect_assist_delay: Option<Duration>) -> Result<()> {
-        if self.pump.is_some() {
-            return Ok(());
-        }
-        let framing = self
-            .framing
-            .take()
-            .ok_or_else(|| Error::Kd("cannot start KD pump: framing already taken".into()))?;
+    /// Hand the framing to a freshly spawned background pump. The target has
+    /// just been resumed (see [`record_running`]), so the link is inline.
+    fn start_pump(
+        &mut self,
+        reconnect_assist_delay: Option<Duration>,
+        drain: Option<ContinueDrain>,
+    ) -> Result<()> {
+        let framing = match std::mem::replace(&mut self.link, Link::Lost) {
+            Link::RunningInline(framing) => framing,
+            other => {
+                self.link = other;
+                return Err(Error::Kd(
+                    "cannot start KD pump: target is not resuming".into(),
+                ));
+            }
+        };
         let (stop_tx, stop_rx) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let pump_shutdown = Arc::clone(&shutdown);
@@ -556,32 +844,43 @@ impl KdBackend {
         let pump_reported_stop = Arc::clone(&reported_stop);
         let pump_debug_log = self.debug_log.clone();
         let arch = self.arch;
+        let breakin_requested = drain
+            .as_ref()
+            .map(ContinueDrain::interrupt_flag)
+            .unwrap_or_default();
         let join = std::thread::spawn(move || {
             run_pump(
                 framing,
                 arch,
-                stop_tx,
-                pump_shutdown,
-                pump_reported_stop,
+                PumpLink {
+                    stop_tx,
+                    shutdown: pump_shutdown,
+                    reported_stop: pump_reported_stop,
+                },
                 reconnect_assist_delay,
                 pump_debug_log,
+                drain,
             )
         });
         kd_trace!("kd: pump: spawned background servicing thread");
-        self.pump = Some(PumpHandle {
+        self.link = Link::RunningPumped(PumpHandle {
             join,
             stop_rx,
             shutdown,
             reported_stop,
+            breakin_requested,
         });
         Ok(())
     }
 
     /// Join the pump thread and take back ownership of the framing
     fn reclaim_framing(&mut self) {
-        if let Some(pump) = self.pump.take() {
+        if let Some(pump) = self.link.take_pump() {
             match pump.join.join() {
-                Ok(framing) => self.framing = Some(framing),
+                // Whoever asked for the framing back also consumes the stop,
+                // if there was one, and records it; until then the target is
+                // still running.
+                Ok(framing) => self.link = Link::RunningInline(framing),
                 Err(_) => {
                     // The pump panicked; the framing (and socket) is lost. The
                     // next foreground op surfaces this as a transport error
@@ -595,7 +894,7 @@ impl KdBackend {
     /// `None` blocks until the pump produces a stop. On a stop (or pump error)
     /// the framing is reclaimed and the pump handle dropped
     fn take_pump_stop(&mut self, wait: Option<Duration>) -> Result<Option<StateChange>> {
-        let Some(pump) = self.pump.as_ref() else {
+        let Link::RunningPumped(pump) = &self.link else {
             return Ok(None);
         };
         let received = match wait {
@@ -636,7 +935,7 @@ impl KdBackend {
 
     /// Stop the pump and return a stop it reported during shutdown, if any.
     fn shutdown_pump_with_stop(&mut self) -> Result<Option<StateChange>> {
-        let Some(pump) = self.pump.take() else {
+        let Some(pump) = self.link.take_pump() else {
             return Ok(None);
         };
         let PumpHandle {
@@ -644,11 +943,12 @@ impl KdBackend {
             stop_rx,
             shutdown,
             reported_stop: _,
+            breakin_requested: _,
         } = pump;
         shutdown.store(true, Ordering::SeqCst);
         let stop = Self::try_recv_pump_stop(&stop_rx)?;
         match join.join() {
-            Ok(framing) => self.framing = Some(framing),
+            Ok(framing) => self.link = Link::RunningInline(framing),
             Err(_) => {
                 kd_trace!("kd: pump: thread panicked during shutdown, framing lost");
                 if stop.is_none() {
@@ -675,18 +975,6 @@ impl KdBackend {
             && stop.exception_code == STATUS_BREAKPOINT
             && self.breakin_addresses.contains(&stop.program_counter)
             && !self.managed_bp_addresses.contains(&stop.program_counter)
-    }
-
-    /// Classify post-resume stops that are safe to drain. Managed breakpoints
-    /// are never drained; the REPL handles wrong-process hits. We absorb raw
-    /// int3 re-breaks at the resumed RIP and stale KD break-in stops.
-    fn is_spurious_continue_rebreak(&self, stop: &StateChange, resumed_from_rip: u64) -> bool {
-        if self.managed_bp_addresses.contains(&stop.program_counter) {
-            return false;
-        }
-        let raw_rebreak_in_place =
-            stop.exception_code == STATUS_BREAKPOINT && stop.program_counter == resumed_from_rip;
-        raw_rebreak_in_place || self.known_breakin_stop(stop)
     }
 
     fn mark_known_breakin_stop(&self, mut stop: StateChange) -> StateChange {
@@ -777,18 +1065,27 @@ impl KdBackend {
             managed_breakpoint_stop
         );
         self.current_processor = stop.processor;
-        self.processor_count = self.processor_count.max(stop.number_processors.max(1));
+        // A rebooted target reports its real count; between reboots the count
+        // never shrinks (no hot-unplug), so keep the high-water mark.
+        self.processor_count = if stop.target_reloaded {
+            stop.number_processors.max(1)
+        } else {
+            self.processor_count.max(stop.number_processors.max(1))
+        };
         self.last_stop_processor = stop.processor;
         self.last_exception_code = stop.exception_code;
         self.last_rip = stop.program_counter;
         self.last_stop_was_managed_breakpoint = managed_breakpoint_stop;
         self.special_register_cache.clear();
-        self.is_running = false;
+        self.efer_cache.clear();
+        self.link.set_inline_running(false);
     }
 
     fn record_running(&mut self) {
-        self.is_running = true;
+        self.link.set_inline_running(true);
         self.special_register_cache.clear();
+        self.efer_cache.clear();
+        self.translations.resume();
     }
 
     fn context_flags(&self) -> u32 {
@@ -798,41 +1095,37 @@ impl KdBackend {
         }
     }
 
-    /// KD reports software-breakpoint stops with the program counter still
-    /// pointing at the breakpoint instruction.
-    fn advance_pc_past_breakpoint(&mut self, processor: u16) -> Result<()> {
-        let context_flags = self.context_flags();
-        let mut context =
-            with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
-                api::get_context(framing, processor, context_flags)
-            })?;
-        let pc = self.register_map.read_u64("rip", &context)?;
-        let next_pc = pc.wrapping_add(self.register_map.breakpoint_step_size() as u64);
-        self.register_map.write_u64("rip", &mut context, next_pc)?;
-        kd_trace!(
-            "kd: advance_pc: p{} read pc={:#x}, writing {}-byte CONTEXT in chunks",
-            processor + 1,
-            pc,
-            context.len()
-        );
-        with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
-            api::set_context_chunked(framing, processor, &context)
-        })?;
-        if trace_enabled()
-            && let Ok(verify_context) =
-                with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
-                    api::get_context(framing, processor, context_flags)
-                })
-            && let Ok(verify_pc) = self.register_map.read_u64("rip", &verify_context)
-        {
+    /// Whether resuming from the last stop must skip an `int3` at its PC.
+    /// The exception code and the managed-breakpoint bookkeeping are only
+    /// hints: another processor can report a hit on one of our breakpoints
+    /// after we have already restored the original byte for a step-over, and
+    /// a stale table breakpoint from a dead session is restored on attach.
+    /// Advancing past a byte that is no longer `int3` resumes inside an
+    /// instruction (observed: `sub rsp,0x88` -> double fault), so the byte at
+    /// PC is read through the target, which reflects what will execute.
+    fn stop_pc_is_raw_int3(&mut self, processor: u16) -> Result<bool> {
+        if !should_advance_pc_before_continue(
+            self.last_exception_code,
+            self.last_stop_was_managed_breakpoint,
+        ) {
+            return Ok(false);
+        }
+        let pc = self.last_rip;
+        let arch = self.arch;
+        let raw = breakpoint_instruction_at(self.framing()?, arch, processor, pc);
+        if !raw {
             kd_trace!(
-                "kd: advance_pc: p{} wrote {:#x}, read back {:#x}",
-                processor + 1,
-                next_pc,
-                verify_pc
+                "kd: stop at {pc:#x} reported a breakpoint but memory holds none; resuming in place"
             );
         }
-        Ok(())
+        Ok(raw)
+    }
+
+    fn advance_pc_past_breakpoint(&mut self, processor: u16) -> Result<()> {
+        self.require_no_pending_write_breakpoint()?;
+        let arch = self.arch;
+        let framing = self.link.framing()?;
+        advance_pc_past_breakpoint(framing, &self.register_map, arch, processor)
     }
 
     fn read_dr_slot_state(&mut self, slot: u8) -> Result<DebugRegisterSlotState> {
@@ -850,15 +1143,33 @@ impl KdBackend {
         self.write_special_registers(special)
     }
 
-    fn rollback_dr_slot_states(
+    fn read_arm64_slot_state(&mut self, slot: u8) -> Result<Arm64DebugRegisterSlotState> {
+        let special = self.read_special_registers_uncached(self.current_processor)?;
+        let (address_offset, control_offset) = arm64_slot_offsets(slot)?;
+        Ok(Arm64DebugRegisterSlotState {
+            address: wire::read_u64(&special, address_offset),
+            control: wire::read_u32(&special, control_offset),
+        })
+    }
+
+    fn apply_arm64_restore(&mut self, slot: u8, state: Arm64DebugRegisterSlotState) -> Result<()> {
+        let mut special = self.read_special_registers_uncached(self.current_processor)?;
+        let (address_offset, control_offset) = arm64_slot_offsets(slot)?;
+        wire::write_u64(&mut special, address_offset, state.address);
+        wire::write_u32(&mut special, control_offset, state.control);
+        self.write_special_registers(special)
+    }
+
+    fn rollback_slot_states<S: Copy>(
         &mut self,
         slot: u8,
-        states: &[(u16, DebugRegisterSlotState)],
+        states: &[(u16, S)],
+        mut restore: impl FnMut(&mut Self, u8, S) -> Result<()>,
     ) -> Result<()> {
         let mut first_error = None;
         for &(processor, state) in states.iter().rev() {
             self.current_processor = processor;
-            if let Err(error) = self.apply_dr_restore(slot, state)
+            if let Err(error) = restore(self, slot, state)
                 && first_error.is_none()
             {
                 first_error = Some(error);
@@ -870,24 +1181,25 @@ impl KdBackend {
         }
     }
 
-    /// Apply one DR-slot update to every processor as a transaction. The slot's
-    /// prior address and DR7 are captured before each write; any read/write
-    /// failure restores every processor that may have been modified, including
-    /// the one whose reply was lost. The caller's selected processor is always
-    /// restored.
-    fn update_dr_slot_on_all_processors(
+    /// Apply one hardware-slot update to every processor as a transaction.
+    /// Each processor's prior slot state is captured before its write; a
+    /// failure restores every processor that may have been modified.
+    fn update_slot_on_all_processors<S: Copy>(
         &mut self,
         slot: u8,
+        slot_count: u8,
         operation: &str,
+        label: &str,
+        mut read: impl FnMut(&mut Self, u8) -> Result<S>,
+        mut restore: impl FnMut(&mut Self, u8, S) -> Result<()>,
         mut update: impl FnMut(&mut Self) -> Result<()>,
     ) -> Result<()> {
-        if slot >= HW_BREAKPOINT_SLOTS {
+        if slot >= slot_count {
             return Err(Error::Kd(format!(
-                "invalid hardware breakpoint slot {slot} (expected 0-{max})",
-                max = HW_BREAKPOINT_SLOTS - 1
+                "invalid hardware breakpoint slot {slot} (expected 0-{})",
+                slot_count.saturating_sub(1)
             )));
         }
-
         let saved = self.current_processor;
         let result = (|| {
             let mut applied = Vec::with_capacity(self.processor_count.max(1) as usize);
@@ -895,7 +1207,7 @@ impl KdBackend {
 
             for processor in 0..self.processor_count.max(1) {
                 self.current_processor = processor;
-                let previous = match self.read_dr_slot_state(slot) {
+                let previous = match read(self, slot) {
                     Ok(previous) => previous,
                     Err(error) => {
                         failure = Some(error);
@@ -912,15 +1224,53 @@ impl KdBackend {
             let Some(error) = failure else {
                 return Ok(());
             };
-            match self.rollback_dr_slot_states(slot, &applied) {
+            match self.rollback_slot_states(slot, &applied, &mut restore) {
                 Ok(()) => Err(error),
                 Err(rollback_error) => Err(Error::Kd(format!(
-                    "hardware breakpoint {operation} failed: {error}; rollback also failed: {rollback_error}"
+                    "{label} {operation} failed: {error}; rollback also failed: {rollback_error}"
                 ))),
             }
         })();
         self.current_processor = saved;
         result
+    }
+
+    fn apply_arm64_set(
+        &mut self,
+        slot: u8,
+        addr: u64,
+        access: HwBreakpointAccess,
+        len: u8,
+    ) -> Result<()> {
+        let (address_offset, control_offset) = arm64_slot_offsets_for_access(slot, access)?;
+        if matches!(access, HwBreakpointAccess::Execute) && (len != 1 || !addr.is_multiple_of(4)) {
+            return Err(Error::Rsp(
+                "ARM64 execute hardware breakpoints require a 4-byte-aligned address and length 1"
+                    .into(),
+            ));
+        }
+
+        let mut special = self.read_special_registers_uncached(self.current_processor)?;
+        if matches!(access, HwBreakpointAccess::Execute) {
+            wire::write_u64(&mut special, address_offset, addr);
+            wire::write_u32(&mut special, control_offset, hwbp::arm64_bcr_value(addr));
+        } else {
+            wire::write_u64(&mut special, address_offset, hwbp::arm64_wvr_address(addr));
+            wire::write_u32(
+                &mut special,
+                control_offset,
+                hwbp::arm64_wcr_value(addr, access, len),
+            );
+        }
+        self.write_special_registers(special)
+    }
+
+    fn apply_arm64_clear(&mut self, slot: u8) -> Result<()> {
+        let (address_offset, control_offset) = arm64_slot_offsets(slot)?;
+        let mut special = self.read_special_registers_uncached(self.current_processor)?;
+        wire::write_u64(&mut special, address_offset, 0);
+        wire::write_u32(&mut special, control_offset, 0);
+        self.write_special_registers(special)
     }
 
     fn kspecial_dr_offset(slot: u8) -> usize {
@@ -956,32 +1306,42 @@ impl KdBackend {
     }
 
     fn read_special_registers_uncached(&mut self, processor: u16) -> Result<Vec<u8>> {
+        let (base, size) = kspecial_control_space(self.arch);
         with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
-            api::read_control_space(
-                framing,
-                processor,
-                AMD64_DEBUG_CONTROL_SPACE_KSPECIAL,
-                KSPECIAL_REGISTERS_MIN_SIZE as u32,
-            )
+            api::read_control_space(framing, processor, base, size as u32)
         })
+    }
+
+    fn read_msr_value(&mut self, processor: u16, msr: u32) -> Result<u64> {
+        with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
+            api::read_machine_specific_register(framing, processor, msr)
+        })
+    }
+
+    fn validate_processor(&self, processor: u16) -> Result<()> {
+        if processor >= self.processor_count.max(1) {
+            return Err(Error::Kd(format!(
+                "processor {} is out of range (target reports {} processor(s))",
+                processor + 1,
+                self.processor_count.max(1)
+            )));
+        }
+        Ok(())
     }
 
     fn write_special_registers(&mut self, special: Vec<u8>) -> Result<()> {
         let processor = self.current_processor;
+        let (base, expected_size) = kspecial_control_space(self.arch);
         let actual = with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
-            api::write_control_space(
-                framing,
-                processor,
-                AMD64_DEBUG_CONTROL_SPACE_KSPECIAL,
-                &special,
-            )
+            api::write_control_space(framing, processor, base, &special)
         })?;
         if actual as usize != special.len() {
             return Err(Error::Kd(format!(
-                "short KSPECIAL_REGISTERS write on processor {}: wrote {} of {} bytes",
+                "short KSPECIAL_REGISTERS write on processor {}: wrote {} of {} bytes (requested layout size {})",
                 processor + 1,
                 actual,
-                special.len()
+                special.len(),
+                expected_size,
             )));
         }
         self.special_register_cache.insert(processor, special);
@@ -1004,6 +1364,22 @@ impl KdBackend {
             .ok_or_else(|| Error::Kd("special-register cache lookup failed".into()))
     }
 
+    /// Prefer the kernel debug-register copies; fall back to GetContext if unavailable.
+    fn arm64_special_registers(&mut self) -> Option<&[u8]> {
+        if self.special_registers_unsupported {
+            return None;
+        }
+        if let Err(error) = self.read_special_registers().map(|_| ()) {
+            kd_trace!("kd: ARM64 KSPECIAL_REGISTERS unavailable: {error}");
+            self.special_registers_unsupported = true;
+            return None;
+        }
+        self.special_register_cache
+            .get(&self.current_processor)
+            .map(Vec::as_slice)
+            .filter(|special| special.len() >= ARM64_KSPECIAL_REGISTERS_MIN_SIZE)
+    }
+
     fn append_control_registers(&mut self, ctx: &mut Vec<u8>) -> Result<()> {
         match self.arch {
             Arch::Amd64 => {
@@ -1011,11 +1387,57 @@ impl KdBackend {
                 append_control_registers_from_special(ctx, special)
             }
             Arch::Arm64 => {
-                // The ARM64 CONTEXT carries no TTBR; fill the synthetic `cr3`
-                // slot (TTBR1_EL1) from guest discovery.
+                if ctx.len() < context_arm64::CONTEXT_SIZE {
+                    return Err(Error::Kd(format!(
+                        "ARM64 CONTEXT buffer too short: {} bytes, expected {}",
+                        ctx.len(),
+                        context_arm64::CONTEXT_SIZE
+                    )));
+                }
+                let ttbr0 =
+                    match self.read_msr_value(self.current_processor, ARM64_WINDBG_TTBR0_EL1) {
+                        Ok(value) => value & Arch::Arm64.dtb_page_mask(),
+                        Err(error) => {
+                            kd_trace!("kd: ARM64 TTBR0_EL1 read unavailable: {error}");
+                            0
+                        }
+                    };
+                let (esr, far) = if self.last_exception_code == STATUS_SINGLE_STEP {
+                    let esr =
+                        match self.read_msr_value(self.current_processor, ARM64_WINDBG_ESR_EL1) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                kd_trace!("kd: ARM64 ESR_EL1 read unavailable: {error}");
+                                0
+                            }
+                        };
+                    let far =
+                        match self.read_msr_value(self.current_processor, ARM64_WINDBG_FAR_EL1) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                kd_trace!("kd: ARM64 FAR_EL1 read unavailable: {error}");
+                                0
+                            }
+                        };
+                    (esr, far)
+                } else {
+                    (0, 0)
+                };
+                let kernel_dtb = self.kernel_dtb_override;
                 ctx.resize(context_arm64::REGISTER_BUFFER_SIZE, 0);
                 ctx[context_arm64::OFFSET_CR3..context_arm64::OFFSET_CR3 + 8]
-                    .copy_from_slice(&self.kernel_dtb_override.to_le_bytes());
+                    .copy_from_slice(&kernel_dtb.to_le_bytes());
+                ctx[context_arm64::OFFSET_TTBR0..context_arm64::OFFSET_TTBR0 + 8]
+                    .copy_from_slice(&ttbr0.to_le_bytes());
+                if let Some(special) = self.arm64_special_registers() {
+                    copy_arm64_debug_registers(ctx, special, true);
+                }
+                if self.last_exception_code == STATUS_SINGLE_STEP {
+                    ctx[context_arm64::OFFSET_ESR..context_arm64::OFFSET_ESR + 8]
+                        .copy_from_slice(&esr.to_le_bytes());
+                    ctx[context_arm64::OFFSET_FAR..context_arm64::OFFSET_FAR + 8]
+                        .copy_from_slice(&far.to_le_bytes());
+                }
                 Ok(())
             }
         }
@@ -1049,18 +1471,11 @@ impl KdBackend {
 
     fn continue_stopped_for_exit(&mut self) -> Result<()> {
         let processor = self.last_stop_processor;
-        if should_advance_pc_before_continue(
-            self.last_exception_code,
-            self.last_stop_was_managed_breakpoint,
-        ) {
+        if self.stop_pc_is_raw_int3(processor)? {
             self.advance_pc_past_breakpoint(processor)?;
         }
         self.continue_preserving_dr7(processor, api::DBG_CONTINUE, false)?;
         self.record_running();
-        // The resume consumed the current stop. Any stashed pending_stop from
-        // an earlier break-in is stale now; keeping it can make exit issue
-        // manipulate requests while the target is already running.
-        self.pending_stop = None;
         Ok(())
     }
 
@@ -1085,7 +1500,7 @@ impl KdBackend {
         }
 
         for _ in 0..KD_EXIT_MAX_CONTINUES {
-            if self.is_running {
+            if self.link.is_running() {
                 match self.try_wait_for_stop(KD_EXIT_STOP_POLL)? {
                     None => return Ok(()),
                     Some(stop) => self.absorb_stray_single_step_for_exit(&stop),
@@ -1128,6 +1543,7 @@ impl KdBackend {
                 version.kern_base, version.ps_loaded_module_list
             )));
         }
+        self.kernel_dtb_override = kernel_dtb;
         kd_trace!(
             "kd: memory hints: dtb={kernel_dtb:#x} base={:#x} psmods={:#x} arch={:?}",
             version.kern_base,
@@ -1179,16 +1595,19 @@ impl KdBackend {
     /// Convert a connected KD backend into synchronized debugger and physical
     /// memory handles after target hints have been collected.
     pub fn into_remote_memory(self) -> (KdBackendHandle, KdMemory) {
-        eprintln!(
-            "{}",
-            format!(
-                "{}: memory source kd; remote reads may be slow.",
-                self.backend_name
-            )
-            .bright_black()
-        );
+        // An emulated UART hands the guest one byte per hypervisor main-loop
+        // iteration, so every KD request costs milliseconds; KDNET has no
+        // such floor.
+        let notice = match self.backend_name {
+            "kdnet" => "kdnet: memory source kd; remote reads may be slow.".to_string(),
+            name => format!(
+                "{name}: memory source kd; prefer --memory-source host if the VM is local, or KDNET"
+            ),
+        };
+        eprintln!("{}", notice.bright_black());
         let register_map = self.register_map.clone();
         let backend_name = self.backend_name;
+        let translations = Arc::clone(&self.translations);
         let inner = Arc::new(Mutex::new(self));
         (
             KdBackendHandle {
@@ -1196,12 +1615,15 @@ impl KdBackend {
                 register_map,
                 backend_name,
             },
-            KdMemory { inner },
+            KdMemory {
+                inner,
+                translations,
+            },
         )
     }
 
     fn require_remote_memory_stopped(&self) -> Result<()> {
-        if self.is_running || self.pump.is_some() {
+        if self.link.is_running() {
             return Err(Error::Kd(
                 "KD remote memory requires a halted target; interrupt it before reading memory"
                     .into(),
@@ -1243,6 +1665,8 @@ impl KdBackend {
 
     fn write_physical_bytes(&mut self, addr: PhysAddr, buf: &[u8]) -> Result<()> {
         self.require_remote_memory_stopped()?;
+        // The write may land in a page table.
+        self.translations.clear();
         let processor = self.current_processor;
         let mut completed = 0usize;
         while completed < buf.len() {
@@ -1264,8 +1688,86 @@ impl KdBackend {
         Ok(())
     }
 
+    /// `DbgKdReadVirtualMemoryApi` resolves through the current processor's
+    /// page tables: kernel space under the kernel root, and user space under
+    /// the root that processor is running on. Both take one request per
+    /// chunk where the host walk costs four page-table reads per page first.
+    /// Any other process root keeps the walk: the API has no address-space
+    /// selector.
+    fn read_virtual_direct(
+        &mut self,
+        addr: VirtAddr,
+        root: Dtb,
+        buf: &mut [u8],
+    ) -> Option<Result<()>> {
+        let kernel_space = match self.arch {
+            Arch::Amd64 => addr.0 >> 63 != 0,
+            Arch::Arm64 => addr.0 & (1 << 55) != 0,
+        };
+        let direct = if kernel_space {
+            self.kernel_dtb_override != 0 && root == self.kernel_dtb_override
+        } else {
+            self.current_processor_runs_on(root)
+        };
+        if !direct {
+            return None;
+        }
+        Some(self.read_virtual_bytes(addr, buf))
+    }
+
+    /// Whether `root` is the page-table root the current processor is
+    /// running on. AMD64 only: its CR3 sits in the special registers cached
+    /// per halt, while the ARM64 user root (TTBR0) would cost a request of
+    /// its own to learn.
+    fn current_processor_runs_on(&mut self, root: Dtb) -> bool {
+        if self.arch != Arch::Amd64 || self.require_remote_memory_stopped().is_err() {
+            return false;
+        }
+        let Ok(special) = self.read_special_registers() else {
+            return false;
+        };
+        let cr3 = wire::read_u64(special, KSPECIAL_REGISTERS_CR3_OFFSET);
+        let mask = self.arch.dtb_page_mask();
+        cr3 & mask == root & mask
+    }
+
+    fn read_virtual_bytes(&mut self, addr: VirtAddr, buf: &mut [u8]) -> Result<()> {
+        self.require_remote_memory_stopped()?;
+        let processor = self.current_processor;
+        let mut completed = 0usize;
+        while completed < buf.len() {
+            let chunk_addr = addr
+                .0
+                .checked_add(completed as u64)
+                .ok_or_else(|| Error::Kd("virtual-memory read address overflow".into()))?;
+            // A page is mapped or not as a whole; chunks that stay inside one
+            // page make a refused chunk exactly the hole a page walk reports.
+            let to_page_end = PAGE_SIZE - (chunk_addr as usize & (PAGE_SIZE - 1));
+            let requested = (buf.len() - completed)
+                .min(KD_REMOTE_MEMORY_CHUNK)
+                .min(to_page_end);
+            let data =
+                match with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
+                    api::read_virtual_memory(framing, processor, chunk_addr, requested as u32)
+                }) {
+                    Ok(data) => data,
+                    Err(Error::KdStatus { .. }) if completed > 0 => {
+                        return Err(Error::PartialRead(completed));
+                    }
+                    Err(Error::KdStatus { .. }) => {
+                        return Err(Error::BadVirtualAddress(VirtAddr(chunk_addr)));
+                    }
+                    Err(error) => return Err(error),
+                };
+            let end = completed + data.len();
+            buf[completed..end].copy_from_slice(&data);
+            completed = end;
+        }
+        Ok(())
+    }
+
     fn needs_drop_cleanup(&self) -> bool {
-        !self.exit_prepared && (self.pump.is_some() || !self.is_running)
+        !self.exit_prepared && matches!(self.link, Link::Halted(_) | Link::RunningPumped(_))
     }
 }
 
@@ -1294,6 +1796,23 @@ impl DebugBackend for KdBackend {
         })?;
         kd_trace!("kd: read_registers: got {} context bytes", ctx.len());
         self.append_control_registers(&mut ctx)?;
+        if self.arch == Arch::Amd64 {
+            let efer = self.efer_cache.get(&processor).copied().or_else(|| {
+                match self.read_msr_value(processor, MSR_EFER) {
+                    Ok(value) => {
+                        self.efer_cache.insert(processor, value);
+                        Some(value)
+                    }
+                    Err(error) => {
+                        kd_trace!("kd: EFER read unavailable: {error}");
+                        None
+                    }
+                }
+            });
+            if let Some(efer) = efer {
+                wire::write_u64(&mut ctx, context::OFFSET_EFER, efer);
+            }
+        }
         kd_trace!("kd: read_registers: extended to {} bytes", ctx.len());
         if trace_enabled() {
             let cr3 = self.register_map.read_u64("cr3", &ctx).unwrap_or(0);
@@ -1334,7 +1853,25 @@ impl DebugBackend for KdBackend {
                         processor,
                         &data[..context_arm64::CONTEXT_SIZE],
                     )
-                })
+                })?;
+                // ARM64 hardware state is authoritative in KSPECIAL_REGISTERS,
+                // while CONTEXT exposes the same BVR/BCR and WVR/WCR fields.
+                // Keep both views coherent when a full context is written. The
+                // SetContext above already carried those fields, so a target
+                // that refuses control space must not fail an applied write.
+                if self.special_registers_unsupported {
+                    return Ok(());
+                }
+                let mut special = match self.read_special_registers_uncached(processor) {
+                    Ok(special) => special,
+                    Err(error) => {
+                        kd_trace!("kd: ARM64 KSPECIAL_REGISTERS mirror skipped: {error}");
+                        self.special_registers_unsupported = true;
+                        return Ok(());
+                    }
+                };
+                update_arm64_debug_registers_from_context(&mut special, data)?;
+                self.write_special_registers(special)
             }
         }
     }
@@ -1366,33 +1903,50 @@ impl DebugBackend for KdBackend {
     }
 
     fn remove_breakpoint(&mut self, addr: u64) -> Result<()> {
-        let handle = self
+        let handle = *self
             .bp_handles
-            .remove(&addr)
+            .get(&addr)
             .ok_or_else(|| Error::Kd(format!("no breakpoint tracked at {addr:#x}")))?;
-        self.managed_bp_addresses.remove(&addr);
         let processor = self.current_processor;
         let result = with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
             api::restore_breakpoint(framing, processor, handle)
         });
-        if let Err(Error::KdStatus { ntstatus, api }) = &result
-            && *ntstatus == STATUS_UNSUCCESSFUL
-            && *api == api::DBGKD_RESTORE_BREAKPOINT
-        {
-            kd_trace!(
-                "kd: restore breakpoint handle {} at {:#x} was already consumed",
-                handle,
-                addr
-            );
-            return Ok(());
+        match result {
+            Ok(()) => {}
+            Err(Error::KdStatus { ntstatus, api })
+                if ntstatus == STATUS_UNSUCCESSFUL && api == api::DBGKD_RESTORE_BREAKPOINT =>
+            {
+                kd_trace!(
+                    "kd: restore breakpoint handle {handle} at {addr:#x} was already consumed"
+                );
+            }
+            // Transport failure: the site may still be patched, so keep
+            // tracking it (a retry restores it; a hit there is still ours).
+            Err(e) => return Err(e),
         }
-        result
+        self.bp_handles.remove(&addr);
+        self.managed_bp_addresses.remove(&addr);
+        Ok(())
     }
 
     fn supports_watchpoints(&self) -> bool {
-        // AArch64 has no x86-style debug registers; hardware watchpoints would
-        // need DBGWCR/DBGWVR support in the KD transport.
-        self.arch == Arch::Amd64
+        // Both architectures expose per-processor debug state through KD
+        // KSPECIAL_REGISTERS (DR0-DR7 on AMD64; BVR/BCR and WVR/WCR on ARM64).
+        matches!(self.arch, Arch::Amd64 | Arch::Arm64)
+    }
+
+    fn hardware_breakpoint_slots(&self) -> u8 {
+        match self.arch {
+            Arch::Amd64 => HW_BREAKPOINT_SLOTS,
+            Arch::Arm64 => hwbp::ARM64_MAX_BREAKPOINTS + hwbp::ARM64_MAX_WATCHPOINTS,
+        }
+    }
+
+    fn hardware_slot_range(&self, access: HwBreakpointAccess) -> std::ops::Range<u8> {
+        match self.arch {
+            Arch::Amd64 => 0..HW_BREAKPOINT_SLOTS,
+            Arch::Arm64 => hwbp::arm64_slot_range(access),
+        }
     }
 
     fn set_hardware_breakpoint(
@@ -1405,11 +1959,34 @@ impl DebugBackend for KdBackend {
         if !self.supports_watchpoints() {
             return Err(Error::NotSupported);
         }
-        // DR state is per-processor, so program every CPU: watched code can run
-        // anywhere. The shared transaction prevents an untracked partial set.
-        self.update_dr_slot_on_all_processors(slot, "install", |backend| {
-            backend.apply_dr_set(slot, addr, access, len)
-        })
+        match self.arch {
+            Arch::Amd64 => {
+                // DR state is per-processor, so program every CPU: watched code
+                // can run anywhere. The shared transaction prevents an
+                // untracked partial set.
+                self.update_slot_on_all_processors(
+                    slot,
+                    HW_BREAKPOINT_SLOTS,
+                    "install",
+                    "hardware breakpoint",
+                    |backend, slot| backend.read_dr_slot_state(slot),
+                    |backend, slot, state| backend.apply_dr_restore(slot, state),
+                    |backend| backend.apply_dr_set(slot, addr, access, len),
+                )
+            }
+            Arch::Arm64 => {
+                arm64_slot_offsets_for_access(slot, access)?;
+                self.update_slot_on_all_processors(
+                    slot,
+                    hwbp::ARM64_MAX_BREAKPOINTS + hwbp::ARM64_MAX_WATCHPOINTS,
+                    "install",
+                    "ARM64 hardware breakpoint",
+                    |backend, slot| backend.read_arm64_slot_state(slot),
+                    |backend, slot, state| backend.apply_arm64_restore(slot, state),
+                    |backend| backend.apply_arm64_set(slot, addr, access, len),
+                )
+            }
+        }
     }
 
     fn clear_hardware_breakpoint(&mut self, slot: u8) -> Result<()> {
@@ -1418,13 +1995,86 @@ impl DebugBackend for KdBackend {
         }
         // A failed disable/remove must leave the manager's still-enabled entry
         // truthful, so clearing receives the same rollback guarantee as set.
-        self.update_dr_slot_on_all_processors(slot, "clear", |backend| backend.apply_dr_clear(slot))
+        match self.arch {
+            Arch::Amd64 => self.update_slot_on_all_processors(
+                slot,
+                HW_BREAKPOINT_SLOTS,
+                "clear",
+                "hardware breakpoint",
+                |backend, slot| backend.read_dr_slot_state(slot),
+                |backend, slot, state| backend.apply_dr_restore(slot, state),
+                |backend| backend.apply_dr_clear(slot),
+            ),
+            Arch::Arm64 => {
+                arm64_slot_offsets(slot)?;
+                self.update_slot_on_all_processors(
+                    slot,
+                    hwbp::ARM64_MAX_BREAKPOINTS + hwbp::ARM64_MAX_WATCHPOINTS,
+                    "clear",
+                    "ARM64 hardware breakpoint",
+                    |backend, slot| backend.read_arm64_slot_state(slot),
+                    |backend, slot, state| backend.apply_arm64_restore(slot, state),
+                    |backend| backend.apply_arm64_clear(slot),
+                )
+            }
+        }
     }
 
     fn supports_user_mode_breakpoints(&self) -> bool {
-        // GuestMemoryPatch user-mode breakpoints write an x86 `int3`; the
-        // AArch64 equivalent (4-byte `brk #0xF000`) is not wired up yet.
-        self.arch == Arch::Amd64
+        // GuestMemoryPatch emits `int3` on AMD64 and `brk #0xF000` on ARM64.
+        matches!(self.arch, Arch::Amd64 | Arch::Arm64)
+    }
+
+    fn supports_msr(&self) -> bool {
+        true
+    }
+
+    fn read_msr(&mut self, processor: u16, msr: u32) -> Result<u64> {
+        self.validate_processor(processor)?;
+        self.read_msr_value(processor, msr)
+    }
+
+    fn write_msr(&mut self, processor: u16, msr: u32, value: u64) -> Result<()> {
+        self.validate_processor(processor)?;
+        with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
+            api::write_machine_specific_register(framing, processor, msr, value)
+        })?;
+        if msr == MSR_EFER {
+            self.efer_cache.insert(processor, value);
+        }
+        Ok(())
+    }
+
+    fn supports_target_control(&self) -> bool {
+        true
+    }
+
+    fn reboot_target(&mut self) -> Result<()> {
+        let processor = self.current_processor;
+        with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
+            api::reboot(framing, processor)
+        })?;
+        // Reboot has no manipulate-state reply: after the transport ACK the
+        // kernel resets the KD stream and eventually emits a fresh state
+        // change. Keep the backend visibly running and let the pump perform
+        // the existing reconnect/reload detection dance.
+        self.record_running();
+        self.start_pump(Some(Duration::ZERO), None)
+    }
+
+    fn cause_bugcheck(&mut self) -> Result<()> {
+        let processor = self.current_processor;
+        with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
+            api::cause_bugcheck(framing, processor)
+        })?;
+        // KeBugCheck2 skips the fatal print and the first debugger break for
+        // MANUALLY_INITIATED_CRASH: the target writes its dump (tens of seconds,
+        // interrupts off, break-ins ignored) and then reboots, or breaks in
+        // afterwards when automatic restart is disabled. Treat it like a reboot,
+        // but do not poke immediately: the kernel still polls for break-ins on
+        // its way into KeBugCheck2 and an early poke detours it into a stop.
+        self.record_running();
+        self.start_pump(Some(POST_BUGCHECK_RECONNECT_ASSIST_DELAY), None)
     }
 
     fn optional_capabilities(&self) -> Vec<BackendCapability> {
@@ -1442,6 +2092,14 @@ impl DebugBackend for KdBackend {
             BackendCapability::supported(DebugCapability::BugcheckDetection),
             BackendCapability::supported(DebugCapability::BugcheckDetails),
             BackendCapability::supported(DebugCapability::DebugOutput),
+            BackendCapability {
+                capability: DebugCapability::Msr,
+                supported: self.supports_msr(),
+            },
+            BackendCapability {
+                capability: DebugCapability::TargetControl,
+                supported: self.supports_target_control(),
+            },
         ]
     }
 
@@ -1493,119 +2151,46 @@ impl DebugBackend for KdBackend {
         &mut self,
         disposition: ContinueDisposition,
     ) -> Result<()> {
-        // Drain stale break-in bytes consumed by KdPollBreakIn after resume
-        const MAX_DRAIN_ITERATIONS: u32 = 64;
-        const DRAIN_POLL: Duration = Duration::from_millis(1000);
-        // Cap on total time spent draining before handing the socket to the
-        // pump. Spurious re-breaks land within the first second; this only
-        // matters when boot traffic streams in continuously (no idle gap to
-        // end the drain), which otherwise pins this thread for minutes.
-        const DRAIN_BUDGET: Duration = Duration::from_secs(2);
-
-        let drain_deadline = Instant::now() + DRAIN_BUDGET;
-        let mut drained = 0u32;
-        loop {
-            let resume_processor = self.last_stop_processor;
-            if should_advance_pc_before_continue(
-                self.last_exception_code,
-                self.last_stop_was_managed_breakpoint,
-            ) {
-                kd_trace!(
-                    "kd: continue: advancing p{} RIP past raw int3 (last_exception_code={:#x})",
-                    resume_processor + 1,
-                    self.last_exception_code,
-                );
-                self.advance_pc_past_breakpoint(resume_processor)?;
-            } else {
-                kd_trace!(
-                    "kd: continue: not advancing p{} (last_exception_code={:#x}, managed_bp={})",
-                    resume_processor + 1,
-                    self.last_exception_code,
-                    self.last_stop_was_managed_breakpoint
-                );
-            }
-            let resumed_from_rip = self.last_rip;
-            let reconnect_assist_after_continue = self.reconnect_assist_after_continue;
+        let resume_processor = self.last_stop_processor;
+        if self.stop_pc_is_raw_int3(resume_processor)? {
             kd_trace!(
-                "kd: continue: sending ContinueApi2 on p{}",
-                resume_processor + 1
+                "kd: continue: advancing p{} RIP past raw int3 (last_exception_code={:#x})",
+                resume_processor + 1,
+                self.last_exception_code,
             );
-            // The requested disposition acknowledges the user's actual stop.
-            // Any immediate raw int3 / assisted break-in drained on a later
-            // iteration is debugger noise and must always be acknowledged as
-            // handled rather than passed into Windows exception dispatch.
-            let continue_status = if drained == 0 {
-                api::status_for_disposition(disposition)
-            } else {
-                api::DBG_CONTINUE
-            };
-            self.continue_preserving_dr7(resume_processor, continue_status, false)?;
-            kd_trace!("kd: continue: ContinueApi2 ACKed, VM should resume");
-            self.record_running();
-
-            self.framing()?
-                .transport_mut()
-                .set_read_timeout(Some(DRAIN_POLL))?;
-            let mut saw_kd_refresh = false;
-            let debug_log = self.debug_log.clone();
-            let arch = self.arch;
-            let result = await_state_change(
-                self.framing()?,
-                AwaitStateOptions {
-                    arch,
-                    saw_kd_refresh: Some(&mut saw_kd_refresh),
-                    surface_all: false,
-                    bugcheck: None,
-                    bugcheck_capture: None,
-                    deadline: Some(drain_deadline),
-                    debug_log: Some(&debug_log),
-                },
+            self.advance_pc_past_breakpoint(resume_processor)?;
+        } else {
+            kd_trace!(
+                "kd: continue: not advancing p{} (last_exception_code={:#x}, managed_bp={})",
+                resume_processor + 1,
+                self.last_exception_code,
+                self.last_stop_was_managed_breakpoint
             );
-
-            match result {
-                Ok(stop) => {
-                    let is_spurious = self.is_spurious_continue_rebreak(&stop, resumed_from_rip);
-                    if is_spurious && drained < MAX_DRAIN_ITERATIONS {
-                        drained += 1;
-                        kd_trace!(
-                            "kd: continue: spurious re-break at {:#x} (drain {}/{})",
-                            stop.program_counter,
-                            drained,
-                            MAX_DRAIN_ITERATIONS
-                        );
-                        self.record_stop(&stop);
-                        continue;
-                    }
-                    kd_trace!(
-                        "kd: continue: real stop at {:#x} (exc={:#x}), stashing as pending",
-                        stop.program_counter,
-                        stop.exception_code
-                    );
-                    self.record_stop(&stop);
-                    self.pending_stop = Some(stop);
-                    return Ok(());
-                }
-                Err(Error::Io(e))
-                    if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
-                {
-                    if saw_kd_refresh {
-                        kd_trace!("kd: continue: KD refresh observed; leaving pump to service it");
-                    }
-                    if drained > 0 {
-                        kd_trace!(
-                            "kd: continue: drained {} spurious break(s), VM now running",
-                            drained
-                        );
-                    }
-                    // VM is genuinely running. Hand the socket to the background
-                    // pump so prints keep getting ACKed (and the debugger stays
-                    // "present") until the next stop, instead of going unserviced
-                    self.start_pump(reconnect_assist_after_continue)?;
-                    return Ok(());
-                }
-                Err(e) => return Err(e),
-            }
         }
+        // The pump absorbs the re-break a stale break-in byte causes right
+        // after resume; it needs to know where we resumed from and which
+        // breakpoints are real. Nothing can change either while the VM runs.
+        let drain = ContinueDrain::new(
+            self.last_rip,
+            self.managed_bp_addresses.clone(),
+            self.breakin_addresses.clone(),
+            self.register_map.clone(),
+        );
+        let reconnect_assist_after_continue = self.reconnect_assist_after_continue;
+        kd_trace!(
+            "kd: continue: sending ContinueApi2 on p{}",
+            resume_processor + 1
+        );
+        self.continue_preserving_dr7(
+            resume_processor,
+            api::status_for_disposition(disposition),
+            false,
+        )?;
+        kd_trace!("kd: continue: ContinueApi2 ACKed, VM should resume");
+        self.record_running();
+        // Hand the socket to the background pump so prints keep getting ACKed
+        // (and the debugger stays "present") until the next stop.
+        self.start_pump(reconnect_assist_after_continue, Some(drain))
     }
 
     fn step(&mut self) -> Result<()> {
@@ -1613,15 +2198,23 @@ impl DebugBackend for KdBackend {
         // single step stops almost immediately, so the caller's wait_for_stop
         // reads it synchronously; no pump needed
         let processor = self.current_processor;
+        // A raw int3 stop still points at the int3; stepping from there would
+        // only execute it again and report the same stop.
+        if processor == self.last_stop_processor && self.stop_pc_is_raw_int3(processor)? {
+            self.advance_pc_past_breakpoint(processor)?;
+        }
         self.continue_preserving_dr7(processor, api::DBG_CONTINUE, true)?;
         self.record_running();
         Ok(())
     }
 
     fn interrupt(&mut self) -> Result<StopEvent> {
-        let stop = if self.pump.is_some() {
+        let stop = if let Link::RunningPumped(pump) = &self.link {
             // Pump owns the socket; poke the kernel with a break-in over the
-            // cloned fd, then collect the state-change the pump reports back
+            // cloned fd, then collect the state-change the pump reports back.
+            // Flag it first: the stop lands at the KD break-in instruction,
+            // where the pump would otherwise absorb it as post-continue noise.
+            pump.breakin_requested.store(true, Ordering::SeqCst);
             self.send_raw_breakin()?;
             match self.take_pump_stop(Some(Duration::from_secs(10)))? {
                 Some(stop) => stop,
@@ -1640,12 +2233,7 @@ impl DebugBackend for KdBackend {
     }
 
     fn wait_for_stop(&mut self) -> Result<StopEvent> {
-        if let Some(stop) = self.pending_stop.take() {
-            let stop = self.mark_known_breakin_stop(stop);
-            self.record_stop(&stop);
-            return Ok(stop_event(stop));
-        }
-        if self.pump.is_some() {
+        if matches!(self.link, Link::RunningPumped(_)) {
             let stop = self
                 .take_pump_stop(None)?
                 .ok_or_else(|| Error::Kd("KD pump returned no stop".into()))?;
@@ -1655,10 +2243,7 @@ impl DebugBackend for KdBackend {
         }
         let debug_log = self.debug_log.clone();
         let arch = self.arch;
-        // Blocking wait: give the socket a timeout long enough to be a block
-        // (the request paths leave their shorter timeouts in place, and the
-
-        // restore-to-none setsockopt is macOS-racy).
+        // Request paths leave shorter timeouts in place; a blocking wait needs a long one.
         let _ = self
             .framing()?
             .transport_mut()
@@ -1681,18 +2266,9 @@ impl DebugBackend for KdBackend {
     }
 
     fn try_wait_for_stop(&mut self, timeout: Duration) -> Result<Option<StopEvent>> {
-        if let Some(stop) = self.pending_stop.take() {
-            let stop = self.mark_known_breakin_stop(stop);
-            kd_trace!(
-                "kd: try_wait: surfacing pending_stop rip={:#x} (bypassing spurious check)",
-                stop.program_counter
-            );
-            self.record_stop(&stop);
-            return Ok(Some(stop_event(stop)));
-        }
         // Pump path: the background thread already services the socket and
         // detects stops, so just poll it. This is the common case while running
-        if self.pump.is_some() {
+        if matches!(self.link, Link::RunningPumped(_)) {
             return match self.take_pump_stop(Some(timeout))? {
                 Some(stop) => {
                     let stop = self.mark_known_breakin_stop(stop);
@@ -1768,20 +2344,12 @@ impl DebugBackend for KdBackend {
     }
 
     fn is_running(&self) -> bool {
-        self.is_running
+        self.link.is_running()
     }
 
     fn has_pending_stop(&self) -> bool {
-        // The background pump caught a state-change, reported it into its
-        // channel, and exited, but no foreground drain has consumed it yet, so
-        // `is_running` still holds its stale post-continue `true`. A locally
-        // queued `pending_stop` (set when a continue observed a KD refresh) is
-        // the same situation. Either way the VM is actually halted.
-        self.pending_stop.is_some()
-            || self
-                .pump
-                .as_ref()
-                .is_some_and(|pump| pump.reported_stop.load(Ordering::SeqCst))
+        // The pump reported a stop nobody has drained yet; `is_running` is stale.
+        matches!(&self.link, Link::RunningPumped(pump) if pump.reported_stop.load(Ordering::SeqCst))
     }
 
     fn prepare_for_exit(&mut self, leave_running: bool) -> Result<()> {
@@ -1794,8 +2362,8 @@ impl DebugBackend for KdBackend {
 
     fn take_modules_changed(&mut self) -> bool {
         // the flag rides back on the framing when the pump reclaims it at a stop
-        self.framing
-            .as_mut()
+        self.link
+            .framing()
             .map(KdFraming::take_modules_changed)
             .unwrap_or(false)
     }
@@ -1834,6 +2402,14 @@ impl DebugBackend for KdBackendHandle {
         self.lock().supports_watchpoints()
     }
 
+    fn hardware_breakpoint_slots(&self) -> u8 {
+        self.lock().hardware_breakpoint_slots()
+    }
+
+    fn hardware_slot_range(&self, access: HwBreakpointAccess) -> std::ops::Range<u8> {
+        self.lock().hardware_slot_range(access)
+    }
+
     fn set_hardware_breakpoint(
         &mut self,
         slot: u8,
@@ -1850,6 +2426,30 @@ impl DebugBackend for KdBackendHandle {
 
     fn supports_user_mode_breakpoints(&self) -> bool {
         self.lock().supports_user_mode_breakpoints()
+    }
+
+    fn supports_msr(&self) -> bool {
+        self.lock().supports_msr()
+    }
+
+    fn read_msr(&mut self, processor: u16, msr: u32) -> Result<u64> {
+        self.lock().read_msr(processor, msr)
+    }
+
+    fn write_msr(&mut self, processor: u16, msr: u32, value: u64) -> Result<()> {
+        self.lock().write_msr(processor, msr, value)
+    }
+
+    fn supports_target_control(&self) -> bool {
+        self.lock().supports_target_control()
+    }
+
+    fn reboot_target(&mut self) -> Result<()> {
+        self.lock().reboot_target()
+    }
+
+    fn cause_bugcheck(&mut self) -> Result<()> {
+        self.lock().cause_bugcheck()
     }
 
     fn optional_capabilities(&self) -> Vec<BackendCapability> {
@@ -1951,10 +2551,14 @@ impl Drop for KdBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const ARM64_KSPECIAL_REGISTERS_TPIDR_EL0_OFFSET: usize = 0x10;
+    use crate::guest::{Guest, WinObject};
     use crate::kd::framing::{
         PACKET_TYPE_KD_ACKNOWLEDGE, PACKET_TYPE_KD_DEBUG_IO, PACKET_TYPE_KD_FILE_IO,
         PACKET_TYPE_KD_RESET, PACKET_TYPE_KD_STATE_CHANGE64, PACKET_TYPE_KD_STATE_MANIPULATE,
     };
+    use crate::phys::PhysMem;
+    use crate::symbols::{FieldInfo, ParsedType, SymbolStore, TypeInfo};
     use std::io::{Cursor, Read, Write};
     use std::time::Instant;
 
@@ -1990,7 +2594,7 @@ mod tests {
         let mut backend = kd_backend_with_framing(host);
         backend.arch = Arch::Arm64;
         backend.register_map = context_arm64::build_register_map();
-        backend.is_running = false;
+        backend.link.set_inline_running(false);
         backend.exit_prepared = true;
         let kernel_base = 0xffff_f802_4e80_0000u64;
         let module_list = 0xffff_f802_4f4d_aed0u64;
@@ -2102,7 +2706,7 @@ mod tests {
     }
 
     #[test]
-    fn arm64_capabilities_exclude_amd64_only_breakpoints() {
+    fn arm64_capabilities_include_debug_breakpoints() {
         let (_kernel, host) = UnixStream::pair().unwrap();
         let mut backend = kd_backend_with_framing(host);
         backend.arch = Arch::Arm64;
@@ -2115,13 +2719,9 @@ mod tests {
                 backend
                     .capabilities()
                     .iter()
-                    .any(|entry| { entry.capability == capability && !entry.supported })
+                    .any(|entry| { entry.capability == capability && entry.supported })
             );
         }
-        assert!(matches!(
-            backend.set_hardware_breakpoint(0, 0x1000, HwBreakpointAccess::Write, 4),
-            Err(Error::NotSupported)
-        ));
     }
 
     struct Loopback {
@@ -2219,79 +2819,6 @@ mod tests {
     }
 
     #[test]
-    fn stop_event_preserves_kd_exception_details() {
-        let stop = StateChange {
-            processor: 1,
-            number_processors: 2,
-            new_state: DBG_KD_EXCEPTION_STATE_CHANGE,
-            exception_code: STATUS_BREAKPOINT,
-            exception_first_chance: Some(true),
-            exception_address: Some(0xfffff800deadbeef),
-            program_counter: 0xfffff800deadbeef,
-            kernel_base_hint: None,
-            is_bugcheck: false,
-            bugcheck: None,
-            target_reloaded: false,
-            assisted_breakin: false,
-        };
-
-        let event = stop_event(stop);
-        assert_eq!(event.thread_id.as_deref(), Some("p1.2"));
-        assert_eq!(event.exception_code, Some(STATUS_BREAKPOINT));
-        assert_eq!(event.first_chance, Some(true));
-        assert_eq!(event.exception_address, Some(0xfffff800deadbeef));
-        assert_eq!(event.program_counter, Some(0xfffff800deadbeef));
-        assert_eq!(event.target_kernel_base_hint, None);
-        assert!(!event.is_bugcheck);
-        assert!(event.bugcheck.is_none());
-        assert!(!event.target_reloaded);
-        assert!(!event.assisted_breakin);
-    }
-
-    #[test]
-    fn stop_event_preserves_target_reload_flag() {
-        let stop = StateChange {
-            processor: 0,
-            number_processors: 1,
-            new_state: DBG_KD_EXCEPTION_STATE_CHANGE,
-            exception_code: STATUS_BREAKPOINT,
-            exception_first_chance: Some(true),
-            exception_address: Some(0xfffff800deadbeef),
-            program_counter: 0xfffff800deadbeef,
-            kernel_base_hint: None,
-            is_bugcheck: false,
-            bugcheck: None,
-            target_reloaded: true,
-            assisted_breakin: false,
-        };
-
-        let event = stop_event(stop);
-        assert!(event.target_reloaded);
-        assert!(!event.is_bugcheck);
-    }
-
-    #[test]
-    fn stop_event_preserves_assisted_breakin_flag() {
-        let stop = StateChange {
-            processor: 0,
-            number_processors: 1,
-            new_state: DBG_KD_EXCEPTION_STATE_CHANGE,
-            exception_code: STATUS_BREAKPOINT,
-            exception_first_chance: Some(true),
-            exception_address: Some(0xfffff800deadbeef),
-            program_counter: 0xfffff800deadbeef,
-            kernel_base_hint: None,
-            is_bugcheck: false,
-            bugcheck: None,
-            target_reloaded: false,
-            assisted_breakin: true,
-        };
-
-        let event = stop_event(stop);
-        assert!(event.assisted_breakin);
-    }
-
-    #[test]
     fn stop_event_flags_surfaced_load_symbols_as_bugcheck() {
         let stop = StateChange {
             processor: 0,
@@ -2317,29 +2844,6 @@ mod tests {
             Some(VirtAddr(0xfffff8007f600000))
         );
         assert!(event.bugcheck.is_none());
-    }
-
-    #[test]
-    fn stop_event_does_not_flag_reloaded_load_symbols_as_bugcheck() {
-        let stop = StateChange {
-            processor: 0,
-            number_processors: 1,
-            new_state: DBG_KD_LOAD_SYMBOLS_STATE_CHANGE,
-            exception_code: 0,
-            exception_first_chance: None,
-            exception_address: None,
-            program_counter: 0xfffff8007faf9325,
-            kernel_base_hint: None,
-            is_bugcheck: false,
-            bugcheck: None,
-            target_reloaded: true,
-            assisted_breakin: false,
-        };
-
-        let event = stop_event(stop);
-        assert!(event.target_reloaded);
-        assert!(!event.is_bugcheck);
-        assert_eq!(event.exception_code, None);
     }
 
     #[test]
@@ -2388,8 +2892,6 @@ mod tests {
         assert!(!saw_refresh);
         assert!(output.is_empty());
         assert_eq!(capture.finish().unwrap().code, 0xd1);
-        // The terminal stream is suppressed during a bugcheck, but the ring is
-        // the complete record and still captures the crash text.
         let page = debug_log.read_since(0);
         assert!(
             page.lines
@@ -2533,24 +3035,6 @@ mod tests {
     }
 
     #[test]
-    fn initial_kdnet_handshake_never_resets_packet_stream() {
-        for attempt in 0..8 {
-            assert_eq!(
-                initial_handshake_stimulus_for_transport(attempt, true),
-                InitialHandshakeStimulus::BreakIn
-            );
-        }
-    }
-
-    #[test]
-    fn kd_initial_timeout_defaults_to_eight_seconds() {
-        assert_eq!(
-            parse_kd_initial_timeout(None).unwrap(),
-            Duration::from_secs(8)
-        );
-    }
-
-    #[test]
     fn kd_initial_timeout_accepts_positive_seconds() {
         assert_eq!(
             parse_kd_initial_timeout(Some("12")).unwrap(),
@@ -2562,15 +3046,6 @@ mod tests {
     fn kd_initial_timeout_rejects_invalid_values() {
         assert!(parse_kd_initial_timeout(Some("0")).is_err());
         assert!(parse_kd_initial_timeout(Some("meow")).is_err());
-    }
-
-    #[test]
-    fn context_payload_accepts_synthetic_register_buffer() {
-        let synthetic = vec![0u8; context::REGISTER_BUFFER_SIZE];
-        assert_eq!(
-            context_payload(&synthetic).unwrap().len(),
-            context::CONTEXT_SIZE
-        );
     }
 
     #[test]
@@ -2593,6 +3068,18 @@ mod tests {
             .copy_from_slice(&0x350ef8u64.to_le_bytes());
         special[KSPECIAL_REGISTERS_CR8_OFFSET..KSPECIAL_REGISTERS_CR8_OFFSET + 8]
             .copy_from_slice(&2u64.to_le_bytes());
+        special[KSPECIAL_REGISTERS_GDTR_OFFSET + 6..KSPECIAL_REGISTERS_GDTR_OFFSET + 8]
+            .copy_from_slice(&0x1234u16.to_le_bytes());
+        special[KSPECIAL_REGISTERS_GDTR_OFFSET + 8..KSPECIAL_REGISTERS_GDTR_OFFSET + 16]
+            .copy_from_slice(&0xffff_f800_0000_1000u64.to_le_bytes());
+        special[KSPECIAL_REGISTERS_IDTR_OFFSET + 6..KSPECIAL_REGISTERS_IDTR_OFFSET + 8]
+            .copy_from_slice(&0x5678u16.to_le_bytes());
+        special[KSPECIAL_REGISTERS_IDTR_OFFSET + 8..KSPECIAL_REGISTERS_IDTR_OFFSET + 16]
+            .copy_from_slice(&0xffff_f800_0000_2000u64.to_le_bytes());
+        special[KSPECIAL_REGISTERS_TR_OFFSET..KSPECIAL_REGISTERS_TR_OFFSET + 2]
+            .copy_from_slice(&0x40u16.to_le_bytes());
+        special[KSPECIAL_REGISTERS_LDTR_OFFSET..KSPECIAL_REGISTERS_LDTR_OFFSET + 2]
+            .copy_from_slice(&0x48u16.to_le_bytes());
         special[KSPECIAL_REGISTERS_DR0_OFFSET..KSPECIAL_REGISTERS_DR0_OFFSET + 8]
             .copy_from_slice(&0xffff_f804_1234_5678u64.to_le_bytes());
         special[KSPECIAL_REGISTERS_DR6_OFFSET..KSPECIAL_REGISTERS_DR6_OFFSET + 8]
@@ -2612,6 +3099,12 @@ mod tests {
         assert_eq!(map.read_u64("dr6", &ctx).unwrap(), 5);
         assert_eq!(map.read_u64("dr7", &ctx).unwrap(), 0x402);
         assert_eq!(map.read_u64("cr8", &ctx).unwrap(), 2);
+        assert_eq!(map.read_u64("gdtr", &ctx).unwrap(), 0xffff_f800_0000_1000);
+        assert_eq!(map.read_u64("gdtr_limit", &ctx).unwrap(), 0x1234);
+        assert_eq!(map.read_u64("idtr", &ctx).unwrap(), 0xffff_f800_0000_2000);
+        assert_eq!(map.read_u64("idtr_limit", &ctx).unwrap(), 0x5678);
+        assert_eq!(map.read_u64("tr", &ctx).unwrap(), 0x40);
+        assert_eq!(map.read_u64("ldtr", &ctx).unwrap(), 0x48);
     }
 
     #[test]
@@ -2643,18 +3136,45 @@ mod tests {
     }
 
     #[test]
+    fn arm64_context_debug_registers_update_special_registers() {
+        let mut ctx = vec![0u8; context_arm64::CONTEXT_SIZE];
+        let mut special = vec![0xa5; ARM64_KSPECIAL_REGISTERS_MIN_SIZE];
+        let map = context_arm64::build_register_map();
+        map.write_u64("bvr0", &mut ctx, 0x4000).unwrap();
+        map.write_u64("bcr0", &mut ctx, 0xe9e1).unwrap();
+        map.write_u64("wvr1", &mut ctx, 0x5000).unwrap();
+        map.write_u64("wcr1", &mut ctx, 0x0000_e9e1).unwrap();
+
+        update_arm64_debug_registers_from_context(&mut special, &ctx).unwrap();
+
+        assert_eq!(
+            wire::read_u64(&special, ARM64_KSPECIAL_REGISTERS_BVR0_OFFSET),
+            0x4000
+        );
+        assert_eq!(
+            wire::read_u32(&special, ARM64_KSPECIAL_REGISTERS_BCR0_OFFSET),
+            0xe9e1
+        );
+        assert_eq!(
+            wire::read_u64(&special, ARM64_KSPECIAL_REGISTERS_WVR0_OFFSET + 8),
+            0x5000
+        );
+        assert_eq!(
+            wire::read_u32(&special, ARM64_KSPECIAL_REGISTERS_WCR0_OFFSET + 4),
+            0x0000_e9e1
+        );
+        assert_eq!(
+            wire::read_u64(&special, ARM64_KSPECIAL_REGISTERS_TPIDR_EL0_OFFSET),
+            0xa5a5_a5a5_a5a5_a5a5,
+            "non-debug special registers must remain untouched"
+        );
+    }
+
+    #[test]
     fn thread_id_uses_one_based_hex() {
         assert_eq!(thread_id_for(0), "p1.1");
         assert_eq!(thread_id_for(3), "p1.4");
         assert_eq!(thread_id_for(15), "p1.10");
-    }
-
-    #[test]
-    fn thread_id_round_trips() {
-        for proc in [0u16, 1, 7, 15, 31] {
-            let tid = thread_id_for(proc);
-            assert_eq!(parse_thread_id(&tid).unwrap(), proc);
-        }
     }
 
     #[test]
@@ -2671,8 +3191,6 @@ mod tests {
         assert!(parse_thread_id_for_processor_count("p1.5", 4).is_err());
     }
 
-    // Wire-format helpers mirroring framing::Header::encode for driving the
-    // pump over a real socket pair (the framing constants are module-private)
     const WIRE_DATA_LEADER: u32 = 0x3030_3030;
     const WIRE_CONTROL_LEADER: u32 = 0x6969_6969;
     const WIRE_HEADER_SIZE: usize = 16;
@@ -2773,16 +3291,14 @@ mod tests {
 
     fn kd_backend_with_pump(pump: PumpHandle, breakin_clone: UnixStream) -> KdBackend {
         KdBackend {
-            framing: None,
+            link: Link::RunningPumped(pump),
             breakin_clone: breakin_clone.into(),
             backend_name: "kd",
-            pump: Some(pump),
             register_map: context::build_register_map(),
             arch: Arch::Amd64,
             kernel_dtb_override: 0,
             processor_count: 1,
             current_processor: 0,
-            pending_stop: None,
             last_stop_processor: 0,
             last_exception_code: 0,
             last_rip: 0,
@@ -2793,25 +3309,25 @@ mod tests {
             breakin_addresses: HashSet::new(),
             pending_write_breakpoint: None,
             special_register_cache: HashMap::new(),
-            is_running: true,
+            special_registers_unsupported: false,
+            efer_cache: HashMap::new(),
             exit_prepared: false,
             debug_log: DebugLog::new(DEBUG_LOG_CAPACITY),
+            translations: Arc::new(TranslationCache::default()),
         }
     }
 
     fn kd_backend_with_framing(host: UnixStream) -> KdBackend {
         let breakin_clone = host.try_clone().unwrap();
         KdBackend {
-            framing: Some(KdFraming::new(host.into())),
+            link: Link::RunningInline(KdFraming::new(host.into())),
             breakin_clone: breakin_clone.into(),
             backend_name: "kd",
-            pump: None,
             register_map: context::build_register_map(),
             arch: Arch::Amd64,
             kernel_dtb_override: 0,
             processor_count: 1,
             current_processor: 0,
-            pending_stop: None,
             last_stop_processor: 0,
             last_exception_code: 0,
             last_rip: 0,
@@ -2822,9 +3338,11 @@ mod tests {
             breakin_addresses: HashSet::new(),
             pending_write_breakpoint: None,
             special_register_cache: HashMap::new(),
-            is_running: true,
+            special_registers_unsupported: false,
+            efer_cache: HashMap::new(),
             exit_prepared: false,
             debug_log: DebugLog::new(DEBUG_LOG_CAPACITY),
+            translations: Arc::new(TranslationCache::default()),
         }
     }
 
@@ -2873,11 +3391,12 @@ mod tests {
     fn kd_memory_reads_physical_bytes_through_shared_backend() {
         let (mut kernel, host) = UnixStream::pair().unwrap();
         let mut backend = kd_backend_with_framing(host);
-        backend.is_running = false;
+        backend.link.set_inline_running(false);
         backend.exit_prepared = true;
         let inner = Arc::new(Mutex::new(backend));
         let memory = KdMemory {
             inner: Arc::clone(&inner),
+            translations: Arc::new(TranslationCache::default()),
         };
         let expected = [0xde, 0xad, 0xbe, 0xef];
 
@@ -2923,9 +3442,434 @@ mod tests {
         backend.exit_prepared = true;
         let memory = KdMemory {
             inner: Arc::new(Mutex::new(backend)),
+            translations: Arc::new(TranslationCache::default()),
         };
         let error = memory.read_bytes(0x1000, &mut [0u8; 8]).unwrap_err();
         assert!(error.to_string().contains("requires a halted target"));
+    }
+
+    /// A halted fake kernel serving `DbgKdReadVirtualMemory` from a map of
+    /// kernel-space regions until the host hangs up; returns the request
+    /// count so tests can assert how many round trips a guest walk costs.
+    fn serve_virtual_memory(
+        mut kernel: UnixStream,
+        regions: Vec<(u64, Vec<u8>)>,
+    ) -> std::thread::JoinHandle<usize> {
+        const UNION: usize = 16;
+        std::thread::spawn(move || {
+            let mut kernel_id = WIRE_FIRST_PACKET_ID;
+            let mut served = 0usize;
+            loop {
+                let mut header = [0u8; WIRE_HEADER_SIZE];
+                if kernel.read_exact(&mut header).is_err() {
+                    return served;
+                }
+                if u32::from_le_bytes(header[0..4].try_into().unwrap()) != WIRE_DATA_LEADER {
+                    continue; // host ACK of our last reply
+                }
+                let len = u16::from_le_bytes(header[6..8].try_into().unwrap()) as usize;
+                let mut request = vec![0u8; len + 1];
+                kernel.read_exact(&mut request).unwrap();
+                let host_id = u32::from_le_bytes(header[8..12].try_into().unwrap());
+                kernel
+                    .write_all(&wire_control_packet(PACKET_TYPE_KD_ACKNOWLEDGE, host_id))
+                    .unwrap();
+
+                let api_number = u32::from_le_bytes(request[0..4].try_into().unwrap());
+                assert_eq!(api_number, api::DBGKD_READ_VIRTUAL_MEMORY);
+                let addr = u64::from_le_bytes(request[UNION..UNION + 8].try_into().unwrap());
+                let wanted =
+                    u32::from_le_bytes(request[UNION + 8..UNION + 12].try_into().unwrap()) as usize;
+                served += 1;
+
+                let mut reply = vec![0u8; api::MANIPULATE_HEADER_SIZE];
+                reply[0..4].copy_from_slice(&api_number.to_le_bytes());
+                reply[UNION..UNION + 8].copy_from_slice(&addr.to_le_bytes());
+                reply[UNION + 8..UNION + 12].copy_from_slice(&(wanted as u32).to_le_bytes());
+                match regions.iter().find_map(|(base, bytes)| {
+                    let start = addr.checked_sub(*base)? as usize;
+                    bytes.get(start..start + wanted)
+                }) {
+                    Some(data) => {
+                        reply[UNION + 12..UNION + 16]
+                            .copy_from_slice(&(data.len() as u32).to_le_bytes());
+                        reply.extend_from_slice(data);
+                    }
+                    None => reply[8..12].copy_from_slice(&0xC000_0005u32.to_le_bytes()),
+                }
+                kernel
+                    .write_all(&wire_data_packet(
+                        PACKET_TYPE_KD_STATE_MANIPULATE,
+                        kernel_id,
+                        &reply,
+                    ))
+                    .unwrap();
+                kernel_id ^= 1;
+            }
+        })
+    }
+
+    /// A halted fake kernel answering manipulate requests from an ordered
+    /// `(api, status, data)` script, asserting each request's API number.
+    fn serve_manipulate(
+        mut kernel: UnixStream,
+        script: Vec<(u32, u32, Vec<u8>)>,
+    ) -> std::thread::JoinHandle<()> {
+        const UNION: usize = 16;
+        std::thread::spawn(move || {
+            let mut kernel_id = WIRE_FIRST_PACKET_ID;
+            let mut script = script.into_iter();
+            loop {
+                let mut header = [0u8; WIRE_HEADER_SIZE];
+                if kernel.read_exact(&mut header).is_err() {
+                    assert!(script.next().is_none(), "missing manipulate request");
+                    return;
+                }
+                if u32::from_le_bytes(header[0..4].try_into().unwrap()) != WIRE_DATA_LEADER {
+                    continue; // host ACK of our last reply
+                }
+                let len = u16::from_le_bytes(header[6..8].try_into().unwrap()) as usize;
+                let mut request = vec![0u8; len + 1];
+                kernel.read_exact(&mut request).unwrap();
+                let host_id = u32::from_le_bytes(header[8..12].try_into().unwrap());
+                kernel
+                    .write_all(&wire_control_packet(PACKET_TYPE_KD_ACKNOWLEDGE, host_id))
+                    .unwrap();
+
+                let (api_number, status, data) =
+                    script.next().expect("unexpected manipulate request");
+                assert_eq!(
+                    u32::from_le_bytes(request[0..4].try_into().unwrap()),
+                    api_number
+                );
+                let mut reply = vec![0u8; api::MANIPULATE_HEADER_SIZE];
+                reply[0..4].copy_from_slice(&api_number.to_le_bytes());
+                reply[8..12].copy_from_slice(&status.to_le_bytes());
+                reply[UNION + 12..UNION + 16].copy_from_slice(&(data.len() as u32).to_le_bytes());
+                reply.extend_from_slice(&data);
+                kernel
+                    .write_all(&wire_data_packet(
+                        PACKET_TYPE_KD_STATE_MANIPULATE,
+                        kernel_id,
+                        &reply,
+                    ))
+                    .unwrap();
+                kernel_id ^= 1;
+            }
+        })
+    }
+
+    #[test]
+    fn arm64_registers_survive_refused_control_space() {
+        let (kernel, host) = UnixStream::pair().unwrap();
+        let mut backend = kd_backend_with_framing(host);
+        backend.arch = Arch::Arm64;
+        backend.register_map = context_arm64::build_register_map();
+        backend.link.set_inline_running(false);
+        backend.exit_prepared = true;
+
+        let mut ctx = vec![0u8; context_arm64::CONTEXT_SIZE];
+        wire::write_u64(&mut ctx, context_arm64::OFFSET_PC, 0xffff_f800_1234_5678);
+        wire::write_u64(&mut ctx, context_arm64::OFFSET_BVR0, 0xffff_f800_dead_0000);
+        wire::write_u32(&mut ctx, context_arm64::OFFSET_BCR0, 0x1e5);
+        let expected = ctx.clone();
+
+        let worker = serve_manipulate(
+            kernel,
+            vec![
+                (api::DBGKD_GET_CONTEXT, api::STATUS_SUCCESS, ctx),
+                (
+                    api::DBGKD_READ_MACHINE_SPECIFIC_REGISTER,
+                    0xc000_0001,
+                    Vec::new(),
+                ),
+                (api::DBGKD_READ_CONTROL_SPACE, 0xc000_0001, Vec::new()),
+                (
+                    api::DBGKD_GET_CONTEXT,
+                    api::STATUS_SUCCESS,
+                    expected.clone(),
+                ),
+                (
+                    api::DBGKD_READ_MACHINE_SPECIFIC_REGISTER,
+                    0xc000_0001,
+                    Vec::new(),
+                ),
+            ],
+        );
+
+        let regs = backend.read_registers().unwrap();
+
+        assert_eq!(&regs[..context_arm64::CONTEXT_SIZE], &expected[..]);
+        assert_eq!(
+            backend.register_map.read_u64("bvr0", &regs).unwrap(),
+            0xffff_f800_dead_0000
+        );
+        // A second read must not retry the refused control-space request.
+        assert_eq!(backend.read_registers().unwrap(), regs);
+        drop(backend);
+        worker.join().unwrap();
+    }
+
+    const FAKE_KERNEL_DTB: u64 = 0x1ad000;
+    const FAKE_KERNEL_BASE: u64 = 0xffff_f800_0000_0000;
+    const FAKE_GUID: u128 = 0x51;
+
+    fn field(offset: u32, size: u64, type_data: ParsedType) -> FieldInfo {
+        FieldInfo {
+            offset,
+            size,
+            type_data,
+        }
+    }
+
+    fn primitive(offset: u32, size: u64) -> FieldInfo {
+        field(offset, size, ParsedType::Primitive("u".into()))
+    }
+
+    fn layout(name: &str, size: usize, fields: &[(&str, FieldInfo)]) -> TypeInfo {
+        TypeInfo {
+            name: name.to_string(),
+            size,
+            fields: fields
+                .iter()
+                .map(|(name, info)| (name.to_string(), info.clone()))
+                .collect(),
+        }
+    }
+
+    /// Build a halted KD-backed guest over `regions` with `types` and
+    /// `symbols` standing in for the kernel PDB. The backend is returned so a
+    /// test can resume it; the join handle yields the request count.
+    fn synthetic_guest(
+        regions: Vec<(u64, Vec<u8>)>,
+        types: Vec<TypeInfo>,
+        symbols: &[(&str, u32)],
+    ) -> (Guest, Arc<Mutex<KdBackend>>, std::thread::JoinHandle<usize>) {
+        let (kernel, host) = UnixStream::pair().unwrap();
+        let mut backend = kd_backend_with_framing(host);
+        backend.link.set_inline_running(false);
+        backend.exit_prepared = true;
+        backend.kernel_dtb_override = FAKE_KERNEL_DTB;
+        let translations = Arc::clone(&backend.translations);
+        let inner = Arc::new(Mutex::new(backend));
+        let phys = Arc::new(PhysMem::remote(KdMemory {
+            inner: Arc::clone(&inner),
+            translations,
+        }));
+        let store = Arc::new(SymbolStore::new());
+        store.inject_module_for_test(FAKE_GUID, types, symbols);
+        let mut ntoskrnl = WinObject::new_with_arch(
+            phys,
+            store,
+            FAKE_KERNEL_DTB,
+            VirtAddr(FAKE_KERNEL_BASE),
+            Arch::Amd64,
+        );
+        ntoskrnl.guid = Some(FAKE_GUID);
+        let worker = serve_virtual_memory(kernel, regions);
+        (Guest::from_kernel(ntoskrnl), inner, worker)
+    }
+
+    fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn resume_and_halt(backend: &Arc<Mutex<KdBackend>>) {
+        let mut backend = backend.lock().unwrap();
+        backend.record_running();
+        backend.link.set_inline_running(false);
+    }
+
+    #[test]
+    fn process_walk_reads_one_span_per_process_and_memoizes_per_halt() {
+        const PID: u32 = 0x440;
+        const LINKS: u32 = 0x448;
+        const NAME: u32 = 0x5a8;
+        const DTB: u32 = 0x28;
+        let eprocess = layout(
+            "_EPROCESS",
+            0x600,
+            &[
+                (
+                    "Pcb",
+                    field(0, 0x438, ParsedType::Struct("_KPROCESS".into())),
+                ),
+                ("UniqueProcessId", primitive(PID, 8)),
+                ("ActiveProcessLinks", primitive(LINKS, 16)),
+                ("ImageFileName", primitive(NAME, 15)),
+            ],
+        );
+        let kprocess = layout(
+            "_KPROCESS",
+            0x438,
+            &[("DirectoryTableBase", primitive(DTB, 8))],
+        );
+
+        let head = FAKE_KERNEL_BASE + 0x1008;
+        let system = 0xffff_e000_0001_0000u64;
+        let smss = 0xffff_e000_0002_0000u64;
+        let mut nt = vec![0u8; 0x2000];
+        put_u64(&mut nt, 0x1000, system);
+        put_u64(&mut nt, 0x1008, system + LINKS as u64);
+        let process = |pid: u64, dtb: u64, name: &[u8], next: u64| {
+            let mut bytes = vec![0u8; 0x600];
+            put_u64(&mut bytes, PID as usize, pid);
+            put_u64(&mut bytes, DTB as usize, dtb);
+            put_u64(&mut bytes, LINKS as usize, next + LINKS as u64);
+            bytes[NAME as usize..NAME as usize + name.len()].copy_from_slice(name);
+            bytes
+        };
+        let regions = vec![
+            (FAKE_KERNEL_BASE, nt),
+            (system, process(4, 0x1ad000, b"System", smss)),
+            (
+                smss,
+                process(0x1d8, 0x2be000, b"smss.exe", head - LINKS as u64),
+            ),
+        ];
+        let (guest, backend, worker) = synthetic_guest(
+            regions,
+            vec![eprocess, kprocess],
+            &[
+                ("PsInitialSystemProcess", 0x1000),
+                ("PsActiveProcessHead", 0x1008),
+            ],
+        );
+
+        let first = guest.enumerate_processes().unwrap();
+        let names: Vec<_> = first.iter().map(|p| (p.name.as_str(), p.pid)).collect();
+        assert_eq!(names, [("System", 4), ("smss.exe", 0x1d8)]);
+        assert_eq!(first[1].dtb, 0x2be000);
+
+        let second = guest.enumerate_processes().unwrap();
+        assert_eq!(second.len(), 2);
+        let one = guest.process_at(VirtAddr(smss)).unwrap();
+        assert_eq!(
+            (one.name.as_str(), one.pid, one.dtb),
+            ("smss.exe", 0x1d8, 0x2be000)
+        );
+
+        resume_and_halt(&backend);
+        assert_eq!(guest.enumerate_processes().unwrap().len(), 2);
+
+        drop(guest);
+        drop(backend);
+        assert_eq!(worker.join().unwrap(), 3 + 1 + 3);
+    }
+
+    #[test]
+    fn user_space_of_the_current_process_is_read_in_one_request() {
+        const USER_VA: u64 = 0x7ff6_1234_5000;
+        const CURRENT_CR3: u64 = 0x2be000;
+        let regions = vec![(USER_VA, b"PEB!".to_vec())];
+        let (guest, backend, worker) = synthetic_guest(regions, Vec::new(), &[]);
+        {
+            let mut backend = backend.lock().unwrap();
+            let mut special = vec![0u8; KSPECIAL_REGISTERS_MIN_SIZE];
+            // PCID bits in CR3 do not distinguish roots.
+            put_u64(
+                &mut special,
+                KSPECIAL_REGISTERS_CR3_OFFSET,
+                CURRENT_CR3 | 0x1,
+            );
+            let processor = backend.current_processor;
+            backend.special_register_cache.insert(processor, special);
+
+            let mut out = [0u8; 4];
+            // Another process's user space still needs the host walk.
+            assert!(
+                backend
+                    .read_virtual_direct(VirtAddr(USER_VA), 0x3cf000, &mut out)
+                    .is_none()
+            );
+            backend
+                .read_virtual_direct(VirtAddr(USER_VA), CURRENT_CR3, &mut out)
+                .unwrap()
+                .unwrap();
+            assert_eq!(&out, b"PEB!");
+        }
+        drop(guest);
+        drop(backend);
+        assert_eq!(worker.join().unwrap(), 1);
+    }
+
+    #[test]
+    fn kernel_module_walk_prefetches_each_record() {
+        const DLL_BASE: u32 = 0x30;
+        const SIZE: u32 = 0x40;
+        const NAME: u32 = 0x58;
+        const TIME_DATE_STAMP: u32 = 0x9c;
+        const CHECK_SUM: u32 = 0x100;
+        let entry = layout(
+            "_KLDR_DATA_TABLE_ENTRY",
+            0x120,
+            &[
+                ("InLoadOrderLinks", primitive(0, 16)),
+                ("DllBase", primitive(DLL_BASE, 8)),
+                ("SizeOfImage", primitive(SIZE, 4)),
+                (
+                    "BaseDllName",
+                    field(NAME, 16, ParsedType::Struct("_UNICODE_STRING".into())),
+                ),
+                ("TimeDateStamp", primitive(TIME_DATE_STAMP, 4)),
+                ("CheckSum", primitive(CHECK_SUM, 4)),
+            ],
+        );
+        let unicode = layout(
+            "_UNICODE_STRING",
+            16,
+            &[("Length", primitive(0, 2)), ("Buffer", primitive(8, 8))],
+        );
+
+        let head = FAKE_KERNEL_BASE + 0x2000;
+        let names = 0xffff_e000_0009_0000u64;
+        let entries = 0xffff_e000_000a_0000u64;
+        let mut nt = vec![0u8; 0x3000];
+        put_u64(&mut nt, 0x2000, entries);
+        let name_bytes: Vec<u8> = "ntoskrnl.exe\0\0\0\0hal.dll"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let mut records = vec![0u8; 0x240];
+        let mut record = |at: usize, next: u64, base: u64, name_off: u64, name_len: u16| {
+            put_u64(&mut records, at, next);
+            put_u64(&mut records, at + DLL_BASE as usize, base);
+            records[at + SIZE as usize..at + SIZE as usize + 4]
+                .copy_from_slice(&0x1000u32.to_le_bytes());
+            records[at + NAME as usize..at + NAME as usize + 2]
+                .copy_from_slice(&name_len.to_le_bytes());
+            put_u64(&mut records, at + NAME as usize + 8, names + name_off);
+        };
+        record(0, entries + 0x120, FAKE_KERNEL_BASE, 0, 24);
+        record(0x120, head, 0xffff_f800_1000_0000, 32, 14);
+        let regions = vec![
+            (FAKE_KERNEL_BASE, nt),
+            (names, name_bytes),
+            (entries, records),
+        ];
+        let (guest, backend, worker) = synthetic_guest(
+            regions,
+            vec![entry, unicode],
+            &[("PsLoadedModuleList", 0x2000)],
+        );
+
+        let modules = guest.kernel_modules().unwrap();
+        let seen: Vec<_> = modules
+            .iter()
+            .map(|m| (m.name.as_str(), m.base_address.0))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("ntoskrnl.exe", FAKE_KERNEL_BASE),
+                ("hal.dll", 0xffff_f800_1000_0000)
+            ]
+        );
+        assert_eq!(guest.kernel_modules().unwrap().len(), 2);
+
+        drop(guest);
+        drop(backend);
+        assert_eq!(worker.join().unwrap(), 1 + 2 * 2);
     }
 
     fn read_special_registers_reply_payload(processor: u16) -> Vec<u8> {
@@ -2953,6 +3897,7 @@ mod tests {
             stop_rx: mpsc::channel().1,
             shutdown: Arc::new(AtomicBool::new(false)),
             reported_stop: Arc::new(AtomicBool::new(false)),
+            breakin_requested: Arc::new(AtomicBool::new(false)),
         };
         let mut backend = kd_backend_with_pump(pump, breakin_clone);
         let pc = 0xfffff800_deadbeef;
@@ -2984,11 +3929,16 @@ mod tests {
 
     #[test]
     fn continue_drains_in_place_rebreak_and_stale_breakin() {
-        let (_kernel, host) = UnixStream::pair().unwrap();
-        let mut backend = kd_backend_with_framing(host);
         let resumed_from = 0xffff_f800_0013_40c4;
         let breakin = 0xffff_f800_002f_90d0;
-        backend.breakin_addresses.insert(breakin);
+        let drain = |managed: &[u64]| {
+            ContinueDrain::new(
+                resumed_from,
+                managed.iter().copied().collect(),
+                HashSet::from([breakin]),
+                context::build_register_map(),
+            )
+        };
 
         let stop_at = |code: u32, pc: u64| StateChange {
             processor: 0,
@@ -3005,38 +3955,24 @@ mod tests {
             assisted_breakin: false,
         };
 
-        // Raw int3 re-break at the rip we resumed from: drain it.
-        assert!(
-            backend.is_spurious_continue_rebreak(
-                &stop_at(STATUS_BREAKPOINT, resumed_from),
-                resumed_from
-            )
-        );
-        // Stale break-in byte trapping at the KD break-in instruction: drain it,
-        // even though it's nowhere near resumed_from.
-        assert!(
-            backend
-                .is_spurious_continue_rebreak(&stop_at(STATUS_BREAKPOINT, breakin), resumed_from)
-        );
+        assert!(drain(&[]).is_spurious(&stop_at(STATUS_BREAKPOINT, resumed_from)));
+        assert!(drain(&[]).is_spurious(&stop_at(STATUS_BREAKPOINT, breakin)));
 
-        // A managed breakpoint hit is a real stop, never drained.
-        backend.managed_bp_addresses.insert(breakin);
-        assert!(
-            !backend
-                .is_spurious_continue_rebreak(&stop_at(STATUS_BREAKPOINT, breakin), resumed_from)
-        );
+        assert!(!drain(&[breakin]).is_spurious(&stop_at(STATUS_BREAKPOINT, breakin)));
 
-        // An unrelated breakpoint elsewhere, and a single-step, are real stops.
-        assert!(
-            !backend.is_spurious_continue_rebreak(
-                &stop_at(STATUS_BREAKPOINT, 0xdead_0000),
-                resumed_from
-            )
-        );
-        assert!(!backend.is_spurious_continue_rebreak(
-            &stop_at(STATUS_SINGLE_STEP, resumed_from),
-            resumed_from
-        ));
+        assert!(!drain(&[]).is_spurious(&stop_at(STATUS_BREAKPOINT, 0xdead_0000)));
+        assert!(!drain(&[]).is_spurious(&stop_at(STATUS_SINGLE_STEP, resumed_from)));
+
+        let mut assisted = stop_at(STATUS_BREAKPOINT, breakin);
+        assisted.assisted_breakin = true;
+        assert!(!drain(&[]).is_spurious(&assisted));
+        let mut reloaded = stop_at(STATUS_BREAKPOINT, resumed_from);
+        reloaded.target_reloaded = true;
+        assert!(!drain(&[]).is_spurious(&reloaded));
+
+        let interrupted = drain(&[]);
+        interrupted.interrupt_flag().store(true, Ordering::SeqCst);
+        assert!(!interrupted.is_spurious(&stop_at(STATUS_BREAKPOINT, resumed_from)));
     }
 
     #[test]
@@ -3121,11 +4057,14 @@ mod tests {
                 run_pump(
                     framing,
                     Arch::Amd64,
-                    tx,
-                    shutdown,
-                    Arc::new(AtomicBool::new(false)),
+                    PumpLink {
+                        stop_tx: tx,
+                        shutdown,
+                        reported_stop: Arc::new(AtomicBool::new(false)),
+                    },
                     None,
                     DebugLog::new(DEBUG_LOG_CAPACITY),
+                    None,
                 )
             })
         };
@@ -3146,7 +4085,6 @@ mod tests {
         assert_eq!(stop.program_counter, pc);
         assert_eq!(stop.exception_code, STATUS_BREAKPOINT);
 
-        // Pump exits on its own after reporting the stop, handing back framing
         shutdown.store(true, Ordering::SeqCst);
         let _framing = handle.join().expect("pump thread panicked");
     }
@@ -3164,11 +4102,14 @@ mod tests {
                 run_pump(
                     framing,
                     Arch::Amd64,
-                    tx,
-                    shutdown,
-                    Arc::new(AtomicBool::new(false)),
+                    PumpLink {
+                        stop_tx: tx,
+                        shutdown,
+                        reported_stop: Arc::new(AtomicBool::new(false)),
+                    },
                     None,
                     DebugLog::new(DEBUG_LOG_CAPACITY),
+                    None,
                 )
             })
         };
@@ -3177,6 +4118,7 @@ mod tests {
             stop_rx: rx,
             shutdown,
             reported_stop: Arc::new(AtomicBool::new(false)),
+            breakin_requested: Arc::new(AtomicBool::new(false)),
         };
         let mut backend = kd_backend_with_pump(pump, breakin_clone);
         let (continue_tx, continue_rx) = mpsc::channel();
@@ -3185,9 +4127,6 @@ mod tests {
         let kernel_thread = std::thread::spawn(move || {
             let pc = 0xfffff800_deadbeef;
             let mut payload = exception_state_change_payload(pc);
-            // A plain access violation: exercises the consume-then-continue path
-            // without tripping the stray-single-step or int3-advance absorbs,
-            // which would issue register reads this mock kernel doesn't service.
             payload[32..36].copy_from_slice(&0xc000_0005u32.to_le_bytes());
             kernel
                 .write_all(&wire_data_packet(
@@ -3258,10 +4197,8 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("kernel thread did not capture continue packet");
 
-        assert!(backend.is_running);
-        assert!(backend.pump.is_none());
+        assert!(matches!(backend.link, Link::RunningInline(_)));
         assert!(backend.exit_prepared);
-        assert!(backend.framing.is_some());
         assert_eq!(
             u32::from_le_bytes(continue_packet[0..4].try_into().unwrap()),
             WIRE_DATA_LEADER
@@ -3285,16 +4222,29 @@ mod tests {
     fn explicit_halted_exit_suppresses_drop_resume() {
         let (host, _kernel) = UnixStream::pair().unwrap();
         let mut backend = kd_backend_with_framing(host);
-        backend.is_running = false;
+        backend.link.set_inline_running(false);
 
         backend.prepare_for_exit(false).unwrap();
         let needs_drop_cleanup = backend.needs_drop_cleanup();
-        // Keep unwinding safe if the assertion ever regresses: a running
-        // framing-only fixture never enters Drop's resume path.
-        backend.is_running = true;
+        backend.link.set_inline_running(true);
 
         assert!(backend.exit_prepared);
         assert!(!needs_drop_cleanup);
+    }
+
+    #[test]
+    fn pump_shutdown_without_a_pump_keeps_the_framing() {
+        let (_kernel, host) = UnixStream::pair().unwrap();
+        let mut backend = kd_backend_with_framing(host);
+        backend.link.set_inline_running(false);
+
+        assert!(backend.shutdown_pump_with_stop().unwrap().is_none());
+        assert!(matches!(backend.link, Link::Halted(_)));
+        backend.reclaim_framing();
+        assert!(matches!(backend.link, Link::Halted(_)));
+        assert!(backend.framing().is_ok());
+
+        backend.link.set_inline_running(true);
     }
 
     #[test]
@@ -3314,25 +4264,21 @@ mod tests {
             assisted_breakin: false,
         };
 
-        // Stray single-step away from any installed int3: absorb it.
         assert!(exit_stop_is_stray_single_step(
             &stop_at(Some(STATUS_SINGLE_STEP), Some(pc), false),
             &managed,
         ));
-        // Unknown PC still counts as stray (can't prove it's at a breakpoint).
         assert!(exit_stop_is_stray_single_step(
             &stop_at(Some(STATUS_SINGLE_STEP), None, false),
             &managed,
         ));
 
-        // A single-step landing on one of our breakpoints is a real hit, not stray.
         managed.insert(pc);
         assert!(!exit_stop_is_stray_single_step(
             &stop_at(Some(STATUS_SINGLE_STEP), Some(pc), false),
             &managed,
         ));
 
-        // A breakpoint stop or a bugcheck is never a stray single-step.
         assert!(!exit_stop_is_stray_single_step(
             &stop_at(Some(STATUS_BREAKPOINT), Some(0x1000), false),
             &managed,
@@ -3341,62 +4287,6 @@ mod tests {
             &stop_at(Some(STATUS_SINGLE_STEP), Some(0x1000), true),
             &managed,
         ));
-    }
-
-    #[test]
-    fn exit_continue_clears_stale_pending_stop() {
-        // Repro for the exit hang: the host's `cont()` resumed past the KD
-        // break-in instruction and stashed the immediate re-break as
-        // pending_stop, which it never drained. The exit continue must clear it;
-        // otherwise the loop re-surfaces the stale stop and issues GetContext
-        // while the target is already running.
-        let (mut kernel, host) = UnixStream::pair().unwrap();
-        kernel
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        let mut backend = kd_backend_with_framing(host);
-        backend
-            .special_register_cache
-            .insert(0, vec![0; KSPECIAL_REGISTERS_MIN_SIZE]);
-
-        backend.pending_stop = Some(StateChange {
-            processor: 0,
-            number_processors: 1,
-            new_state: 0x3030,
-            exception_code: STATUS_BREAKPOINT,
-            exception_first_chance: Some(true),
-            exception_address: Some(0xfffff800_002f90d0),
-            program_counter: 0xfffff800_002f90d0,
-            kernel_base_hint: None,
-            is_bugcheck: false,
-            bugcheck: None,
-            target_reloaded: false,
-            assisted_breakin: false,
-        });
-        // A single-step last stop avoids GetContext before the exit continue,
-        // so this mock only needs to acknowledge the continue request.
-        backend.last_exception_code = STATUS_SINGLE_STEP;
-        backend.last_stop_was_managed_breakpoint = false;
-
-        let kernel_thread = std::thread::spawn(move || {
-            let _continue_req = read_wire_packet(&mut kernel);
-            kernel
-                .write_all(&wire_control_packet(
-                    PACKET_TYPE_KD_ACKNOWLEDGE,
-                    WIRE_FIRST_PACKET_ID,
-                ))
-                .unwrap();
-            kernel.flush().unwrap();
-        });
-
-        backend.continue_stopped_for_exit().unwrap();
-        kernel_thread.join().expect("kernel thread panicked");
-
-        assert!(
-            backend.pending_stop.is_none(),
-            "exit-continue must clear the stale pending_stop"
-        );
-        assert!(backend.is_running);
     }
 
     #[test]
@@ -3414,11 +4304,14 @@ mod tests {
                 run_pump(
                     framing,
                     Arch::Amd64,
-                    tx,
-                    shutdown,
-                    reported_stop,
+                    PumpLink {
+                        stop_tx: tx,
+                        shutdown,
+                        reported_stop,
+                    },
                     None,
                     DebugLog::new(DEBUG_LOG_CAPACITY),
+                    None,
                 )
             })
         };
@@ -3427,15 +4320,13 @@ mod tests {
             stop_rx: rx,
             shutdown,
             reported_stop,
+            breakin_requested: Arc::new(AtomicBool::new(false)),
         };
         let mut backend = kd_backend_with_pump(pump, breakin_clone);
 
-        // Running, with the pump servicing the socket: nothing caught yet.
         assert!(backend.is_running());
         assert!(!backend.has_pending_stop());
 
-        // Kernel emits a state-change; the pump catches it, flags reported_stop,
-        // and exits with the stop sitting undrained in its channel.
         let pc = 0xfffff800_deadbeef;
         let mut payload = exception_state_change_payload(pc);
         payload[32..36].copy_from_slice(&STATUS_BREAKPOINT.to_le_bytes());
@@ -3457,19 +4348,128 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
 
-        // The undrained-stop window: is_running() is still its stale post-continue
-        // true, but has_pending_stop() reports the truth: the VM is halted.
         assert!(backend.is_running());
         assert!(backend.has_pending_stop());
 
-        // Draining the stop reclaims the framing and clears the condition.
         let stop = backend
             .take_pump_stop(Some(Duration::from_secs(5)))
             .unwrap()
             .expect("pump reported no stop");
         assert_eq!(stop.program_counter, pc);
-        assert!(backend.pump.is_none());
+        assert!(matches!(backend.link, Link::RunningInline(_)));
         assert!(!backend.has_pending_stop());
+        backend.record_stop(&stop);
+        assert!(matches!(backend.link, Link::Halted(_)));
+        backend.exit_prepared = true;
+    }
+
+    #[test]
+    fn pump_absorbs_rebreak_after_continue_and_reports_real_stop() {
+        let (mut kernel, host) = UnixStream::pair().unwrap();
+        kernel
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let framing = KdFraming::new(host.into());
+        let resumed_from = 0xfffff800_deadbeef;
+        let real_stop = 0xfffff800_cafe0000;
+        let drain = ContinueDrain::new(
+            resumed_from,
+            HashSet::new(),
+            HashSet::new(),
+            context::build_register_map(),
+        );
+        let (tx, rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let shutdown = Arc::clone(&shutdown);
+            std::thread::spawn(move || {
+                run_pump(
+                    framing,
+                    Arch::Amd64,
+                    PumpLink {
+                        stop_tx: tx,
+                        shutdown,
+                        reported_stop: Arc::new(AtomicBool::new(false)),
+                    },
+                    None,
+                    DebugLog::new(DEBUG_LOG_CAPACITY),
+                    Some(drain),
+                )
+            })
+        };
+
+        let mut kernel_id = WIRE_FIRST_PACKET_ID;
+        let mut send = |kernel: &mut UnixStream, packet_type: u16, payload: &[u8]| {
+            kernel
+                .write_all(&wire_data_packet(packet_type, kernel_id, payload))
+                .unwrap();
+            kernel.flush().unwrap();
+            kernel_id ^= 1;
+        };
+
+        send(
+            &mut kernel,
+            PACKET_TYPE_KD_STATE_CHANGE64,
+            &exception_state_change_payload(resumed_from),
+        );
+
+        let mut context_written = 0usize;
+        loop {
+            let packet = read_wire_packet(&mut kernel);
+            if u32::from_le_bytes(packet[0..4].try_into().unwrap()) == WIRE_CONTROL_LEADER {
+                continue;
+            }
+            let host_id = u32::from_le_bytes(packet[8..12].try_into().unwrap());
+            let request = &packet[WIRE_HEADER_SIZE..packet.len() - 1];
+            let api_number = u32::from_le_bytes(request[0..4].try_into().unwrap());
+            kernel
+                .write_all(&wire_control_packet(PACKET_TYPE_KD_ACKNOWLEDGE, host_id))
+                .unwrap();
+            let reply = match api_number {
+                api::DBGKD_GET_CONTEXT => {
+                    let mut context = vec![0u8; context::CONTEXT_SIZE];
+                    context[context::OFFSET_RIP..context::OFFSET_RIP + 8]
+                        .copy_from_slice(&resumed_from.to_le_bytes());
+                    let mut reply = manipulate_reply_payload(api_number, 0, &[]);
+                    reply.extend_from_slice(&context);
+                    reply
+                }
+                api::DBGKD_SET_CONTEXT_EX => {
+                    let chunk = &request[api::MANIPULATE_HEADER_SIZE..];
+                    context_written += chunk.len();
+                    let mut union = [0u8; 12];
+                    union[8..12].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
+                    manipulate_reply_payload(api_number, 0, &union)
+                }
+                api::DBGKD_READ_CONTROL_SPACE => read_special_registers_reply_payload(0),
+                api::DBGKD_CONTINUE_API2 => break,
+                other => panic!("unexpected request {other:#x} while absorbing a re-break"),
+            };
+            send(&mut kernel, PACKET_TYPE_KD_STATE_MANIPULATE, &reply);
+        }
+        assert_eq!(
+            context_written,
+            context::CONTEXT_SIZE,
+            "the pump must write back the whole advanced context"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "an absorbed re-break must not be reported"
+        );
+
+        send(
+            &mut kernel,
+            PACKET_TYPE_KD_STATE_CHANGE64,
+            &exception_state_change_payload(real_stop),
+        );
+        let stop = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("pump reported no stop")
+            .expect("pump reported an error");
+        assert_eq!(stop.program_counter, real_stop);
+
+        shutdown.store(true, Ordering::SeqCst);
+        let _framing = handle.join().expect("pump thread panicked");
     }
 
     #[test]
@@ -3487,11 +4487,14 @@ mod tests {
                 run_pump(
                     framing,
                     Arch::Amd64,
-                    tx,
-                    shutdown,
-                    Arc::new(AtomicBool::new(false)),
+                    PumpLink {
+                        stop_tx: tx,
+                        shutdown,
+                        reported_stop: Arc::new(AtomicBool::new(false)),
+                    },
                     None,
                     DebugLog::new(DEBUG_LOG_CAPACITY),
+                    None,
                 )
             })
         };
@@ -3539,11 +4542,14 @@ mod tests {
                 run_pump(
                     framing,
                     Arch::Amd64,
-                    tx,
-                    shutdown,
-                    Arc::new(AtomicBool::new(false)),
+                    PumpLink {
+                        stop_tx: tx,
+                        shutdown,
+                        reported_stop: Arc::new(AtomicBool::new(false)),
+                    },
                     None,
                     DebugLog::new(DEBUG_LOG_CAPACITY),
+                    None,
                 )
             })
         };
@@ -3602,11 +4608,14 @@ mod tests {
                 run_pump(
                     framing,
                     Arch::Amd64,
-                    tx,
-                    shutdown,
-                    Arc::new(AtomicBool::new(false)),
+                    PumpLink {
+                        stop_tx: tx,
+                        shutdown,
+                        reported_stop: Arc::new(AtomicBool::new(false)),
+                    },
                     None,
                     DebugLog::new(DEBUG_LOG_CAPACITY),
+                    None,
                 )
             })
         };
@@ -3651,11 +4660,14 @@ mod tests {
                 run_pump(
                     framing,
                     Arch::Amd64,
-                    tx,
-                    shutdown,
-                    Arc::new(AtomicBool::new(false)),
+                    PumpLink {
+                        stop_tx: tx,
+                        shutdown,
+                        reported_stop: Arc::new(AtomicBool::new(false)),
+                    },
                     Some(Duration::ZERO),
                     DebugLog::new(DEBUG_LOG_CAPACITY),
+                    None,
                 )
             })
         };
@@ -3701,11 +4713,14 @@ mod tests {
                 run_pump(
                     framing,
                     Arch::Amd64,
-                    tx,
-                    shutdown,
-                    Arc::new(AtomicBool::new(false)),
+                    PumpLink {
+                        stop_tx: tx,
+                        shutdown,
+                        reported_stop: Arc::new(AtomicBool::new(false)),
+                    },
                     Some(Duration::from_secs(60)),
                     DebugLog::new(DEBUG_LOG_CAPACITY),
+                    None,
                 )
             })
         };
@@ -3823,158 +4838,87 @@ mod tests {
         assert_eq!(stop.program_counter, pc);
     }
 
-    #[test]
-    fn pump_does_not_breakin_immediately_on_bugcheck_refresh_print() {
+    /// Drive `await_state_change` in bugcheck-aware mode: the fake kernel sends
+    /// `prints` then an exception state-change, ACKing whatever comes back.
+    fn await_bugcheck_aware(prints: &[&[u8]], pc: u64) -> StateChange {
         let (mut kernel, host) = UnixStream::pair().unwrap();
         kernel
-            .set_read_timeout(Some(Duration::from_millis(5)))
+            .set_read_timeout(Some(Duration::from_millis(20)))
             .unwrap();
-        let framing = KdFraming::new(host.into());
-        let (tx, _rx) = mpsc::channel();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let handle = {
-            let shutdown = Arc::clone(&shutdown);
-            std::thread::spawn(move || {
-                run_pump(
-                    framing,
-                    Arch::Amd64,
-                    tx,
-                    shutdown,
-                    Arc::new(AtomicBool::new(false)),
-                    None,
-                    DebugLog::new(DEBUG_LOG_CAPACITY),
-                )
-            })
-        };
+        let handle = std::thread::spawn(move || {
+            let mut framing = KdFraming::new(host.into());
+            let mut bugcheck = false;
+            let mut capture = BugcheckCapture::default();
+            await_state_change(
+                &mut framing,
+                AwaitStateOptions {
+                    arch: Arch::Amd64,
+                    saw_kd_refresh: None,
+                    surface_all: false,
+                    bugcheck: Some(&mut bugcheck),
+                    bugcheck_capture: Some(&mut capture),
+                    deadline: None,
+                    debug_log: None,
+                },
+            )
+            .expect("await_state_change failed")
+        });
 
-        let refresh = debug_io_print_payload(KD_REFRESH_MESSAGE);
+        let mut packet_id = WIRE_FIRST_PACKET_ID;
+        let mut buf = [0u8; 128];
+        for text in prints {
+            kernel
+                .write_all(&wire_data_packet(
+                    PACKET_TYPE_KD_DEBUG_IO,
+                    packet_id,
+                    &debug_io_print_payload(text),
+                ))
+                .unwrap();
+            kernel.flush().unwrap();
+            let _ = kernel.read(&mut buf);
+            packet_id ^= 1;
+        }
         kernel
             .write_all(&wire_data_packet(
-                PACKET_TYPE_KD_DEBUG_IO,
-                WIRE_FIRST_PACKET_ID,
-                &refresh,
+                PACKET_TYPE_KD_STATE_CHANGE64,
+                packet_id,
+                &exception_state_change_payload(pc),
             ))
             .unwrap();
         kernel.flush().unwrap();
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut buf = [0u8; 64];
-        let mut outbound = Vec::new();
-        while Instant::now() < deadline && outbound.len() < WIRE_HEADER_SIZE {
-            match kernel.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => outbound.extend_from_slice(&buf[..n]),
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
-                Err(e) => panic!("failed to read pump output: {e}"),
-            }
-        }
-        assert!(
-            outbound.len() >= WIRE_HEADER_SIZE,
-            "pump should ACK the refresh print"
-        );
-
-        let mut saw_breakin = false;
-        let immediate_window = Instant::now() + Duration::from_millis(30);
-        while Instant::now() < immediate_window {
-            match kernel.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    outbound.extend_from_slice(&buf[..n]);
-                    if buf[..n].contains(&BREAKIN_BYTE) {
-                        saw_breakin = true;
-                        break;
-                    }
-                }
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                    break;
-                }
-                Err(e) => panic!("failed to read pump output: {e}"),
-            }
-        }
-        assert!(
-            !saw_breakin,
-            "bugcheck refresh should not interrupt the remaining debug text immediately"
-        );
-
-        shutdown.store(true, Ordering::SeqCst);
-        let _framing = handle.join().expect("pump thread panicked");
+        handle.join().expect("await thread panicked")
     }
 
     #[test]
-    fn pump_does_not_assist_non_e2_bugcheck_after_code_is_captured() {
-        let (mut kernel, host) = UnixStream::pair().unwrap();
-        kernel
-            .set_read_timeout(Some(Duration::from_millis(5)))
-            .unwrap();
-        let framing = KdFraming::new(host.into());
-        let (tx, _rx) = mpsc::channel();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let handle = {
-            let shutdown = Arc::clone(&shutdown);
-            std::thread::spawn(move || {
-                run_pump(
-                    framing,
-                    Arch::Amd64,
-                    tx,
-                    shutdown,
-                    Arc::new(AtomicBool::new(false)),
-                    None,
-                    DebugLog::new(DEBUG_LOG_CAPACITY),
-                )
-            })
-        };
+    fn refresh_print_alone_does_not_mark_the_next_stop_as_a_bugcheck() {
+        // The kernel prints the refresh at boot and whenever it re-probes the
+        // debugger; only the fatal-error print means a crash is in progress.
+        let stop = await_bugcheck_aware(&[KD_REFRESH_MESSAGE], 0xffff_f800_0000_1000);
+        assert!(!stop.is_bugcheck);
+        assert!(stop.bugcheck.is_none());
+    }
 
-        let refresh = debug_io_print_payload(KD_REFRESH_MESSAGE);
-        kernel
-            .write_all(&wire_data_packet(
-                PACKET_TYPE_KD_DEBUG_IO,
-                WIRE_FIRST_PACKET_ID,
-                &refresh,
-            ))
-            .unwrap();
-        let fatal = debug_io_print_payload(
-            b"\r\n*** Fatal System Error: 0x000000d1\r\n                       (0x1,0x2,0x0,0x4)\r\n",
+    #[test]
+    fn fatal_system_error_print_marks_the_next_stop_with_captured_bugcheck() {
+        let stop = await_bugcheck_aware(
+            &[
+                KD_REFRESH_MESSAGE,
+                b"\r\n*** Fatal System Error: 0x000000d1\r\n                       (0x1,0x2,0x0,0x4)\r\n",
+                b"Driver at fault: myfault.sys.\r\n",
+            ],
+            0xffff_f800_0000_1000,
         );
-        kernel
-            .write_all(&wire_data_packet(
-                PACKET_TYPE_KD_DEBUG_IO,
-                WIRE_FIRST_PACKET_ID ^ 1,
-                &fatal,
-            ))
-            .unwrap();
-        kernel.flush().unwrap();
-
-        let deadline = Instant::now() + Duration::from_millis(300);
-        let mut saw_breakin = false;
-        let mut buf = [0u8; 128];
-        while Instant::now() < deadline {
-            match kernel.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if buf[..n].contains(&BREAKIN_BYTE) {
-                        saw_breakin = true;
-                        break;
-                    }
-                }
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
-                Err(e) => panic!("failed to read pump output: {e}"),
-            }
-        }
-        assert!(
-            !saw_breakin,
-            "ordinary bugchecks should rely on the kernel-driven break once the code is known"
-        );
-
-        shutdown.store(true, Ordering::SeqCst);
-        let _framing = handle.join().expect("pump thread panicked");
+        assert!(stop.is_bugcheck);
+        let info = stop.bugcheck.expect("captured bugcheck");
+        assert_eq!(info.code, 0xd1);
+        assert_eq!(info.parameters, [1, 2, 0, 4]);
+        assert_eq!(info.driver.as_deref(), Some("myfault.sys"));
     }
 
     #[test]
     fn only_exception_state_changes_surface_as_breaks() {
-        // Exception breaks and unknown kinds are surfaced to the user
         assert!(!is_transparent_state_change(DBG_KD_EXCEPTION_STATE_CHANGE));
         assert!(!is_transparent_state_change(0xdead_beef));
-        // Symbol load/unload and command-string notifications are continued
         assert!(is_transparent_state_change(
             DBG_KD_LOAD_SYMBOLS_STATE_CHANGE
         ));
@@ -3985,7 +4929,6 @@ mod tests {
 
     #[test]
     fn pump_exits_on_shutdown_when_idle() {
-        // Hold the kernel end open so the host socket stays connected
         let (_kernel, host) = UnixStream::pair().unwrap();
         let framing = KdFraming::new(host.into());
         let (tx, rx) = mpsc::channel();
@@ -3996,16 +4939,18 @@ mod tests {
                 run_pump(
                     framing,
                     Arch::Amd64,
-                    tx,
-                    shutdown,
-                    Arc::new(AtomicBool::new(false)),
+                    PumpLink {
+                        stop_tx: tx,
+                        shutdown,
+                        reported_stop: Arc::new(AtomicBool::new(false)),
+                    },
                     None,
                     DebugLog::new(DEBUG_LOG_CAPACITY),
+                    None,
                 )
             })
         };
 
-        // No traffic: the pump should be parked on its read-timeout loop
         shutdown.store(true, Ordering::SeqCst);
         let _framing = handle.join().expect("pump thread panicked");
         assert!(rx.try_recv().is_err(), "idle pump should report no stop");

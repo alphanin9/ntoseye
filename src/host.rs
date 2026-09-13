@@ -128,26 +128,27 @@ mod platform {
         Ok(region)
     }
 
-    fn gpa_to_offset(hv: HvKind, gpa: PhysAddr) -> u64 {
-        match hv {
-            HvKind::Kvm => {
-                // QEMU: 2 GiB MMIO hole (0x8000_0000 – 0xFFFF_FFFF)
-                if gpa < 0x8000_0000 {
-                    gpa
-                } else {
-                    gpa - 0x8000_0000
-                }
-            }
-            HvKind::Vmware => {
-                // VMware: 3 GiB MMIO hole (0xC000_0000 – 0xFFFF_FFFF)
-                if gpa < 0xC000_0000 {
-                    gpa // low RAM: identity
-                } else if gpa >= 0x1_0000_0000 {
-                    gpa - 0x4000_0000 // high RAM: subtract 1 GiB hole
-                } else {
-                    gpa // inside the hole — no RAM
-                }
-            }
+    /// Offset of a guest-physical address into the VM's RAM mapping, or
+    /// `None` inside the 32-bit MMIO hole, which no RAM backs (mapping it
+    /// anywhere would alias real pages).
+    fn mmio_hole(hv: HvKind) -> (u64, u64) {
+        let start = match hv {
+            HvKind::Kvm => 0x8000_0000,
+            HvKind::Vmware => 0xC000_0000,
+        };
+        (start, 0x1_0000_0000)
+    }
+
+    fn gpa_to_offset(hv: HvKind, gpa: PhysAddr) -> Option<u64> {
+        // Low RAM is identity-mapped up to the hole; RAM above 4 GiB follows
+        // it in the mapping, so the hole's size is subtracted.
+        let (hole_start, hole_end) = mmio_hole(hv);
+        if gpa < hole_start {
+            Some(gpa)
+        } else if gpa < hole_end {
+            None
+        } else {
+            Some(gpa - (hole_end - hole_start))
         }
     }
 
@@ -193,11 +194,22 @@ mod platform {
         pub fn ram_size(&self) -> u64 {
             self.memory.length
         }
+
+        /// Guest-physical RAM as `(base, len)` runs: low RAM up to the
+        /// hypervisor's 32-bit MMIO hole, then the remainder from 4 GiB.
+        /// Inverse of [`gpa_to_offset`].
+        pub fn ram_runs(&self) -> Vec<(u64, u64)> {
+            let (hole_start, hole_end) = mmio_hole(self.hv);
+            let size = self.memory.length;
+            if size <= hole_start {
+                vec![(0, size)]
+            } else {
+                vec![(0, hole_start), (hole_end, size - hole_start)]
+            }
+        }
         fn host_address(&self, addr: PhysAddr, len: usize) -> Result<u64> {
-            let hva = self
-                .memory
-                .start
-                .checked_add(gpa_to_offset(self.hv, addr))
+            let hva = gpa_to_offset(self.hv, addr)
+                .and_then(|offset| self.memory.start.checked_add(offset))
                 .ok_or(Error::BadPhysicalAddress(addr))?;
             let end = hva
                 .checked_add(len as u64)
@@ -252,17 +264,9 @@ mod platform {
     }
 }
 
-/// macOS (UTM) host backend: introspect the QEMU process via Mach task ports.
-///
-/// UTM runs QEMU inside the sandboxed `com.utmapp.QEMUHelper` XPC service; the
-/// guest RAM is a plain anonymous mapping in the `qemu-aarch64-softmmu`
-/// process. We take the task port with `task_for_pid` and read/write guest
-/// physical memory with `mach_vm_read_overwrite` / `mach_vm_write`.
-///
-/// Access control: since macOS 10.14 `task_for_pid` requires the caller to run
-/// as root or carry the `com.apple.security.cs.debugger` entitlement. UTM's
-/// QEMU is a normal (sandboxed) third-party app — not SIP-protected — so
-/// running ntoseye with `sudo` is sufficient.
+/// macOS (UTM) host backend: guest RAM is an anonymous mapping in the QEMU
+/// process, read through its Mach task port (`task_for_pid` needs root or the
+/// `com.apple.security.cs.debugger` entitlement).
 #[cfg(target_os = "macos")]
 mod platform {
     use super::MemoryRegion;
@@ -475,6 +479,11 @@ mod platform {
 
         pub fn ram_size(&self) -> u64 {
             self.memory.length
+        }
+
+        /// Guest-physical RAM as one contiguous run from the `virt` RAM base.
+        pub fn ram_runs(&self) -> Vec<(u64, u64)> {
+            vec![(AARCH64_RAM_BASE, self.memory.length)]
         }
 
         fn gpa_offset(&self, gpa: PhysAddr) -> Result<u64> {

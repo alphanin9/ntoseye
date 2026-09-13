@@ -31,7 +31,7 @@ pub fn refresh_kernel_module_symbols_on_stop(debugger: &Target, caches: &ReplCac
 
 pub fn print_target_reload_report(report: &ReloadReport) {
     if let Some(startup) = &report.startup {
-        println!(
+        outln!(
             "{} kernel reloaded: {} -> {}, psmods {}",
             "target:".bright_black(),
             ui::addr(report.previous_base_address.0),
@@ -39,7 +39,7 @@ pub fn print_target_reload_report(report: &ReloadReport) {
             ui::addr_opt(startup.loaded_module_list)
         );
     } else {
-        println!(
+        outln!(
             "{} kernel reloaded: previous base {}",
             "target:".bright_black(),
             ui::addr(report.previous_base_address.0)
@@ -178,23 +178,11 @@ pub fn refresh_stop_caches_pre(
     modules_changed
 }
 
-/// Refresh the guest-state completion caches after a stop. Both the async and
-/// synchronous stop paths call this, so the set can't drift. Drivers are a
-/// near-static but expensive cache, so they re-enumerate only when the module set
-/// actually changed (`modules_changed`) rather than on every stop.
-pub fn refresh_stop_caches_post(
-    debugger: &Target,
-    caches: &ReplCaches,
-    target_reloaded: bool,
-    modules_changed: bool,
-) {
-    // on reload the rediscovery path already refreshed processes
-    if !target_reloaded && let Err(e) = caches.refresh_processes(debugger) {
-        error!("failed to refresh process cache: {}", e);
-    }
-    if modules_changed {
-        caches.refresh_drivers(debugger);
-    }
+/// Refresh the completion caches derived from debugger state after a stop.
+/// Both the async and synchronous stop paths call this, so the set can't
+/// drift. Guest lists (processes, drivers) are deliberately not walked here:
+/// completions enumerate them on demand, memoized per halt.
+pub fn refresh_stop_caches_post(debugger: &Target, caches: &ReplCaches) {
     caches.refresh_expression_context(debugger);
 }
 
@@ -205,14 +193,14 @@ pub fn print_async_stop_resolution(
     caches: &ReplCaches,
     resolution: StopResolution,
 ) {
-    let target_reloaded = matches!(&resolution, StopResolution::TargetReloaded { .. });
-    let modules_changed = refresh_stop_caches_pre(
+    session.target.selected_frame = None;
+    refresh_stop_caches_pre(
         &mut *session.backend,
         &session.target,
         &mut session.breakpoints,
         caches,
     );
-    refresh_stop_caches_post(&session.target, caches, target_reloaded, modules_changed);
+    refresh_stop_caches_post(&session.target, caches);
     refresh_windows_thread_context_for_backend_thread(&mut session.target, &session.current_thread);
 
     print_stop_separator();
@@ -250,7 +238,7 @@ pub fn print_async_stop_resolution(
         }
         StopResolution::Bugcheck { event } => {
             print_bugcheck_summary(&session.target, event.bugcheck.as_ref());
-            println!();
+            outln!();
             print_break_context_for_bugcheck(
                 &mut *session.backend,
                 &session.register_map,
@@ -261,6 +249,7 @@ pub fn print_async_stop_resolution(
             );
         }
         StopResolution::TargetReloaded { event, coherent } => {
+            caches.clear_threads();
             print_target_reload_notification_context(
                 &session.target,
                 &session.current_thread,
@@ -303,7 +292,7 @@ pub fn print_target_reload_notification_context(
     let pending_status = TargetReloadStatus::PendingRediscovery {
         kernel_base_hint: event.target_kernel_base_hint,
     };
-    println!(
+    outln!(
         "{}{}",
         ui::badge("BREAK"),
         ui::plate(&format!(
@@ -318,7 +307,7 @@ pub fn print_target_reload_notification_context(
         "kernel reloaded; module list is not available yet, continue to retry full reload"
     };
     print_event_children(" ", &[ui::muted(message)]);
-    println!();
+    outln!();
 }
 
 pub fn rebase_kernel_symbol_for_pending_reload(
@@ -373,6 +362,10 @@ pub fn pending_reload_register_kernel_base_hint(
     (rva < CURRENT_KERNEL_RELOAD_WINDOW).then_some(VirtAddr(base))
 }
 
+/// Drain one stop the running target has already reported. Returns whether a
+/// stop was surfaced to the user; a noise stop that was resumed (or an
+/// exception a policy continued) leaves the target running and returns
+/// `false`, so callers that want a stop keep going and break in.
 pub fn surface_pending_stop(
     session: &mut Session,
     caches: &ReplCaches,
@@ -383,7 +376,7 @@ pub fn surface_pending_stop(
     };
     let resolution = session.classify_stop_event(event)?;
     if matches!(resolution, StopResolution::Resumed) {
-        return Ok(true);
+        return Ok(false);
     }
 
     if let StopResolution::Stopped { event, .. } = &resolution
@@ -400,13 +393,14 @@ pub fn surface_pending_stop(
                 Some(false) => "second chance",
                 None => "unknown chance",
             };
-            println!("Exception {code:#010x} ({chance}); continuing");
+            outln!("Exception {code:#010x} ({chance}); continuing");
         }
+        session.target.selected_frame = None;
         session
             .backend
             .continue_execution_with_disposition(disposition)?;
         session.record_continuation_disposition(disposition);
-        return Ok(true);
+        return Ok(false);
     }
 
     print_async_stop_resolution(session, caches, resolution);
@@ -425,7 +419,6 @@ pub fn surface_interrupt_stop(session: &mut Session, caches: &ReplCaches) -> Res
     }
 }
 
-// In core so the REPL and Python SDK share identical step semantics.
 pub use crate::session::step_one_and_clear_tf;
 pub use crate::session::step_over_current_breakpoint;
 
@@ -477,17 +470,19 @@ pub fn print_break_context_at(
     display_rip: Option<u64>,
     cause: Option<String>,
 ) {
-    let _ = client.set_current_thread(thread_id);
-
-    let regs = match client.read_registers() {
+    debugger.selected_frame = None;
+    let regs = match client
+        .set_current_thread(thread_id)
+        .and_then(|()| client.read_registers())
+    {
         Ok(r) => r,
         Err(e) => {
             debugger.registers = None;
-            println!(
+            outln!(
                 "{}{}\n",
                 ui::badge("BREAK"),
                 ui::plate(&format!(
-                    " {} (read_registers failed: {}) ",
+                    " {} (register context unavailable: {}) ",
                     ui::thread_id(thread_id),
                     e
                 ))
@@ -497,14 +492,16 @@ pub fn print_break_context_at(
     };
     debugger.registers = Some(register_map.to_hashmap(&regs));
 
-    let cr3 = register_map.read_u64("cr3", &regs).unwrap_or(0);
+    let cr3 = register_map
+        .read_u64(debugger.arch().dtb_register(), &regs)
+        .unwrap_or(0);
     let rip = register_map.read_u64("rip", &regs).unwrap_or(0);
     let windows_thread = refresh_windows_thread_context_for_backend_thread(debugger, thread_id);
     let trace = resolve_thread_trace_context(debugger, cr3);
     let context_rip = display_rip.unwrap_or(rip);
     let symbol = format_symbol(debugger, &trace, context_rip);
 
-    println!(
+    outln!(
         "{}{}",
         ui::badge("BREAK"),
         ui::plate(&format!(
@@ -544,7 +541,7 @@ pub fn print_break_context_at(
         BREAK_STACKTRACE_DISPLAY_LIMIT,
         true,
     );
-    println!();
+    outln!();
 }
 
 #[cfg(test)]

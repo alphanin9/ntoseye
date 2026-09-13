@@ -4,9 +4,11 @@ use std::collections::HashMap;
 use crate::backend::MemoryOps;
 use crate::error::{Error, Result};
 use crate::types::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
-// PageFrameNumber
-pub const PFN_MASK: u64 = (!0xFu64 << 8) & 0xFFFFFFFFFu64;
+/// x64 page-table entry physical-address field: bits 51:12 (MAXPHYADDR = 52).
+pub const PFN_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 pub const PAGE_SIZE: usize = 0x1000; // 4KiB
 /// AMD64 2 MiB PDE mapping / AArch64 level-2 block.
 pub const LARGE_PAGE_SIZE: u64 = 1 << 21;
@@ -24,8 +26,51 @@ pub const PT_INDEX_MASK: u64 = 0x1FF;
 /// captured virtual memory regions.
 pub const DTB_IDENTITY: Dtb = u64::MAX;
 
-// 'a = lifetime of the borrow of the backend
-//  B = any type that implements phys mem
+/// Page translations remembered across [`AddressSpace`] instances, which are
+/// created per read, for as long as the target's page tables cannot change.
+/// Owned by a backend that knows when that is: a KD target clears it on
+/// every resume and write.
+///
+/// It also carries the target's halt epoch: a counter the owning backend
+/// advances on every resume, so guest-derived lists (processes, modules,
+/// drivers) memoized during one halt are dropped once the target has run.
+/// Writes clear translations but do not advance the epoch: a debugger poke
+/// (breakpoint install) cannot relink kernel lists.
+#[derive(Default)]
+pub struct TranslationCache {
+    pages: Mutex<HashMap<(Dtb, u64), Translation>>,
+    halt_epoch: AtomicU64,
+}
+
+impl TranslationCache {
+    fn pages(&self) -> MutexGuard<'_, HashMap<(Dtb, u64), Translation>> {
+        self.pages.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn get(&self, key: (Dtb, u64)) -> Option<Translation> {
+        self.pages().get(&key).copied()
+    }
+
+    fn insert(&self, key: (Dtb, u64), translation: Translation) {
+        self.pages().insert(key, translation);
+    }
+
+    pub fn clear(&self) {
+        self.pages().clear();
+    }
+
+    /// Drop translations and start a new halt epoch; called when the target
+    /// resumes.
+    pub fn resume(&self) {
+        self.clear();
+        self.halt_epoch.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn halt_epoch(&self) -> u64 {
+        self.halt_epoch.load(Ordering::Relaxed)
+    }
+}
+
 pub struct AddressSpace<'a, B: MemoryOps<PhysAddr>> {
     backend: &'a B,
     dtb: Dtb,
@@ -46,6 +91,7 @@ pub struct AddressSpace<'a, B: MemoryOps<PhysAddr>> {
     pt_cache: RefCell<HashMap<u64, Option<PageTableEntry>>>,
 }
 
+#[derive(Clone, Copy)]
 pub struct Translation {
     pub address: PhysAddr,
     pub large: bool,
@@ -65,6 +111,12 @@ pub struct Translation {
 }
 
 impl Translation {
+    /// The same mapping relocated to `va` within its page.
+    fn at_offset(mut self, va: VirtAddr) -> Self {
+        self.address = (self.address & !(PAGE_SIZE as u64 - 1)) | va.page_offset();
+        self
+    }
+
     pub const fn new_huge(pml4e: PageTableEntry, pdpte: PageTableEntry, va: VirtAddr) -> Self {
         Self {
             page_size: HUGE_PAGE_SIZE,
@@ -227,6 +279,16 @@ impl<'a, B: MemoryOps<PhysAddr>> AddressSpace<'a, B> {
         Ok(entry)
     }
 
+    /// Page-table root that maps `va`: AArch64 selects TTBR1 for the kernel
+    /// half by bit 55; one AMD64 CR3 covers both halves.
+    fn root_for(&self, va: VirtAddr) -> Dtb {
+        if self.arm64 && va.0 & (1 << 55) != 0 {
+            self.kernel_dtb.unwrap_or(self.dtb)
+        } else {
+            self.dtb
+        }
+    }
+
     fn virt_to_phys_arm64(&self, va: VirtAddr) -> Result<Option<Translation>> {
         if self.dtb == DTB_IDENTITY {
             return Ok(Some(Translation {
@@ -241,11 +303,7 @@ impl<'a, B: MemoryOps<PhysAddr>> AddressSpace<'a, B> {
         }
 
         // AArch64: bit 55 selects TTBR1 (kernel) vs TTBR0 (user).
-        let root = if va.0 & (1 << 55) != 0 {
-            self.kernel_dtb.unwrap_or(self.dtb)
-        } else {
-            self.dtb
-        };
+        let root = self.root_for(va);
 
         // Level 0 (index bits 47:39 — same 9-bit index math as x64 PML4).
         let Some(l0) = self.read_pt_entry(root, va.pml4_index())? else {
@@ -287,6 +345,21 @@ impl<'a, B: MemoryOps<PhysAddr>> AddressSpace<'a, B> {
     }
 
     pub fn virt_to_phys(&self, va: VirtAddr) -> Result<Option<Translation>> {
+        let Some(cache) = self.backend.translation_cache() else {
+            return self.walk(va);
+        };
+        let key = (self.root_for(va), va.0 >> PAGE_SHIFT);
+        if let Some(translation) = cache.get(key) {
+            return Ok(Some(translation.at_offset(va)));
+        }
+        let translation = self.walk(va)?;
+        if let Some(translation) = translation {
+            cache.insert(key, translation);
+        }
+        Ok(translation)
+    }
+
+    fn walk(&self, va: VirtAddr) -> Result<Option<Translation>> {
         if self.arm64 {
             return self.virt_to_phys_arm64(va);
         }
@@ -348,6 +421,12 @@ impl<'a, B: MemoryOps<PhysAddr>> AddressSpace<'a, B> {
 
 impl<'a, B: MemoryOps<PhysAddr>> MemoryOps<VirtAddr> for AddressSpace<'a, B> {
     fn read_bytes(&self, addr: VirtAddr, buf: &mut [u8]) -> Result<()> {
+        if let Some(result) = self
+            .backend
+            .read_virtual_direct(addr, self.root_for(addr), buf)
+        {
+            return result;
+        }
         let mut offset = 0;
 
         while offset < buf.len() {
@@ -548,7 +627,6 @@ mod tests {
     #[test]
     fn identity_dtb_skips_page_table_walk() {
         let mut data = vec![0u8; 0x2000];
-        // Plant recognizable bytes at VA/PA 0x1000
         data[0x1000..0x1008].copy_from_slice(&0xDEADBEEFCAFEBABEu64.to_le_bytes());
         let mem = FakePhysMem { data };
         let space = AddressSpace::new(&mem, DTB_IDENTITY);
@@ -561,7 +639,6 @@ mod tests {
     #[test]
     fn identity_dtb_cross_boundary_read() {
         let mut data = vec![0u8; 0x3000];
-        // Span across a 4K boundary: fill 0xFFF..0x1001
         for (i, byte) in data[0xFF0..0x1010].iter_mut().enumerate() {
             *byte = ((0xFF0 + i) & 0xFF) as u8;
         }
@@ -620,5 +697,65 @@ mod tests {
 
         assert!(translation.nx);
         assert!(!translation.uxn);
+    }
+
+    struct CachingPhysMem {
+        inner: FakePhysMem,
+        reads: std::cell::Cell<usize>,
+        cache: TranslationCache,
+    }
+
+    impl MemoryOps<PhysAddr> for CachingPhysMem {
+        fn read_bytes(&self, addr: PhysAddr, buf: &mut [u8]) -> Result<()> {
+            self.reads.set(self.reads.get() + 1);
+            self.inner.read_bytes(addr, buf)
+        }
+
+        fn write_bytes(&self, addr: PhysAddr, buf: &[u8]) -> Result<()> {
+            self.inner.write_bytes(addr, buf)
+        }
+
+        fn translation_cache(&self) -> Option<&TranslationCache> {
+            Some(&self.cache)
+        }
+    }
+
+    /// With a cache, a second read in an already translated page costs one
+    /// backend read, not five, across separate address-space instances; the
+    /// cached mapping is relocated to the new offset within the page.
+    #[test]
+    fn translation_cache_skips_repeat_walks_across_instances() {
+        let mut data = vec![0u8; 0x6000];
+        let va = VirtAddr(0x7fff_1234_5000);
+        let root = 0x1000usize;
+        let mut entry = |table: usize, index: usize, next: u64| {
+            data[table + index * 8..table + index * 8 + 8]
+                .copy_from_slice(&(next | 0b111).to_le_bytes());
+        };
+        entry(root, va.pml4_index(), 0x2000);
+        entry(0x2000, va.pdpt_index(), 0x3000);
+        entry(0x3000, va.pd_index(), 0x4000);
+        entry(0x4000, va.pt_index(), 0x5000);
+        data[0x5000..0x5008].copy_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
+        data[0x5010..0x5018].copy_from_slice(&0x5555_6666_7777_8888u64.to_le_bytes());
+        let mem = CachingPhysMem {
+            inner: FakePhysMem { data },
+            reads: std::cell::Cell::new(0),
+            cache: TranslationCache::default(),
+        };
+
+        let first: u64 = AddressSpace::new(&mem, root as u64).read(va).unwrap();
+        assert_eq!(first, 0x1111_2222_3333_4444);
+        assert_eq!(mem.reads.get(), 5);
+
+        let second: u64 = AddressSpace::new(&mem, root as u64)
+            .read(VirtAddr(va.0 + 0x10))
+            .unwrap();
+        assert_eq!(second, 0x5555_6666_7777_8888);
+        assert_eq!(mem.reads.get(), 6);
+
+        mem.cache.clear();
+        let _: u64 = AddressSpace::new(&mem, root as u64).read(va).unwrap();
+        assert_eq!(mem.reads.get(), 11);
     }
 }

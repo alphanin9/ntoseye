@@ -26,13 +26,10 @@ fn local_symbol_plan_for_module(
     dtb: Dtb,
     module: &ModuleInfo,
 ) -> Result<Option<(PathBuf, u128)>> {
-    match debugger.symbols.extract_download_job(
-        &debugger.phys,
-        dtb,
-        &module.name,
-        module.base_address,
-        debugger.arch(),
-    )? {
+    match debugger
+        .symbols
+        .extract_download_job(&debugger.phys, dtb, module, debugger.arch())?
+    {
         ModuleSymbolDiscovery::Ready { job, guid, .. } => {
             Ok(find_file_case_insensitive(dir, &job.filename).map(|path| (path, guid)))
         }

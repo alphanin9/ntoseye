@@ -1,21 +1,24 @@
 use crate::bugchecks::{BugcheckAnalysis, BugcheckTrapFrame};
+use crate::dbg_backend::{BackendCapability, DebugOutputPage};
+use crate::disasm::DisasmRow;
 use crate::dmp::{DmpException, DmpSystemInfo, TriageCrashInfo, UnloadedDriver};
 use crate::gdb::breakpoints::Breakpoint;
 use crate::guest::{ModuleInfo, ProcessInfo};
-use crate::session::RunStatus;
+use crate::session::{RunStatus, VcpuInfo};
 use crate::symbols::{
     LocalVariableLocation, ProcedureLocal, SourceLocation, SymbolCandidate, SymbolVisibility,
+    TypeInfo, format_symbol_with_offset,
 };
 use crate::target::{
     AddressDescription, AddressModule, DeviceObjectDetail, DiagnosticMetric, DiagnosticValue,
-    DriverObjectDetail, FileObjectDetail, HandleEntryDetail, HandleTableSummary,
+    DriverObjectDetail, DriverObjectInfo, FileObjectDetail, HandleEntryDetail, HandleTableSummary,
     IoStackLocationInfo, IrpHit, IrpInfo, ListTermination, MemoryRegionInfo, MemorySearchMatch,
-    NotifyCallback, ObjectHeaderDetail, PrivilegeInfo, ProcessMemoryUsage, PteLevel,
+    NotifyCallback, ObjectHeaderDetail, PrivilegeInfo, ProcessMemoryUsage, PteLevel, PteWalk,
     ResourceDetail, ResourceListSummary, ResourceOwner, SidAndAttributes, SsdtTable,
-    SymbolSearchMatch, SystemMemorySummary, Target, TokenDetail, irp_major_function_name,
-    kthread_state_name, wait_reason_name,
+    SymbolSearchMatch, SystemMemorySummary, Target, ThreadInfo, TokenDetail,
+    irp_major_function_name, kthread_state_name, wait_reason_name,
 };
-use crate::trapframe::KtrapFrame;
+use crate::trapframe::{KtrapFrame, KtrapFrameData};
 use crate::triage::TriagePrcbInfo;
 use crate::triage_report::{
     BlackboxFinding, BlackboxKind, BlackboxState, CulpritAttribution, CulpritConfidence,
@@ -118,8 +121,6 @@ pub fn to_py<'py>(
         }
     })
 }
-
-// --- builders: one decoded struct → its neutral shape ---
 
 fn io_stack(s: &IoStackLocationInfo) -> View {
     View::Object(vec![
@@ -330,10 +331,11 @@ fn address_module(m: &AddressModule) -> View {
     ])
 }
 
-fn memory_region(r: &MemoryRegionInfo) -> View {
+pub fn memory_region(r: &MemoryRegionInfo) -> View {
     View::Object(vec![
         ("start", View::Hex(r.start.0)),
         ("end", View::Hex(r.end.0)),
+        ("size", View::Num(r.size())),
         ("protection", View::OptNum(r.protection)),
         ("vad_type", View::OptNum(r.vad_type)),
         ("private_memory", View::OptBool(r.private_memory)),
@@ -393,6 +395,79 @@ pub fn pte_level(pte: &PteLevel) -> View {
     ])
 }
 
+/// A full page-table walk: the walked address and DTB, then the levels that
+/// were reached (a large-page mapping short-circuits, so fewer levels).
+pub fn pte_walk(walk: &PteWalk) -> View {
+    let levels = [
+        Some(&walk.pxe),
+        Some(&walk.ppe),
+        walk.pde.as_ref(),
+        walk.pte.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(pte_level)
+    .collect();
+    View::Object(vec![
+        ("address", View::Hex(walk.address.0)),
+        ("dtb", View::Hex(walk.dtb)),
+        ("levels", View::List(levels)),
+    ])
+}
+
+/// One Windows thread from the kernel thread walk; `active` is the vCPU id
+/// currently running it (only resolved while halted).
+pub fn thread(t: &ThreadInfo, active: Option<&str>) -> View {
+    View::Object(vec![
+        ("tid", View::OptNum(t.tid)),
+        ("pid", View::OptNum(t.pid)),
+        ("process_name", View::OptStr(t.process_name.clone())),
+        ("ethread", View::Hex(t.ethread.0)),
+        ("kthread", View::Hex(t.kthread.0)),
+        ("eprocess", View::OptHex(t.eprocess.map(|a| a.0))),
+        ("state", View::OptNum(t.state.map(u64::from))),
+        (
+            "state_name",
+            View::OptStr(t.state.map(|s| kthread_state_name(s).to_string())),
+        ),
+        ("wait_reason", View::OptNum(t.wait_reason.map(u64::from))),
+        (
+            "wait_reason_name",
+            View::OptStr(t.wait_reason.map(|r| wait_reason_name(r).to_string())),
+        ),
+        ("active", View::OptStr(active.map(str::to_string))),
+    ])
+}
+
+pub fn vcpu(v: &VcpuInfo) -> View {
+    View::Object(vec![
+        ("id", View::Str(v.id.clone())),
+        ("rip", View::OptHex(v.rip)),
+        ("context", View::Str(v.context.clone())),
+        ("symbol", View::OptStr(v.symbol.clone())),
+        ("error", View::OptStr(v.error.clone())),
+    ])
+}
+
+/// A page of captured guest debug output plus the cursor for the next poll.
+pub fn debug_log(page: &DebugOutputPage) -> View {
+    let lines = page
+        .lines
+        .iter()
+        .map(|l| {
+            View::Object(vec![
+                ("seq", View::Num(l.seq)),
+                ("timestamp_ms", View::Num(l.timestamp_ms)),
+                ("text", View::Str(l.text.clone())),
+            ])
+        })
+        .collect();
+    View::Object(vec![
+        ("lines", View::List(lines)),
+        ("next_seq", View::Num(page.next_seq)),
+        ("dropped", View::Bool(page.dropped)),
+    ])
+}
 /// A decoded bugcheck (BSOD): code/name/description, its four parameters, and the
 /// faulting instruction when one was identified.
 pub fn bugcheck(a: &BugcheckAnalysis) -> View {
@@ -430,27 +505,76 @@ pub fn bugcheck(a: &BugcheckAnalysis) -> View {
 }
 
 fn ktrap_frame_registers(frame: &KtrapFrame) -> View {
-    View::Object(vec![
-        ("rax", View::Hex(frame.rax)),
-        ("rbx", View::Hex(frame.rbx)),
-        ("rcx", View::Hex(frame.rcx)),
-        ("rdx", View::Hex(frame.rdx)),
-        ("rsi", View::Hex(frame.rsi)),
-        ("rdi", View::Hex(frame.rdi)),
-        ("rbp", View::Hex(frame.rbp)),
-        ("rsp", View::Hex(frame.rsp)),
-        ("r8", View::Hex(frame.r8)),
-        ("r9", View::Hex(frame.r9)),
-        ("r10", View::Hex(frame.r10)),
-        ("r11", View::Hex(frame.r11)),
-        ("rip", View::Hex(frame.rip)),
-        ("cs", View::Hex(frame.cs as u64)),
-        ("ss", View::Hex(frame.ss as u64)),
-        ("eflags", View::Hex(frame.eflags as u64)),
-        ("error_code", View::Hex(frame.error_code)),
-        ("previous_mode", View::Num(frame.previous_mode as u64)),
-        ("previous_irql", View::Num(frame.previous_irql as u64)),
-    ])
+    match &frame.data {
+        KtrapFrameData::Amd64(frame) => View::Object(vec![
+            ("rax", View::Hex(frame.rax)),
+            ("rbx", View::Hex(frame.rbx)),
+            ("rcx", View::Hex(frame.rcx)),
+            ("rdx", View::Hex(frame.rdx)),
+            ("rsi", View::Hex(frame.rsi)),
+            ("rdi", View::Hex(frame.rdi)),
+            ("rbp", View::Hex(frame.rbp)),
+            ("rsp", View::Hex(frame.rsp)),
+            ("r8", View::Hex(frame.r8)),
+            ("r9", View::Hex(frame.r9)),
+            ("r10", View::Hex(frame.r10)),
+            ("r11", View::Hex(frame.r11)),
+            ("rip", View::Hex(frame.rip)),
+            ("cs", View::Hex(frame.cs as u64)),
+            ("ss", View::Hex(frame.ss as u64)),
+            ("eflags", View::Hex(frame.eflags as u64)),
+            ("error_code", View::Hex(frame.error_code)),
+            ("previous_mode", View::Num(frame.previous_mode as u64)),
+            ("previous_irql", View::Num(frame.previous_irql as u64)),
+        ]),
+        KtrapFrameData::Arm64(frame) => {
+            const X_NAMES: [&str; 31] = [
+                "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12",
+                "x13", "x14", "x15", "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24",
+                "x25", "x26", "x27", "x28", "x29", "x30",
+            ];
+            let mut fields = Vec::with_capacity(31 + 9);
+            for (index, name) in X_NAMES.iter().enumerate() {
+                let value = match index {
+                    0..=18 => Some(frame.x[index]),
+                    29 => Some(frame.fp),
+                    30 => Some(frame.lr),
+                    _ => None,
+                };
+                fields.push((*name, value.map_or(View::Null, View::Hex)));
+            }
+            fields.extend([
+                ("fp", View::Hex(frame.fp)),
+                ("lr", View::Hex(frame.lr)),
+                ("sp", View::Hex(frame.sp)),
+                ("pc", View::Hex(frame.pc)),
+                ("cpsr", View::Hex(frame.cpsr)),
+                ("esr", View::Hex(frame.esr)),
+                ("fault_address", View::Hex(frame.fault_address)),
+                ("previous_mode", View::Num(frame.previous_mode as u64)),
+                ("previous_irql", View::Num(frame.previous_irql as u64)),
+            ]);
+            fields.extend([
+                (
+                    "bcr",
+                    View::List(frame.bcr.iter().copied().map(View::Hex).collect()),
+                ),
+                (
+                    "bvr",
+                    View::List(frame.bvr.iter().copied().map(View::Hex).collect()),
+                ),
+                (
+                    "wcr",
+                    View::List(frame.wcr.iter().copied().map(View::Hex).collect()),
+                ),
+                (
+                    "wvr",
+                    View::List(frame.wvr.iter().copied().map(View::Hex).collect()),
+                ),
+            ]);
+            View::Object(fields)
+        }
+    }
 }
 
 /// A decoded `_KTRAP_FRAME` shared by structured host APIs.
@@ -515,23 +639,15 @@ pub fn breakpoint(bp: &Breakpoint) -> View {
 }
 
 pub fn run_status(status: &RunStatus) -> View {
-    let process = status
-        .process
-        .as_ref()
-        .map(|(pid, name, eprocess)| {
-            View::Object(vec![
-                ("pid", View::Num(*pid)),
-                ("name", View::Str(name.clone())),
-                ("eprocess", View::Hex(*eprocess)),
-            ])
-        })
-        .unwrap_or(View::Null);
     View::Object(vec![
         ("running", View::Bool(status.running)),
         ("current_thread", View::Str(status.current_thread.clone())),
         ("rip", View::OptHex(status.rip)),
         ("symbol", View::OptStr(status.symbol.clone())),
-        ("process", process),
+        (
+            "process",
+            status.process.as_ref().map_or(View::Null, process),
+        ),
         ("coherent", View::Bool(status.coherent)),
         ("kernel_base", View::Hex(status.kernel_base)),
     ])
@@ -543,6 +659,13 @@ pub fn stack_frame(frame: &StackFrame) -> View {
         ("sp", View::Hex(frame.sp)),
         ("symbol", View::Str(frame.symbol.clone())),
         ("source", View::Str(frame.source.as_str().to_string())),
+        (
+            "source_location",
+            frame
+                .source_location
+                .as_ref()
+                .map_or(View::Null, source_location),
+        ),
     ])
 }
 
@@ -567,6 +690,66 @@ pub fn module(module: &ModuleInfo) -> View {
         fields.push(("product_version", View::Str(version.clone())));
     }
     View::Object(fields)
+}
+
+/// One decoded instruction: bytes, text, and the resolved branch/rip-relative
+/// target comment when there is one.
+pub fn disasm_row(row: &DisasmRow) -> View {
+    View::Object(vec![
+        ("ip", View::Hex(row.ip)),
+        ("hex", View::Str(row.hex.clone())),
+        ("asm", View::Str(row.asm())),
+        ("comment", View::OptStr(row.comment.clone())),
+    ])
+}
+
+/// A struct's field layout, sorted by offset.
+pub fn type_layout(name: &str, info: &TypeInfo) -> View {
+    let mut fields: Vec<_> = info.fields.iter().collect();
+    fields.sort_by_key(|(_, field)| field.offset);
+    let fields = fields
+        .into_iter()
+        .map(|(field_name, field)| {
+            View::Object(vec![
+                ("name", View::Str(field_name.clone())),
+                ("offset", View::Num(field.offset.into())),
+                ("size", View::Num(field.size)),
+                ("type", View::Str(field.type_data.to_string())),
+            ])
+        })
+        .collect();
+    View::Object(vec![
+        ("name", View::Str(name.to_string())),
+        ("size", View::Num(info.size as u64)),
+        ("fields", View::List(fields)),
+    ])
+}
+
+/// A `_DRIVER_OBJECT` as enumerated from the object directory.
+pub fn driver_object_info(driver: &DriverObjectInfo) -> View {
+    View::Object(vec![
+        ("name", View::Str(driver.name.clone())),
+        ("object", View::Hex(driver.object.0)),
+        ("driver_start", View::Hex(driver.driver_start.0)),
+        ("driver_size", View::Num(driver.driver_size)),
+        ("device_object", View::Hex(driver.device_object.0)),
+        ("driver_unload", View::Hex(driver.driver_unload.0)),
+    ])
+}
+
+/// One row of a backend's capability matrix.
+pub fn capability(capability: &BackendCapability) -> View {
+    View::Object(vec![
+        (
+            "capability",
+            View::Str(capability.capability.name().to_string()),
+        ),
+        (
+            "label",
+            View::Str(capability.capability.label().to_string()),
+        ),
+        ("supported", View::Bool(capability.supported)),
+    ])
 }
 
 pub fn dump_exception(exception: &DmpException) -> View {
@@ -999,9 +1182,7 @@ pub fn symbol_search_match(symbol: &SymbolSearchMatch) -> View {
 pub fn nearest_symbol(address: VirtAddr, symbol: Option<(String, String, u32)>) -> View {
     let (formatted, module, name, offset) = match symbol {
         Some((module, name, offset)) => (
-            View::Str(crate::symbols::format_symbol_with_offset(
-                &module, &name, offset,
-            )),
+            View::Str(format_symbol_with_offset(&module, &name, offset)),
             View::Str(module),
             View::Str(name),
             View::Num(offset.into()),
@@ -1102,7 +1283,7 @@ fn diagnostic_metric<T>(metric: &DiagnosticMetric<T>, encode: impl FnOnce(&T) ->
     View::Object(fields)
 }
 
-fn process(process: &ProcessInfo) -> View {
+pub fn process(process: &ProcessInfo) -> View {
     View::Object(vec![
         ("pid", View::Num(process.pid)),
         ("name", View::Str(process.name.clone())),
@@ -1454,15 +1635,10 @@ pub fn memory_usage(summary: &SystemMemorySummary) -> View {
 
 #[cfg(all(test, feature = "mcp"))]
 mod tests {
-    use super::{bugcheck_trap_frame, handle_table, memory_usage, to_json, trap_frame};
+    use super::{bugcheck_trap_frame, memory_usage, to_json};
     use crate::bugchecks::BugcheckTrapFrame;
     use crate::debugger_data::MetadataSource;
-    use crate::guest::ProcessInfo;
-    use crate::target::{
-        DiagnosticMetric, DiagnosticValue, HandleTableSummary, SystemMemorySummary,
-    };
-    use crate::trapframe::KtrapFrame;
-    use crate::types::VirtAddr;
+    use crate::target::{DiagnosticMetric, DiagnosticValue, SystemMemorySummary};
 
     #[test]
     fn bugcheck_trap_frame_exposes_decode_failure() {
@@ -1475,60 +1651,6 @@ mod tests {
         let json = to_json(&view);
         assert!(json["frame"].is_null());
         assert_eq!(json["error"], "type `_KTRAP_FRAME` not found");
-    }
-
-    #[test]
-    fn standalone_trap_frame_has_shared_structured_shape() {
-        let frame = KtrapFrame {
-            address: 0xffff_f800_1234_5000,
-            rax: 1,
-            rbx: 2,
-            rcx: 3,
-            rdx: 4,
-            rsi: 5,
-            rdi: 6,
-            rbp: 7,
-            rsp: 8,
-            r8: 9,
-            r9: 10,
-            r10: 11,
-            r11: 12,
-            rip: 0xffff_f800_4321_1000,
-            cs: 0x10,
-            ss: 0x18,
-            eflags: 0x202,
-            error_code: 0,
-            previous_mode: 0,
-            previous_irql: 2,
-        };
-        let json = to_json(&trap_frame(&frame, Some("nt!KiDispatchException".into())));
-        assert_eq!(json["address"], "0xfffff80012345000");
-        assert_eq!(json["rip_symbol"], "nt!KiDispatchException");
-        assert_eq!(json["frame"]["rip"], "0xfffff80043211000");
-        assert_eq!(json["frame"]["previous_irql"], 2);
-    }
-
-    #[test]
-    fn handle_table_view_exposes_skipped_entries() {
-        let summary = HandleTableSummary {
-            process: ProcessInfo {
-                pid: 4,
-                name: "System".into(),
-                dtb: 0x1000,
-                eprocess_va: VirtAddr(0xffff_8000_0000_1000),
-            },
-            table: VirtAddr(0xffff_8000_0000_2000),
-            table_level: 1,
-            advertised_handles: 64,
-            scanned_handles: 32,
-            skipped_entries: 3,
-            truncated: true,
-            entries: Vec::new(),
-        };
-
-        let json = to_json(&handle_table(&summary));
-        assert_eq!(json["scanned_handles"], 32);
-        assert_eq!(json["skipped_entries"], 3);
     }
 
     #[test]

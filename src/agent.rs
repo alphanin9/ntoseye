@@ -1349,11 +1349,8 @@ impl AgentSession<'_> {
     }
 
     fn wait_for_stop_cmd(&mut self, timeout_ms: Option<u64>) -> Result<Value> {
-        // A stop the background servicer already parked is the proper event for
-        // this wait; surface it before waiting for a new one.
-        if let Some(parked) = self.session.take_parked_stop() {
-            return self.outcome_json(parked);
-        }
+        // A stop the background servicer already parked is surfaced by
+        // `wait_for_stop_bounded` itself before it waits for a new one.
         let cancel = no_cancel();
         let timeout = timeout_ms.map(Duration::from_millis);
         let outcome = self.session.wait_for_stop_bounded(timeout, &cancel)?;
@@ -1873,6 +1870,8 @@ mod tests {
     #[test]
     fn vmmap_filter_matches_containing_address_and_metadata() {
         let region = MemoryRegionInfo {
+            node_address: VirtAddr(0),
+            level: 0,
             start: VirtAddr(0x1000),
             end: VirtAddr(0x3000),
             protection: Some(6),

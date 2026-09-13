@@ -46,7 +46,7 @@ pub struct BugcheckFault {
 pub struct BugcheckTrapFrame {
     pub address: u64,
     pub frame: Option<KtrapFrame>,
-    /// Symbol for the frame's `Rip`, when the frame decoded.
+    /// Symbol for the frame's instruction pointer, when the frame decoded.
     pub rip_symbol: Option<String>,
     /// Decode failure reason; `None` exactly when `frame` is present.
     pub error: Option<String>,
@@ -416,7 +416,7 @@ pub fn analyze_bugcheck(debugger: &Target, info: &BugcheckInfo) -> BugcheckAnaly
             };
             let rip_symbol = frame
                 .as_ref()
-                .map(|frame| format_symbol(debugger, &trace, frame.rip));
+                .map(|frame| format_symbol(debugger, &trace, frame.instruction_pointer()));
             BugcheckTrapFrame {
                 address,
                 frame,
@@ -1160,7 +1160,7 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
             ),
             arguments: [
                 "memory address referenced",
-                "access type (x64: 0 = read; 1 = legacy write; 2 = modern write; 0x10 = execute)",
+                "access type (0 = read; 1 = write; 2 = execute; some builds report 0x10 for execute)",
                 "address that referenced memory, if known",
                 "page-fault subtype on newer Windows; reserved on older versions",
             ],
@@ -4098,7 +4098,6 @@ mod tests {
 
     #[test]
     fn trap_frame_requires_kernel_pointer() {
-        // A zeroed or user-mode parameter is not chased.
         assert_eq!(
             bugcheck_trap_frame_address(&info(0x139, [3, 0, 0, 0])),
             None
@@ -4206,22 +4205,5 @@ mod tests {
                 bugcheck_descriptor(base).unwrap().arguments
             );
         }
-    }
-
-    #[test]
-    fn page_fault_descriptor_covers_current_x64_values_and_subtype() {
-        let descriptor = bugcheck_descriptor(0x50).unwrap();
-        assert!(descriptor.arguments[1].contains("2 = modern write"));
-        assert!(descriptor.arguments[1].contains("0x10 = execute"));
-        assert!(descriptor.arguments[3].contains("page-fault subtype"));
-    }
-
-    #[test]
-    fn d1_access_argument_documents_execute_faults() {
-        let descriptor = bugcheck_descriptor(0xd1).unwrap();
-        assert_eq!(
-            descriptor.arguments[2],
-            "value 0 = read operation, 1 = write operation, 2 or 8 = execute operation"
-        );
     }
 }

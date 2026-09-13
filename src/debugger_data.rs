@@ -1,5 +1,5 @@
+use crate::dmp::structs::{DbgKdDebugDataHeader64, KdDebuggerData64};
 use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
-use kdmp_parser::structs::{DbgKdDebugDataHeader64, KdDebuggerData64};
 use std::collections::HashSet;
 use std::fmt;
 use std::mem::{offset_of, size_of};
@@ -16,8 +16,8 @@ const KDBG_MAX_REMOTE_SIZE: usize = 0x4000;
 const KDBG_LIST_LIMIT: usize = 64;
 
 // `KDDEBUGGER_DATA64` is an append-only debugger wire/container ABI. Derive
-// offsets from kdmp-parser's SDK-sourced `#[repr(C)]` definition rather than
-// maintaining a second numeric copy here.
+// offsets from the SDK-sourced `#[repr(C)]` definition in `crate::dmp::structs`
+// rather than maintaining a second numeric copy here.
 const KERN_BASE_OFFSET: usize = offset_of!(KdDebuggerData64, kern_base);
 const PS_LOADED_MODULE_LIST_OFFSET: usize = offset_of!(KdDebuggerData64, ps_loaded_module_list);
 const PS_ACTIVE_PROCESS_HEAD_OFFSET: usize = offset_of!(KdDebuggerData64, ps_active_process_head);
@@ -399,9 +399,12 @@ fn read_register(registers: &[Option<u64>; 3], register: Register) -> Option<u64
 
 fn write_register(registers: &mut [Option<u64>; 3], register: Register, value: u64) -> Option<()> {
     let (slot, width) = register_slot(register)?;
+    // x86 semantics: 8/16-bit writes keep the register's upper bits, 32-bit
+    // writes zero-extend.
+    let previous = registers[slot].unwrap_or(0);
     registers[slot] = Some(match width {
-        1 => value & 0xff,
-        2 => value & 0xffff,
+        1 => (previous & !0xff) | (value & 0xff),
+        2 => (previous & !0xffff) | (value & 0xffff),
         4 => value & 0xffff_ffff,
         8 => value,
         _ => unreachable!(),

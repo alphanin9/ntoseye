@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -31,14 +32,9 @@ pub struct DebugOutputPage {
 }
 
 /// Thread-safe, bounded, line-oriented ring buffer of guest debug output.
-///
-/// Guest DbgPrint arrives as arbitrary byte chunks serviced from two threads
-/// (the foreground KD loop and the background pump that owns the socket while
-/// the VM runs), so this is a cheap cloneable shared handle. Text is accumulated
-/// and split on `\n`; each completed line is timestamped and assigned a
-/// monotonic `seq`. Reads are snapshot+cursor and never drain, so independent
-/// consumers (the REPL's live terminal stream, an MCP poller, a Python script)
-/// can each track their own position.
+/// Chunks are split on `\n`; each line gets a timestamp and a monotonic `seq`.
+/// Reads are snapshot+cursor and never drain, so consumers track their own
+/// position.
 #[derive(Clone)]
 pub struct DebugLog {
     inner: Arc<Mutex<DebugLogInner>>,
@@ -69,9 +65,10 @@ impl DebugLog {
     /// Invalid UTF-8 is replaced lossily so the ring always holds valid text.
     pub fn record(&self, bytes: &[u8]) {
         let text = String::from_utf8_lossy(bytes);
-        let now = now_ms();
         let mut inner = self.inner.lock().unwrap();
-        inner.push_text(&text, now);
+        // Stamped under the lock so `seq` order and timestamps agree even when
+        // the foreground loop and the pump race to record.
+        inner.push_text(&text, now_ms());
     }
 
     /// Lines with `seq >= since_seq`, plus the cursor to resume after them.
@@ -96,6 +93,11 @@ impl DebugLog {
 }
 
 impl DebugLogInner {
+    /// A print with no newline is flushed as a line once it reaches this
+    /// size, so a guest that never terminates its output cannot grow the
+    /// partial buffer without bound.
+    const MAX_PARTIAL_LINE: usize = 4096;
+
     fn push_text(&mut self, text: &str, now_ms: u64) {
         for ch in text.chars() {
             if ch == '\n' {
@@ -107,6 +109,10 @@ impl DebugLogInner {
                 self.push_line(line, now_ms);
             } else {
                 self.partial.push(ch);
+                if self.partial.len() >= Self::MAX_PARTIAL_LINE {
+                    let line = std::mem::take(&mut self.partial);
+                    self.push_line(line, now_ms);
+                }
             }
         }
     }
@@ -384,9 +390,35 @@ pub enum DebugCapability {
     BugcheckDetection,
     BugcheckDetails,
     DebugOutput,
+    Msr,
+    TargetControl,
 }
 
 impl DebugCapability {
+    /// Stable machine-readable identifier (the structured hosts' key).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::MemoryIntrospection => "memory_introspection",
+            Self::ExecutionControl => "execution_control",
+            Self::InterruptTarget => "interrupt_target",
+            Self::SingleStep => "single_step",
+            Self::ReadRegisters => "read_registers",
+            Self::WriteRegisters => "write_registers",
+            Self::ThreadList => "thread_list",
+            Self::ThreadSelection => "thread_selection",
+            Self::KernelBreakpoints => "kernel_breakpoints",
+            Self::UserModeBreakpoints => "user_mode_breakpoints",
+            Self::Watchpoints => "watchpoints",
+            Self::TargetReloadDetection => "target_reload_detection",
+            Self::KernelBaseHint => "kernel_base_hint",
+            Self::BugcheckDetection => "bugcheck_detection",
+            Self::BugcheckDetails => "bugcheck_details",
+            Self::DebugOutput => "debug_output",
+            Self::Msr => "msr",
+            Self::TargetControl => "target_control",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::MemoryIntrospection => "memory introspection",
@@ -405,6 +437,8 @@ impl DebugCapability {
             Self::BugcheckDetection => "bugcheck stop detection",
             Self::BugcheckDetails => "bugcheck details",
             Self::DebugOutput => "debug output",
+            Self::Msr => "model-specific registers",
+            Self::TargetControl => "reboot / forced crash",
         }
     }
 }
@@ -462,8 +496,23 @@ pub trait DebugBackend {
         false
     }
 
-    /// Program debug-register slot `slot` (0-3) to trap on `access` at `addr`
-    /// over `len` bytes (1/2/4/8; execute forces 1), on every processor.
+    /// Number of physical hardware-breakpoint slots exposed by this backend.
+    /// AMD64 backends use the four DR0-DR3 slots; ARM64 KD exposes eight
+    /// execute slots and two data-watch slots through one global ID space.
+    fn hardware_breakpoint_slots(&self) -> u8 {
+        HW_BREAKPOINT_SLOTS
+    }
+
+    /// Physical slots available for a hardware breakpoint access mode.
+    /// Backends with separate execute/watchpoint banks override this range;
+    /// the default covers all slots used by AMD64 debug registers.
+    fn hardware_slot_range(&self, access: HwBreakpointAccess) -> Range<u8> {
+        let _ = access;
+        0..self.hardware_breakpoint_slots()
+    }
+
+    /// Program debug-register slot `slot` to trap on `access` at `addr` over
+    /// `len` bytes (1/2/4/8; execute forces 1), on every processor.
     fn set_hardware_breakpoint(
         &mut self,
         _slot: u8,
@@ -494,6 +543,14 @@ pub trait DebugBackend {
             BackendCapability::unsupported(DebugCapability::BugcheckDetection),
             BackendCapability::unsupported(DebugCapability::BugcheckDetails),
             BackendCapability::unsupported(DebugCapability::DebugOutput),
+            BackendCapability {
+                capability: DebugCapability::Msr,
+                supported: self.supports_msr(),
+            },
+            BackendCapability {
+                capability: DebugCapability::TargetControl,
+                supported: self.supports_target_control(),
+            },
         ]
     }
 
@@ -583,13 +640,9 @@ pub trait DebugBackend {
 
     fn is_running(&self) -> bool;
 
-    /// Whether a stop has been caught but not yet drained by the foreground (e.g.
-    /// the background servicer reported a stop into its channel and exited, but no
-    /// `wait_for_stop`/`interrupt` has consumed it). In that window `is_running()`
-    /// is still its last `continue` value, stale, so the VM is actually halted
-    /// even though `is_running()` says true. A read-only "where am I" surface uses
-    /// this to report the truth without consuming the stop. Default `false`:
-    /// backends that stop synchronously have no such window.
+    /// Whether a stop has been caught but not yet drained by the foreground; in
+    /// that window `is_running()` is stale. Default `false`: backends that stop
+    /// synchronously have no such window.
     fn has_pending_stop(&self) -> bool {
         false
     }
@@ -619,6 +672,42 @@ pub trait DebugBackend {
     /// on the per-stop module-list diff.
     fn take_modules_changed(&mut self) -> bool {
         false
+    }
+
+    /// Whether the transport can read/write model-specific registers
+    /// (`rdmsr`/`wrmsr`). KD implements this with
+    /// `DbgKdReadMachineSpecificRegister`; other transports report `false`.
+    fn supports_msr(&self) -> bool {
+        false
+    }
+
+    /// Read model-specific register `msr` on `processor`. On ARM64, `msr` is
+    /// the Windows KD encoding of an AArch64 system register.
+    fn read_msr(&mut self, _processor: u16, _msr: u32) -> Result<u64> {
+        Err(Error::NotSupported)
+    }
+
+    /// Write model-specific register `msr` on `processor`.
+    fn write_msr(&mut self, _processor: u16, _msr: u32, _value: u64) -> Result<()> {
+        Err(Error::NotSupported)
+    }
+
+    /// Whether the transport can reboot the target or force a bugcheck
+    /// (`.reboot` / `.crash`). KD implements these with `DbgKdRebootApi` and
+    /// `DbgKdCauseBugCheckApi`.
+    fn supports_target_control(&self) -> bool {
+        false
+    }
+
+    /// Reboot the target. The target is gone after this returns; the caller
+    /// treats the next stop as a reload.
+    fn reboot_target(&mut self) -> Result<()> {
+        Err(Error::NotSupported)
+    }
+
+    /// Force a `MANUALLY_INITIATED_CRASH` (0xE2) bugcheck on the target.
+    fn cause_bugcheck(&mut self) -> Result<()> {
+        Err(Error::NotSupported)
     }
 }
 
@@ -658,7 +747,6 @@ mod tests {
     #[test]
     fn debug_log_splits_lines_and_strips_crlf() {
         let log = DebugLog::new(16);
-        // Arrives in two chunks, the second completing a line split across them
         log.record(b"DriverEntry failed\r\nhello ");
         log.record(b"world\n");
         let page = log.read_since(0);
@@ -695,20 +783,15 @@ mod tests {
         let log = DebugLog::new(2);
         log.record(b"a\nb\nc\n");
         let page = log.read_since(0);
-        // Only the last two retained; seq 0 ("a") was evicted
         let texts: Vec<&str> = page.lines.iter().map(|l| l.text.as_str()).collect();
         assert_eq!(texts, vec!["b", "c"]);
-        // A reader still holding the evicted cursor learns it fell behind
         assert!(page.dropped);
-        // A reader caught up to the retained window does not
         assert!(!log.read_since(1).dropped);
     }
 
     #[test]
     fn validate_hw_execute_must_be_one_byte() {
-        // Execute at any address with len 1 is legal regardless of alignment.
         assert!(validate_hw_breakpoint(HwBreakpointAccess::Execute, 1, 0x1003).is_ok());
-        // Any other length for an execute breakpoint is rejected (checked before length/alignment).
         assert!(validate_hw_breakpoint(HwBreakpointAccess::Execute, 4, 0x1000).is_err());
         assert!(validate_hw_breakpoint(HwBreakpointAccess::Execute, 2, 0x1000).is_err());
         assert!(validate_hw_breakpoint(HwBreakpointAccess::Execute, 8, 0x1000).is_err());
@@ -716,7 +799,6 @@ mod tests {
 
     #[test]
     fn validate_hw_data_widths_when_aligned() {
-        // Every legal data width at a correctly aligned address is accepted.
         for access in [HwBreakpointAccess::Write, HwBreakpointAccess::ReadWrite] {
             assert!(validate_hw_breakpoint(access, 1, 0x1003).is_ok());
             assert!(validate_hw_breakpoint(access, 2, 0x1000).is_ok());
@@ -727,7 +809,6 @@ mod tests {
 
     #[test]
     fn validate_hw_rejects_invalid_lengths() {
-        // Lengths outside {1,2,4,8} are rejected for data breakpoints.
         for len in [0u8, 3, 5, 16] {
             assert!(validate_hw_breakpoint(HwBreakpointAccess::Write, len, 0x1000).is_err());
             assert!(validate_hw_breakpoint(HwBreakpointAccess::ReadWrite, len, 0x1000).is_err());
@@ -736,11 +817,9 @@ mod tests {
 
     #[test]
     fn validate_hw_requires_length_alignment() {
-        // An address not aligned to the watch length never fires in hardware, so it's rejected.
         assert!(validate_hw_breakpoint(HwBreakpointAccess::Write, 4, 0x1002).is_err());
         assert!(validate_hw_breakpoint(HwBreakpointAccess::Write, 2, 0x1001).is_err());
         assert!(validate_hw_breakpoint(HwBreakpointAccess::ReadWrite, 8, 0x1004).is_err());
-        // Single-byte watches align to every address.
         assert!(validate_hw_breakpoint(HwBreakpointAccess::Write, 1, 0x1001).is_ok());
         assert!(validate_hw_breakpoint(HwBreakpointAccess::ReadWrite, 1, 0x1003).is_ok());
     }

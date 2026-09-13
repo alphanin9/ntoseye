@@ -12,13 +12,12 @@ use crate::unwind::{
 };
 
 pub fn print_section(title: &str) {
-    println!("\n{}", ui::label(title));
+    outln!("\n{}", ui::label(title));
 }
 
-/// Begin a stop block: a blank line. The single seam marking every
-/// stop-output entry point, in case a heavier delimiter is ever wanted.
+/// Begin a stop block: a blank line.
 pub fn print_stop_separator() {
-    println!();
+    outln!();
 }
 
 /// Print the detail lines attached to an event banner: muted `├─` for middle
@@ -33,13 +32,13 @@ pub fn print_event_children(indent: &str, children: &[String]) {
         let glyph = if last { "╰─" } else { "├─" };
         let mut lines = child.lines();
         if let Some(first) = lines.next() {
-            println!("{indent}{} {}", ui::muted(glyph), first);
+            outln!("{indent}{} {}", ui::muted(glyph), first);
         }
         for continuation in lines {
             if last {
-                println!("{indent}   {continuation}");
+                outln!("{indent}   {continuation}");
             } else {
-                println!("{indent}{}  {continuation}", ui::muted("│"));
+                outln!("{indent}{}  {continuation}", ui::muted("│"));
             }
         }
     }
@@ -183,7 +182,7 @@ pub fn print_registers(register_map: &RegisterMap, regs: &[u8], embedded: bool) 
             ["x20", "x21", "x22", "x23"],
             ["x24", "x25", "x26", "x27"],
         ] {
-            println!(
+            outln!(
                 "{indent}{}   {}   {}   {}",
                 cell(row[0]),
                 cell(row[1]),
@@ -191,7 +190,7 @@ pub fn print_registers(register_map: &RegisterMap, regs: &[u8], embedded: bool) 
                 cell(row[3])
             );
         }
-        println!(
+        outln!(
             "{indent}{}   {}   {}   {}",
             cell("x28"),
             cell("fp"),
@@ -199,7 +198,7 @@ pub fn print_registers(register_map: &RegisterMap, regs: &[u8], embedded: bool) 
             cell("sp")
         );
         let cpsr = read_reg_value("cpsr").unwrap_or(0);
-        println!(
+        outln!(
             "{indent}{}   {} {}",
             cell("pc"),
             ui::muted("cpsr"),
@@ -209,7 +208,7 @@ pub fn print_registers(register_map: &RegisterMap, regs: &[u8], embedded: bool) 
         if !flags.is_empty() {
             // Align under the cpsr hex value: cell("pc") (4 + 16 chars) +
             // the "   cpsr " label, i.e. 28 columns.
-            println!("{indent}                            {flags}");
+            outln!("{indent}                            {flags}");
         }
         return;
     }
@@ -222,14 +221,14 @@ pub fn print_registers(register_map: &RegisterMap, regs: &[u8], embedded: bool) 
         ["r8", "r9", "r10"],
         ["r11", "r12", "r13"],
     ] {
-        println!(
+        outln!(
             "{indent}{}   {}   {}",
             cell(row[0]),
             cell(row[1]),
             cell(row[2])
         );
     }
-    println!(
+    outln!(
         "{indent}{}   {}   {} {}{}",
         cell("r14"),
         cell("r15"),
@@ -286,7 +285,7 @@ pub fn format_disasm_line(
 pub fn render_rows(rows: &[DisasmRow], marker_for: impl Fn(u64) -> Option<bool>) {
     let width = hex_column_width(rows.iter().map(|row| row.hex.as_str()));
     for row in rows {
-        println!(
+        outln!(
             "{}",
             format_disasm_line(
                 row.ip,
@@ -344,7 +343,7 @@ pub fn print_disasm_context(
         && (code_dtb == trace.active_dtb
             || code_memory.read_bytes(VirtAddr(rip), &mut bytes).is_err())
     {
-        println!("{}", "  (could not read memory at RIP)".bright_black());
+        outln!("{}", "  (could not read memory at RIP)".bright_black());
         return;
     }
 
@@ -369,17 +368,6 @@ pub fn print_stacktrace(
 ) {
     let stacktrace = build_stacktrace(debugger, register_map, regs, build_limit);
     print_stacktrace_data(&stacktrace, display_limit, embedded);
-}
-
-pub fn print_stacktrace_verbose(
-    debugger: &Target,
-    register_map: &RegisterMap,
-    regs: &[u8],
-    build_limit: usize,
-    display_limit: usize,
-) {
-    let stacktrace = build_stacktrace(debugger, register_map, regs, build_limit);
-    print_stacktrace_data_with_provenance(&stacktrace, display_limit, false);
 }
 
 /// Render an already-collected stack trace in the same layout as [`print_stacktrace`].
@@ -443,14 +431,14 @@ fn print_stacktrace_data_impl(
             format!("  {}", annotations.join(" "))
         };
         if embedded {
-            println!(
+            outln!(
                 "{indent}{} {}{}",
                 ui::muted(&format!("#{num:<2}")),
                 ui::addr(frame.ip),
                 annotation
             );
         } else {
-            println!(
+            outln!(
                 "{indent}{} {}  {}{}",
                 ui::muted(&format!("#{num:<2}")),
                 ui::addr(frame.sp),
@@ -462,7 +450,7 @@ fn print_stacktrace_data_impl(
 
     let hidden = stacktrace.frames.len().saturating_sub(display_limit) + stacktrace.truncated;
     if hidden > 0 {
-        println!(
+        outln!(
             "{indent}{}",
             format!("... {} more frames", hidden).bright_black()
         );
@@ -488,7 +476,6 @@ mod tests {
     #[test]
     fn cpsr_flags_align_under_hex_digits() {
         assert_eq!(format_cpsr(0x6000_0044), "        ZC    F ");
-        // N, A, I, F → "N" under the '8', "AIF" under the trailing '4's.
         assert_eq!(format_cpsr(0x8000_01c4), "        N    AIF");
         assert_eq!(format_cpsr(0x0000_0000), "                ");
     }

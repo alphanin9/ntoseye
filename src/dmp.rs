@@ -1,35 +1,47 @@
 use std::fs::File;
+use std::mem::offset_of;
 use std::path::Path;
 use std::time::Duration;
 
-use kdmp_parser::gxa::Gva;
-use kdmp_parser::parse::KernelDumpParser;
-use kdmp_parser::structs::KdDebuggerData64;
-use kdmp_parser::virt;
 use memmap2::Mmap;
+use zerocopy::FromBytes;
 
-use crate::kd::wire::{read_u16, read_u32, read_u64, read_u64 as buffer_u64};
+use crate::kd::wire::{
+    read_u16, read_u32, read_u64, read_u64 as buffer_u64, write_u16, write_u32, write_u64,
+};
 
 use crate::backend::MemoryOps;
+use crate::cpu_state;
 use crate::dbg_backend::{BackendCapability, DebugBackend, DebugCapability, StopEvent};
 use crate::debugger_data::{DebuggerDataCandidate, MetadataSource};
 use crate::diagnostics;
 use crate::error::{Error, Result};
 use crate::gdb::RegisterMap;
 use crate::kd::context;
+use crate::kd::context_arm64;
 use crate::memory::PAGE_SIZE;
 use crate::session::processor_index_from_backend_thread_id;
-use crate::symbols::TypeInfo;
+use crate::symbols::{ParsedType, TypeInfo};
 use crate::target::Target;
 use crate::triage::{
     TriageBlock, TriageDriver, TriagePrcbInfo, is_triage_dump, parse_drivers, parse_triage,
 };
 use crate::types::{PhysAddr, VirtAddr};
 
-const IMAGE_FILE_MACHINE_AMD64: u32 = 0x8664;
+pub mod parse;
+pub mod structs;
 
-fn require_amd64_dump(machine_type: u32) -> Result<()> {
-    if machine_type == IMAGE_FILE_MACHINE_AMD64 {
+use parse::ParsedDump;
+use structs::{Context, KdDebuggerData64};
+
+pub const IMAGE_FILE_MACHINE_AMD64: u32 = 0x8664;
+pub const IMAGE_FILE_MACHINE_ARM64: u32 = 0xaa64;
+
+fn require_supported_dump(machine_type: u32) -> Result<()> {
+    if matches!(
+        machine_type,
+        IMAGE_FILE_MACHINE_AMD64 | IMAGE_FILE_MACHINE_ARM64
+    ) {
         return Ok(());
     }
     let name = match machine_type {
@@ -42,7 +54,22 @@ fn require_amd64_dump(machine_type: u32) -> Result<()> {
     )))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
+pub struct DmpArm64Context {
+    pub x: [u64; 31],
+    pub cpsr: u32,
+    pub sp: u64,
+    pub pc: u64,
+    pub v: [u128; 32],
+    pub fpcr: u32,
+    pub fpsr: u32,
+    pub bcr: [u32; 8],
+    pub bvr: [u64; 8],
+    pub wcr: [u32; 2],
+    pub wvr: [u64; 2],
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct DmpContext {
     pub rax: u64,
     pub rbx: u64,
@@ -81,6 +108,7 @@ pub struct DmpContext {
     pub last_branch_from_rip: u64,
     pub last_exception_to_rip: u64,
     pub last_exception_from_rip: u64,
+    pub arm64: Option<DmpArm64Context>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -124,7 +152,9 @@ impl DmpContext {
         if buf.len() >= context::OFFSET_XMM0 + 16 * 16 {
             for (i, slot) in xmm.iter_mut().enumerate() {
                 let off = context::OFFSET_XMM0 + i * 16;
-                *slot = u128::from_le_bytes(buf[off..off + 16].try_into().unwrap());
+                let mut bytes = [0u8; 16];
+                bytes.copy_from_slice(&buf[off..off + 16]);
+                *slot = u128::from_le_bytes(bytes);
             }
         }
 
@@ -188,79 +218,186 @@ impl DmpContext {
             } else {
                 0
             },
+            arm64: None,
         }
     }
 
+    /// Parse the public Windows ARM64_NT_CONTEXT layout. The helper is
+    /// deliberately bounds-checked so a truncated dump yields zero for the
+    /// unavailable field instead of panicking while parsing an untrusted file.
+    pub fn from_arm64_bytes(buf: &[u8]) -> Self {
+        if buf.len() < context_arm64::CONTEXT_SIZE {
+            return Self {
+                arm64: Some(DmpArm64Context::default()),
+                ..Self::default()
+            };
+        }
+        let mut x = [0u64; 31];
+        for (i, slot) in x.iter_mut().enumerate() {
+            *slot = read_u64(buf, context_arm64::OFFSET_X0 + i * 8);
+        }
+        let mut v = [0u128; 32];
+        for (i, slot) in v.iter_mut().enumerate() {
+            let off = context_arm64::OFFSET_V0 + i * 16;
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&buf[off..off + 16]);
+            *slot = u128::from_le_bytes(bytes);
+        }
+        let mut bcr = [0u32; 8];
+        for (i, slot) in bcr.iter_mut().enumerate() {
+            *slot = read_u32(buf, context_arm64::OFFSET_BCR0 + i * 4);
+        }
+        let mut bvr = [0u64; 8];
+        for (i, slot) in bvr.iter_mut().enumerate() {
+            *slot = read_u64(buf, context_arm64::OFFSET_BVR0 + i * 8);
+        }
+        let mut wcr = [0u32; 2];
+        for (i, slot) in wcr.iter_mut().enumerate() {
+            *slot = read_u32(buf, context_arm64::OFFSET_WCR0 + i * 4);
+        }
+        let mut wvr = [0u64; 2];
+        for (i, slot) in wvr.iter_mut().enumerate() {
+            *slot = read_u64(buf, context_arm64::OFFSET_WVR0 + i * 8);
+        }
+
+        let cpsr = read_u32(buf, context_arm64::OFFSET_CPSR);
+        let sp = read_u64(buf, context_arm64::OFFSET_SP);
+        let pc = read_u64(buf, context_arm64::OFFSET_PC);
+        let fpcr = read_u32(buf, context_arm64::OFFSET_FPCR);
+        let fpsr = read_u32(buf, context_arm64::OFFSET_FPSR);
+        Self {
+            arm64: Some(DmpArm64Context {
+                x,
+                cpsr,
+                sp,
+                pc,
+                v,
+                fpcr,
+                fpsr,
+                bcr,
+                bvr,
+                wcr,
+                wvr,
+            }),
+            ..Self::default()
+        }
+    }
+
+    pub fn is_arm64(&self) -> bool {
+        self.arm64.is_some()
+    }
+
+    pub fn instruction_pointer(&self) -> u64 {
+        self.arm64.as_ref().map_or(self.rip, |ctx| ctx.pc)
+    }
+
+    pub fn stack_pointer(&self) -> u64 {
+        self.arm64.as_ref().map_or(self.rsp, |ctx| ctx.sp)
+    }
+
     pub fn to_register_buffer(&self, directory_table_base: u64) -> Vec<u8> {
+        if let Some(ctx) = &self.arm64 {
+            let mut data = vec![0u8; context_arm64::REGISTER_BUFFER_SIZE];
+            data[context_arm64::OFFSET_CONTEXT_FLAGS..context_arm64::OFFSET_CONTEXT_FLAGS + 4]
+                .copy_from_slice(&context_arm64::CONTEXT_ALL.to_le_bytes());
+            data[context_arm64::OFFSET_CPSR..context_arm64::OFFSET_CPSR + 4]
+                .copy_from_slice(&ctx.cpsr.to_le_bytes());
+            for (i, &value) in ctx.x.iter().enumerate() {
+                let off = context_arm64::OFFSET_X0 + i * 8;
+                data[off..off + 8].copy_from_slice(&value.to_le_bytes());
+            }
+            data[context_arm64::OFFSET_SP..context_arm64::OFFSET_SP + 8]
+                .copy_from_slice(&ctx.sp.to_le_bytes());
+            data[context_arm64::OFFSET_PC..context_arm64::OFFSET_PC + 8]
+                .copy_from_slice(&ctx.pc.to_le_bytes());
+            for (i, &value) in ctx.v.iter().enumerate() {
+                let off = context_arm64::OFFSET_V0 + i * 16;
+                data[off..off + 16].copy_from_slice(&value.to_le_bytes());
+            }
+            data[context_arm64::OFFSET_FPCR..context_arm64::OFFSET_FPCR + 4]
+                .copy_from_slice(&ctx.fpcr.to_le_bytes());
+            data[context_arm64::OFFSET_FPSR..context_arm64::OFFSET_FPSR + 4]
+                .copy_from_slice(&ctx.fpsr.to_le_bytes());
+            for (i, &value) in ctx.bcr.iter().enumerate() {
+                let off = context_arm64::OFFSET_BCR0 + i * 4;
+                data[off..off + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            for (i, &value) in ctx.bvr.iter().enumerate() {
+                let off = context_arm64::OFFSET_BVR0 + i * 8;
+                data[off..off + 8].copy_from_slice(&value.to_le_bytes());
+            }
+            for (i, &value) in ctx.wcr.iter().enumerate() {
+                let off = context_arm64::OFFSET_WCR0 + i * 4;
+                data[off..off + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            for (i, &value) in ctx.wvr.iter().enumerate() {
+                let off = context_arm64::OFFSET_WVR0 + i * 8;
+                data[off..off + 8].copy_from_slice(&value.to_le_bytes());
+            }
+            data[context_arm64::OFFSET_CR3..context_arm64::OFFSET_CR3 + 8]
+                .copy_from_slice(&directory_table_base.to_le_bytes());
+            return data;
+        }
         let mut data = vec![0u8; context::REGISTER_BUFFER_SIZE];
 
-        macro_rules! put_u64 {
-            ($off:expr, $val:expr) => {
-                data[$off..$off + 8].copy_from_slice(&($val).to_le_bytes());
-            };
-        }
-        macro_rules! put_u32 {
-            ($off:expr, $val:expr) => {
-                data[$off..$off + 4].copy_from_slice(&($val).to_le_bytes());
-            };
-        }
-        macro_rules! put_u16 {
-            ($off:expr, $val:expr) => {
-                data[$off..$off + 2].copy_from_slice(&($val).to_le_bytes());
-            };
-        }
-
-        put_u64!(context::OFFSET_RAX, self.rax);
-        put_u64!(context::OFFSET_RBX, self.rbx);
-        put_u64!(context::OFFSET_RCX, self.rcx);
-        put_u64!(context::OFFSET_RDX, self.rdx);
-        put_u64!(context::OFFSET_RSI, self.rsi);
-        put_u64!(context::OFFSET_RDI, self.rdi);
-        put_u64!(context::OFFSET_RBP, self.rbp);
-        put_u64!(context::OFFSET_RSP, self.rsp);
-        put_u64!(context::OFFSET_R8, self.r8);
-        put_u64!(context::OFFSET_R9, self.r9);
-        put_u64!(context::OFFSET_R10, self.r10);
-        put_u64!(context::OFFSET_R11, self.r11);
-        put_u64!(context::OFFSET_R12, self.r12);
-        put_u64!(context::OFFSET_R13, self.r13);
-        put_u64!(context::OFFSET_R14, self.r14);
-        put_u64!(context::OFFSET_R15, self.r15);
-        put_u64!(context::OFFSET_RIP, self.rip);
-        put_u32!(context::OFFSET_EFLAGS, self.eflags);
-        put_u16!(context::OFFSET_SEG_CS, self.cs);
-        put_u16!(context::OFFSET_SEG_DS, self.ds);
-        put_u16!(context::OFFSET_SEG_ES, self.es);
-        put_u16!(context::OFFSET_SEG_FS, self.fs);
-        put_u16!(context::OFFSET_SEG_GS, self.gs);
-        put_u16!(context::OFFSET_SEG_SS, self.ss);
-        put_u64!(context::OFFSET_DR0, self.dr0);
-        put_u64!(context::OFFSET_DR1, self.dr1);
-        put_u64!(context::OFFSET_DR2, self.dr2);
-        put_u64!(context::OFFSET_DR3, self.dr3);
-        put_u64!(context::OFFSET_DR6, self.dr6);
-        put_u64!(context::OFFSET_DR7, self.dr7);
-        put_u64!(context::OFFSET_CR3, directory_table_base);
-        put_u32!(context::OFFSET_MX_CSR, self.mxcsr);
+        write_u64(&mut data, context::OFFSET_RAX, self.rax);
+        write_u64(&mut data, context::OFFSET_RBX, self.rbx);
+        write_u64(&mut data, context::OFFSET_RCX, self.rcx);
+        write_u64(&mut data, context::OFFSET_RDX, self.rdx);
+        write_u64(&mut data, context::OFFSET_RSI, self.rsi);
+        write_u64(&mut data, context::OFFSET_RDI, self.rdi);
+        write_u64(&mut data, context::OFFSET_RBP, self.rbp);
+        write_u64(&mut data, context::OFFSET_RSP, self.rsp);
+        write_u64(&mut data, context::OFFSET_R8, self.r8);
+        write_u64(&mut data, context::OFFSET_R9, self.r9);
+        write_u64(&mut data, context::OFFSET_R10, self.r10);
+        write_u64(&mut data, context::OFFSET_R11, self.r11);
+        write_u64(&mut data, context::OFFSET_R12, self.r12);
+        write_u64(&mut data, context::OFFSET_R13, self.r13);
+        write_u64(&mut data, context::OFFSET_R14, self.r14);
+        write_u64(&mut data, context::OFFSET_R15, self.r15);
+        write_u64(&mut data, context::OFFSET_RIP, self.rip);
+        write_u32(&mut data, context::OFFSET_EFLAGS, self.eflags);
+        write_u16(&mut data, context::OFFSET_SEG_CS, self.cs);
+        write_u16(&mut data, context::OFFSET_SEG_DS, self.ds);
+        write_u16(&mut data, context::OFFSET_SEG_ES, self.es);
+        write_u16(&mut data, context::OFFSET_SEG_FS, self.fs);
+        write_u16(&mut data, context::OFFSET_SEG_GS, self.gs);
+        write_u16(&mut data, context::OFFSET_SEG_SS, self.ss);
+        write_u64(&mut data, context::OFFSET_DR0, self.dr0);
+        write_u64(&mut data, context::OFFSET_DR1, self.dr1);
+        write_u64(&mut data, context::OFFSET_DR2, self.dr2);
+        write_u64(&mut data, context::OFFSET_DR3, self.dr3);
+        write_u64(&mut data, context::OFFSET_DR6, self.dr6);
+        write_u64(&mut data, context::OFFSET_DR7, self.dr7);
+        write_u64(&mut data, context::OFFSET_CR3, directory_table_base);
+        write_u32(&mut data, context::OFFSET_MX_CSR, self.mxcsr);
         for (i, &val) in self.xmm.iter().enumerate() {
             let off = context::OFFSET_XMM0 + i * 16;
             data[off..off + 16].copy_from_slice(&val.to_le_bytes());
         }
         // Keep the buffer symmetric with from_bytes: PRCB-sourced raw CONTEXT
         // copies carry these, so the header-context buffer must too.
-        put_u64!(context::OFFSET_DEBUG_CONTROL, self.debug_control);
-        put_u64!(context::OFFSET_LAST_BRANCH_TO_RIP, self.last_branch_to_rip);
-        put_u64!(
+        write_u64(&mut data, context::OFFSET_DEBUG_CONTROL, self.debug_control);
+        write_u64(
+            &mut data,
+            context::OFFSET_LAST_BRANCH_TO_RIP,
+            self.last_branch_to_rip,
+        );
+        write_u64(
+            &mut data,
             context::OFFSET_LAST_BRANCH_FROM_RIP,
-            self.last_branch_from_rip
+            self.last_branch_from_rip,
         );
-        put_u64!(
+        write_u64(
+            &mut data,
             context::OFFSET_LAST_EXCEPTION_TO_RIP,
-            self.last_exception_to_rip
+            self.last_exception_to_rip,
         );
-        put_u64!(
+        write_u64(
+            &mut data,
             context::OFFSET_LAST_EXCEPTION_FROM_RIP,
-            self.last_exception_from_rip
+            self.last_exception_from_rip,
         );
 
         data
@@ -268,10 +405,9 @@ impl DmpContext {
 }
 
 /// Clamp the untrusted header's processor count so a malformed dump can't
-/// drive an unbounded per-CPU register-buffer allocation (Windows tops out
-/// at 2048 logical processors).
+/// drive an unbounded per-CPU register-buffer allocation.
 pub fn clamp_processors(n: u32) -> u32 {
-    n.clamp(1, 2048)
+    n.clamp(1, u32::from(cpu_state::MAX_PROCESSORS))
 }
 
 #[derive(Debug, Clone)]
@@ -332,72 +468,23 @@ impl DmpMem {
             return Self::open_triage(mmap);
         }
 
-        match KernelDumpParser::new(path) {
-            Ok(parser) => Self::open_full(mmap, parser),
-            Err(e) => Err(Error::InvalidDump(e.to_string())),
-        }
+        let parsed = parse::parse(&mmap)?;
+        Self::open_full(mmap, parsed)
     }
 
-    fn open_full(mmap: Mmap, parser: KernelDumpParser) -> Result<Self> {
-        let hdr = parser.headers();
-        require_amd64_dump(hdr.machine_image_type)?;
-        let mut pages: Vec<(u64, u64)> = parser
-            .physmem()
-            .map(|(gpa, offset)| (u64::from(gpa), offset))
-            .collect();
-        pages.sort_unstable_by_key(|&(gpa, _)| gpa);
+    fn open_full(mmap: Mmap, parsed: ParsedDump) -> Result<Self> {
+        let hdr = &parsed.headers;
+        require_supported_dump(hdr.machine_image_type)?;
+        // `PhysmemMap` is a `BTreeMap` keyed by GPA, so this is already sorted
+        // ascending -- which `lookup` relies on for its binary search.
+        let pages: Vec<(u64, u64)> = parsed.physmem.into_iter().collect();
 
-        let ctx = parser.context_record();
-
-        let offset_prcb_context = Self::read_prcb_context_offset(&parser);
-
-        let exc = &hdr.exception;
-        let n_params = (exc.number_parameters as usize).min(15);
-        let exception = if exc.exception_code != 0 || exc.exception_address != 0 {
-            Some(DmpException {
-                code: exc.exception_code,
-                flags: exc.exception_flags,
-                address: exc.exception_address,
-                parameters: exc.exception_information[..n_params].to_vec(),
-            })
+        let context = if hdr.machine_image_type == IMAGE_FILE_MACHINE_ARM64 {
+            DmpContext::from_arm64_bytes(&hdr.context_record_buffer)
         } else {
-            None
-        };
-
-        let system_info = Some(DmpSystemInfo {
-            major_version: hdr.major_version,
-            minor_version: hdr.minor_version,
-            system_time: hdr.system_time,
-            system_up_time: hdr.system_up_time,
-            product_type: hdr.product_type,
-            suite_mask: hdr.suite_mask,
-            machine_image_type: hdr.machine_image_type,
-            service_pack_build: 0,
-        });
-
-        let info = DmpInfo {
-            directory_table_base: hdr.directory_table_base,
-            bug_check_code: hdr.bug_check_code,
-            bug_check_parameters: hdr.bug_check_code_parameters,
-            offset_prcb_context,
-            number_processors: clamp_processors(hdr.number_processors),
-            is_triage: false,
-            ps_loaded_module_list: hdr.ps_loaded_module_list,
-            ps_active_process_head: hdr.ps_active_process_head,
-            debugger_data_block: (hdr.kd_debugger_data_block != 0)
-                .then_some(hdr.kd_debugger_data_block),
-            triage_drivers: Vec::new(),
-            exception,
-            system_info,
-            unloaded_drivers: Vec::new(),
-            blackbox_streams: Vec::new(),
-            triage_process_snapshot: None,
-            triage_thread_snapshot: None,
-            triage_prcb_info: None,
-            broken_driver: None,
-            triage_overflowed: false,
-            kern_base: None,
-            context: DmpContext {
+            let (ctx, _) = Context::read_from_prefix(&hdr.context_record_buffer)
+                .map_err(|_| Error::InvalidDump("context record is truncated".to_string()))?;
+            DmpContext {
                 rax: ctx.rax,
                 rbx: ctx.rbx,
                 rcx: ctx.rcx,
@@ -435,7 +522,58 @@ impl DmpMem {
                 last_branch_from_rip: ctx.last_branch_from_rip,
                 last_exception_to_rip: ctx.last_exception_to_rip,
                 last_exception_from_rip: ctx.last_exception_from_rip,
-            },
+                arm64: None,
+            }
+        };
+
+        let exc = &hdr.exception;
+        let n_params = (exc.number_parameters as usize).min(15);
+        let exception = if exc.exception_code != 0 || exc.exception_address != 0 {
+            Some(DmpException {
+                code: exc.exception_code,
+                flags: exc.exception_flags,
+                address: exc.exception_address,
+                parameters: exc.exception_information[..n_params].to_vec(),
+            })
+        } else {
+            None
+        };
+
+        let system_info = Some(DmpSystemInfo {
+            major_version: hdr.major_version,
+            minor_version: hdr.minor_version,
+            system_time: hdr.system_time,
+            system_up_time: hdr.system_up_time,
+            product_type: hdr.product_type,
+            suite_mask: hdr.suite_mask,
+            machine_image_type: hdr.machine_image_type,
+            service_pack_build: 0,
+        });
+
+        let info = DmpInfo {
+            directory_table_base: hdr.directory_table_base,
+            bug_check_code: hdr.bug_check_code,
+            bug_check_parameters: hdr.bug_check_code_parameters,
+            // Resolved by DmpBackend once guest virtual-memory translation is available.
+            offset_prcb_context: None,
+            number_processors: clamp_processors(hdr.number_processors),
+            is_triage: false,
+            ps_loaded_module_list: hdr.ps_loaded_module_list,
+            ps_active_process_head: hdr.ps_active_process_head,
+            debugger_data_block: (hdr.kd_debugger_data_block != 0)
+                .then_some(hdr.kd_debugger_data_block),
+            triage_drivers: Vec::new(),
+            exception,
+            system_info,
+            unloaded_drivers: Vec::new(),
+            blackbox_streams: Vec::new(),
+            triage_process_snapshot: None,
+            triage_thread_snapshot: None,
+            triage_prcb_info: None,
+            broken_driver: None,
+            triage_overflowed: false,
+            kern_base: None,
+            context,
         };
 
         Ok(Self {
@@ -448,7 +586,7 @@ impl DmpMem {
     fn open_triage(mmap: Mmap) -> Result<Self> {
         let (mut info, blocks) = parse_triage(&mmap)?;
         if let Some(system_info) = info.system_info.as_ref() {
-            require_amd64_dump(system_info.machine_image_type)?;
+            require_supported_dump(system_info.machine_image_type)?;
         }
         info.triage_drivers = parse_drivers(&mmap);
         Ok(Self {
@@ -456,14 +594,6 @@ impl DmpMem {
             storage: DmpStorage::Blocks(blocks),
             info,
         })
-    }
-
-    fn read_prcb_context_offset(parser: &KernelDumpParser) -> Option<u16> {
-        let reader = virt::Reader::new(parser);
-        let kdbg_va: Gva = parser.headers().kd_debugger_data_block.into();
-        let kdbg: KdDebuggerData64 = reader.try_read_struct(kdbg_va).ok()??;
-        let off = kdbg.offset_prcb_context;
-        if off > 0 { Some(off) } else { None }
     }
 
     pub fn info(&self) -> &DmpInfo {
@@ -559,10 +689,6 @@ impl MemoryOps<PhysAddr> for DmpMem {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DmpBackend — DebugBackend for crash dump analysis
-// ---------------------------------------------------------------------------
-
 pub struct DmpBackend {
     register_map: RegisterMap,
     per_cpu_registers: Vec<Vec<u8>>,
@@ -580,7 +706,12 @@ pub struct DmpBackend {
 
 impl DmpBackend {
     pub fn new(info: &DmpInfo) -> Self {
-        let register_map = context::build_register_map();
+        let is_arm64 = info.context.is_arm64();
+        let register_map = if is_arm64 {
+            context_arm64::build_register_map()
+        } else {
+            context::build_register_map()
+        };
         let n = info.number_processors.max(1) as usize;
 
         let cpu0_data = Self::build_register_buffer(&info.context, info.directory_table_base);
@@ -588,8 +719,17 @@ impl DmpBackend {
         let mut per_cpu = Vec::with_capacity(n);
         per_cpu.push(cpu0_data);
         for _ in 1..n {
-            let mut data = vec![0u8; context::REGISTER_BUFFER_SIZE];
-            data[context::OFFSET_CR3..context::OFFSET_CR3 + 8]
+            let mut data = if is_arm64 {
+                vec![0u8; context_arm64::REGISTER_BUFFER_SIZE]
+            } else {
+                vec![0u8; context::REGISTER_BUFFER_SIZE]
+            };
+            let dtb_offset = if is_arm64 {
+                context_arm64::OFFSET_CR3
+            } else {
+                context::OFFSET_CR3
+            };
+            data[dtb_offset..dtb_offset + 8]
                 .copy_from_slice(&info.directory_table_base.to_le_bytes());
             per_cpu.push(data);
         }
@@ -605,7 +745,7 @@ impl DmpBackend {
             debugger_data_hint: info
                 .debugger_data_block
                 .map(|address| DebuggerDataCandidate {
-                    address: crate::types::VirtAddr(address),
+                    address: VirtAddr(address),
                     source: MetadataSource::DumpHeader,
                 }),
             triage_crash_info: None,
@@ -618,53 +758,126 @@ impl DmpBackend {
 
     fn read_prcb_contexts(&mut self, target: &Target, prcb_ctx_offset: u16) -> Result<()> {
         let memory = target.guest()?.ntoskrnl.memory();
-        let processor_block = target
-            .guest()?
-            .ntoskrnl
-            .symbol("KiProcessorBlock")?
-            .address();
+        self.read_prcb_contexts_with(target, context::CONTEXT_SIZE, "PRCB", |prcb| {
+            memory.read(prcb + u64::from(prcb_ctx_offset))
+        })
+    }
 
+    fn read_prcb_contexts_with<F>(
+        &mut self,
+        target: &Target,
+        context_size: usize,
+        context_label: &str,
+        context_pointer: F,
+    ) -> Result<()>
+    where
+        F: Fn(VirtAddr) -> Result<VirtAddr>,
+    {
+        let memory = target.guest()?.ntoskrnl.memory();
         for i in 0..self.per_cpu_registers.len() {
-            let prcb: VirtAddr = memory.read(processor_block + (i as u64) * 8)?;
-            if prcb.is_zero() {
-                diagnostics::eprint_warning(format!("KiProcessorBlock[{i}] is null, skipping"));
+            let index = u16::try_from(i).map_err(|_| {
+                Error::DebugInfo(format!("processor index {i} exceeds the supported bound"))
+            })?;
+            let prcb = match cpu_state::kprcb_for_processor(target, index) {
+                Ok(prcb) => prcb,
+                Err(error) => {
+                    diagnostics::eprint_warning(format!(
+                        "KiProcessorBlock[{i}] unavailable: {error}"
+                    ));
+                    continue;
+                }
+            };
+            let context_ptr = match context_pointer(prcb) {
+                Ok(context_ptr) if !context_ptr.is_zero() => context_ptr,
+                Ok(_) => {
+                    diagnostics::eprint_warning(format!(
+                        "PRCB[{i}] Context pointer is null, skipping"
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    diagnostics::eprint_warning(format!(
+                        "failed to read {context_label}[{i}] context pointer: {error}"
+                    ));
+                    continue;
+                }
+            };
+
+            let mut ctx_buf = vec![0u8; context_size];
+            if let Err(error) = memory.read_bytes(context_ptr, &mut ctx_buf) {
+                diagnostics::eprint_warning(format!(
+                    "failed to read {context_label}[{i}] context: {error}"
+                ));
                 continue;
             }
-
-            let context_ptr: VirtAddr = memory.read(prcb + prcb_ctx_offset as u64)?;
-            if context_ptr.is_zero() {
-                diagnostics::eprint_warning(format!("PRCB[{i}] Context pointer is null, skipping"));
-                continue;
-            }
-
-            let mut ctx_buf = vec![0u8; context::CONTEXT_SIZE];
-            if let Err(e) = memory.read_bytes(context_ptr, &mut ctx_buf) {
-                diagnostics::eprint_warning(format!("failed to read PRCB[{i}] context: {e}"));
-                continue;
-            }
-
-            // The copy stops at CONTEXT_SIZE, so the control-register tail
-            // (CR3, seeded at construction) is untouched
-            self.per_cpu_registers[i][..context::CONTEXT_SIZE].copy_from_slice(&ctx_buf);
+            self.per_cpu_registers[i][..context_size].copy_from_slice(&ctx_buf);
         }
-
         Ok(())
     }
 
-    /// Land the user on the bugchecking CPU, the way WinDbg opens a dump. The
-    /// header CONTEXT record belongs to the crashing processor but doesn't say
-    /// which one it is, so match it against the per-CPU PRCB contexts. If
-    /// nothing matches (odd dump), re-seat the header context on CPU 0 so the
-    /// crash registers are what the user sees first, not whatever PRCB[0] held.
+    fn arm64_prcb_context_offset(target: &Target) -> Result<u64> {
+        let symbols = &target.symbols;
+        let prcb = symbols
+            .find_type_across_modules(target.kernel_dtb(), "_KPRCB")
+            .ok_or_else(|| Error::StructNotFound("_KPRCB".into()))?;
+        let processor_state = prcb
+            .fields
+            .get("ProcessorState")
+            .ok_or_else(|| Error::FieldNotFound("ProcessorState".into()))?;
+        let state_name = match &processor_state.type_data {
+            ParsedType::Struct(name) | ParsedType::Union(name) => name,
+            other => {
+                return Err(Error::FieldTypeMismatch(
+                    format!("ProcessorState ({other})"),
+                    "struct".into(),
+                ));
+            }
+        };
+        let state = symbols
+            .find_type_across_modules(target.kernel_dtb(), state_name)
+            .ok_or_else(|| Error::StructNotFound(state_name.clone()))?;
+        let context_frame = state
+            .fields
+            .get("ContextFrame")
+            .ok_or_else(|| Error::FieldNotFound("ContextFrame".into()))?;
+        let offset = processor_state.offset as u64 + context_frame.offset as u64;
+        let context_end = offset
+            .checked_add(context_arm64::CONTEXT_SIZE as u64)
+            .ok_or_else(|| Error::DebugInfo("ARM64 PRCB ContextFrame offset overflow".into()))?;
+        if context_end > prcb.size as u64 {
+            return Err(Error::DebugInfo(format!(
+                "ARM64 PRCB ContextFrame at {offset:#x} exceeds _KPRCB size {:#x}",
+                prcb.size
+            )));
+        }
+        Ok(offset)
+    }
+
+    fn read_arm64_prcb_contexts(&mut self, target: &Target) -> Result<()> {
+        let context_offset = Self::arm64_prcb_context_offset(target)?;
+        self.read_prcb_contexts_with(target, context_arm64::CONTEXT_SIZE, "ARM64 PRCB", |prcb| {
+            Ok(prcb + context_offset)
+        })
+    }
+
+    /// Select the bugchecking CPU by matching the header CONTEXT against the
+    /// per-CPU PRCB contexts; with no match, re-seat the header context on CPU 0.
     fn select_crash_processor(&mut self) {
         // Live-system dumps (bugcheck 0x161) carry no exception context
-        if self.header_context.rip == 0 {
+        if self.header_context.instruction_pointer() == 0 {
             return;
         }
 
         let matches_header = |regs: &Vec<u8>| {
-            buffer_u64(regs, context::OFFSET_RIP) == self.header_context.rip
-                && buffer_u64(regs, context::OFFSET_RSP) == self.header_context.rsp
+            if self.header_context.is_arm64() {
+                buffer_u64(regs, context_arm64::OFFSET_PC)
+                    == self.header_context.instruction_pointer()
+                    && buffer_u64(regs, context_arm64::OFFSET_SP)
+                        == self.header_context.stack_pointer()
+            } else {
+                buffer_u64(regs, context::OFFSET_RIP) == self.header_context.instruction_pointer()
+                    && buffer_u64(regs, context::OFFSET_RSP) == self.header_context.stack_pointer()
+            }
         };
         match self.per_cpu_registers.iter().position(matches_header) {
             Some(i) => self.current_processor = i,
@@ -758,6 +971,16 @@ impl DmpBackend {
         self.triage_crash_info.as_ref()
     }
 
+    /// Full dumps need guest translation to read KDBG; triage dumps resolve
+    /// this from their embedded copy at parse time.
+    fn resolve_prcb_context_offset(&self, target: &Target) -> Option<u16> {
+        let kdbg = self.debugger_data_hint?.address;
+        let memory = target.guest().ok()?.ntoskrnl.memory();
+        let field = offset_of!(KdDebuggerData64, offset_prcb_context) as u64;
+        let offset: u16 = memory.read(kdbg + field).ok()?;
+        (offset > 0).then_some(offset)
+    }
+
     fn unsupported(operation: &str) -> Error {
         Error::DebugInfo(format!(
             "crash dump is a static snapshot; {operation} is not available"
@@ -770,11 +993,26 @@ impl DebugBackend for DmpBackend {
         "dmp"
     }
     fn initialize_from_target(&mut self, target: &Target) {
-        if let Some(offset) = self.prcb_context_offset {
-            if let Err(e) = self.read_prcb_contexts(target, offset) {
-                diagnostics::eprint_warning(format!("could not read PRCB contexts from dump: {e}"));
+        if self.header_context.is_arm64() {
+            if let Err(e) = self.read_arm64_prcb_contexts(target) {
+                diagnostics::eprint_warning(format!(
+                    "could not read ARM64 PRCB ContextFrame contexts from dump: {e}"
+                ));
             }
             self.select_crash_processor();
+        } else {
+            let offset = self
+                .prcb_context_offset
+                .or_else(|| self.resolve_prcb_context_offset(target));
+            if let Some(offset) = offset {
+                self.prcb_context_offset = Some(offset);
+                if let Err(e) = self.read_prcb_contexts(target, offset) {
+                    diagnostics::eprint_warning(format!(
+                        "could not read PRCB contexts from dump: {e}"
+                    ));
+                }
+                self.select_crash_processor();
+            }
         }
 
         if let Some(info) = target.phys.dmp_info() {
@@ -811,6 +1049,8 @@ impl DebugBackend for DmpBackend {
             BackendCapability::supported(DebugCapability::BugcheckDetection),
             BackendCapability::supported(DebugCapability::BugcheckDetails),
             BackendCapability::unsupported(DebugCapability::DebugOutput),
+            BackendCapability::unsupported(DebugCapability::Msr),
+            BackendCapability::unsupported(DebugCapability::TargetControl),
         ]
     }
 
@@ -893,10 +1133,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dump_open_rejects_non_amd64_machine_types() {
-        assert!(require_amd64_dump(IMAGE_FILE_MACHINE_AMD64).is_ok());
-        let error = require_amd64_dump(0x014c).unwrap_err();
+    fn dump_open_rejects_unsupported_machine_types() {
+        assert!(require_supported_dump(IMAGE_FILE_MACHINE_AMD64).is_ok());
+        assert!(require_supported_dump(IMAGE_FILE_MACHINE_ARM64).is_ok());
+        let error = require_supported_dump(0x014c).unwrap_err();
         assert!(error.to_string().contains("I386 crash dump"));
+    }
+
+    #[test]
+    fn arm64_context_header_round_trips_registers_and_debug_state() {
+        let mut raw = vec![0u8; context_arm64::CONTEXT_SIZE];
+        raw[context_arm64::OFFSET_CPSR..context_arm64::OFFSET_CPSR + 4]
+            .copy_from_slice(&0x6000_03c5u32.to_le_bytes());
+        raw[context_arm64::OFFSET_X0..context_arm64::OFFSET_X0 + 8]
+            .copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        raw[context_arm64::OFFSET_SP..context_arm64::OFFSET_SP + 8]
+            .copy_from_slice(&0xffff_0000_1234_5000u64.to_le_bytes());
+        raw[context_arm64::OFFSET_PC..context_arm64::OFFSET_PC + 8]
+            .copy_from_slice(&0xffff_0000_0000_1000u64.to_le_bytes());
+        raw[context_arm64::OFFSET_BCR0..context_arm64::OFFSET_BCR0 + 4]
+            .copy_from_slice(&0x0000_e9e1u32.to_le_bytes());
+        raw[context_arm64::OFFSET_WVR0..context_arm64::OFFSET_WVR0 + 8]
+            .copy_from_slice(&0x4000u64.to_le_bytes());
+        let context = DmpContext::from_arm64_bytes(&raw);
+        let arm = context.arm64.as_ref().unwrap();
+        assert_eq!(arm.x[0], 0x1122_3344_5566_7788);
+        assert_eq!(arm.sp, 0xffff_0000_1234_5000);
+        assert_eq!(arm.pc, 0xffff_0000_0000_1000);
+        assert_eq!(arm.bcr[0], 0x0000_e9e1);
+        assert_eq!(arm.wvr[0], 0x4000);
+
+        let map = context_arm64::build_register_map();
+        let data = context.to_register_buffer(0x1234_5000);
+        assert_eq!(map.read_u64("x0", &data).unwrap(), arm.x[0]);
+        assert_eq!(map.read_u64("pc", &data).unwrap(), arm.pc);
+        assert_eq!(map.read_u64("sp", &data).unwrap(), arm.sp);
+        assert_eq!(map.read_u64("bcr0", &data).unwrap(), arm.bcr[0] as u64);
+        assert_eq!(map.read_u64("wvr0", &data).unwrap(), arm.wvr[0]);
+        assert_eq!(map.read_u64("cr3", &data).unwrap(), 0x1234_5000);
     }
 
     fn make_test_info() -> DmpInfo {
@@ -959,6 +1233,7 @@ mod tests {
                 last_branch_from_rip: 0,
                 last_exception_to_rip: 0,
                 last_exception_from_rip: 0,
+                arm64: None,
             },
         }
     }
@@ -973,77 +1248,11 @@ mod tests {
         assert_eq!(map.read_u64("rax", &data).unwrap(), 0x1111111111111111);
         assert_eq!(map.read_u64("rbx", &data).unwrap(), 0x2222222222222222);
         assert_eq!(map.read_u64("rcx", &data).unwrap(), 0x3333333333333333);
+        assert_eq!(map.read_u64("rdx", &data).unwrap(), 0x4444444444444444);
+        assert_eq!(map.read_u64("rsi", &data).unwrap(), 0x5555555555555555);
+        assert_eq!(map.read_u64("rdi", &data).unwrap(), 0x6666666666666666);
+        assert_eq!(map.read_u64("rbp", &data).unwrap(), 0x7777777777777777);
         assert_eq!(map.read_u64("rsp", &data).unwrap(), 0x8888888888888888);
-        assert_eq!(map.read_u64("rip", &data).unwrap(), 0xfffff80012345678);
-        assert_eq!(map.read_u64("eflags", &data).unwrap(), 0x246);
-        assert_eq!(map.read_u64("cs", &data).unwrap(), 0x10);
-        assert_eq!(
-            map.read_u64("cr3", &data).unwrap(),
-            info.directory_table_base
-        );
-    }
-
-    #[test]
-    fn dmp_backend_capabilities() {
-        let info = make_test_info();
-        let backend = DmpBackend::new(&info);
-        let caps = backend.capabilities();
-
-        let is_supported = |cap: DebugCapability| -> bool {
-            caps.iter().any(|c| c.capability == cap && c.supported)
-        };
-
-        assert!(is_supported(DebugCapability::MemoryIntrospection));
-        assert!(is_supported(DebugCapability::ReadRegisters));
-        assert!(is_supported(DebugCapability::ThreadList));
-        assert!(is_supported(DebugCapability::ThreadSelection));
-        assert!(!is_supported(DebugCapability::ExecutionControl));
-        assert!(!is_supported(DebugCapability::SingleStep));
-        assert!(!is_supported(DebugCapability::WriteRegisters));
-        assert!(!is_supported(DebugCapability::KernelBreakpoints));
-    }
-
-    #[test]
-    fn dmp_backend_is_halted() {
-        let info = make_test_info();
-        let backend = DmpBackend::new(&info);
-        assert!(!backend.is_running());
-    }
-
-    #[test]
-    fn dmp_backend_write_registers_rejected() {
-        let info = make_test_info();
-        let mut backend = DmpBackend::new(&info);
-        let result = backend.write_registers(&[0u8; 100]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn dmp_backend_execution_rejected() {
-        let info = make_test_info();
-        let mut backend = DmpBackend::new(&info);
-        assert!(backend.continue_execution().is_err());
-        assert!(backend.step().is_err());
-        assert!(backend.set_breakpoint(0x1000).is_err());
-        assert!(backend.remove_breakpoint(0x1000).is_err());
-    }
-
-    #[test]
-    fn dmp_backend_exit_is_clean() {
-        // Frontend quit must not trip over the default "leave the VM running"
-        // exit behavior (a dump can't continue)
-        let info = make_test_info();
-        let mut backend = DmpBackend::new(&info);
-        assert!(backend.prepare_for_exit(true).is_ok());
-    }
-
-    #[test]
-    fn dmp_backend_all_registers_round_trip() {
-        let info = make_test_info();
-        let mut backend = DmpBackend::new(&info);
-        let map = backend.register_map().clone();
-        let data = backend.read_registers().unwrap();
-
         assert_eq!(map.read_u64("r8", &data).unwrap(), 0x0808080808080808);
         assert_eq!(map.read_u64("r9", &data).unwrap(), 0x0909090909090909);
         assert_eq!(map.read_u64("r10", &data).unwrap(), 0x1010101010101010);
@@ -1052,11 +1261,14 @@ mod tests {
         assert_eq!(map.read_u64("r13", &data).unwrap(), 0x1313131313131313);
         assert_eq!(map.read_u64("r14", &data).unwrap(), 0x1414141414141414);
         assert_eq!(map.read_u64("r15", &data).unwrap(), 0x1515151515151515);
-        assert_eq!(map.read_u64("rdx", &data).unwrap(), 0x4444444444444444);
-        assert_eq!(map.read_u64("rsi", &data).unwrap(), 0x5555555555555555);
-        assert_eq!(map.read_u64("rdi", &data).unwrap(), 0x6666666666666666);
-        assert_eq!(map.read_u64("rbp", &data).unwrap(), 0x7777777777777777);
+        assert_eq!(map.read_u64("rip", &data).unwrap(), 0xfffff80012345678);
+        assert_eq!(map.read_u64("eflags", &data).unwrap(), 0x246);
+        assert_eq!(map.read_u64("cs", &data).unwrap(), 0x10);
         assert_eq!(map.read_u64("ss", &data).unwrap(), 0x18);
+        assert_eq!(
+            map.read_u64("cr3", &data).unwrap(),
+            info.directory_table_base
+        );
     }
 
     #[test]
@@ -1094,7 +1306,6 @@ mod tests {
         assert_eq!(mem.lookup(0x1000), Some((0x3000, 0x1000)));
         assert_eq!(mem.lookup(0x1500), Some((0x3500, 0x0B00)));
         assert_eq!(mem.lookup(0x5000), Some((0x5000, 0x1000)));
-        // Page not present in dump
         assert_eq!(mem.lookup(0x3000), None);
         assert_eq!(mem.lookup(0x4000), None);
         assert_eq!(mem.lookup(0x8000), None);
@@ -1106,8 +1317,6 @@ mod tests {
         info.number_processors = 4;
         let mut backend = DmpBackend::new(&info);
 
-        // Simulate the PRCB pass: CPU 2 holds the crashing context, the others
-        // (including CPU 0, which starts as the header context) hold idle ones
         for (i, regs) in backend.per_cpu_registers.iter_mut().enumerate() {
             let (rip, rsp) = if i == 2 {
                 (info.context.rip, info.context.rsp)
@@ -1129,7 +1338,6 @@ mod tests {
         info.number_processors = 2;
         let mut backend = DmpBackend::new(&info);
 
-        // No PRCB context matches the header record (CPU 0's got clobbered)
         for regs in backend.per_cpu_registers.iter_mut() {
             regs[context::OFFSET_RIP..context::OFFSET_RIP + 8]
                 .copy_from_slice(&0xfffff800cccc0000u64.to_le_bytes());
@@ -1150,8 +1358,6 @@ mod tests {
     #[test]
     fn triage_mem_read_within_block() {
         let mut data = vec![0u8; 0x4000];
-        // Block at VA 0xfffff80000001000, file offset 0x3000, size 0x100
-        // Fill the file region with recognizable data
         for i in 0..0x100usize {
             data[0x3000 + i] = i as u8;
         }
@@ -1167,12 +1373,10 @@ mod tests {
 
         let mem = DmpMem::new_triage_for_test(data, blocks, info);
 
-        // Read from the middle of the block
         let mut buf = [0u8; 4];
         mem.read_bytes(0xfffff80000001010u64, &mut buf).unwrap();
         assert_eq!(buf, [0x10, 0x11, 0x12, 0x13]);
 
-        // Read past the block should fail
         let mut buf = [0u8; 1];
         assert!(mem.read_bytes(0xfffff80000001100u64, &mut buf).is_err());
     }
@@ -1180,11 +1384,9 @@ mod tests {
     #[test]
     fn triage_overlapping_blocks_fallback() {
         let mut data = vec![0u8; 0x8000];
-        // Large block A: VA 0x1000, size 0x3000, at file offset 0x2000
         for i in 0..0x3000usize {
             data[0x2000 + i] = 0xAA;
         }
-        // Small block B: VA 0x2000, size 0x1000, at file offset 0x5000
         for i in 0..0x1000usize {
             data[0x5000 + i] = 0xBB;
         }
@@ -1206,20 +1408,16 @@ mod tests {
         info.is_triage = true;
         let mem = DmpMem::new_triage_for_test(data, blocks, info);
 
-        // Address in block A only (before B starts)
         let mut buf = [0u8; 1];
         mem.read_bytes(0x1500u64, &mut buf).unwrap();
         assert_eq!(buf[0], 0xAA);
 
-        // Address in the overlap region — B wins (highest start <= addr)
         mem.read_bytes(0x2500u64, &mut buf).unwrap();
         assert_eq!(buf[0], 0xBB);
 
-        // Address past B's end but still within A — must fall back to A
         mem.read_bytes(0x3100u64, &mut buf).unwrap();
         assert_eq!(buf[0], 0xAA);
 
-        // Address past both blocks
         assert!(mem.read_bytes(0x4100u64, &mut buf).is_err());
     }
 }

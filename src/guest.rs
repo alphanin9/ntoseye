@@ -6,18 +6,23 @@ use crate::{
     symbols::{
         DownloadJob, FieldInfo, ModuleSymbolDiscovery, ModuleSymbolLoad, ModuleSymbolSource,
         ModuleSymbolStatus, ParsedType, SymbolIndexDiagnostic, SymbolStore, TypeInfo,
-        download_jobs_parallel,
+        download_jobs_parallel, le_uint,
     },
+    target::{DriverObjectInfo, ListCursor},
     types::*,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use pelite::pe64::{Pe, PeFile, PeView};
 use rayon::prelude::*;
-use std::collections::HashSet;
-use std::ops::Range;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use zerocopy::{FromBytes, IntoBytes};
+
+/// `EPROCESS.ImageFileName` capacity: the kernel keeps this many bytes of the
+/// image name, unterminated when the name is at least this long.
+const IMAGE_FILE_NAME_LEN: usize = 15;
 
 /// used for enumeration without loading full WinObject
 #[derive(Debug, Clone)]
@@ -35,6 +40,7 @@ pub struct ModuleInfo {
     pub short_name: String,
     pub base_address: VirtAddr,
     pub size: u32,
+    pub entry_point: Option<VirtAddr>,
     pub time_date_stamp: Option<u32>,
     pub checksum: Option<u32>,
     pub file_version: Option<String>,
@@ -49,6 +55,7 @@ impl ModuleInfo {
             short_name,
             base_address,
             size,
+            entry_point: None,
             time_date_stamp: None,
             checksum: None,
             file_version: None,
@@ -159,97 +166,196 @@ impl ModuleSymbolLoadReport {
     pub fn failed_count(&self) -> usize {
         self.failed
     }
+
+    /// Fold in a follow-up pass over modules already counted in `total`.
+    fn absorb(&mut self, other: Self) {
+        self.loaded += other.loaded;
+        self.unloaded += other.unloaded;
+        self.no_pdb += other.no_pdb;
+        self.skipped += other.skipped;
+        self.failed += other.failed;
+        self.diagnostic_count += other.diagnostic_count;
+        self.diagnostics.extend(other.diagnostics);
+    }
 }
 
-/// A module image reconstructed from guest memory. Sections whose pages were
-/// paged out are zero-filled in `bytes`; their RVA ranges are recorded as `holes`
-/// so callers don't mistake a zeroed region for real data (which previously led
-/// to e.g. fabricated unwind frames or a wrong PDB GUID).
-#[derive(Debug)]
+/// A module image addressed by RVA. An on-disk image is complete; an image
+/// read from guest memory is demand-read in [`IMAGE_BLOCK`]-sized blocks and
+/// keeps every block it has read, so a stack walk costs the blocks its
+/// lookups touch rather than the whole `.pdata`/`.rdata` of the module,
+/// which for a kernel over a KD serial link is megabytes.
 pub struct PeImage {
-    bytes: Vec<u8>,
-    holes: Vec<Range<usize>>,
+    size: usize,
+    body: ImageBody,
+}
+
+enum ImageBody {
+    Complete(Vec<u8>),
+    Lazy(LazyImage),
+}
+
+/// One block is one KD memory request, and a block never straddles a page,
+/// so a block is either readable or not as a whole.
+const IMAGE_BLOCK: usize = 0x800;
+
+type ImageReader = Box<dyn Fn(usize, &mut [u8]) -> Result<()> + Send + Sync>;
+
+struct LazyImage {
+    /// The header page, read up front; what a `PeView` is built on.
+    headers: Box<[u8]>,
+    /// Reads `buf.len()` bytes of the image at an RVA.
+    read: ImageReader,
+    /// Blocks by index. A block the target refused (paged out) is not
+    /// recorded, so it is asked for again once the target has run.
+    blocks: Mutex<HashMap<usize, Box<[u8]>>>,
+}
+
+impl std::fmt::Debug for PeImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeImage")
+            .field("size", &self.size)
+            .field("complete", &self.is_complete())
+            .finish()
+    }
 }
 
 impl PeImage {
-    /// Wrap fully-available bytes (e.g. a complete on-disk image) with no holes.
+    /// Wrap fully-available bytes (e.g. a complete on-disk image).
     pub fn complete(bytes: Vec<u8>) -> Self {
         Self {
-            bytes,
-            holes: Vec::new(),
+            size: bytes.len(),
+            body: ImageBody::Complete(bytes),
         }
     }
 
-    pub fn as_slice(&self) -> &[u8] {
-        &self.bytes
+    /// Bytes a `PeView` may be built on: the whole image when complete,
+    /// otherwise the header page. Directories past the headers are not in
+    /// here; read them through [`read`](Self::read).
+    pub fn headers(&self) -> &[u8] {
+        match &self.body {
+            ImageBody::Complete(bytes) => bytes,
+            ImageBody::Lazy(lazy) => &lazy.headers,
+        }
     }
 
-    /// Whether the image has no paged-out holes (e.g. built from an on-disk
-    /// file). Used to avoid re-fetching an already-complete image.
+    /// Whether every byte is known up front (an on-disk image); a lazy image
+    /// can always still hit a paged-out block.
     pub fn is_complete(&self) -> bool {
-        self.holes.is_empty()
+        matches!(self.body, ImageBody::Complete(_))
     }
 
-    /// Whether `[at, at+len)` is fully backed by real guest data: in bounds and
-    /// not overlapping a paged-out hole.
+    /// Whether `[at, at+len)` is in bounds and readable from the target.
     pub fn is_present(&self, at: usize, len: usize) -> bool {
-        let Some(end) = at.checked_add(len) else {
-            return false;
-        };
-        end <= self.bytes.len() && !self.holes.iter().any(|h| at < h.end && h.start < end)
+        self.read(at, len).is_some()
     }
 
-    /// Slice of `len` bytes at offset `at`, but only if fully present (see
-    /// [`is_present`](Self::is_present)); otherwise None.
-    pub fn present_slice(&self, at: usize, len: usize) -> Option<&[u8]> {
-        self.is_present(at, len).then(|| &self.bytes[at..at + len])
+    /// `len` bytes at RVA `at`, or `None` when out of bounds or any block of
+    /// the range is paged out. Blocks are fetched on first use.
+    pub fn read(&self, at: usize, len: usize) -> Option<Cow<'_, [u8]>> {
+        let end = at.checked_add(len)?;
+        if end > self.size {
+            return None;
+        }
+        match &self.body {
+            ImageBody::Complete(bytes) => Some(Cow::Borrowed(&bytes[at..end])),
+            ImageBody::Lazy(lazy) => {
+                if len == 0 {
+                    return Some(Cow::Borrowed(&[]));
+                }
+                let mut blocks = lazy.blocks.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut out = Vec::with_capacity(len);
+                for index in at / IMAGE_BLOCK..=(end - 1) / IMAGE_BLOCK {
+                    let block = match blocks.entry(index) {
+                        Entry::Occupied(entry) => entry.into_mut(),
+                        Entry::Vacant(entry) => entry.insert(lazy.fetch(index, self.size)?),
+                    };
+                    let start = at.saturating_sub(index * IMAGE_BLOCK);
+                    let stop = (end - index * IMAGE_BLOCK).min(block.len());
+                    out.extend_from_slice(&block[start..stop]);
+                }
+                Some(Cow::Owned(out))
+            }
+        }
     }
 }
 
-pub fn read_pe_image<'a, B: MemoryOps<PhysAddr>>(
-    base_address: VirtAddr,
-    memory: &memory::AddressSpace<'a, B>,
-) -> Result<PeImage> {
-    let mut header_buf = [0u8; 0x1000];
-
-    memory.read_bytes(base_address, &mut header_buf)?;
-
-    let view = PeView::from_bytes(&header_buf)?;
-    let optional_header = view.optional_header();
-    let sections = view.section_headers();
-
-    let total_size = optional_header.SizeOfImage as usize;
-    let mut image_buffer = vec![0u8; total_size];
-    let mut holes: Vec<Range<usize>> = Vec::new();
-
-    let header_len = std::cmp::min(header_buf.len(), total_size);
-    image_buffer[..header_len].copy_from_slice(&header_buf[..header_len]);
-
-    for section in sections {
-        let v_addr = section.VirtualAddress as usize;
-        let v_size = section.VirtualSize as usize;
-        let raw_size = section.SizeOfRawData as usize;
-        let copy_size = std::cmp::max(v_size, raw_size);
-
-        if copy_size == 0 || v_addr + copy_size > total_size {
-            continue;
-        }
-
-        let target_slice = &mut image_buffer[v_addr..v_addr + copy_size];
-        match memory.read_bytes(VirtAddr(base_address.0 + v_addr as u64), target_slice) {
-            Ok(()) => {}
-            // a page in the section is paged out: read_bytes fills up to the hole
-            // and leaves the rest zeroed. Record the unread tail so callers know
-            // not to trust those bytes.
-            Err(Error::PartialRead(read)) => holes.push((v_addr + read)..(v_addr + copy_size)),
-            // the section's first page is unmapped: the whole region is unread
-            Err(_) => holes.push(v_addr..(v_addr + copy_size)),
-        }
+impl LazyImage {
+    fn fetch(&self, index: usize, size: usize) -> Option<Box<[u8]>> {
+        let start = index * IMAGE_BLOCK;
+        let mut block = vec![0u8; IMAGE_BLOCK.min(size - start)];
+        (self.read)(start, &mut block).ok()?;
+        Some(block.into_boxed_slice())
     }
+}
 
+/// Bytes of a module's headers read before the section table's end is known.
+/// A normally linked image keeps its DOS stub, NT headers, and section table
+/// well inside this; only an image whose table runs past it costs a second
+/// read.
+const PE_HEADER_PROBE: usize = 0x400;
+
+/// Where the section table of the headers in `probe` ends, or `None` when
+/// the NT headers themselves extend past the probe. A buffer that is not a
+/// PE ends at the probe: reading more of it changes nothing.
+fn pe_headers_end(probe: &[u8]) -> Option<usize> {
+    if probe.len() < 0x40 || &probe[..2] != b"MZ" {
+        return Some(probe.len());
+    }
+    let e_lfanew = u32::from_le_bytes(probe[0x3c..0x40].try_into().unwrap()) as usize;
+    let nt = probe.get(e_lfanew..e_lfanew.checked_add(24)?)?;
+    if &nt[..4] != b"PE\0\0" {
+        return Some(probe.len());
+    }
+    let sections = u16::from_le_bytes([nt[6], nt[7]]) as usize;
+    let optional = u16::from_le_bytes([nt[20], nt[21]]) as usize;
+    Some(e_lfanew + 24 + optional + sections * 40)
+}
+
+/// Read a module's headers into a page-sized buffer, as `PeView` wants them,
+/// with a probe-sized first read and a second only when the section table
+/// extends past it. The page tail beyond the table stays zero; nothing in it
+/// is consulted.
+pub fn read_pe_header_page<B: MemoryOps<PhysAddr>>(
+    base_address: VirtAddr,
+    memory: &memory::AddressSpace<'_, B>,
+) -> Result<[u8; PAGE_SIZE]> {
+    read_pe_header_page_with(&|address, buf| memory.read_bytes(base_address + address, buf))
+}
+
+/// [`read_pe_header_page`] over a reader addressed by RVA.
+fn read_pe_header_page_with(
+    read: &dyn Fn(u64, &mut [u8]) -> Result<()>,
+) -> Result<[u8; PAGE_SIZE]> {
+    let mut header_buf = [0u8; PAGE_SIZE];
+    read(0, &mut header_buf[..PE_HEADER_PROBE])?;
+    let end = pe_headers_end(&header_buf[..PE_HEADER_PROBE])
+        .unwrap_or(PAGE_SIZE)
+        .min(PAGE_SIZE);
+    if end > PE_HEADER_PROBE {
+        read(
+            PE_HEADER_PROBE as u64,
+            &mut header_buf[PE_HEADER_PROBE..end],
+        )?;
+    }
+    Ok(header_buf)
+}
+
+/// Open a module image in guest memory: the headers are read now, the rest
+/// on demand through `read`, which reads `buf.len()` bytes at a virtual
+/// address of the module's address space.
+pub fn read_pe_image(
+    base_address: VirtAddr,
+    read: impl Fn(VirtAddr, &mut [u8]) -> Result<()> + Send + Sync + 'static,
+) -> Result<PeImage> {
+    let headers = read_pe_header_page_with(&|address, buf| read(base_address + address, buf))?;
+    let size = PeView::from_bytes(&headers)?.optional_header().SizeOfImage as usize;
     Ok(PeImage {
-        bytes: image_buffer,
-        holes,
+        size,
+        body: ImageBody::Lazy(LazyImage {
+            headers: Box::new(headers),
+            read: Box::new(move |rva, buf| read(base_address + rva as u64, buf)),
+            blocks: Mutex::new(HashMap::new()),
+        }),
     })
 }
 
@@ -263,8 +369,7 @@ pub fn section_name_at<'a, B: MemoryOps<PhysAddr>>(
     address: VirtAddr,
 ) -> Option<String> {
     let rva = u32::try_from(address.0.checked_sub(base.0)?).ok()?;
-    let mut header_buf = [0u8; 0x1000];
-    memory.read_bytes(base, &mut header_buf).ok()?;
+    let header_buf = read_pe_header_page(base, memory).ok()?;
     let view = PeView::from_bytes(&header_buf).ok()?;
     for section in view.section_headers() {
         let va = section.VirtualAddress;
@@ -288,8 +393,7 @@ pub fn read_pe_version_info<B: MemoryOps<PhysAddr>>(
 ) -> Option<(String, String)> {
     use pelite::image::IMAGE_DIRECTORY_ENTRY_RESOURCE;
 
-    let mut header_buf = [0u8; 0x1000];
-    memory.read_bytes(base, &mut header_buf).ok()?;
+    let header_buf = read_pe_header_page(base, memory).ok()?;
     let view = PeView::from_bytes(&header_buf).ok()?;
 
     let rsrc_dir = view.data_directory().get(IMAGE_DIRECTORY_ENTRY_RESOURCE)?;
@@ -492,6 +596,20 @@ impl SymbolRef<'_> {
     }
 }
 
+/// The address space a module lives in: AArch64 kernel VAs walk `kernel_dtb`
+/// (TTBR1) while `dtb` stays the process root.
+fn object_address_space(
+    phys: &Arc<PhysMem>,
+    dtb: Dtb,
+    kernel_dtb: Dtb,
+    arch: Arch,
+) -> AddressSpace<'_, Arc<PhysMem>> {
+    match arch {
+        Arch::Amd64 => AddressSpace::new(phys, dtb),
+        Arch::Arm64 => AddressSpace::new_arm64(phys, dtb, kernel_dtb),
+    }
+}
+
 /// A structured view into a loaded module's memory: it carries its own address
 /// space (`dtb`) and the handles needed to read and resolve symbols/types
 /// (`kvm`, `symbols`), so navigation methods don't take them as arguments. The
@@ -504,7 +622,11 @@ pub struct WinObject {
     /// AArch64 TTBR1 (kernel-space root). Equal to `dtb` for the kernel object
     /// and AMD64; process siblings keep the kernel root for kernel-VA reads.
     kernel_dtb: Dtb,
-    binary_snapshot: Vec<u8>,
+    /// Header page read at symbol load; nothing from the sections.
+    headers: Option<Box<[u8]>>,
+    /// Demand-read image shared across stack traces, so each block is
+    /// fetched once per session.
+    image: Mutex<Option<Arc<PeImage>>>,
     pub guid: Option<u128>,
     phys: Arc<PhysMem>,
     symbols: Arc<SymbolStore>,
@@ -532,7 +654,8 @@ impl WinObject {
             dtb,
             arch,
             kernel_dtb: dtb,
-            binary_snapshot: Vec::new(),
+            headers: None,
+            image: Mutex::new(None),
             guid: None,
             phys,
             symbols,
@@ -544,8 +667,6 @@ impl WinObject {
     }
 
     pub fn load_symbols(mut self) -> Result<Self> {
-        // Clone the Arc handles to a local so `load_from_binary` can take
-        // `&mut self` without aliasing the `self.symbols`/`self.phys` fields.
         let symbols = Arc::clone(&self.symbols);
         self.guid = symbols.load_from_binary(&mut self, "ntoskrnl.exe")?;
         Ok(self)
@@ -576,18 +697,20 @@ impl WinObject {
         self.dtb
     }
 
-    /// Mark this object's module as the kernel in the shared symbol store, so
-    /// type/enum layout lookups prefer it across address spaces and kernel
-    /// symbols stay resolvable from a process's address space. Call after
-    /// [`load_symbols`](Self::load_symbols) so `guid` is populated.
+    /// Mark this object's module as the kernel in the shared symbol store:
+    /// type/enum layout lookups prefer it, and its address space is visible
+    /// from every process. Call after [`load_symbols`](Self::load_symbols) so
+    /// `guid` is populated.
     pub fn register_as_kernel(&self) {
-        self.symbols.set_kernel_guid(self.guid);
-        self.symbols.set_kernel_dtb(Some(self.dtb));
+        self.symbols.set_kernel(self.guid, self.dtb);
     }
 
-    /// Size of the cached binary snapshot (0 until [`view`](Self::view) has run).
+    /// `SizeOfImage` of the module (0 until [`view`](Self::view) has run).
     pub fn binary_size(&self) -> usize {
-        self.binary_snapshot.len()
+        self.headers
+            .as_deref()
+            .and_then(|headers| PeView::from_bytes(headers).ok())
+            .map_or(0, |view| view.optional_header().SizeOfImage as usize)
     }
 
     /// A sibling object sharing this one's physical-memory and symbol handles,
@@ -599,7 +722,8 @@ impl WinObject {
             dtb,
             arch: self.arch,
             kernel_dtb: self.kernel_dtb,
-            binary_snapshot: Vec::new(),
+            headers: None,
+            image: Mutex::new(None),
             guid: None,
             phys: Arc::clone(&self.phys),
             symbols: Arc::clone(&self.symbols),
@@ -615,10 +739,7 @@ impl WinObject {
         phys: &'a Arc<PhysMem>,
         dtb: Dtb,
     ) -> AddressSpace<'a, Arc<PhysMem>> {
-        match self.arch {
-            Arch::Amd64 => AddressSpace::new(phys, dtb),
-            Arch::Arm64 => AddressSpace::new_arm64(phys, dtb, self.kernel_dtb),
-        }
+        object_address_space(phys, dtb, self.kernel_dtb, self.arch)
     }
 
     pub fn memory(&self) -> AddressSpace<'_, Arc<PhysMem>> {
@@ -648,17 +769,32 @@ impl WinObject {
         Ok(result)
     }
 
-    // TODO binary should probably be reread to ensure correctness
-    // TODO bc shared memory might/isnt used, this needs to be mutable to ensure data is fresh :/
+    /// The module's headers, read once from guest memory. Directories past
+    /// the headers are not in the view; see [`image`](Self::image) for those.
     pub fn view(&mut self) -> Option<PeView<'_>> {
-        if self.binary_snapshot.is_empty() {
-            // Clone the Arc so the read borrow doesn't alias `&mut self`.
-            let phys = Arc::clone(&self.phys);
-            let memory = self.address_space(&phys, self.dtb);
-            self.binary_snapshot = read_pe_image(self.base_address, &memory).ok()?.bytes;
+        if self.headers.is_none() {
+            let headers = read_pe_header_page(self.base_address, &self.memory()).ok()?;
+            self.headers = Some(Box::new(headers));
         }
 
-        PeView::from_bytes(&self.binary_snapshot).ok()
+        PeView::from_bytes(self.headers.as_deref()?).ok()
+    }
+
+    /// The in-memory image (see [`read_pe_image`]), opened on first use and
+    /// shared afterwards. `None` when the headers are unreadable; that is
+    /// retried next time rather than cached.
+    pub fn image(&self) -> Option<Arc<PeImage>> {
+        let mut cached = self.image.lock().unwrap_or_else(PoisonError::into_inner);
+        if cached.is_none() {
+            let (phys, dtb, kernel_dtb, arch) =
+                (Arc::clone(&self.phys), self.dtb, self.kernel_dtb, self.arch);
+            let image = read_pe_image(self.base_address, move |address, buf| {
+                object_address_space(&phys, dtb, kernel_dtb, arch).read_bytes(address, buf)
+            })
+            .ok()?;
+            *cached = Some(Arc::new(image));
+        }
+        cached.clone()
     }
 
     /// Resolve this object's struct/type namespace, read in its own address
@@ -689,7 +825,7 @@ pub struct Types<'a> {
 
 impl<'a> Types<'a> {
     /// The parsed layout of struct `name` from the object's PDB (cached).
-    pub fn layout<S>(self, name: S) -> Result<TypeInfo>
+    pub fn layout<S>(self, name: S) -> Result<Arc<TypeInfo>>
     where
         S: Into<String> + AsRef<str>,
     {
@@ -704,12 +840,19 @@ impl<'a> Types<'a> {
     /// against the object's PDB; reads come from this space's `dtb`.
     pub fn struct_at(self, name: &str, base: VirtAddr) -> Result<StructRef<'a>> {
         let ti = self.layout(name)?;
-        Ok(StructRef {
+        Ok(self.struct_with_layout(ti, base))
+    }
+
+    /// Open a struct cursor with an already-resolved layout in this address
+    /// space. Callers that cache layouts can avoid repeating the type lookup.
+    pub fn struct_with_layout(self, layout: Arc<TypeInfo>, base: VirtAddr) -> StructRef<'a> {
+        StructRef {
             obj: self.obj,
             dtb: self.dtb,
-            ti,
+            ti: layout,
             base,
-        })
+            image: None,
+        }
     }
 
     /// Walk an intrusive `_LIST_ENTRY` starting at a bare head address (e.g. a
@@ -717,6 +860,9 @@ impl<'a> Types<'a> {
     /// record. `record_type`/`link_field` give the record layout and the
     /// embedded link (`CONTAINING_RECORD`). Iteration is bounded and stops on a
     /// cycle. Shared by [`StructRef::list`], which sources `head` from a field.
+    ///
+    /// Each record is prefetched (see [`StructRef::prefetch`]) so its fields
+    /// and the link to the next record come from one read.
     pub fn list_at(
         self,
         head: VirtAddr,
@@ -729,29 +875,26 @@ impl<'a> Types<'a> {
 
         let list_memory = |dtb: Dtb| obj.address_space(&obj.phys, dtb);
 
-        let mut current: VirtAddr = list_memory(dtb).read(head)?;
-        let mut count = 0usize;
         const MAX: usize = 1000;
+        let initial = list_memory(dtb).read::<VirtAddr>(head)?;
+        let mut cursor = ListCursor::new(head, MAX);
+        cursor.advance(Ok(initial));
 
         Ok(std::iter::from_fn(move || {
-            if current.is_zero() || current == head || count >= MAX {
-                return None;
-            }
-            count += 1;
+            let current = cursor.next()?;
 
-            let record = StructRef {
-                obj,
-                dtb,
-                ti: record_ti.clone(),
-                base: current - link_offset,
-            };
+            let record = Types { obj, dtb }
+                .struct_with_layout(
+                    Arc::clone(&record_ti),
+                    VirtAddr(current.0.wrapping_sub(link_offset)),
+                )
+                .prefetch();
 
             // Flink sits at offset 0 of the link's _LIST_ENTRY
-            match list_memory(dtb).read::<VirtAddr>(current) {
-                Ok(next) if next == current => current = head, // self-loop: stop after this
-                Ok(next) => current = next,
+            match record.read_field_at::<VirtAddr>(link_offset) {
+                Ok(next) => cursor.advance(Ok(next)),
                 Err(e) => {
-                    current = head;
+                    cursor.advance(Err(e.to_string()));
                     return Some(Err(e));
                 }
             }
@@ -768,13 +911,89 @@ impl<'a> Types<'a> {
 pub struct StructRef<'a> {
     obj: &'a WinObject,
     dtb: Dtb,
-    ti: TypeInfo,
+    ti: Arc<TypeInfo>,
     base: VirtAddr,
+    /// Prefetched copy of the struct's bytes from `base`; field reads inside
+    /// it cost no memory request.
+    image: Option<Arc<[u8]>>,
 }
+
+/// Largest struct [`StructRef::prefetch`] copies whole. Loader entries,
+/// `_EPROCESS`, and `_ETHREAD` all fit; anything bigger keeps per-field reads.
+const STRUCT_PREFETCH_MAX: usize = 0x1000;
 
 impl<'a> StructRef<'a> {
     fn memory(&self) -> AddressSpace<'a, Arc<PhysMem>> {
         self.obj.address_space(&self.obj.phys, self.dtb)
+    }
+
+    /// Read the struct's bytes once so later field reads are served from the
+    /// copy: one request per page instead of one per field on a remote
+    /// target. Best-effort; an unreadable or oversized struct keeps per-field
+    /// reads, which fail or succeed individually as before.
+    pub fn prefetch(mut self) -> Self {
+        if self.image.is_none() && self.ti.size != 0 && self.ti.size <= STRUCT_PREFETCH_MAX {
+            let mut image = vec![0u8; self.ti.size];
+            if self.memory().read_bytes(self.base, &mut image).is_ok() {
+                self.image = Some(image.into());
+            }
+        }
+        self
+    }
+
+    fn read_bytes_at(&self, offset: u64, out: &mut [u8]) -> Result<()> {
+        if let Some(image) = &self.image
+            && let Some(bytes) = usize::try_from(offset)
+                .ok()
+                .and_then(|start| image.get(start..start.checked_add(out.len())?))
+        {
+            out.copy_from_slice(bytes);
+            return Ok(());
+        }
+        self.memory().read_bytes(self.base + offset, out)
+    }
+
+    /// Read an integer field at its PDB-declared width (1..=8 bytes).
+    pub fn read_uint(&self, name: &str) -> Result<u64> {
+        let field = self.field(name)?;
+        let width = usize::try_from(field.size)
+            .map_err(|_| Error::DebugInfo(format!("field '{name}' has invalid integer width")))?;
+        if !(1..=8).contains(&width) {
+            return Err(Error::DebugInfo(format!(
+                "field '{name}' has invalid integer width {width} (expected 1..=8)"
+            )));
+        }
+        let mut bytes = [0u8; 8];
+        self.read_bytes_at(field.offset as u64, &mut bytes[..width])?;
+        Ok(le_uint(&bytes[..width]))
+    }
+
+    /// Read a field's raw bytes at its PDB-declared size, rejecting a zero
+    /// size or one past the caller's bound.
+    pub fn read_field_bytes(&self, name: &str, max_len: usize) -> Result<Vec<u8>> {
+        let field = self.field(name)?;
+        let size = usize::try_from(field.size)
+            .map_err(|_| Error::DebugInfo(format!("field '{name}' has invalid byte width")))?;
+        if size == 0 {
+            return Err(Error::DebugInfo(format!("field '{name}' has no byte size")));
+        }
+        if size > max_len {
+            return Err(Error::DebugInfo(format!(
+                "field '{name}' is {size} bytes (maximum {max_len})"
+            )));
+        }
+        let mut bytes = vec![0u8; size];
+        self.read_bytes_at(field.offset as u64, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn read_field_at<T: Copy + zerocopy::FromZeros + FromBytes + IntoBytes>(
+        &self,
+        offset: u64,
+    ) -> Result<T> {
+        let mut value = T::new_zeroed();
+        self.read_bytes_at(offset, value.as_mut_bytes())?;
+        Ok(value)
     }
 
     /// The address this cursor sits at (e.g. to test a followed pointer for
@@ -791,13 +1010,8 @@ impl<'a> StructRef<'a> {
     }
 
     /// Wrap a freshly resolved layout at `base`, carrying this cursor's context.
-    fn with(&self, ti: TypeInfo, base: VirtAddr) -> StructRef<'a> {
-        StructRef {
-            obj: self.obj,
-            dtb: self.dtb,
-            ti,
-            base,
-        }
+    fn with(&self, ti: Arc<TypeInfo>, base: VirtAddr) -> StructRef<'a> {
+        self.obj.types_in(self.dtb).struct_with_layout(ti, base)
     }
 
     /// Read a scalar field by name. The Rust type `T` (inferred from context)
@@ -807,7 +1021,7 @@ impl<'a> StructRef<'a> {
         name: &str,
     ) -> Result<T> {
         let offset = self.field(name)?.offset as u64;
-        self.memory().read(self.base + offset)
+        self.read_field_at(offset)
     }
 
     /// Follow a pointer field to the struct it targets. The target struct type
@@ -825,7 +1039,7 @@ impl<'a> StructRef<'a> {
             ));
         };
         let struct_name = struct_name.clone();
-        let target: VirtAddr = self.memory().read(self.base + field.offset as u64)?;
+        let target: VirtAddr = self.read_field_at(field.offset as u64)?;
         let ti = self.obj.types().layout(&struct_name)?;
         Ok(self.with(ti, target))
     }
@@ -847,7 +1061,15 @@ impl<'a> StructRef<'a> {
         };
         let base = self.base + field.offset as u64;
         let ti = self.obj.types().layout(&type_name)?;
-        Ok(self.with(ti, base))
+        let mut embedded = self.with(ti, base);
+        // Carry the enclosing image so the sub-struct's fields stay free.
+        if let Some(image) = &self.image {
+            let start = field.offset as usize;
+            if let Some(bytes) = image.get(start..start + embedded.ti.size) {
+                embedded.image = Some(bytes.into());
+            }
+        }
+        Ok(embedded)
     }
 
     /// Decode the `_UNICODE_STRING` this cursor points at to a Rust `String`
@@ -905,6 +1127,11 @@ fn module_info_from_record(record: &StructRef<'_>) -> Result<Option<ModuleInfo>>
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "<unknown>".to_string());
     let mut info = ModuleInfo::new(name, dll_base, size_of_image);
+    if let Ok(entry_point) = record.read_field::<VirtAddr>("EntryPoint")
+        && !entry_point.is_zero()
+    {
+        info.entry_point = Some(entry_point);
+    }
     if let Ok(tds) = record.read_field::<u32>("TimeDateStamp") {
         info = info.with_time_date_stamp(tds);
     }
@@ -916,6 +1143,86 @@ fn module_info_from_record(record: &StructRef<'_>) -> Result<Option<ModuleInfo>>
 
 pub struct Guest {
     pub ntoskrnl: WinObject,
+    memo: Mutex<HaltMemo>,
+}
+
+/// The `_EPROCESS` fields process enumeration needs, fetched with one read
+/// covering their span instead of one request per field over the transport.
+struct EprocessSpan {
+    start: u64,
+    bytes: Vec<u8>,
+    unique_process_id_offset: u64,
+    dir_table_base_offset: u64,
+    active_process_links_offset: u64,
+    image_file_name_offset: u64,
+}
+
+impl EprocessSpan {
+    fn new(guest: &Guest) -> Result<Self> {
+        let eprocess = guest.ntoskrnl.types().layout("_EPROCESS")?;
+        let kprocess = guest.ntoskrnl.types().layout("_KPROCESS")?;
+        let unique_process_id_offset = eprocess.field_offset("UniqueProcessId")?;
+        let dir_table_base_offset =
+            eprocess.field_offset("Pcb")? + kprocess.field_offset("DirectoryTableBase")?;
+        let active_process_links_offset = eprocess.field_offset("ActiveProcessLinks")?;
+        let image_file_name_offset = eprocess.field_offset("ImageFileName")?;
+        let start = unique_process_id_offset
+            .min(dir_table_base_offset)
+            .min(active_process_links_offset)
+            .min(image_file_name_offset);
+        let end = (unique_process_id_offset + 8)
+            .max(dir_table_base_offset + 8)
+            .max(active_process_links_offset + 8)
+            .max(image_file_name_offset + IMAGE_FILE_NAME_LEN as u64);
+        Ok(Self {
+            start,
+            bytes: vec![0u8; (end - start) as usize],
+            unique_process_id_offset,
+            dir_table_base_offset,
+            active_process_links_offset,
+            image_file_name_offset,
+        })
+    }
+
+    fn read(&mut self, memory: &impl MemoryOps<VirtAddr>, eprocess: VirtAddr) -> Result<()> {
+        memory.read_bytes(eprocess + self.start, &mut self.bytes)
+    }
+
+    fn u64_at(&self, offset: u64) -> u64 {
+        let start = (offset - self.start) as usize;
+        u64::from_le_bytes(self.bytes[start..start + 8].try_into().unwrap())
+    }
+
+    fn pid(&self) -> u64 {
+        self.u64_at(self.unique_process_id_offset)
+    }
+
+    fn dtb(&self) -> Dtb {
+        self.u64_at(self.dir_table_base_offset) & !0xfff
+    }
+
+    fn active_process_links_flink(&self) -> VirtAddr {
+        VirtAddr(self.u64_at(self.active_process_links_offset))
+    }
+
+    fn image_file_name(&self) -> &[u8] {
+        let start = (self.image_file_name_offset - self.start) as usize;
+        &self.bytes[start..start + IMAGE_FILE_NAME_LEN]
+    }
+}
+
+/// Guest-derived lists memoized for one halt epoch (see
+/// [`PhysMem::halt_epoch`]). A halted guest cannot relink these lists, so the
+/// first walk per halt serves every later caller: the break context, the
+/// stop-time symbol refresh, completions, and listing commands would otherwise
+/// each re-walk the same kernel lists over the transport. Failed walks are not
+/// remembered.
+#[derive(Default)]
+struct HaltMemo {
+    epoch: Option<u64>,
+    processes: Option<Vec<ProcessInfo>>,
+    kernel_modules: Option<Vec<ModuleInfo>>,
+    drivers: Option<Vec<DriverObjectInfo>>,
 }
 
 fn is_valid_kernel_dtb_amd64(phys: &PhysMem, dtb: Dtb) -> Result<bool> {
@@ -1127,7 +1434,6 @@ fn find_ntoskrnl_va(kernel_dtb: Dtb, phys: &PhysMem) -> Result<Option<VirtAddr>>
             }
 
             if pdpte.is_large_page() {
-                // Unlikely but just making sure
                 if let Ok(true) = is_ntoskrnl_pte(phys, pdpte) {
                     return Ok(Some(VirtAddr::construct(pml4_index, pdpt_index, 0, 0)));
                 }
@@ -1337,14 +1643,8 @@ fn find_ntoskrnl_va_arm64(kernel_dtb: Dtb, phys: &PhysMem) -> Result<Option<Virt
 fn find_ntoskrnl_va_triage(kernel_dtb: Dtb, phys: &PhysMem) -> Result<Option<VirtAddr>> {
     let space = AddressSpace::new(phys, kernel_dtb);
 
-    // Triage dumps include ntoskrnl's base in PsLoadedModuleList. We can
-    // read the PsLoadedModuleList VA from the header; the list entry itself
-    // is at nt!PsLoadedModuleList, which is inside ntoskrnl. The first
-    // entry in the list is ntoskrnl's own LDR_DATA_TABLE_ENTRY whose
-    // DllBase field gives us the base.
-    //
-    // But we don't have the offsets yet (no PDB). Instead, just try
-    // addresses from the data blocks that look like kernel-space PE headers.
+    // No PDB yet, so PsLoadedModuleList can't be walked; probe the data
+    // blocks for kernel-space PE headers instead.
     if let Some(dmp_info) = phys.dmp_info() {
         // Check triage driver base addresses first — ntoskrnl is typically
         // the first entry and this avoids scanning up to 4096 pages.
@@ -1401,6 +1701,54 @@ fn find_ntoskrnl(phys: Arc<PhysMem>, symbols: Arc<SymbolStore>) -> Result<Option
 }
 
 impl Guest {
+    pub fn from_kernel(ntoskrnl: WinObject) -> Self {
+        Self {
+            ntoskrnl,
+            memo: Mutex::new(HaltMemo::default()),
+        }
+    }
+
+    fn memo(&self) -> MutexGuard<'_, HaltMemo> {
+        self.memo.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Serve `slot` from the current halt's memo, walking with `walk` on a
+    /// miss. Memory without a halt signal is never memoized.
+    fn memoized<T: Clone>(
+        &self,
+        slot: impl Fn(&mut HaltMemo) -> &mut Option<Vec<T>>,
+        walk: impl FnOnce() -> Result<Vec<T>>,
+    ) -> Result<Vec<T>> {
+        let Some(epoch) = self.ntoskrnl.phys.halt_epoch() else {
+            return walk();
+        };
+        {
+            let mut memo = self.memo();
+            if memo.epoch != Some(epoch) {
+                *memo = HaltMemo {
+                    epoch: Some(epoch),
+                    ..HaltMemo::default()
+                };
+            }
+            if let Some(list) = slot(&mut memo) {
+                return Ok(list.clone());
+            }
+        }
+        let list = walk()?;
+        let mut memo = self.memo();
+        if memo.epoch == Some(epoch) {
+            *slot(&mut memo) = Some(list.clone());
+        }
+        Ok(list)
+    }
+
+    pub fn memoized_drivers(
+        &self,
+        walk: impl FnOnce() -> Result<Vec<DriverObjectInfo>>,
+    ) -> Result<Vec<DriverObjectInfo>> {
+        self.memoized(|memo| &mut memo.drivers, walk)
+    }
+
     fn queue_module_symbol_load(
         symbols: &SymbolStore,
         downloads: &mut Vec<ModuleSymbolLoad>,
@@ -1443,7 +1791,7 @@ impl Guest {
         // symbol store which guid is the kernel's.
         ntoskrnl.register_as_kernel();
 
-        Ok(Self { ntoskrnl })
+        Ok(Self::from_kernel(ntoskrnl))
     }
 
     pub fn new(phys: Arc<PhysMem>, symbols: Arc<SymbolStore>) -> Result<Self> {
@@ -1516,21 +1864,16 @@ impl Guest {
         };
 
         ntoskrnl.register_as_kernel();
-        Ok(Self { ntoskrnl })
+        Ok(Self::from_kernel(ntoskrnl))
     }
 
     pub fn enumerate_processes(&self) -> Result<Vec<ProcessInfo>> {
+        self.memoized(|memo| &mut memo.processes, || self.walk_processes())
+    }
+
+    fn walk_processes(&self) -> Result<Vec<ProcessInfo>> {
         let memory = self.ntoskrnl.memory();
-
-        let eprocess_info = self.ntoskrnl.types().layout("_EPROCESS")?;
-        let active_process_links_offset = eprocess_info.field_offset("ActiveProcessLinks")?;
-        let pcb_offset = eprocess_info.field_offset("Pcb")?;
-
-        let kprocess_info = self.ntoskrnl.types().layout("_KPROCESS")?;
-        let dir_table_base_offset =
-            pcb_offset + kprocess_info.field_offset("DirectoryTableBase")?;
-        let unique_process_id_offset = eprocess_info.field_offset("UniqueProcessId")?;
-        let image_filename_offset = eprocess_info.field_offset("ImageFileName")?;
+        let mut span = EprocessSpan::new(self)?;
 
         let ps_initial_system_process: VirtAddr =
             self.ntoskrnl.symbol("PsInitialSystemProcess")?.read()?;
@@ -1545,49 +1888,38 @@ impl Guest {
 
         let mut current_eprocess = ps_initial_system_process;
 
-        loop {
+        // Cycle detection handles a corrupt list that loops; the cap handles
+        // one that wanders through unrelated memory without repeating.
+        const PROCESS_WALK_LIMIT: usize = 65_536;
+        while processes.len() < PROCESS_WALK_LIMIT {
             if current_eprocess.0 == 0 || visited.contains(&current_eprocess.0) {
                 break;
             }
             visited.insert(current_eprocess.0);
 
-            let pid = memory.read::<u64>(current_eprocess + unique_process_id_offset)?;
-            let dtb = memory.read::<Dtb>(current_eprocess + dir_table_base_offset)? & !0xfff;
-
+            span.read(&memory, current_eprocess)?;
+            let dtb = span.dtb();
             if dtb == 0 {
                 break;
             }
 
-            let name = self
-                .full_process_name(current_eprocess, dtb)
-                .unwrap_or_else(|_| {
-                    let mut name_buf = [0u8; 15];
-                    if memory
-                        .read_bytes(current_eprocess + image_filename_offset, &mut name_buf)
-                        .is_ok()
-                    {
-                        String::from_utf8_lossy(
-                            &name_buf[..name_buf.iter().position(|&c| c == 0).unwrap_or(15)],
-                        )
-                        .to_string()
-                    } else {
-                        "<unknown>".to_string()
-                    }
-                });
-
             processes.push(ProcessInfo {
-                pid,
-                name,
+                pid: span.pid(),
+                name: self.process_name_from_image_file_name(
+                    current_eprocess,
+                    dtb,
+                    span.image_file_name(),
+                ),
                 dtb,
                 eprocess_va: current_eprocess,
             });
 
-            let flink = memory.read::<VirtAddr>(current_eprocess + active_process_links_offset)?;
+            let flink = span.active_process_links_flink();
             if flink.0 == 0 || Some(flink) == ps_active_process_head {
                 break;
             }
 
-            current_eprocess = flink - active_process_links_offset;
+            current_eprocess = flink - span.active_process_links_offset;
             if current_eprocess == ps_initial_system_process {
                 break;
             }
@@ -1596,26 +1928,62 @@ impl Guest {
         Ok(processes)
     }
 
-    /// Short (15-char) image name straight from EPROCESS.ImageFileName: a
-    /// single read, unlike enumerate_processes or the PEB walk
-    pub fn process_image_name(&self, eprocess_va: VirtAddr) -> Option<String> {
-        let memory = self.ntoskrnl.memory();
-        let offset = self
-            .ntoskrnl
-            .types()
-            .layout("_EPROCESS")
-            .ok()?
-            .field_offset("ImageFileName")
-            .ok()?;
-        let mut name_buf = [0u8; 15];
-        memory
-            .read_bytes(eprocess_va + offset, &mut name_buf)
-            .ok()?;
-        let len = name_buf.iter().position(|&c| c == 0).unwrap_or(15);
+    /// The process at `eprocess_va` without walking the process list: one
+    /// EPROCESS span read plus the PEB walk only for a possibly truncated
+    /// name.
+    pub fn process_at(&self, eprocess_va: VirtAddr) -> Result<ProcessInfo> {
+        let mut span = EprocessSpan::new(self)?;
+        span.read(&self.ntoskrnl.memory(), eprocess_va)?;
+        let dtb = span.dtb();
+        Ok(ProcessInfo {
+            pid: span.pid(),
+            name: self.process_name_from_image_file_name(eprocess_va, dtb, span.image_file_name()),
+            dtb,
+            eprocess_va,
+        })
+    }
+
+    /// Display name for the process at `eprocess_va` given its raw
+    /// `EPROCESS.ImageFileName` bytes. The kernel keeps only the first 15
+    /// bytes of the image name, so the PEB loader list (a page-walked read of
+    /// user memory) is consulted only when the field is full and may be
+    /// truncated; every shorter name is complete as is.
+    fn process_name_from_image_file_name(
+        &self,
+        eprocess_va: VirtAddr,
+        dtb: Dtb,
+        image_file_name: &[u8],
+    ) -> String {
+        let len = image_file_name
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(image_file_name.len());
+        if len == IMAGE_FILE_NAME_LEN
+            && dtb != 0
+            && let Ok(full) = self.full_process_name(eprocess_va, dtb)
+        {
+            return full;
+        }
         if len == 0 {
+            return "<unknown>".to_string();
+        }
+        String::from_utf8_lossy(&image_file_name[..len]).to_string()
+    }
+
+    /// Display name for the process at `eprocess_va` without walking the
+    /// process list: the `ImageFileName` read plus, only for a possibly
+    /// truncated name, the process DTB and PEB walk.
+    pub fn process_name_at(&self, eprocess_va: VirtAddr) -> Option<String> {
+        let mut span = EprocessSpan::new(self).ok()?;
+        span.read(&self.ntoskrnl.memory(), eprocess_va).ok()?;
+        if span.image_file_name()[0] == 0 {
             return None;
         }
-        Some(String::from_utf8_lossy(&name_buf[..len]).to_string())
+        Some(self.process_name_from_image_file_name(
+            eprocess_va,
+            span.dtb(),
+            span.image_file_name(),
+        ))
     }
 
     fn full_process_name(&self, eprocess_va: VirtAddr, dtb: Dtb) -> Result<String> {
@@ -1695,6 +2063,13 @@ impl Guest {
     }
 
     pub fn kernel_modules(&self) -> Result<Vec<ModuleInfo>> {
+        self.memoized(
+            |memo| &mut memo.kernel_modules,
+            || self.walk_kernel_modules(),
+        )
+    }
+
+    fn walk_kernel_modules(&self) -> Result<Vec<ModuleInfo>> {
         let head = self.ntoskrnl.symbol("PsLoadedModuleList")?.address();
 
         // The kernel uses the _KLDR variant; fall back to _LDR if it's absent
@@ -1764,7 +2139,7 @@ impl Guest {
                 continue;
             }
 
-            match symbols.extract_download_job(phys, dtb, &module.name, module.base_address, arch) {
+            match symbols.extract_download_job(phys, dtb, &module, arch) {
                 Ok(ModuleSymbolDiscovery::Ready { job, guid, source }) => {
                     Self::queue_module_symbol_load(
                         symbols,
@@ -1855,9 +2230,15 @@ impl Guest {
         let download_results =
             download_jobs_parallel(jobs_with_info.iter().map(|load| load.job.clone()).collect());
 
+        // Modules whose remembered PDB no longer resolves: forget the record
+        // and rediscover them from the target below.
+        let mut stale_identities: Vec<ModuleInfo> = Vec::new();
         for (load, result) in jobs_with_info.into_iter().zip(download_results) {
             match result {
                 Ok(_) => ready_to_load.push(load),
+                Err(_) if matches!(load.source, ModuleSymbolSource::Identity) => {
+                    stale_identities.push(load.module);
+                }
                 Err(e) => {
                     Self::apply_module_symbol_status(
                         symbols,
@@ -1881,33 +2262,54 @@ impl Guest {
             let results = ready_to_load
                 .into_par_iter()
                 .map(|load| {
-                    let module = load.module.clone();
-                    let guid = load.guid;
                     let result = symbols.load_downloaded_pdb(&load);
                     pb.inc(1);
-                    (module, guid, result)
+                    (load, result)
                 })
                 .collect::<Vec<_>>();
 
             pb.finish_and_clear();
 
-            for (module, guid, result) in results {
+            for (load, result) in results {
                 match result {
                     Ok(_) => {
                         report.record_status(&ModuleSymbolStatus::Loaded);
-                        report.record_diagnostics(&module.name, symbols.index_diagnostics(guid));
+                        report.record_diagnostics(
+                            &load.module.name,
+                            symbols.index_diagnostics(load.guid),
+                        );
+                        if !matches!(load.source, ModuleSymbolSource::Identity) {
+                            symbols.remember_module_identity(&load.module, &load.job);
+                        }
+                    }
+                    Err(_) if matches!(load.source, ModuleSymbolSource::Identity) => {
+                        stale_identities.push(load.module);
                     }
                     Err(e) => {
                         Self::apply_module_symbol_status(
                             symbols,
                             &mut report,
                             dtb,
-                            &module,
+                            &load.module,
                             ModuleSymbolStatus::Failed(e.to_string()),
                         );
                     }
                 }
             }
+        }
+
+        if !stale_identities.is_empty() {
+            for module in &stale_identities {
+                symbols.forget_module_identity(module);
+            }
+            report.absorb(Self::load_module_symbols(
+                phys,
+                symbols,
+                stale_identities,
+                dtb,
+                skip_session_space,
+                arch,
+            )?);
         }
 
         Ok(report)
@@ -1990,32 +2392,168 @@ impl Guest {
 
 #[cfg(test)]
 mod tests {
-    use super::{ModuleSymbolLoadReport, PeImage};
+    use super::{
+        IMAGE_BLOCK, ModuleSymbolLoadReport, PE_HEADER_PROBE, PeImage, read_pe_header_page,
+        read_pe_image,
+    };
+    use crate::backend::MemoryOps;
+    use crate::error::{Error, Result};
+    use crate::memory::{AddressSpace, DTB_IDENTITY};
     use crate::symbols::SymbolIndexDiagnostic;
+    use crate::types::{PhysAddr, VirtAddr};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Identity-mapped memory holding one image at `base`; reads outside it
+    /// fail like an unmapped page. Counts the bytes handed out.
+    struct ImageMemory {
+        base: u64,
+        bytes: Vec<u8>,
+        read: AtomicUsize,
+        /// Bytes past this offset read as unmapped.
+        readable: AtomicUsize,
+    }
+
+    impl ImageMemory {
+        fn new(base: u64, bytes: Vec<u8>) -> Self {
+            Self {
+                base,
+                readable: AtomicUsize::new(bytes.len()),
+                bytes,
+                read: AtomicUsize::new(0),
+            }
+        }
+
+        fn bytes_read(&self) -> usize {
+            self.read.load(Ordering::Relaxed)
+        }
+    }
+
+    impl MemoryOps<PhysAddr> for ImageMemory {
+        fn read_bytes(&self, addr: PhysAddr, buf: &mut [u8]) -> Result<()> {
+            let start = addr
+                .checked_sub(self.base)
+                .filter(|start| {
+                    start + buf.len() as u64 <= self.readable.load(Ordering::Relaxed) as u64
+                })
+                .ok_or(Error::BadPhysicalAddress(addr))? as usize;
+            buf.copy_from_slice(&self.bytes[start..start + buf.len()]);
+            self.read.fetch_add(buf.len(), Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn write_bytes(&self, _addr: PhysAddr, _buf: &[u8]) -> Result<()> {
+            unreachable!()
+        }
+    }
+
+    fn open_image(memory: &Arc<ImageMemory>) -> PeImage {
+        let memory = Arc::clone(memory);
+        read_pe_image(VirtAddr(memory.base), move |address, buf| {
+            AddressSpace::new(&memory, DTB_IDENTITY).read_bytes(address, buf)
+        })
+        .unwrap()
+    }
+
+    /// A PE32+ image with `.text` at 0x1000 and `.rdata` at 0x2000, each one
+    /// page, filled with distinct bytes.
+    fn synthetic_image() -> Vec<u8> {
+        synthetic_image_with_pe_at(0x80)
+    }
+
+    fn synthetic_image_with_pe_at(pe: usize) -> Vec<u8> {
+        let mut image = vec![0u8; 0x3000];
+        image[..2].copy_from_slice(b"MZ");
+        image[0x3c..0x40].copy_from_slice(&(pe as u32).to_le_bytes());
+        image[pe..pe + 4].copy_from_slice(b"PE\0\0");
+        image[pe + 4..pe + 6].copy_from_slice(&0x8664u16.to_le_bytes());
+        image[pe + 6..pe + 8].copy_from_slice(&2u16.to_le_bytes());
+        image[pe + 20..pe + 22].copy_from_slice(&240u16.to_le_bytes());
+        let opt = pe + 24;
+        image[opt..opt + 2].copy_from_slice(&0x20bu16.to_le_bytes());
+        image[opt + 32..opt + 36].copy_from_slice(&0x1000u32.to_le_bytes());
+        image[opt + 36..opt + 40].copy_from_slice(&0x200u32.to_le_bytes());
+        image[opt + 56..opt + 60].copy_from_slice(&0x3000u32.to_le_bytes());
+        image[opt + 60..opt + 64].copy_from_slice(&0x1000u32.to_le_bytes());
+        image[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
+        let sections = opt + 240;
+        for (index, (name, va, fill)) in [
+            (b".text\0\0\0", 0x1000u32, 0xccu8),
+            (b".rdata\0\0", 0x2000, 0xdd),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let header = sections + 40 * index;
+            image[header..header + 8].copy_from_slice(name);
+            image[header + 8..header + 12].copy_from_slice(&0x1000u32.to_le_bytes());
+            image[header + 12..header + 16].copy_from_slice(&va.to_le_bytes());
+            image[header + 16..header + 20].copy_from_slice(&0x1000u32.to_le_bytes());
+            image[header + 20..header + 24].copy_from_slice(&va.to_le_bytes());
+            image[va as usize..va as usize + 0x1000].fill(fill);
+        }
+        image
+    }
+
+    /// Opening an image costs the header probe; a lookup fetches the one
+    /// block it lands in, and a second lookup in that block costs nothing.
     #[test]
-    fn pe_image_present_respects_holes_and_bounds() {
-        // 0x100 bytes with one paged-out hole at [0x40, 0x80)
-        let hole = 0x40..0x80;
-        let image = PeImage {
-            bytes: vec![0u8; 0x100],
-            holes: vec![hole],
-        };
+    fn lazy_image_fetches_blocks_on_first_use() {
+        let memory = Arc::new(ImageMemory::new(0x10_0000, synthetic_image()));
+        let image = open_image(&memory);
+        assert!(!image.is_complete());
+        assert_eq!(memory.bytes_read(), PE_HEADER_PROBE);
 
-        // fully outside the hole -> present
-        assert!(image.is_present(0x00, 0x40));
-        assert!(image.is_present(0x80, 0x80));
-        assert!(image.present_slice(0x10, 0x10).is_some());
+        assert_eq!(&image.read(0x2200, 0x100).unwrap()[..], &[0xdd; 0x100][..]);
+        assert_eq!(memory.bytes_read(), PE_HEADER_PROBE + IMAGE_BLOCK);
+        assert_eq!(&image.read(0x2300, 0x10).unwrap()[..], &[0xdd; 0x10][..]);
+        assert_eq!(memory.bytes_read(), PE_HEADER_PROBE + IMAGE_BLOCK);
 
-        // any overlap with the hole -> absent (including straddling either edge)
-        assert!(!image.is_present(0x40, 0x01));
-        assert!(!image.is_present(0x3f, 0x02));
-        assert!(!image.is_present(0x7f, 0x02));
-        assert!(image.present_slice(0x38, 0x10).is_none());
+        // A range spanning two blocks is stitched from both: the header
+        // page's tail and the first bytes of `.text`.
+        let across = image.read(2 * IMAGE_BLOCK - 4, 8).unwrap();
+        assert_eq!(&across[..4], &[0; 4]);
+        assert_eq!(&across[4..], &[0xcc; 4]);
+        assert!(image.read(0x2ff0, 0x11).is_none());
+    }
 
-        // out of bounds -> absent, and overflow doesn't panic
-        assert!(!image.is_present(0xf0, 0x20));
-        assert!(!image.is_present(usize::MAX, 1));
+    /// A block the target refuses is a hole: the read reports it rather
+    /// than serving zeros, and it is asked for again rather than remembered,
+    /// so a page that is resident by the next lookup is served.
+    #[test]
+    fn lazy_image_reports_unreadable_blocks() {
+        let memory = Arc::new(ImageMemory::new(0x10_0000, synthetic_image()));
+        memory.readable.store(0x2000, Ordering::Relaxed);
+        let image = open_image(&memory);
+
+        assert!(image.is_present(0x1000, 0x10));
+        assert!(!image.is_present(0x2000, 4));
+        assert!(image.read(0x1ff0, 0x20).is_none());
+
+        memory.readable.store(0x3000, Ordering::Relaxed);
+        assert_eq!(&image.read(0x2000, 4).unwrap()[..], &[0xdd; 4][..]);
+    }
+
+    /// The header probe alone covers a normally linked image; a section table
+    /// that runs past the probe is completed by a second read instead of
+    /// being parsed from zeros.
+    #[test]
+    fn read_pe_header_page_extends_past_probe_only_when_needed() {
+        let base = 0x10_0000u64;
+        let memory = ImageMemory::new(base, synthetic_image());
+        let space = AddressSpace::new(&memory, DTB_IDENTITY);
+        let header = read_pe_header_page(VirtAddr(base), &space).unwrap();
+        assert_eq!(memory.bytes_read(), PE_HEADER_PROBE);
+        assert_eq!(&header[..PE_HEADER_PROBE], &memory.bytes[..PE_HEADER_PROBE]);
+
+        let late_pe = PE_HEADER_PROBE - 0x40;
+        let memory = ImageMemory::new(base, synthetic_image_with_pe_at(late_pe));
+        let space = AddressSpace::new(&memory, DTB_IDENTITY);
+        let header = read_pe_header_page(VirtAddr(base), &space).unwrap();
+        let table_end = late_pe + 24 + 240 + 2 * 40;
+        assert_eq!(memory.bytes_read(), table_end);
+        assert_eq!(&header[..table_end], &memory.bytes[..table_end]);
+        assert!(header[table_end..].iter().all(|&byte| byte == 0));
     }
 
     #[test]

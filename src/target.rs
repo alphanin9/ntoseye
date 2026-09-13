@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
+use crate::unwind::frame_base_for_register_values;
 use crate::{
     backend::MemoryOps,
     bugchecks::looks_like_kernel_pointer,
@@ -19,7 +20,7 @@ use crate::{
     phys::PhysMem,
     symbols::{
         LocalVariableLocation, ParsedType, ProcedureLocal, SourceLocation, SymbolCandidate,
-        SymbolIndex, SymbolStore, TypeInfo,
+        SymbolIndex, SymbolStore, TypeInfo, format_symbol_with_offset,
     },
     types::{Arch, Dtb, PageTableEntry, Value, VirtAddr},
 };
@@ -37,6 +38,10 @@ pub struct Target {
     triage_modules_cache: Option<Vec<ModuleInfo>>,
     context_dtb_override: Option<Dtb>,
     pub registers: Option<HashMap<String, u64>>,
+    /// Frontend-selected stack/context frame. The REPL owns the lifetime and
+    /// mirrors it into this target so expression and local evaluation see the
+    /// same recovered register context across command calls.
+    pub selected_frame: Option<SelectedFrame>,
     /// Windows thread metadata selected for inspection. Whether it is live on
     /// the backend vCPU or parked is session state; Target only owns identity
     /// and the corresponding process/address-space view.
@@ -50,7 +55,21 @@ pub struct Target {
     pub results_origin: Option<String>,
 }
 
-const CR3_PAGE_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+/// A debugger-selected non-live register context. Register values are kept as
+/// a sparse map because unwind metadata can recover only a subset of the full
+/// live register file for caller frames; `seed_registers` keeps the original
+/// context available when `.frame N` navigates repeatedly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedFrame {
+    pub index: usize,
+    pub ip: u64,
+    pub sp: u64,
+    pub frame_base: Option<u64>,
+    pub registers: HashMap<String, u64>,
+    /// Sparse register context from which this selection's stack walk started.
+    /// It remains stable as `.frame N` moves through the recovered trace.
+    pub seed_registers: HashMap<String, u64>,
+}
 
 /// A user-defined convenience variable and the expression it was defined from
 #[derive(Debug, Clone)]
@@ -266,6 +285,16 @@ pub struct SymbolSearchMatch {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Arm64SavedRegisters {
+    pub x: [Option<u64>; 31],
+    pub sp: Option<u64>,
+    pub pc: Option<u64>,
+    pub cpsr: Option<u64>,
+    pub fp: Option<u64>,
+    pub lr: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SavedThreadRegisters {
     pub rip: Option<u64>,
     pub rsp: Option<u64>,
@@ -285,11 +314,20 @@ pub struct SavedThreadRegisters {
     pub r14: Option<u64>,
     pub r15: Option<u64>,
     pub rflags: Option<u64>,
+    pub arm64: Option<Arm64SavedRegisters>,
 }
 
 impl SavedThreadRegisters {
     pub fn get(&self, name: &str) -> Option<u64> {
-        match name.to_ascii_lowercase().as_str() {
+        let name = name.to_ascii_lowercase();
+        if let Some(index) = name
+            .strip_prefix('x')
+            .and_then(|index| index.parse::<usize>().ok())
+            .filter(|&index| index < 31)
+        {
+            return self.arm64.as_ref()?.x[index];
+        }
+        match name.as_str() {
             "rip" => self.rip,
             "rsp" => self.rsp,
             "rax" => self.rax,
@@ -308,6 +346,11 @@ impl SavedThreadRegisters {
             "r14" => self.r14,
             "r15" => self.r15,
             "rflags" | "eflags" => self.rflags,
+            "sp" => self.arm64.as_ref()?.sp,
+            "pc" => self.arm64.as_ref()?.pc,
+            "cpsr" => self.arm64.as_ref()?.cpsr,
+            "fp" => self.arm64.as_ref()?.fp,
+            "lr" => self.arm64.as_ref()?.lr,
             _ => None,
         }
     }
@@ -464,6 +507,16 @@ pub fn kthread_state_name(state: u8) -> &'static str {
     }
 }
 
+/// Case-insensitive lookup in a register map; exact match first.
+pub fn lookup_register(registers: &HashMap<String, u64>, name: &str) -> Option<u64> {
+    registers.get(name).copied().or_else(|| {
+        registers
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+            .map(|(_, value)| *value)
+    })
+}
+
 pub fn wait_reason_name(reason: u8) -> &'static str {
     match reason {
         0 => "Executive",
@@ -511,6 +564,8 @@ pub fn wait_reason_name(reason: u8) -> &'static str {
 
 #[derive(Debug, Clone)]
 pub struct MemoryRegionInfo {
+    pub node_address: VirtAddr,
+    pub level: usize,
     pub start: VirtAddr,
     pub end: VirtAddr,
     pub protection: Option<u64>,
@@ -699,6 +754,108 @@ pub enum ListTermination {
     Corrupt(String),
 }
 
+impl ListTermination {
+    pub(crate) fn diagnostic(&self) -> Option<String> {
+        match self {
+            Self::Head => None,
+            Self::Null => Some("null link".to_string()),
+            Self::Cycle(address) => Some(format!("non-head cycle at {:#x}", address.0)),
+            Self::Bound => Some("entry bound reached".to_string()),
+            Self::Corrupt(error) => Some(format!("unreadable link: {error}")),
+        }
+    }
+}
+
+/// Termination state for walking an intrusive list: bounded, stopping at the
+/// head, a null link, or the first link seen twice. The caller supplies each
+/// link read after consuming the current entry, so a typed walk can take the
+/// next link from the record image it already prefetched.
+pub(crate) struct ListCursor {
+    head: VirtAddr,
+    limit: usize,
+    current: Option<VirtAddr>,
+    visited: HashSet<u64>,
+    yielded: usize,
+    first_entry: bool,
+    termination: Option<ListTermination>,
+}
+
+impl ListCursor {
+    pub(crate) fn new(head: VirtAddr, limit: usize) -> Self {
+        Self {
+            head,
+            limit,
+            current: None,
+            visited: HashSet::with_capacity(16),
+            yielded: 0,
+            first_entry: false,
+            termination: None,
+        }
+    }
+
+    /// Construct a cursor over a ring whose first element is `first` itself,
+    /// rather than the link stored at a head. The walk ends when it returns
+    /// to `first`; commands that treat their address argument as element one
+    /// (`dt -l`, `!list`, `dl`) use this.
+    pub(crate) fn from_first(first: VirtAddr, limit: usize) -> Self {
+        Self {
+            head: first,
+            limit,
+            current: Some(first),
+            visited: HashSet::with_capacity(16),
+            yielded: 0,
+            first_entry: true,
+            termination: None,
+        }
+    }
+
+    pub(crate) fn next(&mut self) -> Option<VirtAddr> {
+        if self.termination.is_some() {
+            return None;
+        }
+        let current = self.current.take()?;
+        if !self.first_entry && current == self.head {
+            self.termination = Some(ListTermination::Head);
+            return None;
+        }
+        if current.is_zero() {
+            self.termination = Some(ListTermination::Null);
+            return None;
+        }
+        if !self.visited.insert(current.0) {
+            self.termination = Some(ListTermination::Cycle(current));
+            return None;
+        }
+        if self.yielded >= self.limit {
+            self.termination = Some(ListTermination::Bound);
+            return None;
+        }
+        self.first_entry = false;
+        self.yielded += 1;
+        Some(current)
+    }
+
+    pub(crate) fn advance(&mut self, next: std::result::Result<VirtAddr, String>) {
+        if self.termination.is_some() {
+            return;
+        }
+        self.current = match next {
+            Ok(next) => Some(next),
+            Err(error) => {
+                self.termination = Some(ListTermination::Corrupt(error));
+                None
+            }
+        };
+    }
+
+    /// The termination reached; the walk must have been driven to `next()`
+    /// returning `None`.
+    pub(crate) fn finish(self) -> ListTermination {
+        self.termination
+            .expect("ListCursor::finish called before next() returned None")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ResourceListSummary {
     pub head: VirtAddr,
@@ -740,31 +897,13 @@ where
     F: FnMut(VirtAddr) -> Result<VirtAddr>,
 {
     let mut links = Vec::new();
-    let mut visited = HashSet::new();
-    let mut current = match read_next(head) {
-        Ok(current) => current,
-        Err(error) => return (links, ListTermination::Corrupt(error.to_string())),
-    };
-
-    loop {
-        if current == head {
-            return (links, ListTermination::Head);
-        }
-        if current.is_zero() {
-            return (links, ListTermination::Null);
-        }
-        if !visited.insert(current.0) {
-            return (links, ListTermination::Cycle(current));
-        }
-        if links.len() >= limit {
-            return (links, ListTermination::Bound);
-        }
+    let mut cursor = ListCursor::new(head, limit);
+    cursor.advance(read_next(head).map_err(|error| error.to_string()));
+    while let Some(current) = cursor.next() {
         links.push(current);
-        current = match read_next(current) {
-            Ok(next) => next,
-            Err(error) => return (links, ListTermination::Corrupt(error.to_string())),
-        };
+        cursor.advance(read_next(current).map_err(|error| error.to_string()));
     }
+    (links, cursor.finish())
 }
 
 struct ObjectNameLayout {
@@ -977,6 +1116,7 @@ impl Target {
             triage_modules_cache,
             context_dtb_override: None,
             registers: None,
+            selected_frame: None,
             windows_thread_selection: None,
             user_vars: HashMap::new(),
             results: Vec::new(),
@@ -998,7 +1138,7 @@ impl Target {
             WinObject::new_with_arch(phys.clone(), symbols.clone(), kernel_dtb, kernel_base, arch)
                 .load_symbols()?;
         ntoskrnl.register_as_kernel();
-        let guest = Guest { ntoskrnl };
+        let guest = Guest::from_kernel(ntoskrnl);
         let _ = guest.load_all_kernel_module_symbols(&phys, &symbols);
 
         Ok(Self {
@@ -1012,6 +1152,7 @@ impl Target {
             triage_modules_cache: None,
             context_dtb_override: None,
             registers: None,
+            selected_frame: None,
             windows_thread_selection: None,
             user_vars: HashMap::new(),
             results: Vec::new(),
@@ -1133,28 +1274,22 @@ impl Target {
     /// Walk an intrusive `_LIST_ENTRY` from `head` (the list-head address) in
     /// the current address space, returning each record's base
     /// (`link_addr - link_offset`). Bounded (max 1000) and cycle-stopping,
-    /// mirroring the engine's `Types::list_at`. Shared by the SDK and MCP list
-    /// walking; the typed cursor walk (`StructRef::list`) is the richer form.
+    /// mirroring the engine's `Types::list_at`; a bad link truncates the walk
+    /// rather than discarding the records already collected. Shared by the SDK
+    /// and MCP list walking; the typed cursor walk (`StructRef::list`) is the
+    /// richer form.
     pub fn walk_list(&self, head: VirtAddr, link_offset: u64) -> Result<Vec<u64>> {
         const MAX: usize = 1000;
         let mem = self.current_process()?.memory();
-        let mut buf = [0u8; 8];
-        mem.read_bytes(head, &mut buf)?;
-        let mut current = u64::from_le_bytes(buf);
+        let mut cursor = ListCursor::new(head, MAX);
+        cursor.advance(Ok(mem.read::<VirtAddr>(head)?));
         let mut out = Vec::new();
-        let mut count = 0usize;
-        while current != 0 && current != head.0 && count < MAX {
-            count += 1;
-            out.push(current.saturating_sub(link_offset));
-            // truncate on a bad link rather than failing the whole walk
-            if mem.read_bytes(VirtAddr(current), &mut buf).is_err() {
-                break;
-            }
-            let next = u64::from_le_bytes(buf);
-            if next == current {
-                break; // self-loop
-            }
-            current = next;
+        while let Some(current) = cursor.next() {
+            out.push(current.0.wrapping_sub(link_offset));
+            cursor.advance(
+                mem.read::<VirtAddr>(current)
+                    .map_err(|error| error.to_string()),
+            );
         }
         Ok(out)
     }
@@ -1244,6 +1379,7 @@ impl Target {
 
         self.current_process = Some(winobj);
         self.current_process_info = Some(process_info);
+        self.selected_frame = None;
         self.clear_context_dtb_override();
         self.clear_current_windows_thread_context();
         Ok(AttachReport {
@@ -1253,6 +1389,7 @@ impl Target {
     }
 
     pub fn detach(&mut self) {
+        self.selected_frame = None;
         self.clear_context_dtb_override();
         self.clear_current_windows_thread_context();
         self.current_process = None;
@@ -1268,14 +1405,16 @@ impl Target {
     }
 
     pub fn normalize_cr3(cr3: u64) -> Dtb {
-        cr3 & CR3_PAGE_MASK
+        cr3 & Arch::Amd64.dtb_page_mask()
     }
 
     pub fn set_current_windows_thread_context(&mut self, thread: ThreadInfo) {
+        self.selected_frame = None;
         self.windows_thread_selection = Some(thread);
     }
 
     pub fn set_parked_windows_thread(&mut self, thread: ThreadInfo) {
+        self.selected_frame = None;
         self.windows_thread_selection = Some(thread);
         // A parked thread has no coherent register file. In particular, do not
         // let expressions reuse registers cached from the still-selected vCPU.
@@ -1287,6 +1426,18 @@ impl Target {
     }
 
     pub fn thread_process_dtb(&self, thread: &ThreadInfo) -> Option<Dtb> {
+        // A known owning EPROCESS answers with one read; only a thread whose
+        // process pointer was unreadable needs the list walk by pid.
+        if thread.pid != Some(0)
+            && let Some(eprocess) = thread.eprocess
+            && let Some(process) = self
+                .guest
+                .as_ref()
+                .and_then(|guest| guest.process_at(eprocess).ok())
+            && process.dtb != 0
+        {
+            return Some(process.dtb);
+        }
         let processes = self
             .guest
             .as_ref()
@@ -1300,9 +1451,38 @@ impl Target {
         )
     }
 
+    /// The process whose page-table root is `cr3_masked`. The selected
+    /// Windows thread's owner is checked first: at a stop that is almost
+    /// always the answer and costs one EPROCESS read, where the fallback walks
+    /// the process list.
+    pub fn process_for_cr3(&self, cr3_masked: u64) -> Option<ProcessInfo> {
+        let guest = self.guest.as_ref()?;
+        if let Some(eprocess) = self
+            .windows_thread_selection
+            .as_ref()
+            .and_then(|thread| thread.eprocess)
+            && let Ok(process) = guest.process_at(eprocess)
+            && (process.dtb & self.arch().dtb_page_mask()) == cr3_masked
+        {
+            return Some(process);
+        }
+        guest
+            .enumerate_processes()
+            .ok()?
+            .into_iter()
+            .find(|process| (process.dtb & self.arch().dtb_page_mask()) == cr3_masked)
+    }
+
     pub fn current_thread_pseudo_register(&self, name: &str) -> Option<u64> {
         let thread = self.windows_thread_selection.as_ref()?;
         thread.pseudo_register_value(name)
+    }
+
+    /// Read a cached register in a case-insensitive manner. The cache is
+    /// populated from either the live backend context or a selected frame, so
+    /// expression evaluation does not need to know which one is active.
+    pub fn register_value(&self, name: &str) -> Option<u64> {
+        lookup_register(self.registers.as_ref()?, name)
     }
 
     pub fn builtin_variable_value(&self, name: &str) -> Option<u64> {
@@ -1545,11 +1725,8 @@ impl Target {
         if self.triage_fallback.is_some() {
             return true;
         }
-        // Triage dumps capture kernel state at bugcheck time — it is
-        // coherent by definition.  The MZ check below guards against
-        // undetected reboots on live VMs, which can't happen for dumps.
-        // The ntoskrnl base page is often not captured in triage dumps,
-        // so the MZ read would fail even though the state is valid.
+        // Triage dumps often lack the ntoskrnl base page, so the MZ check
+        // below would fail on a perfectly coherent snapshot.
         if self.phys.dmp_info().is_some_and(|i| i.is_triage) {
             return true;
         }
@@ -1665,66 +1842,30 @@ impl Target {
         self.address_space(self.kernel_dtb())
     }
 
-    /// Symbol address space for an address in the active inspection context.
-    /// Kernel addresses fall back to the kernel DTB when a user process is
-    /// selected and owns no module covering the address.
-    pub fn symbol_dtb_for_address(&self, address: VirtAddr) -> Dtb {
-        let current_dtb = self.current_dtb();
-        let kernel_dtb = self.kernel_dtb();
-        if !looks_like_kernel_pointer(address.0) || current_dtb == kernel_dtb {
-            return current_dtb;
-        }
-        self.symbols
-            .find_module_for_address_in_context(current_dtb, kernel_dtb, address)
-            .map(|module| module.dtb)
-            .unwrap_or(current_dtb)
-    }
-
-    /// Return all matching symbol identities in the active address space,
-    /// adding the kernel address space when a user process is selected.
+    /// All matching symbol identities visible from the active address space.
     pub fn symbol_candidates(&self, name: &str) -> Vec<SymbolCandidate> {
-        let current_dtb = self.current_dtb();
-        let kernel_dtb = self.kernel_dtb();
-        let mut candidates = self.symbols.find_symbol_candidates(current_dtb, name);
-        if current_dtb != kernel_dtb {
-            candidates.extend(self.symbols.find_symbol_candidates(kernel_dtb, name));
-        }
-        candidates.sort_by(|left, right| {
-            left.module
-                .to_ascii_lowercase()
-                .cmp(&right.module.to_ascii_lowercase())
-                .then_with(|| left.address.0.cmp(&right.address.0))
-                .then_with(|| left.compiland.cmp(&right.compiland))
-        });
-        candidates.dedup_by(|left, right| {
-            left.module.eq_ignore_ascii_case(&right.module)
-                && left.address == right.address
-                && left.visibility == right.visibility
-                && left.compiland == right.compiland
-        });
-        candidates
+        self.symbols
+            .find_symbol_candidates(self.current_dtb(), name)
     }
 
     /// Fuzzy-search the active symbol index and resolve only unambiguous
     /// module/address identities. `module!query` restricts the search.
     pub fn search_symbols(&self, query: &str, limit: usize) -> Vec<SymbolSearchMatch> {
         let dtb = self.current_dtb();
-        let (module, names) = match query.split_once('!') {
-            Some((module, query)) => (
-                Some(module),
-                self.symbols
-                    .search_symbols_in_module(dtb, module, query, limit),
-            ),
-            None => (None, self.current_symbol_index().search(query, limit)),
+        let names: Vec<String> = match query.split_once('!') {
+            Some((module, query)) => self
+                .symbols
+                .search_symbols_in_module(dtb, module, query, limit)
+                .into_iter()
+                .map(|name| format!("{module}!{name}"))
+                .collect(),
+            None => self.current_symbol_index().search(query, limit),
         };
         names
             .into_iter()
-            .map(|name| {
-                let lookup = module
-                    .map(|module| format!("{module}!{name}"))
-                    .unwrap_or_else(|| name.clone());
+            .map(|qualified| {
                 let locations: HashSet<(String, u64)> = self
-                    .symbol_candidates(&lookup)
+                    .symbol_candidates(&qualified)
                     .into_iter()
                     .map(|candidate| (candidate.module, candidate.address.0))
                     .collect();
@@ -1734,6 +1875,10 @@ impl Target {
                 } else {
                     (None, None)
                 };
+                let name = qualified
+                    .rsplit_once('!')
+                    .map_or(qualified.as_str(), |(_, bare)| bare)
+                    .to_string();
                 SymbolSearchMatch {
                     name,
                     address,
@@ -1742,55 +1887,30 @@ impl Target {
             })
             .collect()
     }
-    /// Structured nearest-symbol lookup with kernel-address fallback.
     pub fn nearest_symbol_current_context(
         &self,
         address: VirtAddr,
     ) -> Option<(String, String, u32)> {
-        let current_dtb = self.current_dtb();
         self.symbols
-            .find_closest_symbol_for_address(current_dtb, address)
-            .or_else(|| {
-                let kernel_dtb = self.kernel_dtb();
-                (looks_like_kernel_pointer(address.0) && current_dtb != kernel_dtb)
-                    .then(|| {
-                        self.symbols
-                            .find_closest_symbol_for_address(kernel_dtb, address)
-                    })
-                    .flatten()
-            })
+            .find_closest_symbol_for_address(self.current_dtb(), address)
     }
 
     pub fn closest_symbol_current_context(&self, address: VirtAddr) -> Option<String> {
         self.nearest_symbol_current_context(address)
-            .map(|(module, name, offset)| {
-                crate::symbols::format_symbol_with_offset(&module, &name, offset)
-            })
+            .map(|(module, name, offset)| format_symbol_with_offset(&module, &name, offset))
     }
 
-    /// Resolve cached source information using the active address space with the
-    /// same kernel-address fallback as symbol rendering.
     pub fn source_location(&self, address: VirtAddr) -> Option<SourceLocation> {
-        let dtb = self.symbol_dtb_for_address(address);
-        self.symbols.source_location(dtb, address)
+        self.symbols.source_location(self.current_dtb(), address)
     }
 
-    /// Resolve `file:line` across the active and kernel address spaces.
     pub fn source_addresses(&self, file: &str, line: u32) -> Vec<VirtAddr> {
-        let current_dtb = self.current_dtb();
-        let kernel_dtb = self.kernel_dtb();
-        let mut addresses = self.symbols.source_addresses(current_dtb, file, line);
-        if current_dtb != kernel_dtb {
-            addresses.extend(self.symbols.source_addresses(kernel_dtb, file, line));
-        }
-        addresses.sort_by_key(|address| address.0);
-        addresses.dedup();
-        addresses
+        self.symbols
+            .source_addresses(self.current_dtb(), file, line)
     }
     /// Return private procedure locals in scope at `address`.
     pub fn procedure_locals(&self, address: VirtAddr) -> Result<Option<Vec<ProcedureLocal>>> {
-        let dtb = self.symbol_dtb_for_address(address);
-        self.symbols.procedure_locals(dtb, address)
+        self.symbols.procedure_locals(self.current_dtb(), address)
     }
 
     /// Resolve a scalar local from the current halted register/memory context.
@@ -1803,10 +1923,8 @@ impl Target {
         local: &ProcedureLocal,
     ) -> Option<u64> {
         if self
-            .registers
-            .as_ref()
-            .and_then(|registers| registers.get("rip"))
-            .is_none_or(|rip| *rip != address.0)
+            .register_value("rip")
+            .is_none_or(|rip| rip != address.0)
         {
             return None;
         }
@@ -1817,7 +1935,7 @@ impl Target {
         let registers = self.registers.as_ref()?;
         match &local.location {
             LocalVariableLocation::Register { register } => {
-                let value = *registers.get(register)?;
+                let value = lookup_register(registers, register)?;
                 Some(if size == 8 {
                     value
                 } else {
@@ -1825,7 +1943,7 @@ impl Target {
                 })
             }
             LocalVariableLocation::RegisterRelative { register, offset } => {
-                let base = *registers.get(register)?;
+                let base = lookup_register(registers, register)?;
                 let address = VirtAddr(base.wrapping_add_signed(i64::from(*offset)));
                 let mut bytes = [0u8; 8];
                 self.context_memory()
@@ -1833,8 +1951,21 @@ impl Target {
                     .ok()?;
                 Some(u64::from_le_bytes(bytes))
             }
-            LocalVariableLocation::FrameRelative { .. }
-            | LocalVariableLocation::Unavailable { .. } => None,
+            LocalVariableLocation::FrameRelative { offset } => {
+                let frame_base = self
+                    .selected_frame
+                    .as_ref()
+                    .and_then(|frame| frame.frame_base)
+                    .or_else(|| frame_base_for_register_values(self, registers))
+                    .or_else(|| lookup_register(registers, "rsp"))?;
+                let address = VirtAddr(frame_base.wrapping_add_signed(i64::from(*offset)));
+                let mut bytes = [0u8; 8];
+                self.context_memory()
+                    .read_bytes(address, &mut bytes[..size])
+                    .ok()?;
+                Some(u64::from_le_bytes(bytes))
+            }
+            LocalVariableLocation::Unavailable { .. } => None,
         }
     }
 
@@ -2024,6 +2155,10 @@ impl Target {
 
     pub fn enumerate_driver_objects(&self) -> Result<Vec<DriverObjectInfo>> {
         let guest = self.guest()?;
+        guest.memoized_drivers(|| self.walk_driver_objects(guest))
+    }
+
+    fn walk_driver_objects(&self, guest: &Guest) -> Result<Vec<DriverObjectInfo>> {
         let memory = guest.ntoskrnl.memory();
         let object_name = self.object_name_layout()?;
         let dir = self.object_directory_layout()?;
@@ -2463,7 +2598,7 @@ impl Target {
 
     fn handle_table_context(
         &self,
-    ) -> Result<(ProcessInfo, VirtAddr, VirtAddr, u8, usize, TypeInfo)> {
+    ) -> Result<(ProcessInfo, VirtAddr, VirtAddr, u8, usize, Arc<TypeInfo>)> {
         let process = self.selected_process_info()?;
         let types = self.guest()?.ntoskrnl.types_in(process.dtb);
         let eprocess = types.struct_at("_EPROCESS", process.eprocess_va)?;
@@ -3288,7 +3423,6 @@ impl Target {
             });
         }
 
-        // 4. Nothing recognized.
         Ok(AddressDescription {
             address,
             dtb,
@@ -3544,7 +3678,6 @@ impl Target {
         let numeric_filter = filter.and_then(|f| f.parse::<u64>().ok());
         let mut out = Vec::new();
 
-        // --- process / thread IrpLists ---
         let procs = guest.enumerate_processes()?;
         let thread_head_off = off("_EPROCESS", "ThreadListHead");
         let thread_link_off = off("_ETHREAD", "ThreadListEntry");
@@ -3621,7 +3754,6 @@ impl Target {
             }
         }
 
-        // --- device CurrentIrp sweep (skipped for a numeric/pid filter) ---
         if numeric_filter.is_none() {
             let current_irp_off = off("_DEVICE_OBJECT", "CurrentIrp");
             let next_off = off("_DEVICE_OBJECT", "NextDevice");
@@ -3701,14 +3833,22 @@ impl Target {
     }
 
     pub fn enumerate_threads(&self) -> Result<Vec<ThreadInfo>> {
+        const MAX_ENUMERATED_THREADS: usize = 65_536;
         let processes = self.guest()?.enumerate_processes()?;
         let mut threads = Vec::new();
 
         for process in &processes {
+            if threads.len() >= MAX_ENUMERATED_THREADS {
+                break;
+            }
             let Ok(process_threads) = self.enumerate_threads_for_process_info(process) else {
                 continue;
             };
-            threads.extend(process_threads);
+            threads.extend(
+                process_threads
+                    .into_iter()
+                    .take(MAX_ENUMERATED_THREADS.saturating_sub(threads.len())),
+            );
         }
 
         Ok(threads)
@@ -3770,11 +3910,9 @@ impl Target {
                 .and_then(|offset| memory.read::<u8>(kthread + offset).ok())
         };
 
-        // KTHREAD.Process is a KPROCESS*, which is the Pcb at offset 0 of the
-        // owning EPROCESS; present across modern builds and the most reliable
-        // source. ThreadsProcess (older builds) and ProcessFastRef (newest, an
-        // EX_FAST_REF that packs the pointer with refcount bits in the low 4)
-        // are build-specific fallbacks.
+        // KTHREAD.Process (KPROCESS* == EPROCESS base) first; ThreadsProcess
+        // (older builds) and ProcessFastRef (EX_FAST_REF, refcount in low 4
+        // bits) are build-specific fallbacks.
         let eprocess = read_kthread_ptr("Process")
             .or_else(|| read_ethread_ptr("ThreadsProcess"))
             .or_else(|| {
@@ -3786,24 +3924,21 @@ impl Target {
                     .filter(|addr| !addr.is_zero())
             });
 
-        // Bulk enumeration passes the owning process as a hint, so it never
-        // walks the process list per thread. Single-thread lookups (break
-        // context, `thread_info_from_ethread`) have no hint, so match the
-        // thread's pid/EPROCESS against a one-shot process list for the name.
-        let owner: Option<ProcessInfo> = match process_hint {
-            Some(_) => None,
-            None => guest.enumerate_processes().ok().and_then(|processes| {
-                processes.into_iter().find(|process| {
-                    pid.is_some_and(|pid| process.pid == pid)
-                        || eprocess.is_some_and(|eprocess| process.eprocess_va == eprocess)
-                })
+        // Only a thread with neither a hint nor a readable process pointer
+        // pays for a process-list walk.
+        let owner: Option<ProcessInfo> = match (process_hint, eprocess) {
+            (Some(_), _) | (None, Some(_)) => None,
+            (None, None) => guest.enumerate_processes().ok().and_then(|processes| {
+                processes
+                    .into_iter()
+                    .find(|process| pid.is_some_and(|pid| process.pid == pid))
             }),
         };
         let owner = process_hint.or(owner.as_ref());
 
         let process_name = owner
             .map(|process| process.name.clone())
-            .or_else(|| eprocess.and_then(|eprocess| guest.process_image_name(eprocess)))
+            .or_else(|| eprocess.and_then(|eprocess| guest.process_name_at(eprocess)))
             // PID 0 is the System Idle Process, which isn't on PsActiveProcessHead
             // and so never matches above; label its per-CPU idle threads like WinDbg
             .or_else(|| (pid == Some(0)).then(|| "Idle".to_string()));
@@ -3919,10 +4054,10 @@ impl Target {
         let modules = guest.process_modules(process).unwrap_or_default();
 
         let mut regions = Vec::new();
-        let mut stack = vec![root];
+        let mut stack = vec![(root, 0usize)];
         let mut visited = HashSet::new();
 
-        while let Some(node) = stack.pop() {
+        while let Some((node, level)) = stack.pop() {
             if node.is_zero() || !visited.insert(node.0) || visited.len() > 65536 {
                 continue;
             }
@@ -3930,16 +4065,22 @@ impl Target {
             let left = Self::canonical_vad_link(memory.read::<VirtAddr>(node + left_offset)?);
             let right = Self::canonical_vad_link(memory.read::<VirtAddr>(node + right_offset)?);
             if !right.is_zero() {
-                stack.push(right);
+                stack.push((right, level.saturating_add(1)));
             }
             if !left.is_zero() {
-                stack.push(left);
+                stack.push((left, level.saturating_add(1)));
             }
 
             let vad = node - vad_node_offset;
-            if let Some(region) =
-                self.read_vad_region(&memory, &vad_layout, flags_layout.as_ref(), vad, &modules)
-            {
+            if let Some(region) = self.read_vad_region(
+                &memory,
+                &vad_layout,
+                flags_layout.as_deref(),
+                node,
+                level,
+                vad,
+                &modules,
+            ) {
                 regions.push(region);
             }
         }
@@ -4010,6 +4151,8 @@ impl Target {
         memory: &impl MemoryOps<VirtAddr>,
         vad_layout: &TypeInfo,
         flags_layout: Option<&TypeInfo>,
+        node_address: VirtAddr,
+        level: usize,
         vad: VirtAddr,
         modules: &[ModuleInfo],
     ) -> Option<MemoryRegionInfo> {
@@ -4048,6 +4191,8 @@ impl Target {
             .map(|module| module.name.clone());
 
         Some(MemoryRegionInfo {
+            node_address,
+            level,
             start,
             end,
             protection,
@@ -4201,6 +4346,7 @@ mod tests {
         decode_token_privilege_bitmaps, select_object_header_candidate, select_thread_process_dtb,
         thread_owner_matches,
     };
+    use crate::error::Error;
     use crate::guest::ProcessInfo;
     use crate::types::VirtAddr;
 
@@ -4227,50 +4373,6 @@ mod tests {
             trap_frame: Some(VirtAddr(0xffff_f000_0000_7000)),
             pending_irps: Some(vec![VirtAddr(0xffff_8000_0000_3000)]),
         }
-    }
-
-    #[test]
-    fn thread_pseudo_registers_cover_common_windbg_names() {
-        let thread = sample_thread();
-        assert_eq!(
-            thread.pseudo_register_value("thread"),
-            Some(thread.ethread.0)
-        );
-        assert_eq!(
-            thread.pseudo_register_value("ethread"),
-            Some(thread.ethread.0)
-        );
-        assert_eq!(
-            thread.pseudo_register_value("kthread"),
-            Some(thread.kthread.0)
-        );
-        assert_eq!(thread.pseudo_register_value("tid"), thread.tid);
-        assert_eq!(thread.pseudo_register_value("pid"), thread.pid);
-        assert_eq!(
-            thread.pseudo_register_value("proc"),
-            thread.eprocess.map(|addr| addr.0)
-        );
-        assert_eq!(
-            thread.pseudo_register_value("process"),
-            thread.eprocess.map(|addr| addr.0)
-        );
-        assert_eq!(
-            thread.pseudo_register_value("teb"),
-            thread.teb.map(|addr| addr.0)
-        );
-        assert_eq!(
-            thread.pseudo_register_value("priority"),
-            thread.priority.map(u64::from)
-        );
-        assert_eq!(
-            thread.pseudo_register_value("basepriority"),
-            thread.base_priority.map(u64::from)
-        );
-        assert_eq!(
-            thread.pseudo_register_value("waitirql"),
-            thread.wait_irql.map(u64::from)
-        );
-        assert_eq!(thread.pseudo_register_value("stackresident"), Some(1));
     }
 
     #[test]
@@ -4310,7 +4412,6 @@ mod tests {
         };
         assert!(!thread_owner_matches(&thread, &same_pid_wrong_process));
         assert!(thread_owner_matches(&thread, &owner));
-        assert_eq!(owner.dtb, 0x2222_0000);
         assert_eq!(
             select_thread_process_dtb(
                 &thread,
@@ -4348,7 +4449,7 @@ mod tests {
         let (links, termination) = bounded_list_walk(VirtAddr(0), 8, |address| match address.0 {
             0 => Ok(VirtAddr(1)),
             1 => Ok(VirtAddr(2)),
-            _ => Err(crate::error::Error::DebugInfo("synthetic bad flink".into())),
+            _ => Err(Error::DebugInfo("synthetic bad flink".into())),
         });
         assert_eq!(links, vec![VirtAddr(1), VirtAddr(2)]);
         assert_eq!(
@@ -4447,7 +4548,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             &error,
-            crate::error::Error::StructNotFound(name)
+            Error::StructNotFound(name)
                 if name == "_OBJECT_HEADER_CREATOR_INFO"
         ));
     }

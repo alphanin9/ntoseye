@@ -1,7 +1,7 @@
 use crate::{
     backend::MemoryOps,
     error::{Error, Result},
-    guest::{ModuleInfo, WinObject},
+    guest::{ModuleInfo, WinObject, read_pe_header_page},
     memory,
     types::{Arch, Dtb, PhysAddr, VirtAddr},
 };
@@ -28,11 +28,14 @@ use std::{
     path::{Path, PathBuf},
     ptr,
     sync::{
-        Arc, OnceLock,
+        Arc, OnceLock, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
 };
-use std::{fmt, io::Cursor};
+use std::{
+    fmt,
+    io::{self, Cursor, Write},
+};
 
 // NOTE global is probably fine here?
 pub static FORCE_DOWNLOADS: OnceLock<bool> = OnceLock::new();
@@ -102,6 +105,12 @@ pub struct SymbolStore {
     index: DashMap<u128, SymbolIndex>,
     index_types: DashMap<u128, SymbolIndex>,
     index_enums: DashMap<u128, SymbolIndex>,
+    /// GUID -> struct/union name -> (size, field list) of its largest complete
+    /// definition (a header-local `_KPCR` stub precedes the real one in
+    /// ntoskrnl.pdb). Member types are usually forward references (size 0),
+    /// so array element counts and field sizes need the size; layout dumps
+    /// need the field list without rescanning the type stream.
+    struct_defs: DashMap<u128, HashMap<String, (u64, TypeIndex)>>,
     /// GUID -> symbol name -> every address-bearing PDB record. Private/static
     /// duplicates retain their compiland identity; resolution prefers public
     /// records when present but never collapses distinct candidate addresses.
@@ -113,7 +122,9 @@ pub struct SymbolStore {
     /// otherwise rescans the entire PDB type stream on every call; keying on
     /// guid makes this self-coherent (a reloaded module gets a new guid, so a
     /// stale entry can never be returned).
-    type_cache: DashMap<(u128, String), Arc<TypeInfo>>,
+    /// `None` remembers a type the PDB does not define, so repeated misses
+    /// (`_MM_SESSION_SPACE` per process) cost a map probe, not a stream scan.
+    type_cache: DashMap<(u128, String), Option<Arc<TypeInfo>>>,
 
     modules: DashMap<(Dtb, u64), LoadedModule>,
     module_status: DashMap<(Dtb, u64), ModuleSymbolStatus>,
@@ -128,14 +139,14 @@ pub struct SymbolStore {
     /// consults this guid first regardless of the attached DTB; updated whenever
     /// the kernel module (re)loads.
     kernel_guid: Mutex<Option<u128>>,
-
-    /// DTB the kernel modules are registered under. The kernel is mapped into
-    /// every process's address space, so kernel modules stay in scope for name
-    /// lookups and completion while the active DTB is a user process's --
-    /// otherwise `nt!X` would stop resolving the moment the debugger halted on
-    /// a user thread. `None` until the kernel is discovered (e.g. triage dumps
-    /// without a kernel), which degrades scoping to an exact DTB match.
+    /// Address space kernel modules are registered under. Kernel space is
+    /// mapped into every process, so lookups scoped to a user DTB also see
+    /// these modules (`bp nt!NtClose` from a process context).
     kernel_dtb: Mutex<Option<Dtb>>,
+
+    /// PDBs of modules identified in earlier sessions; opened on first use so
+    /// building a store touches no files.
+    identities: OnceLock<ModuleIdentities>,
 }
 
 fn guid_to_u128(guid: GUID) -> u128 {
@@ -323,6 +334,140 @@ fn images_directory() -> Option<PathBuf> {
     Some(images_path)
 }
 
+/// The image identity the symbol server keys on: file name, `TimeDateStamp`,
+/// `SizeOfImage`. The loader's module record carries all three.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ModuleIdentity {
+    name: String,
+    time_date_stamp: u32,
+    size_of_image: u32,
+}
+
+impl ModuleIdentity {
+    fn of(module: &ModuleInfo) -> Option<Self> {
+        Some(Self {
+            name: SymbolStore::symbol_server_file_name(&module.name).to_ascii_lowercase(),
+            time_date_stamp: module.time_date_stamp?,
+            size_of_image: module.size,
+        })
+    }
+}
+
+/// What [`SymbolStore::build_download_job`] needs to name a PDB.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PdbReference {
+    server_name: String,
+    guid: u128,
+    age: u32,
+}
+
+/// Module identity to PDB map persisted across sessions, one tab-separated
+/// line per module, so a module seen before is identified without reading
+/// its headers, debug directory, and CodeView record from the target.
+struct ModuleIdentities {
+    path: Option<PathBuf>,
+    entries: std::sync::Mutex<HashMap<ModuleIdentity, PdbReference>>,
+}
+
+impl ModuleIdentities {
+    fn open(path: Option<PathBuf>) -> Self {
+        let entries = path
+            .as_deref()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .map(|text| text.lines().filter_map(Self::parse_line).collect())
+            .unwrap_or_default();
+        Self {
+            path,
+            entries: std::sync::Mutex::new(entries),
+        }
+    }
+
+    fn parse_line(line: &str) -> Option<(ModuleIdentity, PdbReference)> {
+        let mut fields = line.split('\t');
+        let name = fields.next()?.to_string();
+        let time_date_stamp = u32::from_str_radix(fields.next()?, 16).ok()?;
+        let size_of_image = u32::from_str_radix(fields.next()?, 16).ok()?;
+        let guid = u128::from_str_radix(fields.next()?, 16).ok()?;
+        let age = u32::from_str_radix(fields.next()?, 16).ok()?;
+        let server_name = fields.next()?.to_string();
+        if fields.next().is_some() || name.is_empty() || server_name.is_empty() {
+            return None;
+        }
+        Some((
+            ModuleIdentity {
+                name,
+                time_date_stamp,
+                size_of_image,
+            },
+            PdbReference {
+                server_name,
+                guid,
+                age,
+            },
+        ))
+    }
+
+    fn format_line(identity: &ModuleIdentity, reference: &PdbReference) -> String {
+        format!(
+            "{}\t{:08x}\t{:x}\t{:032X}\t{:X}\t{}\n",
+            identity.name,
+            identity.time_date_stamp,
+            identity.size_of_image,
+            reference.guid,
+            reference.age,
+            reference.server_name
+        )
+    }
+
+    fn get(&self, identity: &ModuleIdentity) -> Option<PdbReference> {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(identity)
+            .cloned()
+    }
+
+    /// Record a module's PDB. A failure to persist only costs the next
+    /// session the reads this one already paid.
+    fn insert(&self, identity: ModuleIdentity, reference: PdbReference) {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if entries.get(&identity) == Some(&reference) {
+            return;
+        }
+        let line = Self::format_line(&identity, &reference);
+        let replaced = entries.insert(identity, reference).is_some();
+        if let Some(path) = &self.path {
+            let _ = if replaced {
+                Self::write_all(path, &entries)
+            } else {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .and_then(|mut file| file.write_all(line.as_bytes()))
+            };
+        }
+    }
+
+    /// Drop a module whose recorded PDB could not be loaded.
+    fn remove(&self, identity: &ModuleIdentity) {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if entries.remove(identity).is_some()
+            && let Some(path) = &self.path
+        {
+            let _ = Self::write_all(path, &entries);
+        }
+    }
+
+    fn write_all(path: &Path, entries: &HashMap<ModuleIdentity, PdbReference>) -> io::Result<()> {
+        let text: String = entries
+            .iter()
+            .map(|(identity, reference)| Self::format_line(identity, reference))
+            .collect();
+        std::fs::write(path, text)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +478,98 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("ntoseye-{name}-{nonce}"))
+    }
+
+    fn identity(name: &str) -> ModuleIdentity {
+        ModuleIdentity {
+            name: name.to_string(),
+            time_date_stamp: 0x6600_0000,
+            size_of_image: 0x7000,
+        }
+    }
+
+    fn reference(age: u32) -> PdbReference {
+        PdbReference {
+            server_name: "driver.pdb".to_string(),
+            guid: 0x0123_4567_89ab_cdef_0123_4567_89ab_cdef,
+            age,
+        }
+    }
+
+    /// Identities survive a reopen, a re-recorded module keeps one entry,
+    /// and a forgotten one stays forgotten; a damaged line is skipped
+    /// rather than poisoning the rest.
+    #[test]
+    fn module_identities_persist_across_reopen() {
+        let root = temp_root("identities");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("identities");
+
+        let identities = ModuleIdentities::open(Some(path.clone()));
+        identities.insert(identity("a.sys"), reference(1));
+        identities.insert(identity("b.sys"), reference(2));
+        identities.insert(identity("a.sys"), reference(3));
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"garbage line\n")
+            .unwrap();
+
+        let reopened = ModuleIdentities::open(Some(path.clone()));
+        assert_eq!(reopened.get(&identity("a.sys")), Some(reference(3)));
+        assert_eq!(reopened.get(&identity("b.sys")), Some(reference(2)));
+        assert_eq!(reopened.get(&identity("c.sys")), None);
+
+        reopened.remove(&identity("a.sys"));
+        let again = ModuleIdentities::open(Some(path));
+        assert_eq!(again.get(&identity("a.sys")), None);
+        assert_eq!(again.get(&identity("b.sys")), Some(reference(2)));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A module recorded in an earlier session is identified without a
+    /// single read from the target.
+    #[test]
+    fn remembered_module_is_discovered_without_reading_the_target() {
+        struct NoReads;
+        impl MemoryOps<PhysAddr> for NoReads {
+            fn read_bytes(&self, addr: PhysAddr, _: &mut [u8]) -> Result<()> {
+                panic!("read at {addr:#x} for a remembered module");
+            }
+            fn write_bytes(&self, _: PhysAddr, _: &[u8]) -> Result<()> {
+                unreachable!()
+            }
+        }
+
+        let root = temp_root("identity-discovery");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = SymbolStore::new();
+        let identities = ModuleIdentities::open(Some(root.join("identities")));
+        identities.insert(identity("driver.sys"), reference(2));
+        store.identities.set(identities).ok().unwrap();
+
+        let mut module = ModuleInfo::new(
+            "\\SystemRoot\\drivers\\Driver.sys".to_string(),
+            VirtAddr(0xffff_f800_1000_0000),
+            0x7000,
+        );
+        module = module.with_time_date_stamp(0x6600_0000);
+        let discovery = store
+            .extract_download_job(&NoReads, 0x1000, &module, Arch::Amd64)
+            .unwrap();
+        let ModuleSymbolDiscovery::Ready { job, guid, source } = discovery else {
+            panic!("expected a ready job");
+        };
+        assert!(matches!(source, ModuleSymbolSource::Identity));
+        assert_eq!(guid, reference(2).guid);
+        assert_eq!(job.filename, "driver.pdb");
+        assert!(
+            job.urls[0].ends_with("/driver.pdb/0123456789ABCDEF0123456789ABCDEF2/driver.pdb"),
+            "{}",
+            job.urls[0]
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -367,40 +604,6 @@ mod tests {
         assert!(home.exists());
 
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn symbol_sources_preserve_order_and_reset_defaults() {
-        let store = SymbolStore::new();
-        let private = SymbolSource::LocalDirectory(PathBuf::from("/private"));
-        let server = SymbolSource::Http("https://symbols.example.test".to_string());
-
-        store.set_symbol_sources(vec![private.clone()]);
-        store.append_symbol_source(server.clone());
-        assert_eq!(store.symbol_sources(), vec![private, server]);
-
-        store.reset_symbol_sources();
-        assert_eq!(
-            store.symbol_sources(),
-            symbol_sources_from_servers(pdb_servers())
-        );
-    }
-
-    #[test]
-    fn configured_pdb_servers_feed_default_symbol_sources_in_order() {
-        let servers = vec![
-            "https://private.example.test/symbols".to_string(),
-            "https://backup.example.test/symbols".to_string(),
-        ];
-
-        assert_eq!(
-            symbol_sources_from_servers(&servers),
-            vec![
-                SymbolSource::Cache,
-                SymbolSource::Http(servers[0].clone()),
-                SymbolSource::Http(servers[1].clone()),
-            ]
-        );
     }
 
     #[test]
@@ -772,19 +975,10 @@ mod tests {
     }
 
     #[test]
-    fn private_index_skips_pdb2_function_list_records() {
-        assert!(is_private_address_symbol_kind(0x1110));
-        assert!(is_private_address_symbol_kind(0x110d));
-        assert!(!is_private_address_symbol_kind(PDB_S_CALLEES));
-        assert!(!is_private_address_symbol_kind(PDB_S_CALLERS));
-        assert!(is_pdb2_function_list_symbol(PDB_S_CALLEES));
-        assert!(is_pdb2_function_list_symbol(PDB_S_CALLERS));
-    }
-    #[test]
-    fn module_lookup_prefers_active_dtb_then_falls_back() {
+    fn kernel_modules_are_visible_from_user_address_spaces() {
         let store = SymbolStore::new();
-        let active_dtb = 0x1000;
-        let fallback_dtb = 0x2000;
+        let user_dtb = 0x1000;
+        let kernel_dtb = 0x2000;
         let base = VirtAddr(0x180000000);
         let module = |name: &str, guid, dtb| LoadedModule {
             name: name.to_string(),
@@ -793,25 +987,40 @@ mod tests {
             size: 0x1000,
             dtb,
         };
-        store.modules.insert(
-            (fallback_dtb, base.0),
-            module("kernel.sys", 0x22, fallback_dtb),
-        );
-
-        let resolved = store
-            .find_module_for_address_in_context(active_dtb, fallback_dtb, base)
-            .unwrap();
-        assert_eq!(resolved.dtb, fallback_dtb);
-        assert_eq!(resolved.name, "kernel.sys");
-
         store
             .modules
-            .insert((active_dtb, base.0), module("user.dll", 0x11, active_dtb));
-        let resolved = store
-            .find_module_for_address_in_context(active_dtb, fallback_dtb, base)
-            .unwrap();
-        assert_eq!(resolved.dtb, active_dtb);
-        assert_eq!(resolved.name, "user.dll");
+            .insert((kernel_dtb, base.0), module("kernel.sys", 0x22, kernel_dtb));
+
+        assert!(store.find_module_for_address(user_dtb, base).is_none());
+        assert!(store.module_base_by_name(user_dtb, "kernel").is_none());
+
+        store.set_kernel(Some(0x22), kernel_dtb);
+        let resolved = store.find_module_for_address(user_dtb, base).unwrap();
+        assert_eq!(resolved.name, "kernel.sys");
+        assert_eq!(store.module_base_by_name(user_dtb, "kernel"), Some(base));
+    }
+
+    #[test]
+    fn qualified_index_search_matches_bare_names_unless_query_names_a_module() {
+        let index = SymbolIndex {
+            names: vec![
+                "nt!KeBugCheckEx".to_string(),
+                "nt!memcpy".to_string(),
+                "ntdll!memcpy".to_string(),
+            ],
+        };
+        assert_eq!(index.search("Ke*", 10), vec!["nt!KeBugCheckEx"]);
+        assert_eq!(
+            index.search("memcpy", 10),
+            vec!["nt!memcpy", "ntdll!memcpy"]
+        );
+        assert_eq!(index.search("ntdll!*", 10), vec!["ntdll!memcpy"]);
+        assert!(index.search("nt!*", 10).contains(&"nt!memcpy".to_string()));
+        assert!(
+            !index
+                .search("nt!*", 10)
+                .contains(&"ntdll!memcpy".to_string())
+        );
     }
 }
 
@@ -855,6 +1064,8 @@ impl ModuleSymbolStatus {
 pub enum ModuleSymbolSource {
     Memory,
     Image,
+    /// Remembered from an earlier session (see [`ModuleIdentities`]).
+    Identity,
     /// A PDB loaded from a host directory (the agent's `load-symbols` command).
     Local,
 }
@@ -864,6 +1075,7 @@ impl ModuleSymbolSource {
         match self {
             Self::Memory => "memory",
             Self::Image => "image",
+            Self::Identity => "cached",
             Self::Local => "local",
         }
     }
@@ -972,7 +1184,8 @@ fn download_job(job: &DownloadJob, pb: ProgressBar) -> Result<()> {
         }
     }
     pb.finish_and_clear();
-    Err(last_err.expect("DownloadJob.urls must not be empty"))
+    Err(last_err
+        .unwrap_or_else(|| Error::DebugInfo("no symbol server URL to download from".into())))
 }
 
 fn download_url_to_path(url: &str, path: &Path, filename: &str, pb: &ProgressBar) -> Result<()> {
@@ -988,11 +1201,8 @@ fn download_url_to_path(url: &str, path: &Path, filename: &str, pb: &ProgressBar
         std::fs::create_dir_all(parent)?;
     }
 
-    // Download to a unique temp file and rename into place. Writing the final
-    // path directly truncates it in place, which corrupts the file under
-    // concurrent duplicate jobs and rips pages out from under any existing
-    // mmap of it (--force-download-symbols re-downloads loaded PDBs); a rename
-    // leaves prior mappings on the old inode intact.
+    // Rename into place: truncating the final path would corrupt concurrent
+    // jobs and any existing mmap of it.
     let tmp_path = unique_temp_path(path);
     let mut file = File::create(&tmp_path)?;
     let mut downloaded = pb.wrap_read(response);
@@ -1207,7 +1417,6 @@ impl fmt::Display for ParsedType {
             | ParsedType::Struct(s)
             | ParsedType::Union(s)
             | ParsedType::Enum(s) => write!(f, "{}", s),
-            // ParsedType::Pointer(inner) => write!(f, "{}*", inner),
             ParsedType::Pointer(inner) => {
                 if let ParsedType::Function(ret_type, args) = &**inner {
                     write!(f, "{} (*)(", ret_type)?;
@@ -1222,7 +1431,20 @@ impl fmt::Display for ParsedType {
                     write!(f, "{}*", inner)
                 }
             }
-            ParsedType::Array(inner, count) => write!(f, "{}[{}]", inner, count),
+            ParsedType::Array(inner, count) => {
+                // `T[2][256]` is Array(Array(T, 256), 2): outer count first.
+                let mut dims = vec![*count];
+                let mut element = inner.as_ref();
+                while let ParsedType::Array(next, n) = element {
+                    dims.push(*n);
+                    element = next.as_ref();
+                }
+                write!(f, "{element}")?;
+                for n in dims {
+                    write!(f, "[{n}]")?;
+                }
+                Ok(())
+            }
             ParsedType::Bitfield {
                 underlying,
                 pos,
@@ -1569,6 +1791,13 @@ const PDB_S_CALLERS: u16 = 0x115b;
 fn is_pdb2_function_list_symbol(kind: u16) -> bool {
     matches!(kind, PDB_S_CALLEES | PDB_S_CALLERS)
 }
+/// Largest `IMAGE_DEBUG_DIRECTORY` array read from a guest image; real images
+/// carry a few entries.
+const MAX_DEBUG_DIRECTORY_BYTES: usize = 0x1000;
+/// Largest CodeView record read from a guest image (a GUID, an age, and a
+/// PDB path).
+const MAX_CODEVIEW_BYTES: usize = 0x1000;
+
 impl SymbolStore {
     fn module_key(dtb: Dtb, base_address: VirtAddr) -> (Dtb, u64) {
         (dtb, base_address.0)
@@ -1583,6 +1812,7 @@ impl SymbolStore {
             index: DashMap::new(),
             index_types: DashMap::new(),
             index_enums: DashMap::new(),
+            struct_defs: DashMap::new(),
             symbol_rvas: DashMap::new(),
             source_lines: DashMap::new(),
             index_diagnostics: DashMap::new(),
@@ -1594,6 +1824,7 @@ impl SymbolStore {
             source_paths: RwLock::new(Vec::new()),
             kernel_guid: Mutex::new(None),
             kernel_dtb: Mutex::new(None),
+            identities: OnceLock::new(),
         }
     }
 
@@ -1642,33 +1873,50 @@ impl SymbolStore {
 
     /// Record the kernel module's guid so type/enum layout lookups can prefer it
     /// regardless of the attached address space. Called when `ntoskrnl` loads.
-    pub fn set_kernel_guid(&self, guid: Option<u128>) {
+    pub fn set_kernel(&self, guid: Option<u128>, dtb: Dtb) {
         *self.kernel_guid.lock() = guid;
+        *self.kernel_dtb.lock() = Some(dtb);
     }
 
     pub fn kernel_guid(&self) -> Option<u128> {
         *self.kernel_guid.lock()
     }
 
-    /// Record which DTB the kernel modules live under, so they stay in scope for
-    /// lookups made while attached to (or halted in) a process. Called when
-    /// `ntoskrnl` loads, and again after a reboot re-discovers it.
-    pub fn set_kernel_dtb(&self, dtb: Option<Dtb>) {
-        *self.kernel_dtb.lock() = dtb;
+    /// Whether `module` is visible from address space `dtb`: its own space, or
+    /// kernel space, which every process maps.
+    fn module_in_scope(&self, module: &LoadedModule, dtb: Dtb) -> bool {
+        module.dtb == dtb || Some(module.dtb) == *self.kernel_dtb.lock()
     }
 
-    pub fn kernel_dtb(&self) -> Option<Dtb> {
-        *self.kernel_dtb.lock()
-    }
-
-    /// Whether a module registered under `module_dtb` is visible to a lookup
-    /// scoped to `dtb`. Kernel modules are visible from every address space
-    /// because the kernel is mapped into all of them; this is the name-lookup
-    /// counterpart to [`crate::unwind::preferred_code_dtb`], which resolves the
-    /// other direction by picking the DTB of the module *containing* a known
-    /// address.
-    fn module_in_scope(&self, module_dtb: Dtb, dtb: Dtb) -> bool {
-        module_dtb == dtb || self.kernel_dtb() == Some(module_dtb)
+    /// Register a module's layouts and public symbol RVAs without a PDB, for
+    /// tests that drive guest walks over synthetic memory.
+    #[cfg(test)]
+    pub fn inject_module_for_test(
+        &self,
+        guid: u128,
+        types: Vec<TypeInfo>,
+        symbols: &[(&str, u32)],
+    ) {
+        for type_info in types {
+            self.type_cache
+                .insert((guid, type_info.name.clone()), Some(Arc::new(type_info)));
+        }
+        self.symbol_rvas.insert(
+            guid,
+            symbols
+                .iter()
+                .map(|(name, rva)| {
+                    (
+                        name.to_string(),
+                        vec![IndexedSymbol {
+                            rva: *rva,
+                            visibility: SymbolVisibility::Public,
+                            compiland: None,
+                        }],
+                    )
+                })
+                .collect(),
+        );
     }
 
     pub fn clear_modules_for_dtb(&self, dtb: Dtb) {
@@ -1839,8 +2087,7 @@ impl SymbolStore {
         memory: &memory::AddressSpace<'_, B>,
         base_address: VirtAddr,
     ) -> Result<Option<(u32, u32)>> {
-        let mut header_buf = [0u8; 0x1000];
-        memory.read_bytes(base_address, &mut header_buf)?;
+        let header_buf = read_pe_header_page(base_address, memory)?;
         let view = PeView::from_bytes(&header_buf)?;
         Ok(view
             .data_directory()
@@ -1866,6 +2113,13 @@ impl SymbolStore {
             )));
         }
 
+        // A handful of entries at most in any real image; the field is guest
+        // memory, so bound the allocation before trusting it.
+        if debug_size as usize > MAX_DEBUG_DIRECTORY_BYTES {
+            return Err(Error::DebugInfo(format!(
+                "debug directory size {debug_size:#x} exceeds {MAX_DEBUG_DIRECTORY_BYTES:#x}"
+            )));
+        }
         let mut bytes = vec![0u8; debug_size as usize];
         memory.read_bytes(base_address + debug_rva as u64, &mut bytes)?;
 
@@ -1890,6 +2144,12 @@ impl SymbolStore {
                 "codeview entry is missing raw data".to_string(),
             ));
         }
+        if entry.SizeOfData as usize > MAX_CODEVIEW_BYTES {
+            return Err(Error::DebugInfo(format!(
+                "codeview entry size {:#x} exceeds {MAX_CODEVIEW_BYTES:#x}",
+                entry.SizeOfData
+            )));
+        }
 
         let mut bytes = vec![0u8; entry.SizeOfData as usize];
         memory.read_bytes(base_address + entry.AddressOfRawData as u64, &mut bytes)?;
@@ -1909,7 +2169,8 @@ impl SymbolStore {
                 let path =
                     Self::read_c_string_lossy(&bytes[size_of::<IMAGE_DEBUG_CV_INFO_PDB70>()..]);
                 let summary = format!("CodeView RSDS age={} path={}", image.Age, path);
-                let job = self.build_download_job(&path, image.Signature, image.Age)?;
+                let job =
+                    self.build_download_job(&path, guid_to_u128(image.Signature), image.Age)?;
                 Ok((summary, Some(job)))
             }
             b"NB10" => {
@@ -1935,24 +2196,13 @@ impl SymbolStore {
     fn build_download_job(
         &self,
         pdb_file_name: &str,
-        guid: GUID,
+        guid: u128,
         age: u32,
     ) -> Result<(DownloadJob, u128)> {
         let server_name = Self::symbol_server_file_name(pdb_file_name);
-        let guid_str = format!(
-            "{:08X}{:04X}{:04X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-            guid.Data1,
-            guid.Data2,
-            guid.Data3,
-            guid.Data4[0],
-            guid.Data4[1],
-            guid.Data4[2],
-            guid.Data4[3],
-            guid.Data4[4],
-            guid.Data4[5],
-            guid.Data4[6],
-            guid.Data4[7],
-        );
+        // `guid_to_u128` packs the GUID fields big-endian in field order, so
+        // the hex of the u128 is the symbol server's GUID spelling.
+        let guid_str = format!("{guid:032X}");
 
         let index_path = format!("{}/{}{:X}/{}", server_name, guid_str, age, server_name);
         let urls: Vec<String> = pdb_servers()
@@ -1969,7 +2219,6 @@ impl SymbolStore {
         let storage_dir = symbols_directory().ok_or(Error::StorageNotFound)?;
         let path = storage_dir.join(&filename);
 
-        let guid = guid_to_u128(guid);
         let job = DownloadJob {
             urls,
             path,
@@ -2037,9 +2286,10 @@ impl SymbolStore {
                 view.file_header().Machine
             )));
         }
-        let debug = view.debug()?;
 
-        if let Some((job, guid)) = self.download_job_from_debug(&debug)? {
+        if let Some((job, guid)) =
+            self.extract_download_job_from_memory(&object.memory(), object.base_address)?
+        {
             download_job(&job, ProgressBar::new(0))?;
             self.ensure_pdb_loaded(job.expected_identity().unwrap(), &job.path)?;
 
@@ -2116,10 +2366,21 @@ impl SymbolStore {
         &self,
         backend: &B,
         dtb: Dtb,
-        module_name: &str,
-        base_address: VirtAddr,
+        module: &ModuleInfo,
         arch: Arch,
     ) -> Result<ModuleSymbolDiscovery> {
+        if let Some(reference) =
+            ModuleIdentity::of(module).and_then(|identity| self.module_identities().get(&identity))
+        {
+            let (job, guid) =
+                self.build_download_job(&reference.server_name, reference.guid, reference.age)?;
+            return Ok(ModuleSymbolDiscovery::Ready {
+                job,
+                guid,
+                source: ModuleSymbolSource::Identity,
+            });
+        }
+        let (module_name, base_address) = (module.name.as_str(), module.base_address);
         // `dtb` is the root for the module's own VA half: the kernel root for
         // kernel modules and the process root for user modules.
         let addr_space = match arch {
@@ -2143,10 +2404,45 @@ impl SymbolStore {
         }
     }
 
+    fn module_identities(&self) -> &ModuleIdentities {
+        self.identities.get_or_init(|| {
+            ModuleIdentities::open(symbols_directory().map(|dir| dir.join("identities")))
+        })
+    }
+
+    /// Record which PDB `job` names for `module`. A module whose record
+    /// lacks a `TimeDateStamp` has no identity to key on.
+    pub fn remember_module_identity(&self, module: &ModuleInfo, job: &DownloadJob) {
+        if let (Some(identity), Some(request)) = (ModuleIdentity::of(module), &job.pdb) {
+            self.module_identities().insert(
+                identity,
+                PdbReference {
+                    server_name: request.server_name.clone(),
+                    guid: request.identity.guid,
+                    age: request.identity.age,
+                },
+            );
+        }
+    }
+
+    /// Forget a recorded PDB that failed to load.
+    pub fn forget_module_identity(&self, module: &ModuleInfo) {
+        if let Some(identity) = ModuleIdentity::of(module) {
+            self.module_identities().remove(&identity);
+        }
+    }
+
     pub fn load_downloaded_pdb(&self, load: &ModuleSymbolLoad) -> Result<()> {
         let module_key = Self::module_key(load.dtb, load.module.base_address);
         if let Some(existing) = self.modules.get(&module_key) {
-            debug_assert_eq!(existing.guid, load.guid);
+            // A job that outlived a reload/reattach of its module describes a
+            // different image; finishing it would mark the wrong PDB loaded.
+            if existing.guid != load.guid {
+                return Err(Error::DebugInfo(format!(
+                    "stale symbol job for {}: module was replaced",
+                    load.module.name
+                )));
+            }
             self.set_module_symbol_status(
                 load.dtb,
                 load.module.base_address,
@@ -2228,8 +2524,11 @@ impl SymbolStore {
                     }) = entry.as_code_view()
                     {
                         let pdb_path = pdb_file_name.to_string();
-                        let (job, guid) =
-                            self.build_download_job(&pdb_path, image.Signature, image.Age)?;
+                        let (job, guid) = self.build_download_job(
+                            &pdb_path,
+                            guid_to_u128(image.Signature),
+                            image.Age,
+                        )?;
                         return Ok(Some((job, guid)));
                     }
                 }
@@ -2301,8 +2600,7 @@ impl SymbolStore {
         memory: &memory::AddressSpace<'_, B>,
         base_address: VirtAddr,
     ) -> Result<(u32, u32)> {
-        let mut header_buf = [0u8; 0x1000];
-        memory.read_bytes(base_address, &mut header_buf)?;
+        let header_buf = read_pe_header_page(base_address, memory)?;
         let view = PeView::from_bytes(&header_buf)?;
         Ok((
             view.file_header().TimeDateStamp,
@@ -2354,12 +2652,8 @@ impl SymbolStore {
         };
         expected.matches(actual).map_err(Error::DebugInfo)?;
 
-        // Exactly one loader may win per guid: parallel loads of two modules
-        // sharing a PDB both get past the contains_key fast path, and a plain
-        // insert would replace the winner's Arc<Mmap>, unmapping pages the
-        // stored PDB's 'static cursor still points into (a cold-cache SIGSEGV).
-        // The loser drops its own pdb+mmap pair instead. `build_index` takes
-        // the pdbs shard again, so it must run after the entry guard drops.
+        // One loader wins per guid; replacing an existing entry would unmap
+        // pages the stored PDB's cursor still points into.
         match self.pdbs.entry(expected.guid) {
             Entry::Occupied(_) => {
                 let matches = self
@@ -2389,13 +2683,14 @@ impl SymbolStore {
         self.ensure_index_built(expected.guid)
     }
 
+    /// Module-qualified (`nt!KeBugCheckEx`) names of every symbol visible from
+    /// `dtb` (all modules when `None`). Qualified so a completed or listed name
+    /// resolves unambiguously even when several modules export it.
     pub fn merged_symbol_index(&self, dtb: Option<Dtb>) -> SymbolIndex {
         let total_modules = self
             .modules
             .iter()
-            .filter(|module| {
-                dtb.is_none_or(|filter_dtb| self.module_in_scope(module.dtb, filter_dtb))
-            })
+            .filter(|module| dtb.is_none_or(|filter_dtb| self.module_in_scope(module, filter_dtb)))
             .count();
         let progress = ProgressBar::new((total_modules + 1) as u64);
         progress.set_style(task_progress_style());
@@ -2405,13 +2700,14 @@ impl SymbolStore {
 
         for module in self.modules.iter() {
             if let Some(filter_dtb) = dtb
-                && !self.module_in_scope(module.dtb, filter_dtb)
+                && !self.module_in_scope(&module, filter_dtb)
             {
                 continue;
             }
 
             if let Some(index) = self.index.get(&module.guid) {
-                all_strings.extend(index.names.iter().cloned());
+                let short = ModuleInfo::derive_short_name(&module.name);
+                all_strings.extend(index.names.iter().map(|name| format!("{short}!{name}")));
             }
 
             progress.inc(1);
@@ -2430,9 +2726,7 @@ impl SymbolStore {
         let total_modules = self
             .modules
             .iter()
-            .filter(|module| {
-                dtb.is_none_or(|filter_dtb| self.module_in_scope(module.dtb, filter_dtb))
-            })
+            .filter(|module| dtb.is_none_or(|filter_dtb| self.module_in_scope(module, filter_dtb)))
             .count();
         let progress = ProgressBar::new((total_modules + 1) as u64);
         progress.set_style(task_progress_style());
@@ -2442,7 +2736,7 @@ impl SymbolStore {
 
         for module in self.modules.iter() {
             if let Some(filter_dtb) = dtb
-                && !self.module_in_scope(module.dtb, filter_dtb)
+                && !self.module_in_scope(&module, filter_dtb)
             {
                 continue;
             }
@@ -2467,9 +2761,7 @@ impl SymbolStore {
         let total_modules = self
             .modules
             .iter()
-            .filter(|module| {
-                dtb.is_none_or(|filter_dtb| self.module_in_scope(module.dtb, filter_dtb))
-            })
+            .filter(|module| dtb.is_none_or(|filter_dtb| self.module_in_scope(module, filter_dtb)))
             .count();
         let progress = ProgressBar::new((total_modules + 1) as u64);
         progress.set_style(task_progress_style());
@@ -2479,7 +2771,7 @@ impl SymbolStore {
 
         for module in self.modules.iter() {
             if let Some(filter_dtb) = dtb
-                && !self.module_in_scope(module.dtb, filter_dtb)
+                && !self.module_in_scope(&module, filter_dtb)
             {
                 continue;
             }
@@ -2500,12 +2792,8 @@ impl SymbolStore {
         SymbolIndex { names: all_strings }
     }
 
-    pub fn find_type_across_modules(&self, dtb: Dtb, type_name: &str) -> Option<TypeInfo> {
-        // Type layouts are address-space independent, so a kernel type must
-        // resolve to the kernel's definition even while attached to a user
-        // process whose modules (e.g. ntdll) define same-named-but-different
-        // types or omit kernel-only ones. Consult the kernel module first, then
-        // fall back to the current address space's modules for user-mode types.
+    pub fn find_type_across_modules(&self, dtb: Dtb, type_name: &str) -> Option<Arc<TypeInfo>> {
+        // Kernel definitions win over same-named user-mode types (e.g. ntdll).
         //
         // NOTE this hands a WOW64 (32-bit) process the kernel's 64-bit layout
         // for a shared type name instead of its own 32-bit one; revisit with
@@ -2573,6 +2861,38 @@ impl SymbolStore {
             .map(|resolved| resolved.map(|(address, _)| address))
     }
 
+    /// Base address of the module whose short name is `module_short` (WinDbg
+    /// lets a bare module name stand for its base: `? nt`, `u nt+0x1000`).
+    pub fn module_base_by_name(&self, dtb: Dtb, module_short: &str) -> Option<VirtAddr> {
+        self.modules
+            .iter()
+            .find(|module| {
+                self.module_in_scope(module, dtb)
+                    && ModuleInfo::derive_short_name(&module.name)
+                        .eq_ignore_ascii_case(module_short)
+            })
+            .map(|module| module.base_address)
+    }
+
+    /// Short names of the modules visible from `dtb` whose name starts with
+    /// `prefix` (case-insensitive), sorted and deduplicated.
+    pub fn module_short_names_with_prefix(&self, dtb: Dtb, prefix: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .modules
+            .iter()
+            .filter(|module| self.module_in_scope(module, dtb))
+            .map(|module| ModuleInfo::derive_short_name(&module.name))
+            .filter(|short| {
+                short
+                    .get(..prefix.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+            })
+            .collect();
+        names.sort_unstable_by_key(|name| name.to_ascii_lowercase());
+        names.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        names
+    }
+
     /// Return every PDB candidate for a symbol, retaining module, visibility,
     /// and private-compiland provenance. `module!symbol` restricts the module;
     /// a bare symbol searches the active address space.
@@ -2582,32 +2902,9 @@ impl SymbolStore {
             None => (None, symbol_name),
         };
 
-        // Two passes rather than one widened filter: the active address space
-        // must win a bare-name collision with the kernel, so kernel modules are
-        // only consulted once the current DTB has come up empty.
-        let candidates = self.symbol_candidates_in_dtb(dtb, module_filter, name);
-        if !candidates.is_empty() {
-            return candidates;
-        }
-        match self.kernel_dtb() {
-            Some(kernel_dtb) if kernel_dtb != dtb => {
-                self.symbol_candidates_in_dtb(kernel_dtb, module_filter, name)
-            }
-            _ => candidates,
-        }
-    }
-
-    /// Collect the candidates for `name` within the modules of exactly one
-    /// address space.
-    fn symbol_candidates_in_dtb(
-        &self,
-        dtb: Dtb,
-        module_filter: Option<&str>,
-        name: &str,
-    ) -> Vec<SymbolCandidate> {
         let mut candidates = Vec::new();
         for module in self.modules.iter() {
-            if module.dtb != dtb {
+            if !self.module_in_scope(&module, dtb) {
                 continue;
             }
             let short = ModuleInfo::derive_short_name(&module.name);
@@ -2691,7 +2988,7 @@ impl SymbolStore {
         limit: usize,
     ) -> Vec<String> {
         for module in self.modules.iter() {
-            if !self.module_in_scope(module.dtb, dtb) {
+            if !self.module_in_scope(&module, dtb) {
                 continue;
             }
             if !ModuleInfo::derive_short_name(&module.name).eq_ignore_ascii_case(module_short) {
@@ -2710,10 +3007,7 @@ impl SymbolStore {
         address: VirtAddr,
     ) -> Option<(String, String, u32)> {
         for module in self.modules.iter() {
-            // Safe to widen to kernel modules without a second pass: a match
-            // also requires the address to fall inside the module, and kernel
-            // and user ranges never overlap.
-            if !self.module_in_scope(module.dtb, dtb) {
+            if !self.module_in_scope(&module, dtb) {
                 continue;
             }
 
@@ -2736,26 +3030,8 @@ impl SymbolStore {
     pub fn find_module_for_address(&self, dtb: Dtb, address: VirtAddr) -> Option<LoadedModule> {
         self.modules
             .iter()
-            .find(|module| {
-                self.module_in_scope(module.dtb, dtb) && module.contains_address(address)
-            })
+            .find(|module| self.module_in_scope(module, dtb) && module.contains_address(address))
             .map(|module| module.clone())
-    }
-
-    /// Resolve the module containing `address`, preferring the active address
-    /// space and then consulting an explicit fallback such as the kernel DTB.
-    pub fn find_module_for_address_in_context(
-        &self,
-        primary_dtb: Dtb,
-        fallback_dtb: Dtb,
-        address: VirtAddr,
-    ) -> Option<LoadedModule> {
-        self.find_module_for_address(primary_dtb, address)
-            .or_else(|| {
-                (fallback_dtb != primary_dtb)
-                    .then(|| self.find_module_for_address(fallback_dtb, address))
-                    .flatten()
-            })
     }
 
     /// Resolve a virtual address to cached C13 source information.
@@ -2778,7 +3054,7 @@ impl SymbolStore {
         let mut addresses = Vec::new();
         let mappings = self.source_paths.read();
         for module in self.modules.iter() {
-            if module.dtb != dtb {
+            if !self.module_in_scope(&module, dtb) {
                 continue;
             }
             let Some(lines) = self.source_lines.get(&module.guid) else {
@@ -2810,6 +3086,7 @@ impl SymbolStore {
 
     fn procedure_local(
         &self,
+        guid: u128,
         finder: &TypeFinder<'_>,
         name: String,
         type_index: TypeIndex,
@@ -2819,10 +3096,10 @@ impl SymbolStore {
         ProcedureLocal {
             name,
             type_name: self
-                .resolve_type(finder, type_index)
+                .resolve_type(guid, finder, type_index)
                 .map(|parsed| parsed.to_string())
                 .unwrap_or_else(|_| format!("type({:#x})", type_index.0)),
-            byte_size: self.type_size(finder, type_index, 8).ok(),
+            byte_size: self.type_size(guid, finder, type_index, 8).ok(),
             is_parameter,
             location,
         }
@@ -2924,6 +3201,7 @@ impl SymbolStore {
                             "not live at this address"
                         };
                         locals.push(self.procedure_local(
+                            module.guid,
                             &finder,
                             local.name.to_string().into(),
                             local.type_index,
@@ -3057,6 +3335,7 @@ impl SymbolStore {
                     }
                     pdb2::SymbolData::RegisterVariable(variable) if visible => {
                         locals.push(self.procedure_local(
+                            module.guid,
                             &finder,
                             variable.name.to_string().into(),
                             variable.type_index,
@@ -3069,6 +3348,7 @@ impl SymbolStore {
                     }
                     pdb2::SymbolData::RegisterRelative(variable) if visible => {
                         locals.push(self.procedure_local(
+                            module.guid,
                             &finder,
                             variable.name.to_string().into(),
                             variable.type_index,
@@ -3082,6 +3362,7 @@ impl SymbolStore {
                     }
                     pdb2::SymbolData::BasePointerRelative(variable) if visible => {
                         locals.push(self.procedure_local(
+                            module.guid,
                             &finder,
                             variable.name.to_string().into(),
                             variable.type_index,
@@ -3095,6 +3376,7 @@ impl SymbolStore {
                     pdb2::SymbolData::MultiRegisterVariable(variable) if visible => {
                         if let Some((_, name)) = variable.registers.first() {
                             locals.push(self.procedure_local(
+                                module.guid,
                                 &finder,
                                 name.to_string().into(),
                                 variable.type_index,
@@ -3376,9 +3658,17 @@ impl SymbolStore {
         strings.dedup();
         source_lines.sort_by_key(|line| line.rva);
 
-        // NOW FOR TYPES!
         let mut type_strings: Vec<String> = Vec::new();
         let mut enum_strings: Vec<String> = Vec::new();
+        let mut struct_defs: HashMap<String, (u64, TypeIndex)> = HashMap::new();
+        let mut record_struct = |name: String, size: u64, fields: Option<TypeIndex>| {
+            if let Some(fields) = fields {
+                let entry = struct_defs.entry(name).or_insert((0, fields));
+                if size >= entry.0 {
+                    *entry = (size, fields);
+                }
+            }
+        };
 
         let type_information = pdb_lock.type_information()?;
         let mut type_finder = type_information.finder();
@@ -3393,13 +3683,17 @@ impl SymbolStore {
                         if !class.properties.forward_reference()
                             && class.name.to_string() != "<anonymous-tag>" =>
                     {
-                        type_strings.push(class.name.to_string().into());
+                        let name = class.name.to_string().into_owned();
+                        record_struct(name.clone(), class.size, class.fields);
+                        type_strings.push(name);
                     }
                     TypeData::Union(union)
                         if !union.properties.forward_reference()
                             && union.name.to_string() != "<anonymous-tag>" =>
                     {
-                        type_strings.push(union.name.to_string().into());
+                        let name = union.name.to_string().into_owned();
+                        record_struct(name.clone(), union.size, Some(union.fields));
+                        type_strings.push(name);
                     }
                     TypeData::Enumeration(en)
                         if !en.properties.forward_reference()
@@ -3441,18 +3735,11 @@ impl SymbolStore {
                 names: enum_strings,
             },
         );
+        self.struct_defs.insert(guid, struct_defs);
 
         self.index_diagnostics.insert(guid, diagnostics);
         Ok(())
     }
-
-    // pub fn symbol_index(&self, guid: u128) -> Option<Arc<SymbolIndex>> {
-    //     self.index.get(&guid).map(|v| Arc::new(v.clone()))
-    // }
-
-    // pub fn types_index(&self, guid: u128) -> Option<Arc<SymbolIndex>> {
-    //     self.index_types.get(&guid).map(|v| Arc::new(v.clone()))
-    // }
 
     fn symbol_records(&self, guid: u128, symbol_name: &str) -> Vec<IndexedSymbol> {
         if let Some(map) = self.symbol_rvas.get(&guid) {
@@ -3540,14 +3827,7 @@ impl SymbolStore {
                     target_rva
                         .checked_sub(record.rva)
                         .filter(|offset| *offset <= 8192)
-                        .map(|offset| {
-                            (
-                                name.clone(),
-                                offset,
-                                record.visibility,
-                                record.compiland.clone(),
-                            )
-                        })
+                        .map(|offset| (name, offset, record.visibility, &record.compiland))
                 })
             })
             .min_by(|left, right| {
@@ -3560,14 +3840,22 @@ impl SymbolStore {
                         };
                         rank(left.2).cmp(&rank(right.2))
                     })
-                    .then_with(|| left.0.cmp(&right.0))
-                    .then_with(|| left.3.cmp(&right.3))
+                    .then_with(|| left.0.cmp(right.0))
+                    .then_with(|| left.3.cmp(right.3))
             })
-            .map(|(name, offset, _, _)| (name, offset))
+            .map(|(name, offset, _, _)| (name.clone(), offset))
+    }
+
+    fn struct_size_by_name(&self, guid: u128, name: &str) -> u64 {
+        self.struct_defs
+            .get(&guid)
+            .and_then(|defs| defs.get(name).map(|(size, _)| *size))
+            .unwrap_or(0)
     }
 
     fn type_size<'p>(
         &self,
+        guid: u128,
         finder: &pdb2::TypeFinder<'p>,
         index: pdb2::TypeIndex,
         ptr_size: u64,
@@ -3615,20 +3903,32 @@ impl SymbolStore {
                     _ => Ok(0),
                 }
             }
-            pdb2::TypeData::Class(data) => Ok(data.size), // NOTE this might (probably will) return 0
-            pdb2::TypeData::Union(data) => Ok(data.size), // FIXME possibly? ^^
+            // Members reference their struct through a forward declaration
+            // whose size is 0; the index knows the complete definition.
+            pdb2::TypeData::Class(data) => Ok(if data.properties.forward_reference() {
+                self.struct_size_by_name(guid, &data.name.to_string())
+            } else {
+                data.size
+            }),
+            pdb2::TypeData::Union(data) => Ok(if data.properties.forward_reference() {
+                self.struct_size_by_name(guid, &data.name.to_string())
+            } else {
+                data.size
+            }),
             pdb2::TypeData::Pointer(_) => Ok(ptr_size),
             pdb2::TypeData::Modifier(data) => {
-                self.type_size(finder, data.underlying_type, ptr_size)
+                self.type_size(guid, finder, data.underlying_type, ptr_size)
             }
             pdb2::TypeData::Enumeration(data) => {
-                self.type_size(finder, data.underlying_type, ptr_size)
+                self.type_size(guid, finder, data.underlying_type, ptr_size)
             }
             pdb2::TypeData::Array(data) => {
-                Ok(data.dimensions.iter().fold(0, |acc, &x| acc + x as u64))
+                // pdb2 reports cumulative byte sizes per dimension (`int[4][4]`
+                // is `[16, 64]`), so the last entry is the whole array.
+                Ok(data.dimensions.last().map_or(0, |&bytes| u64::from(bytes)))
             }
             pdb2::TypeData::Bitfield(data) => {
-                self.type_size(finder, data.underlying_type, ptr_size)
+                self.type_size(guid, finder, data.underlying_type, ptr_size)
             }
             pdb2::TypeData::Procedure(_) => Ok(ptr_size),
             _ => Ok(0),
@@ -3637,6 +3937,7 @@ impl SymbolStore {
 
     fn resolve_type<'p>(
         &self,
+        guid: u128,
         finder: &TypeFinder<'p>,
         index: TypeIndex,
     ) -> pdb2::Result<ParsedType> {
@@ -3679,24 +3980,23 @@ impl SymbolStore {
             TypeData::Enumeration(data) => Ok(ParsedType::Enum(data.name.to_string().into_owned())),
 
             TypeData::Pointer(data) => {
-                let inner = self.resolve_type(finder, data.underlying_type)?;
+                let inner = self.resolve_type(guid, finder, data.underlying_type)?;
                 Ok(ParsedType::Pointer(Box::new(inner)))
             }
 
             TypeData::Array(data) => {
-                let inner = self.resolve_type(finder, data.element_type)?;
-                let count = data.dimensions.first().unwrap_or(&0);
-                let mut sizeof_type = self.type_size(finder, data.element_type, 8)? as u32;
-                if sizeof_type == 0 {
-                    sizeof_type = 1;
-                }
-
-                Ok(ParsedType::Array(Box::new(inner), count / sizeof_type))
+                let inner = self.resolve_type(guid, finder, data.element_type)?;
+                // Total byte size (see `type_size`) over the element size gives
+                // the flattened element count.
+                let bytes = data.dimensions.last().copied().unwrap_or(0);
+                let sizeof_type =
+                    (self.type_size(guid, finder, data.element_type, 8)? as u32).max(1);
+                Ok(ParsedType::Array(Box::new(inner), bytes / sizeof_type))
             }
 
-            TypeData::Modifier(data) => self.resolve_type(finder, data.underlying_type),
+            TypeData::Modifier(data) => self.resolve_type(guid, finder, data.underlying_type),
             TypeData::Bitfield(data) => {
-                let inner = self.resolve_type(finder, data.underlying_type)?;
+                let inner = self.resolve_type(guid, finder, data.underlying_type)?;
 
                 Ok(ParsedType::Bitfield {
                     underlying: Box::new(inner),
@@ -3707,7 +4007,7 @@ impl SymbolStore {
 
             pdb2::TypeData::Procedure(data) => {
                 let return_type = if let Some(idx) = data.return_type {
-                    self.resolve_type(finder, idx)?
+                    self.resolve_type(guid, finder, idx)?
                 } else {
                     ParsedType::Primitive("void".to_string())
                 };
@@ -3717,7 +4017,7 @@ impl SymbolStore {
                     && let Ok(pdb2::TypeData::ArgumentList(list)) = arg_item.parse()
                 {
                     for arg_idx in list.arguments {
-                        let arg_type = self.resolve_type(finder, arg_idx)?;
+                        let arg_type = self.resolve_type(guid, finder, arg_idx)?;
                         args.push(arg_type);
                     }
                 }
@@ -3731,6 +4031,7 @@ impl SymbolStore {
 
     fn process_field_list<'p>(
         &self,
+        guid: u128,
         type_finder: &pdb2::TypeFinder<'p>,
         field_index: pdb2::TypeIndex,
         fields_map: &mut HashMap<String, FieldInfo>,
@@ -3743,13 +4044,13 @@ impl SymbolStore {
                     let name = member.name.to_string().into_owned();
                     let offset = member.offset;
 
-                    let type_info = self.resolve_type(type_finder, member.field_type)?;
+                    let type_info = self.resolve_type(guid, type_finder, member.field_type)?;
 
                     fields_map.insert(
                         name,
                         FieldInfo {
                             offset: offset as u32,
-                            size: self.type_size(type_finder, member.field_type, 8)?,
+                            size: self.type_size(guid, type_finder, member.field_type, 8)?,
                             type_data: type_info,
                         },
                     );
@@ -3757,22 +4058,29 @@ impl SymbolStore {
             }
 
             if let Some(more_fields) = list.continuation {
-                self.process_field_list(type_finder, more_fields, fields_map)?;
+                self.process_field_list(guid, type_finder, more_fields, fields_map)?;
             }
         }
         Ok(())
     }
 
-    pub fn dump_struct_with_types<S>(&self, guid: u128, struct_name: S) -> Option<TypeInfo>
+    pub fn dump_struct_with_types<S>(&self, guid: u128, struct_name: S) -> Option<Arc<TypeInfo>>
     where
         S: Into<String> + AsRef<str>,
     {
-        // A hit skips the full PDB type-stream scan below. Cloning the cached
-        // layout is cheap next to that scan, so callers keep their owned return
         let cache_key = (guid, struct_name.as_ref().to_string());
         if let Some(cached) = self.type_cache.get(&cache_key) {
-            return Some((**cached).clone());
+            return cached.clone();
         }
+
+        let definition = self
+            .struct_defs
+            .get(&guid)
+            .and_then(|defs| defs.get(struct_name.as_ref()).copied());
+        let Some((size, field_index)) = definition else {
+            self.type_cache.insert(cache_key, None);
+            return None;
+        };
 
         let pdb = self.pdbs.get_mut(&guid)?;
         let mut pdb_lock = pdb.lock();
@@ -3780,39 +4088,38 @@ impl SymbolStore {
         let mut type_finder = type_information.finder();
         let mut iter = type_information.iter();
 
-        while let Some(typ) = iter.next().ok()? {
+        // The finder only knows records the iterator has passed. A field list
+        // and everything it references precede the class record, so stop once
+        // the list is indexed; fall back to the full stream if a member still
+        // resolves to an unindexed record.
+        while type_finder.max_index() < field_index {
+            let Some(_) = iter.next().ok()? else { break };
             type_finder.update(&iter);
-
-            let (name, size, field_index) = match typ.parse() {
-                Ok(TypeData::Class(class)) if !class.properties.forward_reference() => {
-                    (class.name.to_string(), class.size, class.fields)
+        }
+        let mut fields = HashMap::new();
+        let parsed = match self.process_field_list(guid, &type_finder, field_index, &mut fields) {
+            Err(pdb2::Error::TypeNotIndexed(..)) => {
+                while iter.next().ok()?.is_some() {
+                    type_finder.update(&iter);
                 }
-                Ok(TypeData::Union(union)) if !union.properties.forward_reference() => {
-                    (union.name.to_string(), union.size, Some(union.fields))
-                }
-                _ => continue,
-            };
-            if name != struct_name.as_ref() {
-                continue;
+                fields.clear();
+                self.process_field_list(guid, &type_finder, field_index, &mut fields)
             }
-
-            let mut fields_map: HashMap<String, FieldInfo> = HashMap::new();
-            if let Some(field_index) = field_index {
-                self.process_field_list(&type_finder, field_index, &mut fields_map)
-                    .ok()?;
-            }
-
-            let type_info = TypeInfo {
-                name: struct_name.into(),
-                size: size as usize,
-                fields: fields_map,
-            };
-            self.type_cache
-                .insert(cache_key, Arc::new(type_info.clone()));
-            return Some(type_info);
+            other => other,
+        };
+        if parsed.is_err() {
+            self.type_cache.insert(cache_key, None);
+            return None;
         }
 
-        None
+        let type_info = Arc::new(TypeInfo {
+            name: struct_name.into(),
+            size: size as usize,
+            fields,
+        });
+        self.type_cache
+            .insert(cache_key, Some(Arc::clone(&type_info)));
+        Some(type_info)
     }
 
     /// Variants `(name, value)` of a PDB enum, in declaration order. Enums live
@@ -3883,20 +4190,38 @@ fn variant_to_i64(v: &pdb2::Variant) -> i64 {
 impl SymbolIndex {
     /// Fuzzy substring search over the names, ranked best-first. Smart-case
     /// (case-insensitive unless the query has uppercase), so `process` matches
-    /// `PsGetProcessId`. Empty query returns the first `limit` names.
+    /// `PsGetProcessId`. Empty query returns the first `limit` names. On a
+    /// module-qualified index a query without `!` matches the bare name, so
+    /// `Ke*` finds `nt!KeBugCheckEx` without the `nt!` counting as text.
     pub fn search(&self, query: &str, limit: usize) -> Vec<String> {
         if query.is_empty() || limit == 0 {
             return self.names.iter().take(limit).cloned().collect();
         }
+        let qualified_query = query.contains('!');
+        fn haystack(qualified_query: bool, name: &str) -> &str {
+            if qualified_query {
+                name
+            } else {
+                name.rsplit_once('!').map_or(name, |(_, bare)| bare)
+            }
+        }
+        if query
+            .as_bytes()
+            .iter()
+            .any(|byte| matches!(*byte, b'*' | b'?'))
+        {
+            return self
+                .names
+                .iter()
+                .filter(|name| glob_matches(query, haystack(qualified_query, name), true))
+                .take(limit)
+                .cloned()
+                .collect();
+        }
 
         let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
 
-        // Fuzzy-scoring every name is the per-keystroke hot path: an attached
-        // GUI process can pull in hundreds of thousands of publics across its
-        // loaded modules, and `Pattern::match_list` scores them on a single
-        // thread. Spread the scan across cores instead; each rayon job keeps
-        // its own matcher and utf32 scratch buffer (both reused across the items
-        // that job sees, like the original thread-local matcher did).
+        // Per-keystroke hot path over up to hundreds of thousands of names.
         let mut scored: Vec<(u32, &String)> = self
             .names
             .par_iter()
@@ -3904,17 +4229,14 @@ impl SymbolIndex {
                 || (Matcher::new(Config::DEFAULT), Vec::new()),
                 |(matcher, buf), name| {
                     pattern
-                        .score(Utf32Str::new(name, buf), matcher)
+                        .score(Utf32Str::new(haystack(qualified_query, name), buf), matcher)
                         .map(|score| (score, name))
                 },
             )
             .filter_map(|scored| scored)
             .collect();
 
-        // Only the top `limit` matches are shown, so partial-select them instead
-        // of fully sorting every match; a short, broad query can match most of
-        // the list, and the full O(n log n) sort there is what stings. Ties break
-        // alphabetically (names are unique) for a stable, predictable ordering.
+        // Partial-select the top `limit`; ties break alphabetically.
         let by_rank =
             |a: &(u32, &String), b: &(u32, &String)| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1));
         if scored.len() > limit {
@@ -3924,4 +4246,42 @@ impl SymbolIndex {
         scored.sort_unstable_by(by_rank);
         scored.into_iter().map(|(_, name)| name.clone()).collect()
     }
+}
+
+/// Anchored glob match: `*` matches any number of bytes, `?` exactly one.
+/// `ignore_case` compares literals ASCII case-insensitively (symbol, type,
+/// process, and module names); pool tags are case-sensitive.
+pub fn glob_matches(pattern: &str, name: &str, ignore_case: bool) -> bool {
+    let pattern = pattern.as_bytes();
+    let name = name.as_bytes();
+    let mut pattern_index = 0;
+    let mut name_index = 0;
+    let mut star_index = None;
+    let mut star_name_index = 0;
+
+    while name_index < name.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == b'?'
+                || pattern[pattern_index] == name[name_index]
+                || (ignore_case && pattern[pattern_index].eq_ignore_ascii_case(&name[name_index])))
+        {
+            pattern_index += 1;
+            name_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+            star_index = Some(pattern_index);
+            pattern_index += 1;
+            star_name_index = name_index;
+        } else if let Some(star) = star_index {
+            pattern_index = star + 1;
+            star_name_index += 1;
+            name_index = star_name_index;
+        } else {
+            return false;
+        }
+    }
+
+    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
 }

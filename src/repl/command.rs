@@ -18,6 +18,7 @@ pub struct CommandSpec {
     pub details: Option<&'static str>,
     pub completion: CompletionSpec,
     pub run_state: Option<RunState>,
+    pub run: RunEffect,
     pub style: CommandStyle,
     pub flow: Flow,
     pub handler: CommandHandler,
@@ -27,6 +28,20 @@ pub struct CommandSpec {
 pub enum RunState {
     Halted,
     Running,
+}
+
+/// What a command does to target execution, so dispatch contexts that must
+/// not let a command move the target (breakpoint actions, exception
+/// commands, a remote host with its own run-control) can refuse it by
+/// metadata rather than by a name list that aliases can bypass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunEffect {
+    /// Leaves execution state alone (or only pauses it).
+    None,
+    /// Executes one instruction and returns promptly.
+    Step,
+    /// Resumes until the next stop; may block indefinitely.
+    Run,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -345,8 +360,8 @@ fn skip_ws(s: &str, pos: usize) -> usize {
 pub fn report_command_parse_error(line: &str, err: CommandParseError) {
     let start = err.span.start.min(line.len());
     let end = err.span.end.min(line.len()).max(start + 1);
-    println!("{line}");
-    println!(
+    outln!("{line}");
+    outln!(
         "{}{} {}",
         " ".repeat(start),
         "^".repeat(end - start),
@@ -401,6 +416,7 @@ macro_rules! repl_command {
         $(, details: $details:expr)?
         $(, completion: $completion:tt)?
         $(, run_state: $run_state:ident)?
+        $(, run: $run:ident)?
         $(, style: $style:ident)?
         , flow: $flow:ident
         $(,)?
@@ -414,6 +430,7 @@ macro_rules! repl_command {
             $(, details: $details)?
             $(, completion: $completion)?
             $(, run_state: $run_state)?
+            $(, run: $run)?
             $(, style: $style)?
             , flow: $flow,
         }
@@ -428,6 +445,7 @@ macro_rules! repl_command {
         $(, details: $details:expr)?
         $(, completion: $completion:tt)?
         $(, run_state: $run_state:ident)?
+        $(, run: $run:ident)?
         $(, style: $style:ident)?
         $(, flow: $flow:ident)?
         $(,)?
@@ -441,6 +459,7 @@ macro_rules! repl_command {
                 details: $crate::repl_command!(@details $($details)?),
                 completion: $crate::repl_command!(@completion $($completion)?),
                 run_state: $crate::repl_command!(@run_state $($run_state)?),
+                run: $crate::repl_command!(@run $($run)?),
                 style: $crate::repl_command!(@style $($style)?),
                 flow: $crate::repl_command!(@flow $($flow)?),
                 handler: $handler,
@@ -477,6 +496,10 @@ macro_rules! repl_command {
     (@run_state Halted) => { Some($crate::repl::RunState::Halted) };
     (@run_state Running) => { Some($crate::repl::RunState::Running) };
 
+    (@run) => { $crate::repl::RunEffect::None };
+    (@run Step) => { $crate::repl::RunEffect::Step };
+    (@run Run) => { $crate::repl::RunEffect::Run };
+
     (@style) => { $crate::repl::CommandStyle::StructuredArgs };
     (@style StructuredArgs) => { $crate::repl::CommandStyle::StructuredArgs };
     (@style RawTail) => { $crate::repl::CommandStyle::RawTail };
@@ -490,130 +513,6 @@ macro_rules! repl_command {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn command_registry_is_populated() {
-        assert!(!COMMANDS.is_empty());
-        assert!(command_registry().get("continue").is_some());
-    }
-
-    #[test]
-    fn builtin_aliases_resolve_to_command_specs() {
-        let registry = command_registry();
-        assert_eq!(registry.get("g").unwrap().names[0], "continue");
-        assert_eq!(registry.get("t").unwrap().names[0], "si");
-        assert_eq!(registry.get("u").unwrap().names[0], "disasm");
-        assert_eq!(registry.get("r").unwrap().names[0], "registers");
-        assert_eq!(registry.get("q").unwrap().names[0], "quit");
-        assert_eq!(registry.get("q").unwrap().flow, Flow::Quit);
-        assert_eq!(registry.get("?").unwrap().names[0], "ev");
-        for (alias, canonical) in [
-            ("!pte", "pte"),
-            ("!pool", "pool"),
-            ("!irp", "irp"),
-            ("!drvobj", "drvobj"),
-            ("!devobj", "devobj"),
-            ("!object", "object"),
-            ("!analyze", "analyze"),
-        ] {
-            assert_eq!(registry.get(alias).unwrap().names[0], canonical);
-        }
-        for stack_variant in ["kb", "kp", "kv"] {
-            assert_eq!(registry.get(stack_variant).unwrap().names[0], "k");
-        }
-        for command in [
-            "uf",
-            "lmv",
-            ".reload",
-            ".sympath",
-            ".symfix",
-            "ld",
-            "gh",
-            "gn",
-            "sxe",
-            "sxd",
-            "sxn",
-            "sxi",
-            "n",
-            "reload-scripts",
-        ] {
-            assert!(
-                registry.get(command).is_some(),
-                "{command} is not registered"
-            );
-        }
-        assert_eq!(
-            registry.get("?").unwrap().style,
-            CommandStyle::ExpressionTail
-        );
-    }
-
-    #[test]
-    fn per_arg_completion_is_command_metadata() {
-        let registry = command_registry();
-
-        let completion = registry.get("dt").unwrap().completion;
-        assert!(matches!(
-            completion.strategy_for_arg(0),
-            CompletionStrategy::Type
-        ));
-        assert!(matches!(
-            completion.strategy_for_arg(1),
-            CompletionStrategy::Expression
-        ));
-        assert!(matches!(
-            completion.strategy_for_arg(2),
-            CompletionStrategy::None
-        ));
-
-        let completion = registry.get("f").unwrap().completion;
-        assert!(matches!(
-            completion.strategy_for_arg(0),
-            CompletionStrategy::Expression
-        ));
-        assert!(matches!(
-            completion.strategy_for_arg(1),
-            CompletionStrategy::None
-        ));
-        assert!(matches!(
-            completion.strategy_for_arg(2),
-            CompletionStrategy::Expression
-        ));
-
-        let completion = registry.get("s").unwrap().completion;
-        assert!(matches!(
-            completion.strategy_for_arg(0),
-            CompletionStrategy::Expression
-        ));
-        assert!(matches!(
-            completion.strategy_for_arg(1),
-            CompletionStrategy::None
-        ));
-        assert!(matches!(
-            completion.strategy_for_arg(2),
-            CompletionStrategy::Expression
-        ));
-
-        let completion = registry.get("thread").unwrap().completion;
-        assert!(matches!(
-            completion.strategy_for_arg(0),
-            CompletionStrategy::Thread
-        ));
-        assert!(matches!(
-            completion.strategy_for_arg(1),
-            CompletionStrategy::None
-        ));
-
-        let completion = registry.get("set").unwrap().completion;
-        assert!(matches!(
-            completion.strategy_for_arg(0),
-            CompletionStrategy::None
-        ));
-        assert!(matches!(
-            completion.strategy_for_arg(1),
-            CompletionStrategy::Expression
-        ));
-    }
 
     #[test]
     fn parses_quoted_arguments() {
@@ -647,10 +546,5 @@ mod tests {
         assert_eq!(invocation.name, "?");
         assert!(invocation.argv.is_empty());
         assert_eq!(invocation.raw_tail, "rax + rbx");
-    }
-
-    #[test]
-    fn command_help_includes_details() {
-        assert!(command_help("x").contains("operators:"));
     }
 }

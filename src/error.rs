@@ -9,7 +9,6 @@ use crate::types::{PhysAddr, VirtAddr};
 
 #[derive(Debug, Error)]
 pub enum Error {
-    // Handle crate errors
     #[cfg(target_os = "linux")]
     #[error(transparent)]
     Nix(#[from] nix::Error),
@@ -49,6 +48,8 @@ pub enum Error {
 
     #[error("KD protocol failure: {0}")]
     Kd(String),
+    #[error("KD protocol failure: send exceeded retry budget: {0}")]
+    KdSendExhausted(String),
     #[error("KD protocol failure: kernel returned NTSTATUS {ntstatus:#x} for api {api:#x}")]
     KdStatus { ntstatus: u32, api: u32 },
 
@@ -76,7 +77,6 @@ pub enum Error {
     #[error("{0}")]
     DebugInfo(String),
 
-    // Handle other errors
     #[error("PDB file not found for {0:?}")]
     PdbNotFound(PathBuf),
 

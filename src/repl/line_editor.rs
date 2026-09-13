@@ -95,6 +95,9 @@ fn make_suggestions(
 
 pub struct MyCompleter {
     pub caches: ReplCaches,
+    /// Target lent by the REPL loop for the current `read_line`; absent in
+    /// tests and outside a prompt.
+    pub target: TargetLoan,
 }
 
 #[derive(Clone, Copy)]
@@ -119,8 +122,9 @@ impl<'a> CompletionInput<'a> {
         // Find the start of the identifier being typed by scanning backward for
         // expression boundary characters (operators, parens, dereference).
         let ident_start = raw_prefix
-            .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-            .map(|i| i + 1)
+            .char_indices()
+            .rfind(|(_, c)| !c.is_ascii_alphanumeric() && *c != '_')
+            .map(|(i, c)| i + c.len_utf8())
             .unwrap_or(0);
         let prefix = &raw_prefix[ident_start..];
         let span_start = arg_start + ident_start;
@@ -288,7 +292,9 @@ impl MyCompleter {
             }
 
             CompletionStrategy::Process => {
-                let processes = self.caches.processes.read().unwrap();
+                let processes = self
+                    .target
+                    .with(|target| self.caches.processes_for_completion(target));
                 let prefix_lower = input.prefix.to_lowercase();
                 processes
                     .iter()
@@ -391,7 +397,9 @@ impl MyCompleter {
             }
 
             CompletionStrategy::Driver => {
-                let drivers = self.caches.drivers.read().unwrap();
+                let drivers = self
+                    .target
+                    .with(|target| self.caches.drivers_for_completion(target));
                 let prefix_lower = input.prefix.to_lowercase();
                 drivers
                     .iter()
@@ -537,9 +545,31 @@ impl MyCompleter {
     }
 
     fn complete_symbol_names(&self, input: CompletionInput<'_>, limit: usize) -> Vec<Suggestion> {
+        // A prefix naming a module offers `module!` first, so one Tab selects
+        // the namespace and the next completes inside it; symbol matches are
+        // module-qualified so the inserted text resolves unambiguously.
+        let mut suggestions = if input.prefix.is_empty() {
+            Vec::new()
+        } else {
+            let dtb = *self.caches.dtb.read().unwrap();
+            let modules = self
+                .caches
+                .symbol_store
+                .module_short_names_with_prefix(dtb, input.prefix)
+                .into_iter()
+                .map(|module| format!("{module}!"))
+                .collect();
+            make_suggestions(modules, "Module", input.span_start, input.pos)
+        };
         let symbols = self.caches.symbols.read().unwrap();
         let results = symbols.search(input.prefix, limit);
-        make_suggestions(results, "Symbol", input.span_start, input.pos)
+        suggestions.extend(make_suggestions(
+            results,
+            "Symbol",
+            input.span_start,
+            input.pos,
+        ));
+        suggestions
     }
 
     fn complete_expression_variables(&self, input: CompletionInput<'_>) -> Vec<Suggestion> {
@@ -745,6 +775,7 @@ mod tests {
 
     fn completer() -> MyCompleter {
         MyCompleter {
+            target: TargetLoan::default(),
             caches: ReplCaches {
                 symbols: Arc::new(RwLock::new(SymbolIndex::default())),
                 types: Arc::new(RwLock::new(SymbolIndex::default())),
