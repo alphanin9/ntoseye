@@ -89,18 +89,20 @@ These failure modes cost real time to rediscover:
 
 ## Debugging From The Kernel
 
-**Module-load stops did not fire over KDNET on this guest.** `dbg.exceptions.set_module_event("ld", ...)` (`sxe ld`) relies on the target's `LoadSymbols` state change. On Windows 11 26200, when a driver loads, the target sends only the `.kdfiles` lookup (seen with `NTOSEYE_TRACE=kd`), so the filter never stops, even with a blocking `run()`. A module that loads mid-session is also missing from `dbg.modules` and `lm` until `dbg.command(".reload", timeout=120)` or a new attach. Deferred breakpoints by symbol probably do not arm at load for the same reason (untested). Until that is fixed:
-
-- To stop in `DriverEntry`, compile a `DbgBreakPoint()` into a debug build of the driver.
-- For code that runs after load, resume, start the service through QGA, `interrupt()`, `.reload`, then set breakpoints on the loaded image. `dbg.drivers` gives the driver object's fields, such as `driver_unload`:
+Stop in `DriverEntry` with a deferred breakpoint. Put the build directory on the symbol path, add the breakpoint before the driver loads, resume, then start the service through QGA. ntoseye arms the breakpoint when the target reports the load, before `DriverEntry` runs:
 
 ```python
-dbg.run(timeout=0)                     # then, from the shell: sc start MyDrv
-dbg.interrupt(); dbg.command(".reload", timeout=120)
-drv = next(d for d in dbg.drivers if d.name.lower() == r"\driver\mydrv")
-bp = dbg.breakpoints.add(drv.driver_unload)
-dbg.run(timeout=0)                     # then, from the shell: sc stop MyDrv
+dbg.symbols.path = [*dbg.symbols.path, "/path/to/build/release"]
+bp = dbg.breakpoints.add("mydrv!DriverEntry")      # deferred until mydrv loads
+dbg.exceptions.set_module_event("ld", "mydrv", mode="break")  # optional: stop at the load itself
+dbg.run(timeout=0)                                  # then, from the shell: sc start MyDrv
 ```
+
+Then collect the stops with `dbg.wait(timeout=...)`: first `Stop.ModuleLoad` (at `nt!DebugService2`) if the filter is set, then `Stop.Breakpoint` at `mydrv!DriverEntry`. While the driver sits in `DriverEntry`, `sc start` blocks and QGA stops answering until you resume.
+
+**Limitation: a driver image without a debug directory loads silently.** Load filters, deferred breakpoints, and the module list all depend on the target reporting the load (the `LoadSymbols` state change). On this guest, a `slopfuscator_hello.sys` build with a CodeView (`RSDS`) record was reported. An obfuscated build without one was not: `NTOSEYE_TRACE=kd` showed only the `.kdfiles` lookup. The two builds differ in more than the debug record, so the debug record is the likely cause, not a proven one. With such an image, the `ld` filter never stops, the deferred breakpoint stays `deferred` while `DriverEntry` runs past it, and `dbg.modules` and `lm` miss the driver until `dbg.command(".reload", timeout=120)` or a new attach. A `module+offset` breakpoint cannot be deferred either (`SymbolNotFoundError` while the module is not loaded). Check the image before you deploy it: `python3 -c "import sys; print(open(sys.argv[1],'rb').read().find(b'RSDS') >= 0)" MyDrv.sys`. For an image without one, stop after the load instead: resume, start the service, `interrupt()`, `.reload`, then set breakpoints in the loaded image. For example, `dbg.drivers` gives the driver object's `driver_unload`.
+
+The symbols must also match the deployed image: an `lm` entry with symbols `failed` and `pdb -` means ntoseye found no debug record to match a PDB against. Check `dbg.command("lmv m mydrv")`.
 
 Run to a hit and inspect it:
 
@@ -112,7 +114,7 @@ match dbg.wait(timeout=30):
         thread = dbg.threads[stop.thread]
         for frame in thread.backtrace(limit=8):
             print(frame)
-        print(dbg.command("dv /t"))
+        print(dbg.command("dv", timeout=30))
     case stop:
         print("stopped:", stop.kind, stop.symbol)
 ```
@@ -201,7 +203,7 @@ sc.exe create MyDrv type= kernel binPath= $dst | Out-Null
 sc.exe start MyDrv
 ```
 
-While the debugger holds the guest stopped, QGA cannot run anything. Resume first (`dbg.run(timeout=0)`, or a `run(timeout=...)` that waits for the module-load stop), then trigger the load through QGA from the shell.
+While the debugger holds the guest stopped, QGA cannot run anything. Resume first with `dbg.run(timeout=0)`, then trigger the load through QGA from the shell.
 
 ## QGA Helper
 
