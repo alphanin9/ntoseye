@@ -10,7 +10,7 @@ description: Windows kernel driver debugging workflow for NTOSEYE-backed QEMU/li
 Keep Windows driver work anchored to the local VM/debugger setup instead of generic Windows administration:
 
 - **Debugger:** the `ntoseye` Python SDK over KDNET, driven from a persistent Python kernel (the harness's `eval` tool, a Jupyter kernel). It is also the crash-recovery channel.
-- **Files:** virtiofs.
+- **Files:** virtiofs when the domain has a `<filesystem>` device, otherwise QGA `guest-file-write`.
 - **Guest control:** QEMU Guest Agent (or SSH).
 
 The SDK is the same debugger core as the REPL. `dbg.command("...")` runs any WinDbg-style REPL line, and the typed namespaces (`dbg.processes`, `dbg.modules`, `dbg.breakpoints`, `dbg.types`, `dbg.memory`, ...) return structured values, so a cell can filter and walk the data and print only what matters. The upstream docs are the API reference: `docs/scripting/sdk.md`, the type stub `python/ntoseye/_ntoseye.pyi` (every method, with docstrings), and `docs/using/drivers.md` (driver development from a Linux host).
@@ -22,7 +22,7 @@ Discover the actual local setup rather than assuming it:
 - `virsh -c qemu:///system list --all` finds the VM. On this host the domain is `win11`.
 - `ntoseye status` prints the configured debug transports, endpoints, and launch commands. It reads the *default* libvirt URI, so run it as `LIBVIRT_DEFAULT_URI=qemu:///system ntoseye status`, or the system domains do not appear. If it reports `Debug backend: not configured` on a KDNET guest, check by attaching: KDNET adds no XML device, only the Hyper-V vendor ID.
 - Inspect the QEMU command line with `ps -eo pid,cmd | rg -i "qemu|virtiofs|guest-agent|qga|qmp|serial"`.
-- Prefer existing virtiofs mounts for moving files. In the known setup, libvirt exposes `virtiofsd --shared-dir /home/user/dev/windows_shared` and the QEMU fs tag is `win_share`. Other setups may differ.
+- Use an existing virtiofs share for moving files when there is one: `virsh -c qemu:///system dumpxml win11 | rg -A4 '<filesystem'`. One earlier setup exposed `virtiofsd --shared-dir /home/user/dev/windows_shared` with the fs tag `win_share`, mounted in the guest as `Z:`. Without a `<filesystem>` device (as on this VM in the last session), push files over QGA instead (see Driver Deploy Loop).
 - Test QGA before assuming it works:
 
 ```bash
@@ -41,7 +41,7 @@ uv venv .venv && uv pip install --python .venv/bin/python maturin patchelf
 . .venv/bin/activate && maturin develop --release
 ```
 
-Run the Python kernel from that venv (or `pip install ntoseye` for the latest release instead). After a rebuild, a long-lived kernel still has the old native module loaded. `ntoseye.build` holds the commit stamp of the loaded extension (`<commit>` or `<commit>-dirty`). If it differs from `git rev-parse --short=12 HEAD`, restart the kernel, but close the debugger first (see Attach Rules).
+Run the Python kernel from that venv (or `pip install ntoseye` for the latest release instead). The install is editable, so a kernel running a different interpreter can `sys.path.insert(0, "/home/user/dev/ntoseye/python")` instead: a plain site-packages path does not work, because the editable `.pth` file is not processed. After a rebuild, a long-lived kernel still has the old native module loaded. `ntoseye.build` holds the commit stamp of the loaded extension (`<commit>` or `<commit>-dirty`). If it differs from `git rev-parse --short=12 HEAD`, restart the kernel, but close the debugger first (see Attach Rules).
 
 **No `sudo`.** KDNET carries both run control and memory over the debug transport, so the kernel runs as your normal user. Root is only needed to read guest RAM from the QEMU process (`memory_source="host"`, and the `gdb` and `memory` backends), and QEMU runs as `libvirt-qemu`. With the default `memory_source="auto"`, an unprivileged attach prints that host memory is unavailable and falls back to KD memory. This is the intended path, not an error. Pass `memory_source="kd"` to skip the probe.
 
@@ -57,7 +57,13 @@ KEY=$(python3 skills/ntoseye-windows-driver-debugging/scripts/qga-exec.py --doma
 
 The guest targets `192.168.122.1:50000` (the host's `virbr0` address), and the `kdnet` backend listens on `0.0.0.0:50000` by default, so `connect` is not needed.
 
-Keep one `Debugger` alive across cells. Do not use a `with` block that spans cells:
+**Warm the symbol cache from a shell first.** A cold attach downloads and indexes the kernel's PDBs, which can take minutes, and the harness can kill the kernel cell during it. The guest then stays frozen (see Attach Rules). After a guest update or a new symbol cache, run one attach-and-close as a standalone script so the slow part happens outside the kernel:
+
+```bash
+python/.venv/bin/python -c 'import ntoseye,sys; ntoseye.attach("kdnet", key=sys.argv[1], memory_source="kd", kd_handshake_timeout=60).close()' "$KEY"
+```
+
+A warm attach then takes a few seconds. Keep one `Debugger` alive across cells, and do not use a `with` block that spans cells:
 
 ```python
 import ntoseye
@@ -74,7 +80,8 @@ print(ntoseye.build, dbg.stop.kind, dbg.inspect.version())
 These failure modes cost real time to rediscover:
 
 - **Wait for the guest to finish booting before attaching.** An attach in the middle of boot lands in a storm of module loads, the kernel PE read never settles, and ntoseye gives up with `PE view failed`. Wait until `guest-ping` succeeds.
-- **Never kill a live session.** If the Python kernel is killed, restarted, or times out while it is attached, the target stays frozen at the break-in: QEMU still reports `running`, but the guest spins in the KD stub and QGA stops answering. Call `dbg.close()` before you restart the kernel. If the guest is already wedged, an ACPI shutdown does not get through, and `virsh destroy win11` is the only way out.
+- **Never kill a live session.** If the Python kernel is killed, restarted, or times out while it is attached, the target stays frozen at the break-in: QEMU still reports `running`, but the guest spins in the KD stub and QGA stops answering. Call `dbg.close()` before you restart the kernel. To recover a wedged guest, attach again and close: `ntoseye.attach(...)` handshakes with the waiting target, and `close()` resumes it, after which `guest-ping` answers again. An ACPI shutdown does not get through; use `virsh destroy win11` only if a new attach also fails.
+- **While the guest is stopped, QGA cannot run anything.** Resume first (`dbg.run(timeout=0)` returns at once with the guest running), trigger the guest action through QGA, then collect the stop with `dbg.wait(timeout=...)`. A cell that blocks in `run(timeout=...)` cannot also drive QGA, unless the QGA call runs in a parallel tool call.
 - **Bound every wait.** Pass `timeout=` to `run()`, `wait()`, `step*()`, and `command()`, so a cell cannot block the kernel indefinitely. `run(timeout=...)` returns `None` while the guest keeps running, and `dbg.interrupt()` breaks in.
 - The default handshake window is 8 s. For a slow guest, pass `kd_handshake_timeout=60` (or set `NTOSEYE_KD_TIMEOUT=60`).
 - `NTOSEYE_TRACE=kd` (set before the kernel starts) writes the KD packet exchange to stderr. It is the fastest way to tell a broken transport from a slow one.
@@ -82,20 +89,23 @@ These failure modes cost real time to rediscover:
 
 ## Debugging From The Kernel
 
-Stop at the driver's load, before `DriverEntry`, with the deferred breakpoints already armed:
+**Module-load stops did not fire over KDNET on this guest.** `dbg.exceptions.set_module_event("ld", ...)` (`sxe ld`) relies on the target's `LoadSymbols` state change. On Windows 11 26200, when a driver loads, the target sends only the `.kdfiles` lookup (seen with `NTOSEYE_TRACE=kd`), so the filter never stops, even with a blocking `run()`. A module that loads mid-session is also missing from `dbg.modules` and `lm` until `dbg.command(".reload", timeout=120)` or a new attach. Deferred breakpoints by symbol probably do not arm at load for the same reason (untested). Until that is fixed:
+
+- To stop in `DriverEntry`, compile a `DbgBreakPoint()` into a debug build of the driver.
+- For code that runs after load, resume, start the service through QGA, `interrupt()`, `.reload`, then set breakpoints on the loaded image. `dbg.drivers` gives the driver object's fields, such as `driver_unload`:
 
 ```python
-dbg.exceptions.set_module_event("ld", "mydrv", mode="break")
-stop = dbg.run(timeout=120)          # now start the service via QGA
-if isinstance(stop, Stop.ModuleLoad):
-    print(stop.module.name, hex(stop.module.base))
-    bp = dbg.breakpoints.add("mydrv!DispatchCreate")
+dbg.run(timeout=0)                     # then, from the shell: sc start MyDrv
+dbg.interrupt(); dbg.command(".reload", timeout=120)
+drv = next(d for d in dbg.drivers if d.name.lower() == r"\driver\mydrv")
+bp = dbg.breakpoints.add(drv.driver_unload)
+dbg.run(timeout=0)                     # then, from the shell: sc stop MyDrv
 ```
 
 Run to a hit and inspect it:
 
 ```python
-match dbg.run(timeout=30):
+match dbg.wait(timeout=30):
     case None:
         print("still running")
     case Stop.Breakpoint() as stop if stop.hit(bp):
@@ -160,6 +170,21 @@ Split the work this way:
 - Use the SDK session for breakpoints, register and memory inspection, stop-state recovery, and crash analysis.
 
 Do not load a driver directly from the shared folder unless that path has been tested. Copying to NTFS avoids edge cases in path visibility, filesystem semantics, locking, and policy.
+
+Without virtiofs, write the file straight to its NTFS path through QGA. The guest must be running, and `C:\drv` must exist (`qga-exec.py -- 'C:\Windows\System32\cmd.exe' /c 'mkdir C:\drv'`):
+
+```python
+import base64, json, subprocess
+def qga(payload):
+    out = subprocess.run(["virsh", "-c", "qemu:///system", "qemu-agent-command", "win11", json.dumps(payload)],
+                         capture_output=True, text=True, check=True).stdout
+    return json.loads(out)["return"]
+data = open("/path/to/MyDrv.sys", "rb").read()
+handle = qga({"execute": "guest-file-open", "arguments": {"path": r"C:\drv\MyDrv.sys", "mode": "wb"}})
+for i in range(0, len(data), 48000):
+    qga({"execute": "guest-file-write", "arguments": {"handle": handle, "buf-b64": base64.b64encode(data[i:i + 48000]).decode()}})
+qga({"execute": "guest-file-close", "arguments": {"handle": handle}})
+```
 
 Example guest deploy script:
 
