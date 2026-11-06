@@ -1,0 +1,1610 @@
+//! PE image access independent of any guest: the demand-read [`PeImage`],
+//! header and section reads, the export directory, version resources, and
+//! mapping an on-disk image file to its in-memory layout.
+
+use crate::arch::{IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_I386};
+use crate::base::{
+    bytes::{get_u16, get_u32, read_u16, read_u32},
+    error::{Error, Result},
+    memory::{self, MemoryOps, PAGE_SIZE},
+    types::*,
+};
+use ntoseye_macros::record;
+use pelite::{
+    PeFile, PeView, Wrap,
+    image::{
+        IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_EXPORT, IMAGE_DIRECTORY_ENTRY_IAT,
+        IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, IMAGE_SCN_MEM_WRITE,
+    },
+};
+use std::borrow::Cow;
+use std::collections::{HashMap, hash_map::Entry};
+use std::ops::{Deref, DerefMut, Range};
+use std::path::Path;
+use std::sync::{Mutex, PoisonError};
+
+pub mod headers;
+
+/// A module's header page. `PeView` rejects bytes that are not 4-byte
+/// aligned, and a bare byte array has no alignment of its own, so a header
+/// page returned by value parsed or failed depending on where the compiler
+/// happened to place it.
+#[repr(C, align(8))]
+pub struct HeaderPage([u8; PAGE_SIZE]);
+
+impl HeaderPage {
+    pub fn zeroed() -> Self {
+        Self([0; PAGE_SIZE])
+    }
+}
+
+impl Deref for HeaderPage {
+    type Target = [u8; PAGE_SIZE];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for HeaderPage {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl AsRef<[u8]> for HeaderPage {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// One PE export (`Module.exports`, `!dh -e`), recovered from a module's
+/// mapped export directory. An export has a name or only an ordinal, and a
+/// forwarder has no address.
+#[record]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleExportInfo {
+    pub ordinal: u32,
+    /// `None` for an ordinal-only export.
+    pub name: Option<String>,
+    /// The RVA of the export. `None` for a forwarder.
+    #[record(hex)]
+    pub rva: Option<u32>,
+    /// The mapped address. `None` for a forwarder.
+    pub address: Option<VirtAddr>,
+    /// The target of a forwarder (`OTHER.Function`).
+    pub forwarder: Option<String>,
+}
+
+/// `IMAGE_EXPORT_DIRECTORY` and the DLL name it points at.
+#[record(impl)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportDirectory {
+    /// The DLL name that the directory records.
+    pub name: String,
+    #[record(hex)]
+    pub characteristics: u32,
+    #[record(hex)]
+    pub time_date_stamp: u32,
+    #[record(skip)]
+    pub version: (u16, u16),
+    pub ordinal_base: u32,
+    pub number_of_functions: u32,
+    pub number_of_names: u32,
+    #[record(hex)]
+    pub address_of_functions: u32,
+    #[record(hex)]
+    pub address_of_names: u32,
+    #[record(hex)]
+    pub address_of_name_ordinals: u32,
+}
+
+#[record]
+impl ExportDirectory {
+    /// `major.minor`.
+    #[record(getter, rename = "version")]
+    pub fn version_text(&self) -> String {
+        headers::version_text(self.version)
+    }
+}
+
+/// A mapped image's export directory and the exports it lists (`!dh -e`).
+#[record]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageExports {
+    /// `None` if the image has no exports.
+    pub directory: Option<ExportDirectory>,
+    #[record(rename = "entries")]
+    pub exports: Vec<ModuleExportInfo>,
+}
+
+/// A module image addressed by RVA. An on-disk image is complete; an image
+/// read from guest memory is demand-read in `IMAGE_BLOCK`-sized blocks and
+/// keeps every block it has read, so a stack walk costs the blocks its
+/// lookups touch rather than the whole `.pdata`/`.rdata` of the module,
+/// which for a kernel over a KD serial link is megabytes.
+pub struct PeImage {
+    size: usize,
+    body: ImageBody,
+}
+
+enum ImageBody {
+    Complete(Vec<u8>),
+    Lazy(LazyImage),
+}
+
+/// One block is one KD memory request, and a block never straddles a page,
+/// so a block is either readable or not as a whole.
+const IMAGE_BLOCK: usize = 0x800;
+
+type ImageReader = Box<dyn Fn(usize, &mut [u8]) -> Result<()> + Send + Sync>;
+
+struct LazyImage {
+    /// The header page, read up front; what a `PeView` is built on.
+    headers: Box<HeaderPage>,
+    /// Reads `buf.len()` bytes of the image at an RVA.
+    read: ImageReader,
+    /// Blocks by index. A block the target refused (paged out) is not
+    /// recorded, so it is asked for again once the target has run.
+    blocks: Mutex<HashMap<usize, Box<[u8]>>>,
+}
+
+impl std::fmt::Debug for PeImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeImage")
+            .field("size", &self.size)
+            .field("complete", &self.is_complete())
+            .finish()
+    }
+}
+
+impl PeImage {
+    /// Wrap fully-available bytes (e.g. a complete on-disk image).
+    pub fn complete(bytes: Vec<u8>) -> Self {
+        Self {
+            size: bytes.len(),
+            body: ImageBody::Complete(bytes),
+        }
+    }
+
+    /// Bytes a `PeView` may be built on: the whole image when complete,
+    /// otherwise the header page. Directories past the headers are not in
+    /// here; read them through [`read`](Self::read).
+    pub fn headers(&self) -> &[u8] {
+        match &self.body {
+            ImageBody::Complete(bytes) => bytes,
+            ImageBody::Lazy(lazy) => &lazy.headers[..],
+        }
+    }
+
+    /// Whether every byte is known up front (an on-disk image); a lazy image
+    /// can always still hit a paged-out block.
+    pub fn is_complete(&self) -> bool {
+        matches!(self.body, ImageBody::Complete(_))
+    }
+
+    /// Whether `[at, at+len)` is in bounds and readable from the target.
+    pub fn is_present(&self, at: usize, len: usize) -> bool {
+        self.read(at, len).is_some()
+    }
+
+    /// `len` bytes at RVA `at`, or `None` when out of bounds or any block of
+    /// the range is paged out. Blocks are fetched on first use.
+    pub fn read(&self, at: usize, len: usize) -> Option<Cow<'_, [u8]>> {
+        let end = at.checked_add(len)?;
+        if end > self.size {
+            return None;
+        }
+        match &self.body {
+            ImageBody::Complete(bytes) => Some(Cow::Borrowed(&bytes[at..end])),
+            ImageBody::Lazy(lazy) => {
+                if len == 0 {
+                    return Some(Cow::Borrowed(&[]));
+                }
+                let mut blocks = lazy.blocks.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut out = Vec::with_capacity(len);
+                for index in at / IMAGE_BLOCK..=(end - 1) / IMAGE_BLOCK {
+                    let block = match blocks.entry(index) {
+                        Entry::Occupied(entry) => entry.into_mut(),
+                        Entry::Vacant(entry) => entry.insert(lazy.fetch(index, self.size)?),
+                    };
+                    let start = at.saturating_sub(index * IMAGE_BLOCK);
+                    let stop = (end - index * IMAGE_BLOCK).min(block.len());
+                    out.extend_from_slice(&block[start..stop]);
+                }
+                Some(Cow::Owned(out))
+            }
+        }
+    }
+
+    /// The image's [`CodeLayout`]. Its metadata pointer is relocated to the
+    /// header's `ImageBase`, which the loader rewrites to where it mapped the
+    /// image, so an in-memory image and its file both resolve it.
+    pub fn code_layout(&self) -> Option<CodeLayout> {
+        let base = image_base(&PeView::from_bytes(self.headers()).ok()?);
+        read_code_layout(base, &|rva, buf| {
+            let bytes = usize::try_from(rva)
+                .ok()
+                .and_then(|rva| self.read(rva, buf.len()))
+                .ok_or(Error::BadVirtualAddress(VirtAddr(base.wrapping_add(rva))))?;
+            buf.copy_from_slice(&bytes);
+            Ok(())
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// Fill `buf` with the bytes at `rva` of this image, an image file
+    /// ([`read_pe_image_from_file`]), as the loader maps it at `base`:
+    /// relocated there, with the header's `ImageBase` rewritten to say so.
+    /// Only bytes that loading leaves as the file has them are read: the
+    /// headers and the sections the image does not write, less what the
+    /// loader fills in ([`Self::loader_written`]). Returns how many leading
+    /// bytes of `buf` were filled; fewer than its length means the next byte
+    /// is not one of them.
+    pub fn read_loaded(&self, base: u64, rva: usize, buf: &mut [u8]) -> usize {
+        let Ok(view) = PeView::from_bytes(self.headers()) else {
+            return 0;
+        };
+        let length = self.loaded_as_file(&view, rva).min(buf.len());
+        if length == 0 {
+            return 0;
+        }
+        // An address the loader relocates may start up to seven bytes before
+        // the range or end up to seven after it, and is relocated whole.
+        let start = rva.saturating_sub(7);
+        let end = (rva + length + 7).min(self.size);
+        let Some(window) = self.read(start, end - start) else {
+            return 0;
+        };
+        let mut window = window.into_owned();
+        let delta = base.wrapping_sub(image_base(&view));
+        if delta != 0
+            && let Some(directory) = view.data_directory().get(IMAGE_DIRECTORY_ENTRY_BASERELOC)
+            && let Some(relocations) =
+                self.read(directory.VirtualAddress as usize, directory.Size as usize)
+        {
+            apply_base_relocations(&relocations, delta, start as u32, &mut window);
+        }
+        if let Some(field) = image_base_field(self.headers()) {
+            let value = base.to_le_bytes();
+            for (at, byte) in field.zip(value) {
+                if let Some(slot) = at.checked_sub(start).and_then(|at| window.get_mut(at)) {
+                    *slot = byte;
+                }
+            }
+        }
+        buf[..length].copy_from_slice(&window[rva - start..rva - start + length]);
+        length
+    }
+
+    /// How many bytes from `rva` on loading leaves as this image file has
+    /// them (see [`Self::read_loaded`]); 0 when the byte at `rva` is not one.
+    /// A writable section holds what the process wrote, not the file's
+    /// values. A section is mapped to the next multiple of the section
+    /// alignment, its bytes past the file's zero.
+    fn loaded_as_file(&self, view: &PeView<'_>, rva: usize) -> usize {
+        let (size_of_headers, alignment) = match view.optional_header() {
+            Wrap::T32(header) => (header.SizeOfHeaders, header.SectionAlignment),
+            Wrap::T64(header) => (header.SizeOfHeaders, header.SectionAlignment),
+        };
+        let mapped_end = |end: u32| end.next_multiple_of(alignment.max(1)) as usize;
+        let end = if rva < mapped_end(size_of_headers) {
+            mapped_end(size_of_headers)
+        } else {
+            let section = view.section_headers().iter().find_map(|section| {
+                let start = section.VirtualAddress as usize;
+                let end = mapped_end(
+                    section
+                        .VirtualAddress
+                        .saturating_add(section.VirtualSize.max(section.SizeOfRawData)),
+                );
+                (start..end)
+                    .contains(&rva)
+                    .then_some((section.Characteristics, end))
+            });
+            match section {
+                Some((characteristics, end)) if characteristics & IMAGE_SCN_MEM_WRITE == 0 => end,
+                _ => return 0,
+            }
+        };
+        let mut end = end.min(self.size);
+        for written in self.loader_written(view) {
+            if written.contains(&rva) {
+                return 0;
+            }
+            if written.start > rva {
+                end = end.min(written.start);
+            }
+        }
+        end.saturating_sub(rva)
+    }
+
+    /// The RVA ranges of this image file that the loader writes in sections
+    /// the image does not: the import address table, which it binds, and
+    /// the function pointers its load config names for the control-flow
+    /// guard checks and dispatches, which it points at the system's.
+    fn loader_written(&self, view: &PeView<'_>) -> Vec<Range<usize>> {
+        let directory = |index: usize| {
+            view.data_directory()
+                .get(index)
+                .filter(|directory| directory.VirtualAddress != 0 && directory.Size != 0)
+                .map(|directory| {
+                    let start = directory.VirtualAddress as usize;
+                    start..start + directory.Size as usize
+                })
+        };
+        let mut written: Vec<Range<usize>> =
+            directory(IMAGE_DIRECTORY_ENTRY_IAT).into_iter().collect();
+        let Some(config) = directory(IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG) else {
+            return written;
+        };
+        let (fields, width) = match view.optional_header() {
+            Wrap::T64(_) => (LOAD_CONFIG_LOADER_POINTERS, 8),
+            Wrap::T32(_) => (LOAD_CONFIG32_LOADER_POINTERS, 4),
+        };
+        let read = |at: usize, width: usize| {
+            let bytes = self.read(at, width)?;
+            let mut value = [0u8; 8];
+            value[..width].copy_from_slice(&bytes);
+            Some(u64::from_le_bytes(value))
+        };
+        let Some(size) = read(config.start, 4) else {
+            return written;
+        };
+        let base = image_base(view);
+        for field in fields {
+            if (size as usize) < field + width {
+                continue;
+            }
+            let slot = read(config.start + field, width)
+                .filter(|slot| *slot != 0)
+                .and_then(|slot| slot.checked_sub(base));
+            if let Some(slot) = slot.and_then(|slot| usize::try_from(slot).ok()) {
+                written.push(slot..slot + width);
+            }
+        }
+        written
+    }
+}
+
+impl LazyImage {
+    fn fetch(&self, index: usize, size: usize) -> Option<Box<[u8]>> {
+        let start = index * IMAGE_BLOCK;
+        let mut block = vec![0u8; IMAGE_BLOCK.min(size - start)];
+        (self.read)(start, &mut block).ok()?;
+        Some(block.into_boxed_slice())
+    }
+}
+
+/// Bytes of a module's headers read before the section table's end is known.
+/// A normally linked image keeps its DOS stub, NT headers, and section table
+/// well inside this; only an image whose table runs past it costs a second
+/// read.
+const PE_HEADER_PROBE: usize = 0x400;
+
+/// Where the section table of the headers in `probe` ends, or `None` when
+/// the NT headers themselves extend past the probe. A buffer that is not a
+/// PE ends at the probe: reading more of it changes nothing.
+pub fn pe_headers_end(probe: &[u8]) -> Option<usize> {
+    if probe.len() < 0x40 || &probe[..2] != b"MZ" {
+        return Some(probe.len());
+    }
+    let e_lfanew = read_u32(probe, 0x3c) as usize;
+    let nt = probe.get(e_lfanew..e_lfanew.checked_add(24)?)?;
+    if &nt[..4] != b"PE\0\0" {
+        return Some(probe.len());
+    }
+    let sections = read_u16(nt, 6) as usize;
+    let optional = read_u16(nt, 20) as usize;
+    Some(e_lfanew + 24 + optional + sections * 40)
+}
+
+/// Read a module's headers into a page-sized buffer, as `PeView` wants them,
+/// with a probe-sized first read and a second only when the section table
+/// extends past it. The page tail beyond the table stays zero; nothing in it
+/// is consulted.
+pub fn read_pe_header_page<B: MemoryOps<PhysAddr>>(
+    base_address: VirtAddr,
+    memory: &memory::AddressSpace<'_, B>,
+) -> Result<HeaderPage> {
+    read_pe_header_page_with(&|address, buf| memory.read_bytes(base_address + address, buf))
+}
+
+/// [`read_pe_header_page`] over a reader addressed by RVA.
+fn read_pe_header_page_with(read: &dyn Fn(u64, &mut [u8]) -> Result<()>) -> Result<HeaderPage> {
+    let mut header_buf = HeaderPage::zeroed();
+    read(0, &mut header_buf[..PE_HEADER_PROBE])?;
+    let end = pe_headers_end(&header_buf[..PE_HEADER_PROBE])
+        .unwrap_or(PAGE_SIZE)
+        .min(PAGE_SIZE);
+    if end > PE_HEADER_PROBE {
+        read(
+            PE_HEADER_PROBE as u64,
+            &mut header_buf[PE_HEADER_PROBE..end],
+        )?;
+    }
+    Ok(header_buf)
+}
+
+/// `SizeOfImage` of either PE format.
+pub fn size_of_image(view: &PeView<'_>) -> u32 {
+    match view.optional_header() {
+        Wrap::T32(header) => header.SizeOfImage,
+        Wrap::T64(header) => header.SizeOfImage,
+    }
+}
+
+/// Preferred `ImageBase` of either PE format.
+pub fn image_base(view: &PeView<'_>) -> u64 {
+    match view.optional_header() {
+        Wrap::T32(header) => u64::from(header.ImageBase),
+        Wrap::T64(header) => header.ImageBase,
+    }
+}
+
+/// `CHPEMetadataPointer` in `IMAGE_LOAD_CONFIG_DIRECTORY64`: a virtual
+/// address, relocated like the image.
+const LOAD_CONFIG_CHPE_METADATA: usize = 0xc8;
+/// The same pointer in `IMAGE_LOAD_CONFIG_DIRECTORY32`, 4 bytes wide.
+const LOAD_CONFIG32_CHPE_METADATA: usize = 0x7c;
+/// The `IMAGE_LOAD_CONFIG_DIRECTORY64` fields that hold the address of a
+/// function pointer the loader fills: `GuardCFCheckFunctionPointer`,
+/// `GuardCFDispatchFunctionPointer`, `GuardRFFailureRoutineFunctionPointer`,
+/// `GuardRFVerifyStackPointerFunctionPointer`, the three XFG check and
+/// dispatch pointers, and `GuardMemcpyFunctionPointer`.
+const LOAD_CONFIG_LOADER_POINTERS: [usize; 8] =
+    [0x70, 0x78, 0xd8, 0xe8, 0x118, 0x120, 0x128, 0x138];
+/// The same fields in `IMAGE_LOAD_CONFIG_DIRECTORY32`, 4 bytes wide.
+const LOAD_CONFIG32_LOADER_POINTERS: [usize; 8] = [0x48, 0x4c, 0x84, 0x90, 0xac, 0xb0, 0xb4, 0xbc];
+/// More range entries than any image has; bounds a corrupt count.
+const MAX_CODE_RANGES: u32 = 1 << 16;
+/// `IMAGE_ARM64EC_METADATA` through `ExtraRFETable` (+0x40) and
+/// `ExtraRFETableSize` (+0x44).
+const ARM64EC_METADATA_EXTRA_RFE: usize = 0x40;
+const ARM64EC_METADATA_SIZE: usize = 0x48;
+
+/// Which instruction set each part of an image holds: the header's machine,
+/// and for a hybrid image, the code-range map in its load config. An ARM64X
+/// or ARM64EC image's map (`IMAGE_ARM64EC_METADATA`) types each range ARM64,
+/// ARM64EC, or AMD64; an ARM64EC image's header says AMD64 though most of its
+/// code is ARM64. A CHPE x86 image (`IMAGE_CHPE_METADATA_X86`, the x86 system
+/// DLLs of ARM64 Windows) marks the ranges compiled to native ARM64 code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeLayout {
+    machine: CodeMachine,
+    /// `(start RVA, end RVA, machine)`, sorted by start.
+    ranges: Vec<(u32, u32, CodeMachine)>,
+    /// An ARM64EC or ARM64X image's second runtime-function table
+    /// (`ExtraRFETable`), for the code the header's machine does not
+    /// describe; see [`Self::runtime_functions`].
+    extra_runtime_functions: Option<(u32, u32)>,
+}
+
+impl CodeLayout {
+    pub fn machine_at(&self, rva: u32) -> CodeMachine {
+        let index = self.ranges.partition_point(|&(start, _, _)| start <= rva);
+        index
+            .checked_sub(1)
+            .map(|index| self.ranges[index])
+            .filter(|&(_, end, _)| rva < end)
+            .map_or(self.machine, |(_, _, machine)| machine)
+    }
+
+    /// The RVA and size of the runtime functions (`.pdata`) for code of
+    /// `machine`, given the image's `exception` directory. A hybrid image
+    /// has one table per instruction set: the exception directory holds the
+    /// header machine's, `ExtraRFETable` the other's. An ARM64X image loaded
+    /// into an x64 process has its header rewritten to AMD64 and the two
+    /// swapped, so which is which follows the header, not the file.
+    pub fn runtime_functions(
+        &self,
+        machine: CodeMachine,
+        exception: Option<(u32, u32)>,
+    ) -> Option<(u32, u32)> {
+        if machine == self.machine {
+            exception
+        } else {
+            self.extra_runtime_functions
+        }
+    }
+}
+
+/// Read an image's [`CodeLayout`] through `read`, which reads at an RVA of
+/// the image mapped at `base`. `None` when the header names no machine this
+/// debugger decodes.
+pub fn read_code_layout(
+    base: u64,
+    read: &dyn Fn(u64, &mut [u8]) -> Result<()>,
+) -> Result<Option<CodeLayout>> {
+    let headers = read_pe_header_page_with(read)?;
+    let view = PeView::from_bytes(&*headers)?;
+    let machine = match view.file_header().Machine {
+        IMAGE_FILE_MACHINE_I386 => CodeMachine::X86,
+        IMAGE_FILE_MACHINE_AMD64 => CodeMachine::Amd64,
+        IMAGE_FILE_MACHINE_ARM64 => CodeMachine::Arm64,
+        _ => return Ok(None),
+    };
+    let mut layout = CodeLayout {
+        machine,
+        ranges: Vec::new(),
+        extra_runtime_functions: None,
+    };
+    let (field, width) = match view.optional_header() {
+        Wrap::T64(_) => (LOAD_CONFIG_CHPE_METADATA, 8),
+        Wrap::T32(_) => (LOAD_CONFIG32_CHPE_METADATA, 4),
+    };
+    let config = view
+        .data_directory()
+        .get(IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG)
+        .copied();
+    let Some(config) = config.filter(|config| config.VirtualAddress != 0) else {
+        return Ok(Some(layout));
+    };
+    let mut size = [0u8; 4];
+    read(u64::from(config.VirtualAddress), &mut size)?;
+    if (u32::from_le_bytes(size) as usize) < field + width {
+        return Ok(Some(layout));
+    }
+    let mut pointer = [0u8; 8];
+    read(
+        u64::from(config.VirtualAddress) + field as u64,
+        &mut pointer[..width],
+    )?;
+    let metadata = u64::from_le_bytes(pointer);
+    let Some(metadata_rva) = metadata.checked_sub(base).filter(|_| metadata != 0) else {
+        return Ok(Some(layout));
+    };
+    // A CHPE x86 image's metadata has the map and nothing this reads after
+    // it; an ARM64EC image's goes on to its second runtime-function table.
+    let mut header = [0u8; ARM64EC_METADATA_SIZE];
+    let header_len = if machine == CodeMachine::X86 {
+        12
+    } else {
+        ARM64EC_METADATA_SIZE
+    };
+    read(metadata_rva, &mut header[..header_len])?;
+    if machine != CodeMachine::X86 {
+        let table = read_u32(&header, ARM64EC_METADATA_EXTRA_RFE);
+        let size = read_u32(&header, ARM64EC_METADATA_EXTRA_RFE + 4);
+        layout.extra_runtime_functions = (table != 0 && size != 0).then_some((table, size));
+    }
+    let (map_rva, count) = (read_u32(&header, 4), read_u32(&header, 8));
+    if count == 0 || count > MAX_CODE_RANGES {
+        return Ok(Some(layout));
+    }
+    let mut entries = vec![0u8; count as usize * 8];
+    read(u64::from(map_rva), &mut entries)?;
+    layout.ranges = entries
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .filter_map(|entry| {
+            let (offset, length) = (read_u32(entry, 0), read_u32(entry, 4));
+            let (start, machine) = if machine == CodeMachine::X86 {
+                // Bit 0 marks native code; the rest of the offset is the start.
+                let native = offset & 1 != 0;
+                (
+                    offset & !1,
+                    if native {
+                        CodeMachine::Arm64
+                    } else {
+                        CodeMachine::X86
+                    },
+                )
+            } else {
+                // The low two bits type the range: ARM64, ARM64EC, or AMD64.
+                let machine = match offset & 3 {
+                    0 | 1 => CodeMachine::Arm64,
+                    2 => CodeMachine::Amd64,
+                    _ => return None,
+                };
+                (offset & !3, machine)
+            };
+            Some((start, start.saturating_add(length), machine))
+        })
+        .collect();
+    layout.ranges.sort_unstable_by_key(|&(start, _, _)| start);
+    Ok(Some(layout))
+}
+
+/// Open a module image in guest memory: the headers are read now, the rest
+/// on demand through `read`, which reads `buf.len()` bytes at a virtual
+/// address of the module's address space.
+pub fn read_pe_image(
+    base_address: VirtAddr,
+    read: impl Fn(VirtAddr, &mut [u8]) -> Result<()> + Send + Sync + 'static,
+) -> Result<PeImage> {
+    let headers = read_pe_header_page_with(&|address, buf| read(base_address + address, buf))?;
+    let size = size_of_image(&PeView::from_bytes(&headers)?) as usize;
+    Ok(PeImage {
+        size,
+        body: ImageBody::Lazy(LazyImage {
+            headers: Box::new(headers),
+            read: Box::new(move |rva, buf| read(base_address + rva as u64, buf)),
+            blocks: Mutex::new(HashMap::new()),
+        }),
+    })
+}
+
+/// `len` bytes at `rva` of `image`, or an error naming `what` was being read
+/// there.
+fn read_image_bytes<'a>(
+    image: &'a PeImage,
+    rva: u32,
+    len: usize,
+    what: &str,
+) -> Result<Cow<'a, [u8]>> {
+    let start = rva as usize;
+    if start.checked_add(len).is_none_or(|end| end > image.size) {
+        return Err(Error::DebugInfo(format!(
+            "{what} at RVA {rva:#x} ({len:#x} bytes) lies outside SizeOfImage"
+        )));
+    }
+    image.read(start, len).ok_or_else(|| {
+        Error::DebugInfo(format!(
+            "{what} at RVA {rva:#x} ({len:#x} bytes) is not resident"
+        ))
+    })
+}
+
+/// The NUL-terminated string at `rva` of `image`, up to 4096 bytes, shown
+/// lossily when not UTF-8. It is read in pieces that stop at each block end,
+/// so a string that ends just before a paged-out block still reads.
+fn read_image_c_string(image: &PeImage, rva: u32, what: &str) -> Result<String> {
+    const CHUNK: usize = 128;
+    const MAX_LENGTH: usize = 4096;
+    let mut bytes = Vec::new();
+    let mut at = rva as usize;
+    while bytes.len() < MAX_LENGTH {
+        let len = CHUNK
+            .min(IMAGE_BLOCK - at % IMAGE_BLOCK)
+            .min(MAX_LENGTH - bytes.len())
+            .min(image.size.saturating_sub(at));
+        if len == 0 {
+            break;
+        }
+        let chunk = image
+            .read(at, len)
+            .ok_or_else(|| Error::DebugInfo(format!("{what} at RVA {rva:#x} is not resident")))?;
+        if let Some(end) = chunk.iter().position(|byte| *byte == 0) {
+            bytes.extend_from_slice(&chunk[..end]);
+            return Ok(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        bytes.extend_from_slice(&chunk);
+        at += len;
+    }
+    Err(Error::DebugInfo(format!(
+        "{what} at RVA {rva:#x} is unterminated or longer than {MAX_LENGTH} bytes"
+    )))
+}
+
+/// Read the export directory and its named and ordinal-only exports from a
+/// mapped module image. The image remains lazy: only the export directory,
+/// address tables, and strings are fetched. A directory entry with a zero
+/// RVA or size (most drivers') means the image exports nothing.
+pub fn read_pe_exports(image: &PeImage, base: VirtAddr) -> Result<ImageExports> {
+    const DIRECTORY_SIZE: usize = 40;
+    const MAX_EXPORTS: usize = 1_000_000;
+
+    let headers = PeView::from_bytes(image.headers())?;
+    let Some(entry) = headers
+        .data_directory()
+        .get(IMAGE_DIRECTORY_ENTRY_EXPORT)
+        .filter(|entry| entry.VirtualAddress != 0 && entry.Size != 0)
+    else {
+        return Ok(ImageExports {
+            directory: None,
+            exports: Vec::new(),
+        });
+    };
+    let directory_rva = entry.VirtualAddress;
+    let directory_size = entry.Size;
+    if directory_size < DIRECTORY_SIZE as u32 {
+        return Err(Error::DebugInfo(format!(
+            "export directory size {directory_size:#x} is shorter than \
+             IMAGE_EXPORT_DIRECTORY ({DIRECTORY_SIZE:#x})"
+        )));
+    }
+    let data = read_image_bytes(image, directory_rva, DIRECTORY_SIZE, "export directory")?;
+    let u32_at = |offset| read_u32(&data, offset);
+    let directory = ExportDirectory {
+        name: read_image_c_string(image, u32_at(12), "export DLL name")?,
+        characteristics: u32_at(0),
+        time_date_stamp: u32_at(4),
+        version: (read_u16(&data, 8), read_u16(&data, 10)),
+        ordinal_base: u32_at(16),
+        number_of_functions: u32_at(20),
+        number_of_names: u32_at(24),
+        address_of_functions: u32_at(28),
+        address_of_names: u32_at(32),
+        address_of_name_ordinals: u32_at(36),
+    };
+    let ordinal_base = directory.ordinal_base;
+    let function_count = directory.number_of_functions as usize;
+    let name_count = directory.number_of_names as usize;
+    if function_count > MAX_EXPORTS || name_count > MAX_EXPORTS {
+        return Err(Error::DebugInfo(
+            "PE export count exceeds the safety bound".into(),
+        ));
+    }
+
+    let functions = read_image_bytes(
+        image,
+        directory.address_of_functions,
+        function_count * 4,
+        "export address table",
+    )?;
+    let names = read_image_bytes(
+        image,
+        directory.address_of_names,
+        name_count * 4,
+        "export name table",
+    )?;
+    let ordinals = read_image_bytes(
+        image,
+        directory.address_of_name_ordinals,
+        name_count * 2,
+        "export ordinal table",
+    )?;
+    let mut names_by_function: HashMap<usize, Vec<String>> = HashMap::new();
+    for index in 0..name_count {
+        let name_rva = read_u32(&names, index * 4);
+        let function_index = usize::from(read_u16(&ordinals, index * 2));
+        if function_index >= function_count {
+            return Err(Error::DebugInfo(format!(
+                "PE export name index {function_index} exceeds function count {function_count}"
+            )));
+        }
+        names_by_function
+            .entry(function_index)
+            .or_default()
+            .push(read_image_c_string(image, name_rva, "export name")?);
+    }
+
+    let mut exports = Vec::new();
+    let forwarder_end = directory_rva.saturating_add(directory_size);
+    for index in 0..function_count {
+        let function_rva = read_u32(&functions, index * 4);
+        if function_rva == 0 {
+            continue;
+        }
+        let ordinal = ordinal_base
+            .checked_add(index as u32)
+            .ok_or_else(|| Error::DebugInfo("PE export ordinal overflow".into()))?;
+        let forwarder = (function_rva >= directory_rva && function_rva < forwarder_end)
+            .then(|| read_image_c_string(image, function_rva, "export forwarder"))
+            .transpose()?;
+        let rva = forwarder.is_none().then_some(function_rva);
+        let address = rva.map(|rva| VirtAddr(base.0.saturating_add(u64::from(rva))));
+        let names = names_by_function.remove(&index).unwrap_or_default();
+        if names.is_empty() {
+            exports.push(ModuleExportInfo {
+                ordinal,
+                name: None,
+                rva,
+                address,
+                forwarder,
+            });
+        } else {
+            exports.extend(names.into_iter().map(|name| ModuleExportInfo {
+                ordinal,
+                name: Some(name),
+                rva,
+                address,
+                forwarder: forwarder.clone(),
+            }));
+        }
+    }
+    Ok(ImageExports {
+        directory: Some(directory),
+        exports,
+    })
+}
+
+/// Name of the PE section containing `address` within the image loaded at
+/// `base` (e.g. `.text`), or `None` if `address` isn't in a section or `base`
+/// isn't a readable PE. Reads only the header page, like `read_pe_image`'s
+/// prologue.
+pub fn section_name_at<'a, B: MemoryOps<PhysAddr>>(
+    memory: &memory::AddressSpace<'a, B>,
+    base: VirtAddr,
+    address: VirtAddr,
+) -> Option<String> {
+    let rva = u32::try_from(address.0.checked_sub(base.0)?).ok()?;
+    let header_buf = read_pe_header_page(base, memory).ok()?;
+    let view = PeView::from_bytes(&header_buf).ok()?;
+    for section in view.section_headers() {
+        let va = section.VirtualAddress;
+        let size = section.VirtualSize.max(section.SizeOfRawData);
+        if rva >= va && rva < va.saturating_add(size) {
+            return section.name().ok().map(|s| s.to_string());
+        }
+    }
+    None
+}
+
+/// Read VS_FIXEDFILEINFO from a PE image's resource section in guest memory,
+/// as its file and product version strings (see
+/// [`read_pe_fixed_file_info`]).
+pub fn read_pe_version_info<B: MemoryOps<PhysAddr>>(
+    base: VirtAddr,
+    memory: &memory::AddressSpace<'_, B>,
+) -> Option<(String, String)> {
+    read_pe_fixed_file_info(base, memory).map(|info| version_strings(&info))
+}
+
+/// Read VS_FIXEDFILEINFO, its 13 words, from a PE image's resource section
+/// in guest memory.
+///
+/// Reads only the header page + the `.rsrc` section (not the full image).
+/// Returns `None` if the image has no resources, the resource section is
+/// paged out, or no RT_VERSION resource is present.
+pub fn read_pe_fixed_file_info<B: MemoryOps<PhysAddr>>(
+    base: VirtAddr,
+    memory: &memory::AddressSpace<'_, B>,
+) -> Option<[u32; 13]> {
+    use pelite::image::IMAGE_DIRECTORY_ENTRY_RESOURCE;
+
+    let header_buf = read_pe_header_page(base, memory).ok()?;
+    let view = PeView::from_bytes(&header_buf).ok()?;
+
+    let rsrc_dir = view.data_directory().get(IMAGE_DIRECTORY_ENTRY_RESOURCE)?;
+    let rsrc_rva = rsrc_dir.VirtualAddress;
+    let rsrc_size = (rsrc_dir.Size as usize).min(256 * 1024);
+    if rsrc_size < 16 {
+        return None;
+    }
+
+    let mut rsrc_buf = vec![0u8; rsrc_size];
+    memory
+        .read_bytes(VirtAddr(base.0 + rsrc_rva as u64), &mut rsrc_buf)
+        .ok()?;
+
+    let data_entry_rva = find_rt_version_data_entry(&rsrc_buf, rsrc_rva)?;
+
+    let ver_rva = get_u32(&rsrc_buf, data_entry_rva)?;
+    let ver_size = get_u32(&rsrc_buf, data_entry_rva + 4)? as usize;
+    if !(52..=32 * 1024).contains(&ver_size) {
+        return None;
+    }
+
+    let ver_offset_in_rsrc = (ver_rva as usize).checked_sub(rsrc_rva as usize)?;
+    let ver_data = rsrc_buf.get(ver_offset_in_rsrc..ver_offset_in_rsrc + ver_size)?;
+
+    fixed_file_info(ver_data)
+}
+
+const RT_VERSION: u32 = 16;
+const VS_FIXEDFILEINFO_SIGNATURE: u32 = 0xFEEF04BD;
+
+/// Navigate the resource directory tree (3 levels) to find the
+/// IMAGE_RESOURCE_DATA_ENTRY for the first RT_VERSION resource.
+/// Returns the offset within `rsrc` of the data entry (which holds
+/// the RVA and size of the VS_VERSION_INFO blob).
+fn find_rt_version_data_entry(rsrc: &[u8], rsrc_rva: u32) -> Option<usize> {
+    // Level 0: root directory — find type entry for RT_VERSION
+    let type_entry = find_resource_id_entry(rsrc, 0, RT_VERSION)?;
+    // Level 1: name directory — take first entry
+    let name_entry = first_resource_entry(rsrc, type_entry)?;
+    // Level 2: language directory — take first entry
+    let lang_entry = first_resource_entry(rsrc, name_entry)?;
+
+    // lang_entry should point to a data entry (bit 31 clear)
+    if lang_entry & 0x8000_0000 != 0 {
+        return None;
+    }
+    let data_entry_off = lang_entry as usize;
+    if data_entry_off + 16 > rsrc.len() {
+        return None;
+    }
+
+    // Validate: the RVA should fall within the resource section
+    let rva = get_u32(rsrc, data_entry_off)?;
+    if rva < rsrc_rva || (rva as usize - rsrc_rva as usize) >= rsrc.len() {
+        return None;
+    }
+    Some(data_entry_off)
+}
+
+/// Scan an IMAGE_RESOURCE_DIRECTORY at `dir_off` for an entry with the
+/// given resource ID. Returns the OffsetToData/OffsetToDirectory value
+/// from the matching entry (with the high bit preserved).
+fn find_resource_id_entry(rsrc: &[u8], dir_off: usize, target_id: u32) -> Option<u32> {
+    if dir_off + 16 > rsrc.len() {
+        return None;
+    }
+    let num_named = get_u16(rsrc, dir_off + 12)? as usize;
+    let num_id = get_u16(rsrc, dir_off + 14)? as usize;
+    let entries_start = dir_off + 16;
+    for i in num_named..(num_named + num_id) {
+        let entry_off = entries_start + i * 8;
+        let id = get_u32(rsrc, entry_off)?;
+        if id == target_id {
+            return get_u32(rsrc, entry_off + 4);
+        }
+    }
+    None
+}
+
+/// Return the OffsetToData of the first entry in the directory at the
+/// offset encoded in `parent_entry` (which must have bit 31 set for a
+/// subdirectory).
+fn first_resource_entry(rsrc: &[u8], parent_entry: u32) -> Option<u32> {
+    if parent_entry & 0x8000_0000 == 0 {
+        return None;
+    }
+    let dir_off = (parent_entry & 0x7FFF_FFFF) as usize;
+    if dir_off + 16 > rsrc.len() {
+        return None;
+    }
+    let num_named = get_u16(rsrc, dir_off + 12)? as usize;
+    let num_id = get_u16(rsrc, dir_off + 14)? as usize;
+    if num_named + num_id == 0 {
+        return None;
+    }
+    let first_entry_off = dir_off + 16;
+    get_u32(rsrc, first_entry_off + 4)
+}
+
+/// The 13 words of the VS_FIXEDFILEINFO in a VS_VERSIONINFO blob.
+fn fixed_file_info(data: &[u8]) -> Option<[u32; 13]> {
+    let sig_bytes = VS_FIXEDFILEINFO_SIGNATURE.to_le_bytes();
+    let pos = data.windows(4).position(|w| w == sig_bytes)?;
+    let info = data.get(pos..pos + 52)?;
+    let mut words = [0u32; 13];
+    for (index, word) in words.iter_mut().enumerate() {
+        *word = read_u32(info, index * 4);
+    }
+    Some(words)
+}
+
+/// The file and product versions of a VS_FIXEDFILEINFO, as
+/// `major.minor.build.revision`: each MS word holds major and minor, each
+/// LS word build and revision.
+pub fn version_strings(info: &[u32; 13]) -> (String, String) {
+    let version =
+        |ms: u32, ls: u32| format!("{}.{}.{}.{}", ms >> 16, ms & 0xffff, ls >> 16, ls & 0xffff);
+    (version(info[2], info[3]), version(info[4], info[5]))
+}
+
+/// The `[start, end)` RVAs of the executable sections `view`'s headers
+/// list, clipped to the image's `SizeOfImage`; a section with nothing in the
+/// image is left out.
+pub fn executable_ranges<'a>(view: &impl pelite::pe64::Pe<'a>) -> Vec<(u32, u32)> {
+    let size = view.optional_header().SizeOfImage;
+    view.section_headers()
+        .iter()
+        .filter(|section| section.Characteristics & pelite::image::IMAGE_SCN_MEM_EXECUTE != 0)
+        .map(|section| {
+            let start = section.VirtualAddress;
+            let end = start.saturating_add(section.VirtualSize.max(section.SizeOfRawData));
+            (start, end.min(size))
+        })
+        .filter(|(start, end)| start < end)
+        .collect()
+}
+
+/// Whether `disk` is the file `mapped` was loaded from: the headers agree
+/// except in `OptionalHeader.ImageBase`, which the loader rewrites to the
+/// address it relocated the image to.
+pub fn headers_match_relocated(disk: &[u8], mapped: &[u8]) -> bool {
+    if disk.len() != mapped.len() {
+        return false;
+    }
+    let Some(image_base) = image_base_field(disk) else {
+        return false;
+    };
+    disk[..image_base.start] == mapped[..image_base.start]
+        && disk[image_base.end..] == mapped[image_base.end..]
+}
+
+/// Where `OptionalHeader.ImageBase` lies in `headers`: eight bytes in a
+/// PE32+ header, four in a PE32 one.
+fn image_base_field(headers: &[u8]) -> Option<Range<usize>> {
+    let optional = (get_u32(headers, 0x3c)? as usize).checked_add(24)?;
+    let field = match get_u16(headers, optional)? {
+        0x20b => optional + 24..optional + 32,
+        0x10b => optional + 28..optional + 32,
+        _ => return None,
+    };
+    (field.end <= headers.len()).then_some(field)
+}
+
+/// `IMAGE_REL_BASED_HIGHLOW`: a 32-bit address.
+const IMAGE_REL_BASED_HIGHLOW: u16 = 3;
+/// `IMAGE_REL_BASED_DIR64`: a 64-bit address.
+const IMAGE_REL_BASED_DIR64: u16 = 10;
+
+/// Apply `relocations`, an image's base relocation directory, to `window`,
+/// the image's bytes at `rva`, for the image loaded `delta` (wrapping) above
+/// its preferred base. An address not wholly inside the window is left as
+/// it is; a caller that needs one across the window's edge widens the
+/// window.
+pub fn apply_base_relocations(relocations: &[u8], delta: u64, rva: u32, window: &mut [u8]) {
+    let start = u64::from(rva);
+    let end = start + window.len() as u64;
+    let mut cursor = 0;
+    while let (Some(page), Some(block_size)) = (
+        get_u32(relocations, cursor),
+        get_u32(relocations, cursor + 4),
+    ) {
+        let block_size = block_size as usize;
+        if block_size < 8 || block_size > relocations.len() - cursor {
+            break;
+        }
+        // A block's entries are offsets into its page, and an address at the
+        // page's last offset runs on past the page.
+        let page = u64::from(page);
+        if page < end && page + PAGE_SIZE as u64 + 8 > start {
+            for entry in relocations[cursor + 8..cursor + block_size]
+                .as_chunks::<2>()
+                .0
+            {
+                let entry = u16::from_le_bytes(*entry);
+                let width = match entry >> 12 {
+                    IMAGE_REL_BASED_DIR64 => 8,
+                    IMAGE_REL_BASED_HIGHLOW => 4,
+                    _ => continue,
+                };
+                let at = page + u64::from(entry & 0xfff);
+                if at < start || at + width > end {
+                    continue;
+                }
+                let offset = (at - start) as usize;
+                let field = &mut window[offset..offset + width as usize];
+                if width == 8 {
+                    let value = u64::from_le_bytes(field.try_into().unwrap());
+                    field.copy_from_slice(&value.wrapping_add(delta).to_le_bytes());
+                } else {
+                    let value = u32::from_le_bytes(field.try_into().unwrap());
+                    field.copy_from_slice(&value.wrapping_add(delta as u32).to_le_bytes());
+                }
+            }
+        }
+        cursor += block_size;
+    }
+}
+
+/// Build a complete (hole-free) `PeImage` from an on-disk PE file by mapping its
+/// raw sections to their RVAs: the same layout `read_pe_image` produces from
+/// guest memory, but sourced from the full file. Used to recover read-only data
+/// (e.g. unwind tables) when the in-memory image has paged-out holes.
+pub fn read_pe_image_from_file(path: &Path) -> Result<PeImage> {
+    let data = std::fs::read(path)?;
+    let file = PeFile::from_bytes(&data)?;
+    let (total_size, size_of_headers) = match file.optional_header() {
+        Wrap::T32(header) => (header.SizeOfImage as usize, header.SizeOfHeaders as usize),
+        Wrap::T64(header) => (header.SizeOfImage as usize, header.SizeOfHeaders as usize),
+    };
+    let mut image_buffer = vec![0u8; total_size];
+
+    let headers_size = size_of_headers.min(total_size).min(data.len());
+    image_buffer[..headers_size].copy_from_slice(&data[..headers_size]);
+
+    for section in file.section_headers() {
+        let v_addr = section.VirtualAddress as usize;
+        let raw_ptr = section.PointerToRawData as usize;
+        let raw_size = section.SizeOfRawData as usize;
+        if raw_size == 0 || v_addr + raw_size > total_size || raw_ptr + raw_size > data.len() {
+            continue;
+        }
+        image_buffer[v_addr..v_addr + raw_size].copy_from_slice(&data[raw_ptr..raw_ptr + raw_size]);
+    }
+
+    Ok(PeImage::complete(image_buffer))
+}
+
+/// The file name of an image that no loader names: the stem of its CodeView
+/// PDB, with `.dll` or `.exe` as its header's `Characteristics` say. A
+/// renamed copy of the file keeps its build's PDB name, so the copy and the
+/// image mapped in memory are cached under the same name.
+pub fn image_file_name(pdb_path: &str, characteristics: u16) -> String {
+    let file = pdb_path.rsplit(['\\', '/']).next().unwrap_or(pdb_path);
+    let stem = file.rsplit_once('.').map_or(file, |(stem, _)| stem);
+    let extension = if characteristics & pelite::image::IMAGE_FILE_DLL != 0 {
+        "dll"
+    } else {
+        "exe"
+    };
+    format!("{stem}.{extension}")
+}
+
+/// The symbol-store identity of the PE file `data` read from `path`: the
+/// name it is cached under ([`image_file_name`], or the file's own name when
+/// it has no CodeView record), its `TimeDateStamp`, and its `SizeOfImage`.
+pub fn image_file_identity(path: &Path, data: &[u8]) -> Result<(String, u32, u32)> {
+    let file = PeFile::from_bytes(data)?;
+    let header = file.file_header();
+    let size_of_image = match file.optional_header() {
+        Wrap::T32(optional) => optional.SizeOfImage,
+        Wrap::T64(optional) => optional.SizeOfImage,
+    };
+    let pdb = file
+        .debug()
+        .ok()
+        .and_then(|debug| debug.pdb_file_name())
+        .and_then(|name| name.to_str().ok().map(str::to_string));
+    let name = match pdb {
+        Some(pdb) => image_file_name(&pdb, header.Characteristics),
+        None => path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| Error::InvalidArgument(format!("{} names no file", path.display())))?
+            .to_string(),
+    };
+    Ok((name, header.TimeDateStamp, size_of_image))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        IMAGE_BLOCK, ModuleExportInfo, PE_HEADER_PROBE, PeImage, apply_base_relocations,
+        read_code_layout, read_image_c_string, read_pe_exports, read_pe_header_page, read_pe_image,
+    };
+    use crate::base::error::{Error, Result};
+    use crate::base::memory::{AddressSpace, DTB_IDENTITY, MemoryOps};
+    use crate::base::types::CodeMachine;
+    use crate::base::types::{PhysAddr, VirtAddr};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Identity-mapped memory holding one image at `base`; reads outside it
+    /// fail like an unmapped page. Counts the bytes handed out.
+    struct ImageMemory {
+        base: u64,
+        bytes: Vec<u8>,
+        read: AtomicUsize,
+        /// Bytes past this offset read as unmapped.
+        readable: AtomicUsize,
+    }
+
+    impl ImageMemory {
+        fn new(base: u64, bytes: Vec<u8>) -> Self {
+            Self {
+                base,
+                readable: AtomicUsize::new(bytes.len()),
+                bytes,
+                read: AtomicUsize::new(0),
+            }
+        }
+
+        fn bytes_read(&self) -> usize {
+            self.read.load(Ordering::Relaxed)
+        }
+    }
+
+    impl MemoryOps<PhysAddr> for ImageMemory {
+        fn read_bytes(&self, addr: PhysAddr, buf: &mut [u8]) -> Result<()> {
+            let start = addr
+                .checked_sub(self.base)
+                .filter(|start| {
+                    start + buf.len() as u64 <= self.readable.load(Ordering::Relaxed) as u64
+                })
+                .ok_or(Error::BadPhysicalAddress(addr))? as usize;
+            buf.copy_from_slice(&self.bytes[start..start + buf.len()]);
+            self.read.fetch_add(buf.len(), Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn write_bytes(&self, _addr: PhysAddr, _buf: &[u8]) -> Result<()> {
+            unreachable!()
+        }
+    }
+
+    fn open_image(memory: &Arc<ImageMemory>) -> PeImage {
+        let memory = Arc::clone(memory);
+        read_pe_image(VirtAddr(memory.base), move |address, buf| {
+            AddressSpace::new_amd64(&memory, DTB_IDENTITY).read_bytes(address, buf)
+        })
+        .unwrap()
+    }
+
+    /// A PE32+ image with `.text` at 0x1000 and `.rdata` at 0x2000, each one
+    /// page, filled with distinct bytes.
+    fn synthetic_image() -> Vec<u8> {
+        synthetic_image_with_pe_at(0x80)
+    }
+
+    fn synthetic_image_with_pe_at(pe: usize) -> Vec<u8> {
+        let mut image = vec![0u8; 0x3000];
+        image[..2].copy_from_slice(b"MZ");
+        image[0x3c..0x40].copy_from_slice(&(pe as u32).to_le_bytes());
+        image[pe..pe + 4].copy_from_slice(b"PE\0\0");
+        image[pe + 4..pe + 6].copy_from_slice(&0x8664u16.to_le_bytes());
+        image[pe + 6..pe + 8].copy_from_slice(&2u16.to_le_bytes());
+        image[pe + 20..pe + 22].copy_from_slice(&240u16.to_le_bytes());
+        let opt = pe + 24;
+        image[opt..opt + 2].copy_from_slice(&0x20bu16.to_le_bytes());
+        image[opt + 32..opt + 36].copy_from_slice(&0x1000u32.to_le_bytes());
+        image[opt + 36..opt + 40].copy_from_slice(&0x200u32.to_le_bytes());
+        image[opt + 56..opt + 60].copy_from_slice(&0x3000u32.to_le_bytes());
+        image[opt + 60..opt + 64].copy_from_slice(&0x1000u32.to_le_bytes());
+        image[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
+        let sections = opt + 240;
+        for (index, (name, va, fill)) in [
+            (b".text\0\0\0", 0x1000u32, 0xccu8),
+            (b".rdata\0\0", 0x2000, 0xdd),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let header = sections + 40 * index;
+            image[header..header + 8].copy_from_slice(name);
+            image[header + 8..header + 12].copy_from_slice(&0x1000u32.to_le_bytes());
+            image[header + 12..header + 16].copy_from_slice(&va.to_le_bytes());
+            image[header + 16..header + 20].copy_from_slice(&0x1000u32.to_le_bytes());
+            image[header + 20..header + 24].copy_from_slice(&va.to_le_bytes());
+            image[va as usize..va as usize + 0x1000].fill(fill);
+        }
+        image
+    }
+
+    /// [`synthetic_image`] as a hybrid image of `machine` loaded at `base`: a
+    /// load config in `.rdata` whose `CHPEMetadataPointer` (relocated, as in
+    /// memory) leads to a code map of `ranges` (`StartOffset`, `Length`).
+    fn hybrid_image(machine: u16, base: u64, ranges: &[(u32, u32)]) -> Vec<u8> {
+        let mut image = synthetic_image();
+        let (pe, config, metadata, map) = (0x80, 0x2000usize, 0x2100usize, 0x2200usize);
+        image[pe + 4..pe + 6].copy_from_slice(&machine.to_le_bytes());
+        let directory = pe + 24 + 112 + 10 * 8;
+        image[directory..directory + 4].copy_from_slice(&(config as u32).to_le_bytes());
+        image[directory + 4..directory + 8].copy_from_slice(&0x140u32.to_le_bytes());
+        image[config..config + 0x140].fill(0);
+        image[config..config + 4].copy_from_slice(&0x140u32.to_le_bytes());
+        image[config + 0xc8..config + 0xd0]
+            .copy_from_slice(&(base + metadata as u64).to_le_bytes());
+        image[metadata..metadata + 12].fill(0);
+        image[metadata..metadata + 4].copy_from_slice(&1u32.to_le_bytes());
+        image[metadata + 4..metadata + 8].copy_from_slice(&(map as u32).to_le_bytes());
+        image[metadata + 8..metadata + 12].copy_from_slice(&(ranges.len() as u32).to_le_bytes());
+        for (index, (offset, length)) in ranges.iter().enumerate() {
+            let entry = map + 8 * index;
+            image[entry..entry + 4].copy_from_slice(&offset.to_le_bytes());
+            image[entry + 4..entry + 8].copy_from_slice(&length.to_le_bytes());
+        }
+        image
+    }
+
+    /// A PE32 x86 image at `base` whose CHPE map marks 0x1000..0x1100 native
+    /// and 0x1100..0x1200 x86. The 32-bit optional header keeps its data
+    /// directories at +96 and the load config's CHPEMetadataPointer at 0x7c.
+    fn chpe_x86_image(base: u32) -> Vec<u8> {
+        let mut image = vec![0u8; 0x3000];
+        let mut put = |at: usize, bytes: &[u8]| image[at..at + bytes.len()].copy_from_slice(bytes);
+        let pe = 0x80;
+        put(0, b"MZ");
+        put(0x3c, &(pe as u32).to_le_bytes());
+        put(pe, b"PE\0\0");
+        put(pe + 4, &0x14cu16.to_le_bytes());
+        put(pe + 6, &1u16.to_le_bytes());
+        put(pe + 20, &224u16.to_le_bytes());
+        let opt = pe + 24;
+        put(opt, &0x10bu16.to_le_bytes());
+        put(opt + 28, &base.to_le_bytes());
+        put(opt + 32, &0x1000u32.to_le_bytes());
+        put(opt + 36, &0x200u32.to_le_bytes());
+        put(opt + 56, &0x3000u32.to_le_bytes());
+        put(opt + 60, &0x1000u32.to_le_bytes());
+        put(opt + 92, &16u32.to_le_bytes());
+        put(opt + 96 + 10 * 8, &0x2000u32.to_le_bytes());
+        put(opt + 96 + 10 * 8 + 4, &0x80u32.to_le_bytes());
+        let section = opt + 224;
+        put(section, b".text\0\0\0");
+        put(section + 8, &0x2000u32.to_le_bytes());
+        put(section + 12, &0x1000u32.to_le_bytes());
+        put(section + 16, &0x2000u32.to_le_bytes());
+        put(section + 20, &0x1000u32.to_le_bytes());
+        put(0x2000, &0x80u32.to_le_bytes());
+        put(0x2000 + 0x7c, &(base + 0x2100).to_le_bytes());
+        put(0x2104, &0x2200u32.to_le_bytes());
+        put(0x2108, &2u32.to_le_bytes());
+        put(0x2200, &(0x1000u32 | 1).to_le_bytes());
+        put(0x2204, &0x100u32.to_le_bytes());
+        put(0x2208, &0x1100u32.to_le_bytes());
+        put(0x220c, &0x100u32.to_le_bytes());
+        image
+    }
+
+    fn layout_of(image: &[u8], base: u64) -> super::CodeLayout {
+        let read = |rva: u64, buf: &mut [u8]| {
+            let start = rva as usize;
+            buf.copy_from_slice(&image[start..start + buf.len()]);
+            Ok(())
+        };
+        read_code_layout(base, &read).unwrap().unwrap()
+    }
+
+    /// A hybrid image keeps each instruction set's runtime functions in its
+    /// own table: the exception directory is the header machine's and
+    /// `ExtraRFETable` the other's. An ARM64X image loaded into an x64
+    /// process has its header rewritten to AMD64 and the two swapped; reading
+    /// the file's assignment there sends every lookup to the wrong format.
+    #[test]
+    fn a_hybrid_image_names_each_machines_runtime_functions_by_its_header() {
+        const BASE: u64 = 0x7ff6_0000_0000;
+        let (exception, extra): ((u32, u32), (u32, u32)) = ((0x2800, 0x60), (0x2900, 0x30));
+        for (header, own, other) in [
+            (0xaa64u16, CodeMachine::Arm64, CodeMachine::Amd64),
+            (0x8664, CodeMachine::Amd64, CodeMachine::Arm64),
+        ] {
+            let mut image = hybrid_image(header, BASE, &[(0x1000 | 2, 0x100)]);
+            image[0x2140..0x2144].copy_from_slice(&extra.0.to_le_bytes());
+            image[0x2144..0x2148].copy_from_slice(&extra.1.to_le_bytes());
+            let layout = layout_of(&image, BASE);
+            assert_eq!(
+                layout.runtime_functions(own, Some(exception)),
+                Some(exception)
+            );
+            assert_eq!(
+                layout.runtime_functions(other, Some(exception)),
+                Some(extra)
+            );
+        }
+    }
+
+    /// An ARM64EC image says AMD64 in its header while most of its code is
+    /// ARM64; its code map types each range (ARM64, ARM64EC, AMD64), and
+    /// only an AMD64 range is x64 code.
+    #[test]
+    fn a_hybrid_image_code_map_decides_each_range() {
+        const BASE: u64 = 0x7ff6_0000_0000;
+        let image = hybrid_image(0x8664, BASE, &[(0x1000 | 1, 0x800), (0x1800 | 2, 0x800)]);
+        let layout = layout_of(&image, BASE);
+        assert_eq!(layout.machine_at(0x1000), CodeMachine::Arm64);
+        assert_eq!(layout.machine_at(0x17fc), CodeMachine::Arm64);
+        assert_eq!(layout.machine_at(0x1800), CodeMachine::Amd64);
+        // Outside the map, the header's machine.
+        assert_eq!(layout.machine_at(0x2400), CodeMachine::Amd64);
+
+        let arm64x = hybrid_image(0xaa64, BASE, &[(0x1000 | 2, 0x100)]);
+        let layout = layout_of(&arm64x, BASE);
+        assert_eq!(layout.machine_at(0x1080), CodeMachine::Amd64);
+        assert_eq!(layout.machine_at(0x1100), CodeMachine::Arm64);
+
+        // A CHPE x86 image: bit 0 of an entry marks native ARM64 code.
+        let layout = layout_of(&chpe_x86_image(0x70_0000), 0x70_0000);
+        assert_eq!(layout.machine_at(0x1080), CodeMachine::Arm64);
+        assert_eq!(layout.machine_at(0x1180), CodeMachine::X86);
+        assert_eq!(layout.machine_at(0x2400), CodeMachine::X86);
+
+        // No metadata: the header decides everywhere.
+        let mut plain = synthetic_image();
+        plain[0x84..0x86].copy_from_slice(&0xaa64u16.to_le_bytes());
+        assert_eq!(
+            layout_of(&plain, BASE).machine_at(0x1000),
+            CodeMachine::Arm64
+        );
+    }
+
+    /// An image file reads as the loader maps it away from its preferred
+    /// base: every address its relocation directory names moves with the
+    /// image, one cut by the read's start too, and its header's `ImageBase`
+    /// says where it was loaded. A section reads to its aligned end. The
+    /// import address table and a guard dispatch pointer, which the loader
+    /// fills, and a writable section, which the process changes, are not
+    /// read from the file.
+    #[test]
+    fn an_image_file_reads_relocated_to_where_it_was_loaded() {
+        const PREFERRED: u64 = 0x1_4000_0000;
+        const BASE: u64 = 0x7ff6_1230_0000;
+        let (optional, directories, text, rdata) = (0x98usize, 0x108usize, 0x188, 0x1b0usize);
+        let mut image = synthetic_image();
+        image[optional + 24..optional + 32].copy_from_slice(&PREFERRED.to_le_bytes());
+        image[text + 8..text + 12].copy_from_slice(&0xe00u32.to_le_bytes());
+        image[text + 16..text + 20].copy_from_slice(&0xe00u32.to_le_bytes());
+        image[0x1010..0x1018].copy_from_slice(&(PREFERRED + 0x1234).to_le_bytes());
+        image[0x1020..0x1028].copy_from_slice(&(PREFERRED + 0x5678).to_le_bytes());
+        // A load config whose `GuardCFDispatchFunctionPointer` is at 0x1900.
+        image[0x1400..0x1404].copy_from_slice(&0x80u32.to_le_bytes());
+        image[0x1478..0x1480].copy_from_slice(&(PREFERRED + 0x1900).to_le_bytes());
+        // One block for the `.text` page, at the start of `.rdata`.
+        let block = [0x1000u32.to_le_bytes(), 12u32.to_le_bytes()].concat();
+        image[0x2000..0x2008].copy_from_slice(&block);
+        image[0x2008..0x200a].copy_from_slice(&0xa010u16.to_le_bytes());
+        image[0x200a..0x200c].copy_from_slice(&0xa020u16.to_le_bytes());
+        let directory = |index: usize| directories + 8 * index;
+        image[directory(5)..directory(5) + 8]
+            .copy_from_slice(&[0x2000u32.to_le_bytes(), 12u32.to_le_bytes()].concat());
+        image[directory(12)..directory(12) + 8]
+            .copy_from_slice(&[0x1800u32.to_le_bytes(), 0x10u32.to_le_bytes()].concat());
+        image[directory(10)..directory(10) + 8]
+            .copy_from_slice(&[0x1400u32.to_le_bytes(), 0x80u32.to_le_bytes()].concat());
+        image[rdata + 36..rdata + 40].copy_from_slice(&0xc000_0040u32.to_le_bytes());
+        let file = PeImage::complete(image);
+        let read = |base: u64, rva: usize, len: usize| {
+            let mut buf = vec![0u8; len];
+            let read = file.read_loaded(base, rva, &mut buf);
+            buf.truncate(read);
+            buf
+        };
+
+        let code = read(BASE, 0x1010, 0x18);
+        assert_eq!(code[..8], (BASE + 0x1234).to_le_bytes());
+        assert_eq!(code[8..0x10], [0xcc; 8]);
+        assert_eq!(code[0x10..], (BASE + 0x5678).to_le_bytes());
+        assert_eq!(read(BASE, 0x1014, 4), (BASE + 0x1234).to_le_bytes()[4..]);
+        assert_eq!(
+            read(PREFERRED, 0x1010, 8),
+            (PREFERRED + 0x1234).to_le_bytes()
+        );
+        assert_eq!(read(BASE, optional + 24, 8), BASE.to_le_bytes());
+        // The read stops at the import address table, the guard pointer, and
+        // the writable `.rdata`.
+        assert_eq!(read(BASE, 0x17f8, 0x20), [0xcc; 8]);
+        assert!(read(BASE, 0x1800, 8).is_empty());
+        assert_eq!(read(BASE, 0x18f8, 0x20), [0xcc; 8]);
+        assert_eq!(read(BASE, 0x1908, 8), [0xcc; 8]);
+        assert_eq!(read(BASE, 0x1ff8, 0x10), [0xcc; 8]);
+
+        // A 32-bit image's addresses move by the delta's low half.
+        let block = [0x1000u32.to_le_bytes(), 10u32.to_le_bytes()].concat();
+        let relocations = [&block[..], &0x3004u16.to_le_bytes()].concat();
+        let mut window = [0u8; 8];
+        window[4..].copy_from_slice(&0x0040_1000u32.to_le_bytes());
+        apply_base_relocations(&relocations, 0x10_0000, 0x1000, &mut window);
+        assert_eq!(window[4..], 0x0050_1000u32.to_le_bytes());
+    }
+
+    /// Opening an image costs the header probe; a lookup fetches the one
+    /// block it lands in, and a second lookup in that block costs nothing.
+    #[test]
+    fn lazy_image_fetches_blocks_on_first_use() {
+        let memory = Arc::new(ImageMemory::new(0x10_0000, synthetic_image()));
+        let image = open_image(&memory);
+        assert!(!image.is_complete());
+        assert_eq!(memory.bytes_read(), PE_HEADER_PROBE);
+
+        assert_eq!(&image.read(0x2200, 0x100).unwrap()[..], &[0xdd; 0x100][..]);
+        assert_eq!(memory.bytes_read(), PE_HEADER_PROBE + IMAGE_BLOCK);
+        assert_eq!(&image.read(0x2300, 0x10).unwrap()[..], &[0xdd; 0x10][..]);
+        assert_eq!(memory.bytes_read(), PE_HEADER_PROBE + IMAGE_BLOCK);
+
+        // A range spanning two blocks is stitched from both: the header
+        // page's tail and the first bytes of `.text`.
+        let across = image.read(2 * IMAGE_BLOCK - 4, 8).unwrap();
+        assert_eq!(&across[..4], &[0; 4]);
+        assert_eq!(&across[4..], &[0xcc; 4]);
+        assert!(image.read(0x2ff0, 0x11).is_none());
+    }
+
+    /// A block the target refuses is a hole: the read reports it rather
+    /// than serving zeros, and it is asked for again rather than remembered,
+    /// so a page that is resident by the next lookup is served.
+    #[test]
+    fn lazy_image_reports_unreadable_blocks() {
+        let memory = Arc::new(ImageMemory::new(0x10_0000, synthetic_image()));
+        memory.readable.store(0x2000, Ordering::Relaxed);
+        let image = open_image(&memory);
+
+        assert!(image.is_present(0x1000, 0x10));
+        assert!(!image.is_present(0x2000, 4));
+        assert!(image.read(0x1ff0, 0x20).is_none());
+
+        memory.readable.store(0x3000, Ordering::Relaxed);
+        assert_eq!(&image.read(0x2000, 4).unwrap()[..], &[0xdd; 4][..]);
+    }
+
+    /// A string that ends just before a paged-out block reads, though a
+    /// fixed-size read from its start would run into that block.
+    #[test]
+    fn an_image_string_ending_before_an_unreadable_block_reads() {
+        let mut bytes = synthetic_image();
+        bytes[0x1ff0..0x1ff6].copy_from_slice(b"Alpha\0");
+        let memory = Arc::new(ImageMemory::new(0x10_0000, bytes));
+        memory.readable.store(0x2000, Ordering::Relaxed);
+        let image = open_image(&memory);
+        assert_eq!(
+            read_image_c_string(&image, 0x1ff0, "name").unwrap(),
+            "Alpha"
+        );
+        // One that runs on into the unreadable block does not.
+        assert!(read_image_c_string(&image, 0x1ff8, "name").is_err());
+    }
+
+    /// The header probe alone covers a normally linked image; a section table
+    /// that runs past the probe is completed by a second read instead of
+    /// being parsed from zeros.
+    #[test]
+    fn read_pe_header_page_extends_past_probe_only_when_needed() {
+        let base = 0x10_0000u64;
+        let memory = ImageMemory::new(base, synthetic_image());
+        let space = AddressSpace::new_amd64(&memory, DTB_IDENTITY);
+        let header = read_pe_header_page(VirtAddr(base), &space).unwrap();
+        assert_eq!(memory.bytes_read(), PE_HEADER_PROBE);
+        assert_eq!(&header[..PE_HEADER_PROBE], &memory.bytes[..PE_HEADER_PROBE]);
+
+        let late_pe = PE_HEADER_PROBE - 0x40;
+        let memory = ImageMemory::new(base, synthetic_image_with_pe_at(late_pe));
+        let space = AddressSpace::new_amd64(&memory, DTB_IDENTITY);
+        let header = read_pe_header_page(VirtAddr(base), &space).unwrap();
+        let table_end = late_pe + 24 + 240 + 2 * 40;
+        assert_eq!(memory.bytes_read(), table_end);
+        assert_eq!(&header[..table_end], &memory.bytes[..table_end]);
+        assert!(header[table_end..].iter().all(|&byte| byte == 0));
+    }
+
+    /// `synthetic_image` with an export directory in `.rdata`: ordinal base
+    /// 5, three functions (a named one, a forwarder, an ordinal-only one),
+    /// and a name table whose second entry points at `name_index`.
+    fn image_with_exports(name_index: u16) -> Vec<u8> {
+        const DIRECTORY: usize = 0x2000;
+        let mut image = synthetic_image();
+        image[DIRECTORY..0x3000].fill(0);
+        let put = |image: &mut Vec<u8>, at: usize, bytes: &[u8]| {
+            image[at..at + bytes.len()].copy_from_slice(bytes);
+        };
+        let opt = 0x80 + 24;
+        put(&mut image, opt + 112, &(DIRECTORY as u32).to_le_bytes());
+        put(&mut image, opt + 116, &0x500u32.to_le_bytes());
+        for (offset, value) in [
+            (16, 5u32),
+            (20, 3),
+            (24, 2),
+            (28, 0x2100),
+            (32, 0x2200),
+            (36, 0x2300),
+        ] {
+            put(&mut image, DIRECTORY + offset, &value.to_le_bytes());
+        }
+        for (index, rva) in [0x1010u32, 0x2400, 0x1020].into_iter().enumerate() {
+            put(&mut image, 0x2100 + 4 * index, &rva.to_le_bytes());
+        }
+        put(&mut image, 0x2200, &0x2410u32.to_le_bytes());
+        put(&mut image, 0x2204, &0x2420u32.to_le_bytes());
+        put(&mut image, 0x2300, &0u16.to_le_bytes());
+        put(&mut image, 0x2302, &name_index.to_le_bytes());
+        put(&mut image, 0x2400, b"OTHER.Func\0");
+        put(&mut image, 0x2410, b"Alpha\0");
+        put(&mut image, 0x2420, b"Forwarded\0");
+        image
+    }
+
+    #[test]
+    fn an_image_that_exports_nothing_has_no_exports() {
+        let mut image = image_with_exports(1);
+        let opt = 0x80 + 24;
+        image[opt + 112..opt + 120].fill(0);
+        let exports = read_pe_exports(&PeImage::complete(image), VirtAddr(0x10_0000)).unwrap();
+        assert_eq!(exports.directory, None);
+        assert_eq!(exports.exports, []);
+    }
+
+    #[test]
+    fn exports_cover_named_forwarded_and_ordinal_only_entries() {
+        let base = VirtAddr(0x10_0000);
+        let exports = read_pe_exports(&PeImage::complete(image_with_exports(1)), base).unwrap();
+        assert_eq!(
+            exports.exports,
+            [
+                ModuleExportInfo {
+                    name: Some("Alpha".into()),
+                    ordinal: 5,
+                    rva: Some(0x1010),
+                    address: Some(base + 0x1010u64),
+                    forwarder: None,
+                },
+                ModuleExportInfo {
+                    name: Some("Forwarded".into()),
+                    ordinal: 6,
+                    rva: None,
+                    address: None,
+                    forwarder: Some("OTHER.Func".into()),
+                },
+                ModuleExportInfo {
+                    name: None,
+                    ordinal: 7,
+                    rva: Some(0x1020),
+                    address: Some(base + 0x1020u64),
+                    forwarder: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn export_name_past_the_function_table_is_an_error() {
+        let image = PeImage::complete(image_with_exports(3));
+        assert!(read_pe_exports(&image, VirtAddr(0x10_0000)).is_err());
+    }
+}

@@ -1,78 +1,115 @@
-<picture>
-  <source media="(prefers-color-scheme: light)" srcset="media/logo_light.svg">
-  <img align="right" width="18%" src="media/logo_dark.svg" alt="logo">
-</picture>
+# ntoseye
 
-# ntoseye ![license](https://img.shields.io/badge/license-MIT-blue) [![crates.io](https://img.shields.io/crates/v/ntoseye.svg)](https://crates.io/crates/ntoseye)
+<img align="right" width="32%" src="media/ntoseye.svg" alt="logo">
 
-WinDbg-like kernel debugger for Windows, from Linux and macOS.
+[![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square&labelColor=1c1c1c)](LICENSE)
+[![release](https://img.shields.io/github/v/release/dmaivel/ntoseye?style=flat-square&labelColor=1c1c1c&logo=github&logoColor=white)](https://github.com/dmaivel/ntoseye/releases/latest)
+[![crates.io](https://img.shields.io/crates/v/ntoseye?style=flat-square&labelColor=1c1c1c&logo=rust&logoColor=white)](https://crates.io/crates/ntoseye)
+[![docs.rs](https://img.shields.io/docsrs/ntoseye?style=flat-square&labelColor=1c1c1c&logo=docsdotrs&logoColor=white)](https://docs.rs/ntoseye)
+
+A WinDbg-like Windows debugger for Linux and macOS, with support for kernel-mode and user-mode debugging of virtual and physical machines, and offline crash-dump analysis.
+
+## Showcase
+
+| Debugging via REPL | Debugging via VSCode + DAP |
+| - | - |
+| ![repl](media/repl.webp) | ![vscode](media/vscode.webp) |
 
 ## Features
 
-- WinDbg-compatible REPL commands
-- Kernel and usermode debugging
-- Remote debugging
-- Public/private PDB symbols, source lines, and scoped local-variable metadata
-- Deferred, conditional, pass-count, one-shot, and command-action breakpoints
-- Hardware watchpoints
-- Crash-dump analysis
-- [Four backends](docs/backends.md): Windows KDCOM and KDNET, QEMU's GDB stub, and passive memory introspection
-- [Python SDK and custom commands](docs/sdk.md)
-- [MCP integration](docs/mcp.md)
+- WinDbg-style commands and expressions
+- Public and private PDB symbols, source lines, and local variables
+- Conditional and deferred breakpoints, hardware watchpoints, and breakpoint commands
+- [KD/KDNET, QEMU GDB, and passive memory backends](https://ntoseye.com/setup/backends/)
+- [VBS secure kernel (VTL1) and trustlet inspection](https://ntoseye.com/vbs/secure-kernel/)
+- [Windows hypervisor (Hyper-V) debugging](https://ntoseye.com/vbs/)
+- [Host-served driver images for driver development](https://ntoseye.com/using/kdfiles/)
+- [Python SDK](https://ntoseye.com/scripting/sdk/) and [custom commands](https://ntoseye.com/scripting/commands/)
+- [Editor integration over DAP](https://ntoseye.com/integrations/dap/)
+- [IDA, Binja, Ghidra over the GDB remote protocol](https://ntoseye.com/integrations/gdbserver/)
+- [Agent integration over MCP](https://ntoseye.com/integrations/mcp/)
 
 ### Supported Windows
 
-`ntoseye` supports 64-bit AMD64 and ARM64 Windows 10 and 11 targets.
+| Windows | x64 | x86 | ARM64 |
+| --- | --- | --- | --- |
+| 11 | Yes |  | Yes |
+| 10 | Yes | No | Yes |
+| 8.1 | Yes | No |  |
+| 8 | Untested | No |  |
+| 7 SP1 | Yes | No |  |
+| 7 RTM | Untested | No |  |
+| Vista SP2 | Yes | No |  |
+| Vista SP1 | Untested | No |  |
+| Vista RTM | Untested | No |  |
+| XP SP3 |  | No |  |
+| XP SP2 | Yes | No |  |
+| XP SP1 |  | No |  |
+| XP RTM | Untested | No |  |
+| 2000 |  | No |  |
 
 ### Supported hypervisors
 
-`ntoseye` supports any hypervisor, cloud VM, or physical machine reachable over [KDNET](docs/kdnet.md).
+`ntoseye` supports any target that Windows can debug over [KDNET](https://ntoseye.com/setup/kdnet/). KVM/QEMU, VMware Workstation, and UTM guests additionally get [KDCOM, GDB, and memory-only backends](https://ntoseye.com/setup/backends/).
 
-KVM/QEMU, VMware Workstation, and UTM guests additionally get the [GDB and memory-only backends](docs/backends.md).
-
-### Disclaimer
+### Files and network access
 
 `ntoseye` downloads symbols and images from Microsoft's official symbol server when required. Config, cache, and REPL state live under `~/.ntoseye`:
 
 - `~/.ntoseye/commands/` for custom scripted commands
-- `~/.ntoseye/images/` for binaries downloaded from the VM
-- `~/.ntoseye/symbols/` for PDBs
+- `~/.ntoseye/symbols/` for PDBs and images, a symbol store in the `symstore` layout that WinDbg, IDA, Ghidra, and rizin read
 - `~/.ntoseye/aliases` for command aliases
 - `~/.ntoseye/history` for persistent REPL history
+- `~/.ntoseye/sites/` for breakpoint instructions a session has planted that the target would not take out itself (user-mode sites, and kernel sites over the `gdb` backend), restored by the next attach if that session dies
 
-### Preview
+# Getting started
 
-![ntos](media/preview.png)
+## Install
 
-# Installation
+`ntoseye` runs on Linux (x86-64, ARM64) and macOS on Apple Silicon. Every method below installs the same debugger; they differ in whether it embeds Python, which [custom commands](https://ntoseye.com/scripting/commands/) need, and in what they need installed first:
 
-## Install via shell script
+| Method | Custom commands | Needs |
+|---|---|---|
+| [Shell script](#shell-script) | no | nothing |
+| [uv or pipx](#uv-or-pipx) | yes | Python 3.9 or newer |
+| [cargo](#cargo) | yes | Rust, and Python 3.9 or newer with its development files (`python3-dev` on Debian and Ubuntu) |
+| [pip](#python-sdk), for the Python SDK | yes | Python 3.9 or newer |
+
+### Shell script
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dmaivel/ntoseye/releases/latest/download/ntoseye-installer.sh | sh
 ```
 
-Prebuilt release binaries include the CLI and MCP server but omit embedded Python for portability. Use a Cargo or source build for [in-REPL Python commands](docs/sdk.md); the standalone `pip install ntoseye` SDK needs neither.
+Installs a prebuilt binary to `~/.local/bin`.
 
-## Install via cargo
+### uv or pipx
+
+```bash
+uv tool install ntoseye    # or: pipx install ntoseye
+```
+
+Installs the `ntoseye` command in its own environment.
+
+### cargo
 
 ```bash
 cargo install ntoseye
 ```
 
-`cargo install` and default source builds enable embedded Python and link against the local Python installation.
+Builds the release from crates.io, linked against your Python.
 
-## Install the Python SDK
+### Python SDK
 
-For standalone debugger automation from Python on Linux or Apple Silicon macOS:
+To drive the debugger from your own Python code, install the same package into your project's environment:
 
 ```bash
 pip install ntoseye
 ```
 
-The Python package exposes the debugger through `import ntoseye`; it does not install the `ntoseye` CLI. See the [Python SDK documentation](docs/sdk.md).
+This also puts the `ntoseye` command in that environment. See the [Python SDK documentation](https://ntoseye.com/scripting/sdk/).
 
-## Building
+## Building from source
 
 ```bash
 git clone https://github.com/dmaivel/ntoseye.git
@@ -80,49 +117,66 @@ cd ntoseye
 cargo build --release
 ```
 
-To build without embedded Python:
+Like `cargo install`, a default build embeds Python and needs its development files. To build without it:
 
 ```bash
-cargo build --release --no-default-features --features cli,mcp
+cargo build --release --no-default-features --features cli,mcp,dap,gdbserver
 ```
+
+To build the documentation site, whose command and SDK references are generated from the source (this runs `cargo`):
+
+```bash
+pip install -r docs/requirements.txt
+sphinx-build -b dirhtml -n -W docs docs/_build/html
+```
+
+For a live preview that rebuilds as you edit, `pip install sphinx-autobuild` and run `sphinx-autobuild -b dirhtml docs docs/_build/html` (served at `http://127.0.0.1:8000`).
 
 # Usage
 
 ## Quickstart
 
+If you are using QEMU/KVM, VMware, or UTM, you can use `ntoseye configure` for easy setup. Otherwise, look at [KDNET](https://ntoseye.com/setup/kdnet/) instructions.
+
 1. Power off the Windows VM.
 2. Run `ntoseye configure` and select the hypervisor, virtual machine, and debugger backend. Note the `Run` command it prints.
 3. Start the VM, run the printed guest setup commands in Administrator PowerShell, and reboot.
-4. On Linux, allow `ntoseye` to inspect the hypervisor process. This resets on reboot:
-   ```bash
-   echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
-   ```
-   Alternatively, prefix the printed `Run` command with `sudo`.
-5. Run the command saved in step 2.
+4. Run the command saved in step 2.
 
 Run `ntoseye status` at any time to inspect configured transports, assigned guest ports, endpoints, and launch commands without changing a VM.
 
 ### Hypervisor setup
 
-`ntoseye configure` handles automatic setup for supported libvirt, VMware Workstation, and UTM guests. For plain QEMU or manual configuration, see the [KVM/QEMU](docs/kvm-qemu.md), [VMware](docs/vmware.md), and [UTM](docs/utm.md) setup guides.
+`ntoseye configure` handles automatic setup for supported libvirt, VMware Workstation, and UTM guests. For plain QEMU or manual configuration, see the [KVM/QEMU](https://ntoseye.com/setup/kvm-qemu/), [VMware](https://ntoseye.com/setup/vmware/), and [UTM](https://ntoseye.com/setup/utm/) setup guides.
 
-For any other hypervisor, a cloud VM, or a physical machine, follow the [KDNET guide](docs/kdnet.md) instead; `configure` is not needed.
+For any other target, follow the [KDNET guide](https://ntoseye.com/setup/kdnet/) instead; `configure` is not needed.
 
 ### Not sure which backend to use?
 
-See the [backend comparison table](docs/backends.md).
+See the [backend comparison table](https://ntoseye.com/setup/backends/).
 
 # Documentation
 
-The debugger is self-documented: run `ntoseye --help` for command-line arguments, and press tab in the REPL for completions and descriptions of commands, symbols, and types.
+The full documentation is at [ntoseye.com](https://ntoseye.com). The debugger also documents itself: run `ntoseye --help` for command-line arguments, press tab in the REPL for completions and descriptions of commands, symbols, and types, and run `.hh <command>` for a command's full help. The site's command reference is built from that same help.
 
-- [REPL usage](docs/usage.md): expressions, radix, breakpoints, watchpoints, aliases
-- [Symbols and source](docs/symbols.md): private PDBs, `.sympath`/`.srcpath`, source breakpoints
-- [Choosing a backend](docs/backends.md): kd/kdnet/gdb/memory comparison, per-hypervisor setup for [KVM/QEMU](docs/kvm-qemu.md), [VMware](docs/vmware.md), and [UTM](docs/utm.md)
-- [KDNET](docs/kdnet.md): `kdnet.exe` guest setup, host launch, reboot behaviour
-- [Crash dumps](docs/dumps.md): offline dump analysis, generating dumps, guest tweaks
-- [Python SDK and custom commands](docs/sdk.md)
-- [MCP integration](docs/mcp.md)
+- [Your first session](https://ntoseye.com/get-started/tutorial/): from attaching to stepping
+- [Coming from WinDbg](https://ntoseye.com/get-started/windbg/): what carries over and what differs
+- [Troubleshooting](https://ntoseye.com/get-started/troubleshooting/)
+- [Using the REPL](https://ntoseye.com/using/repl/): command names, aliases
+- [Expressions](https://ntoseye.com/reference/expressions/): numbers and radix, operators, registers and pseudo-registers, symbols, types, locals
+- [Breakpoints and watchpoints](https://ntoseye.com/using/breakpoints/): the breakpoint grammar, conditions, scoping
+- [VBS and the Windows hypervisor](https://ntoseye.com/vbs/): VTL1 and trustlet inspection, the hypervisor's partitions, guests, and hypercalls, stops in the hypervisor
+- [WOW64 processes](https://ntoseye.com/platforms/wow64/)
+- [Memory and paging](https://ntoseye.com/using/memory/): memory sources, writes, paged-out memory
+- [Symbols and source](https://ntoseye.com/using/symbols/): private PDBs, `.sympath`/`.srcpath`, source breakpoints
+- [Choosing a backend](https://ntoseye.com/setup/backends/): kd/kdnet/gdb/memory comparison, per-hypervisor setup for [KVM/QEMU](https://ntoseye.com/setup/kvm-qemu/), [VMware](https://ntoseye.com/setup/vmware/), and [UTM](https://ntoseye.com/setup/utm/)
+- [KDNET](https://ntoseye.com/setup/kdnet/): `kdnet.exe` guest setup, host launch, reboot behavior
+- [Crash dumps](https://ntoseye.com/using/dumps/): offline dump analysis, generating dumps, guest tweaks
+- [Driver replacement map](https://ntoseye.com/using/kdfiles/): `.kdfiles`, loading a driver from the host instead of the guest
+- [Python SDK](https://ntoseye.com/scripting/sdk/) and [custom REPL commands](https://ntoseye.com/scripting/commands/)
+- [MCP integration](https://ntoseye.com/integrations/mcp/)
+- [Editor integration (DAP)](https://ntoseye.com/integrations/dap/): source-level debugging from VS Code, Emacs (dape), or nvim-dap
+- [Disassembler integration (GDB remote protocol)](https://ntoseye.com/integrations/gdbserver/): debugging from IDA, Binary Ninja, Ghidra, gdb, or lldb
 
 # Credits
 

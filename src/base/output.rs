@@ -1,0 +1,692 @@
+//! The REPL's stdout seam. Command rendering writes through `out!` /
+//! `outln!` instead of `print!`/`println!`, so a host that owns stdout for
+//! something else (the stdio MCP transport, which speaks JSON-RPC on it) can
+//! run a command and take its text with [`capture`]. With no capture active
+//! the macros are plain stdout, so the interactive REPL is unchanged.
+//!
+//! Capture is thread-local: the REPL and the MCP session actor are each one
+//! thread, and a capture installed on one never sees output from another.
+//! Transcript logging is process-wide so a `.logopen` command also records
+//! diagnostics emitted by the backend or another command context.
+//!
+//! A command's output starts right under the command line and is set apart
+//! from the next prompt by exactly one blank line, however many blank
+//! lines the command itself ended with. Each stream holds its blank lines
+//! back ([`BlankLines`]) and writes them only once text follows, so the
+//! blank lines between a command's sections still print. The REPL drops
+//! the blank lines a command starts with ([`drop_leading_blank_lines`])
+//! and ends its output with the one blank line before each prompt
+//! ([`separate_prompt`]); a capture, with no prompt to follow, drops both.
+//!
+//! Styling reaches stdout and stderr only when the stream is a terminal,
+//! `NO_COLOR` is unset or empty, and `TERM` is not `dumb`; a redirected
+//! stream gets plain text.
+
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::fmt;
+use std::fs::OpenOptions;
+use std::io::{self, IsTerminal, Write};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex, OnceLock};
+
+use indicatif::{ProgressBar, WeakProgressBar};
+
+thread_local! {
+    /// The active captures, innermost last.
+    static CAPTURES: RefCell<Vec<Capture>> = const { RefCell::new(Vec::new()) };
+}
+
+struct Capture {
+    text: Vec<u8>,
+    /// Whether errors and warnings land here too, or pass on to an
+    /// enclosing capture (or the terminal).
+    diagnostics: bool,
+    blank_lines: BlankLines,
+}
+
+static LOG_SINK: LazyLock<Mutex<Option<std::fs::File>>> = LazyLock::new(|| Mutex::new(None));
+
+/// The blank lines held back from stdout and from the transcript.
+static STDOUT_BLANK_LINES: Mutex<BlankLines> = Mutex::new(BlankLines::new(true));
+static LOG_BLANK_LINES: Mutex<BlankLines> = Mutex::new(BlankLines::new(true));
+
+/// A stream's blank lines, held back until text follows them: what a
+/// stream ends with is never written, nor, from `starting`, what it starts
+/// with.
+struct BlankLines {
+    /// Whether the stream's last line lacks its newline.
+    open: bool,
+    /// How many blank lines are held back.
+    held: usize,
+    /// Whether nothing has been written since the command began, so a
+    /// blank line would start its output.
+    starting: bool,
+}
+
+impl BlankLines {
+    const fn new(starting: bool) -> Self {
+        Self {
+            open: false,
+            held: 0,
+            starting,
+        }
+    }
+
+    /// Pass `text`, the next piece of the stream, on to `write`, holding
+    /// back the blank lines it ends with and writing those held before it.
+    fn pass(&mut self, text: &str, write: &mut impl FnMut(&str)) {
+        let text = if self.starting && !self.open {
+            text.trim_start_matches('\n')
+        } else {
+            text
+        };
+        let body = text.trim_end_matches('\n');
+        let mut newlines = text.len() - body.len();
+        if !body.is_empty() {
+            self.starting = false;
+            for _ in 0..self.held {
+                write("\n");
+            }
+            self.held = 0;
+            write(body);
+            self.open = true;
+        }
+        // The first newline ends the open line; the rest are blank lines.
+        if self.open && newlines > 0 {
+            write("\n");
+            self.open = false;
+            newlines -= 1;
+        }
+        self.held += newlines;
+    }
+
+    /// Write the blank lines held back: text follows them on another stream.
+    fn release(&mut self, write: &mut impl FnMut(&str)) {
+        for _ in 0..self.held {
+            write("\n");
+        }
+        self.held = 0;
+        self.starting = false;
+    }
+
+    /// End the output with one blank line in place of those held back,
+    /// when anything was written since the command began, and start over.
+    fn end(&mut self, write: &mut impl FnMut(&str)) {
+        if !self.starting {
+            if self.open {
+                write("\n");
+                self.open = false;
+            }
+            write("\n");
+        }
+        self.held = 0;
+        self.starting = true;
+    }
+}
+
+/// [`BlankLines`] as a [`fmt::Write`], so formatted text passes through it
+/// piece by piece without being collected first.
+struct HoldBlankLines<'a, W: FnMut(&str)> {
+    blank_lines: &'a mut BlankLines,
+    write: W,
+}
+
+impl<W: FnMut(&str)> fmt::Write for HoldBlankLines<'_, W> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.blank_lines.pass(text, &mut self.write);
+        Ok(())
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Set the next prompt apart from the last command's output by one blank
+/// line, in place of the blank lines the output ended with; none when the
+/// command printed nothing.
+pub fn separate_prompt() {
+    {
+        let mut stdout = io::stdout().lock();
+        lock(&STDOUT_BLANK_LINES).end(&mut |text: &str| {
+            let _ = stdout.write_all(text.as_bytes());
+        });
+        let _ = stdout.flush();
+    }
+    let mut sink = LOG_SINK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut blank_lines = lock(&LOG_BLANK_LINES);
+    match sink.as_mut() {
+        Some(file) => {
+            blank_lines.end(&mut |text: &str| {
+                let _ = file.write_all(text.as_bytes());
+            });
+            let _ = file.flush();
+        }
+        None => blank_lines.end(&mut |_| {}),
+    }
+}
+
+/// Drop the blank lines the next command's output starts with: it follows
+/// the command line.
+pub fn drop_leading_blank_lines() {
+    lock(&STDOUT_BLANK_LINES).starting = true;
+    lock(&LOG_BLANK_LINES).starting = true;
+}
+
+static NO_COLOR: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()));
+static DUMB_TERMINAL: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("TERM").is_some_and(|term| term == "dumb"));
+static STDOUT_STYLED: LazyLock<bool> =
+    LazyLock::new(|| !*NO_COLOR && !*DUMB_TERMINAL && io::stdout().is_terminal());
+static STDERR_STYLED: LazyLock<bool> =
+    LazyLock::new(|| !*NO_COLOR && !*DUMB_TERMINAL && io::stderr().is_terminal());
+
+/// Whether `TERM` is `dumb`: a terminal, such as Emacs's `M-x shell`, that
+/// shows text but acts on no escape sequence, so it gets no styling and the
+/// plain prompt.
+pub fn dumb_terminal() -> bool {
+    *DUMB_TERMINAL
+}
+
+/// How the REPL draws a long task's progress itself (Tern's native bar),
+/// given a handle on the bar to poll and its label.
+pub type ProgressHook = fn(WeakProgressBar, &'static str);
+
+static PROGRESS_HOOK: OnceLock<ProgressHook> = OnceLock::new();
+
+/// Draw [`progress_bar`]s with `hook` from now on.
+pub fn set_progress_hook(hook: ProgressHook) {
+    let _ = PROGRESS_HOOK.set(hook);
+}
+
+static TEXT_HOOK: OnceLock<fn()> = OnceLock::new();
+
+/// Run `hook` before each write of text to the terminal, ahead of
+/// [`printed`] counting it: the REPL ends a finished progress bar there,
+/// so the text takes the bar's row.
+pub fn set_text_hook(hook: fn()) {
+    let _ = TEXT_HOOK.set(hook);
+}
+
+static PRINTED: AtomicU64 = AtomicU64::new(0);
+
+/// How many times text has been written to the terminal: equal readings
+/// mean nothing was printed in between.
+pub fn printed() -> u64 {
+    PRINTED.load(Ordering::Relaxed)
+}
+
+/// A bar of `len` steps for work the user waits on: drawn by the REPL's
+/// terminal when it can, else by indicatif on stderr. A host capturing the
+/// output gets indicatif's.
+pub fn progress_bar(len: u64, label: &'static str) -> ProgressBar {
+    native_progress_bar(len, label).unwrap_or_else(|| ProgressBar::new(len))
+}
+
+/// A bar the REPL's terminal draws itself, labeled by its message or else
+/// `label`; `None` when it can't, so indicatif draws it (on its own or in a
+/// `MultiProgress`). Never while the line editor owns the screen: a
+/// surface opened there would move the cursor under it.
+pub fn native_progress_bar(len: u64, label: &'static str) -> Option<ProgressBar> {
+    let hook = PROGRESS_HOOK
+        .get()
+        .filter(|_| !capturing() && !PROMPTING.load(Ordering::Relaxed))?;
+    let bar = ProgressBar::hidden();
+    bar.set_length(len);
+    hook(bar.downgrade(), label);
+    Some(bar)
+}
+
+static PROMPTING: AtomicBool = AtomicBool::new(false);
+
+/// Run `f`, the line editor reading a line, with native progress bars off:
+/// a completion that builds the symbol index draws indicatif's instead.
+pub fn prompting<T>(f: impl FnOnce() -> T) -> T {
+    PROMPTING.store(true, Ordering::Relaxed);
+    let result = f();
+    PROMPTING.store(false, Ordering::Relaxed);
+    result
+}
+
+fn print_stdout(args: fmt::Arguments<'_>) {
+    if let Some(hook) = TEXT_HOOK.get() {
+        hook();
+    }
+    PRINTED.fetch_add(1, Ordering::Relaxed);
+    // A failed write is dropped, not a panic like `print!`'s: a terminal
+    // that went away must not stop the teardown that releases the guest.
+    let mut stdout = io::stdout().lock();
+    let mut write = |text: &str| {
+        let _ = stdout.write_all(text.as_bytes());
+    };
+    let mut blank_lines = lock(&STDOUT_BLANK_LINES);
+    if *STDOUT_STYLED {
+        let _ = fmt::write(
+            &mut HoldBlankLines {
+                blank_lines: &mut blank_lines,
+                write,
+            },
+            args,
+        );
+    } else {
+        blank_lines.pass(&strip_ansi(&args.to_string()), &mut write);
+    }
+}
+
+fn print_stderr(args: fmt::Arguments<'_>) {
+    if let Some(hook) = TEXT_HOOK.get() {
+        hook();
+    }
+    PRINTED.fetch_add(1, Ordering::Relaxed);
+    // What stdout held back comes before this text.
+    {
+        let mut stdout = io::stdout().lock();
+        lock(&STDOUT_BLANK_LINES).release(&mut |text: &str| {
+            let _ = stdout.write_all(text.as_bytes());
+        });
+        let _ = stdout.flush();
+    }
+    let mut stderr = io::stderr();
+    if *STDERR_STYLED {
+        let _ = stderr.write_fmt(args);
+    } else {
+        let _ = stderr.write_all(strip_ansi(&args.to_string()).as_bytes());
+    }
+}
+
+/// Open the command transcript sink. Every subsequent `out!`, `outln!`,
+/// and diagnostic emission is copied here with terminal escape sequences
+/// removed. Opening a new sink replaces the previous one.
+pub fn open_log(path: impl AsRef<Path>, append: bool) -> io::Result<()> {
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(!append)
+        .append(append)
+        .open(path)?;
+    let mut sink = LOG_SINK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *sink = Some(file);
+    Ok(())
+}
+
+/// Close the command transcript sink, flushing it first when possible;
+/// `false` when none was open.
+pub fn close_log() -> bool {
+    let mut sink = LOG_SINK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(mut file) = sink.take() else {
+        return false;
+    };
+    let _ = file.flush();
+    true
+}
+
+fn log_text(text: &str) {
+    let mut sink = LOG_SINK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(file) = sink.as_mut() else {
+        return;
+    };
+    // A failed transcript must never interfere with debugger output. Keep the
+    // sink installed so a transient error does not silently redirect later
+    // output elsewhere, and flush each write so `.logclose` is optional.
+    lock(&LOG_BLANK_LINES).pass(text, &mut |text: &str| {
+        let _ = file.write_all(text.as_bytes());
+    });
+    let _ = file.flush();
+}
+
+fn log_args(args: fmt::Arguments<'_>) {
+    let mut sink = LOG_SINK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(file) = sink.as_mut() else {
+        return;
+    };
+    let mut text = String::new();
+    let _ = fmt::write(&mut text, args);
+    let clean = strip_ansi(&text);
+    lock(&LOG_BLANK_LINES).pass(&clean, &mut |text: &str| {
+        let _ = file.write_all(text.as_bytes());
+    });
+    let _ = file.flush();
+}
+
+/// Record one command line in the active transcript without echoing it to the
+/// terminal or a capture buffer. The REPL owns the prompt itself, so the
+/// transcript uses a plain `> ` prompt that remains useful in redirected logs.
+pub fn log_input_line(line: &str) {
+    let mut text = String::with_capacity(line.len() + 3);
+    text.push_str("> ");
+    text.push_str(line);
+    text.push('\n');
+    let clean = strip_ansi(&text);
+    log_text(&clean);
+}
+
+/// Append to the innermost capture that takes this kind of text; `false`
+/// when none does.
+fn append_to_capture(args: fmt::Arguments<'_>, diagnostic: bool) -> bool {
+    CAPTURES.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        let Some(capture) = stack
+            .iter_mut()
+            .rev()
+            .find(|capture| !diagnostic || capture.diagnostics)
+        else {
+            return false;
+        };
+        let text = &mut capture.text;
+        let _ = fmt::write(
+            &mut HoldBlankLines {
+                blank_lines: &mut capture.blank_lines,
+                write: |piece: &str| text.extend_from_slice(piece.as_bytes()),
+            },
+            args,
+        );
+        true
+    })
+}
+
+/// Backing call for `out!`/`outln!`: append to the active capture, else
+/// print to stdout.
+pub fn write_fmt(args: fmt::Arguments<'_>) {
+    log_args(args);
+    if !append_to_capture(args, false) {
+        print_stdout(args);
+    }
+}
+
+/// Whether stdout gets styling: it is a terminal, `NO_COLOR` is unset or
+/// empty, and `TERM` is not `dumb`.
+pub fn stdout_styled() -> bool {
+    *STDOUT_STYLED
+}
+
+/// Whether this thread's REPL output goes to a capture rather than the
+/// terminal.
+pub fn capturing() -> bool {
+    CAPTURES.with(|stack| !stack.borrow().is_empty())
+}
+
+/// Whether a `.logopen` transcript records the output.
+pub fn transcript_open() -> bool {
+    LOG_SINK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_some()
+}
+
+/// Backing call for errors and warnings: append to the innermost capture
+/// that takes diagnostics (a capturing host wants everything the user would
+/// have seen), else print to stderr or, for `to_stderr == false`, stdout.
+pub fn write_diagnostic_fmt(args: fmt::Arguments<'_>, to_stderr: bool) {
+    log_args(args);
+    if append_to_capture(args, true) {
+        return;
+    }
+    if to_stderr {
+        print_stderr(args);
+    } else {
+        print_stdout(args);
+    }
+}
+
+/// Backing call for diagnostics that intentionally use stderr on a terminal.
+/// It still participates in the transcript sink, while preserving stderr as
+/// the visible channel outside a captured host.
+pub fn write_stderr_fmt(args: fmt::Arguments<'_>) {
+    log_args(args);
+    print_stderr(args);
+}
+
+/// `print!` that honors an active [`capture`].
+#[cfg_attr(not(feature = "repl"), allow(unused_macros))]
+macro_rules! out {
+    ($($arg:tt)*) => {
+        $crate::base::output::write_fmt(format_args!($($arg)*))
+    };
+}
+
+/// `println!` that honors an active [`capture`].
+#[cfg_attr(not(feature = "repl"), allow(unused_macros))]
+macro_rules! outln {
+    () => {
+        $crate::base::output::write_fmt(format_args!("\n"))
+    };
+    ($($arg:tt)*) => {
+        $crate::base::output::write_fmt(format_args!("{}\n", format_args!($($arg)*)))
+    };
+}
+
+/// Drops the captures from its depth on, so a panic unwinding out of `f`
+/// (e.g. a Python exception converted at the boundary) cannot leave a stale
+/// buffer swallowing the REPL's output.
+struct Restore(usize);
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        CAPTURES.with(|stack| stack.borrow_mut().truncate(self.0));
+    }
+}
+
+fn capture_with<R>(diagnostics: bool, f: impl FnOnce() -> R) -> (R, String) {
+    let depth = CAPTURES.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        stack.push(Capture {
+            text: Vec::new(),
+            diagnostics,
+            blank_lines: BlankLines::new(true),
+        });
+        stack.len() - 1
+    });
+    let restore = Restore(depth);
+    let result = f();
+    let text = CAPTURES
+        .with(|stack| stack.borrow_mut().drain(depth..).next())
+        .map(|capture| capture.text)
+        .unwrap_or_default();
+    drop(restore);
+    (result, strip_ansi(&String::from_utf8_lossy(&text)))
+}
+
+/// Run `f` with this thread's REPL output, errors and warnings included,
+/// captured instead of printed. Returns `f`'s result and the captured text
+/// with terminal styling (ANSI CSI sequences) stripped, since a capturing
+/// host is never a terminal.
+pub fn capture<R>(f: impl FnOnce() -> R) -> (R, String) {
+    capture_with(true, f)
+}
+
+/// [`capture`] for a command whose output is data, not for the user
+/// (`.foreach`'s InCommands): errors and warnings skip this capture and
+/// reach whatever would have shown them without it.
+pub fn capture_output<R>(f: impl FnOnce() -> R) -> (R, String) {
+    capture_with(false, f)
+}
+
+/// Remove ANSI escape sequences: CSI (`ESC [ … final`) and OSC (`ESC ] … BEL`
+/// / `ESC \`), which is everything `owo_colors` emits.
+pub fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                // Parameter/intermediate bytes 0x20..=0x3F, then one final
+                // byte 0x40..=0x7E.
+                for c in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                let mut prev = '\0';
+                for c in chars.by_ref() {
+                    if c == '\x07' || (prev == '\x1b' && c == '\\') {
+                        break;
+                    }
+                    prev = c;
+                }
+            }
+            // A lone ESC or an unknown sequence introducer: drop the ESC and
+            // keep going with whatever followed.
+            Some(other) => out.push(other),
+            None => {}
+        }
+    }
+    out
+}
+
+/// Text from the target (a driver's `DbgPrint`), made safe to print on a
+/// terminal: each control character but tab, newline and carriage return
+/// becomes its visible picture (`ESC` as `␛`), and each C1 control the
+/// replacement character, so the target cannot move the cursor, recolor
+/// the screen, retitle the window or plant a link. Text without one is
+/// returned as is.
+pub fn neutralize_controls(text: &str) -> Cow<'_, str> {
+    let control = |c: char| c.is_control() && !matches!(c, '\t' | '\n' | '\r');
+    if !text.chars().any(control) {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(
+        text.chars()
+            .map(|c| match c {
+                c if !control(c) => c,
+                '\u{7f}' => '\u{2421}',
+                c if c < ' ' => char::from_u32(0x2400 + c as u32).unwrap_or('\u{fffd}'),
+                _ => '\u{fffd}',
+            })
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use owo_colors::OwoColorize;
+
+    #[test]
+    fn capture_collects_and_strips_styling() {
+        let (value, text) = capture(|| {
+            outln!("{} {}", "bold".bold(), "red".bright_red());
+            out!("tail");
+            7
+        });
+        assert_eq!(value, 7);
+        assert_eq!(text, "bold red\ntail");
+    }
+
+    #[test]
+    fn captures_nest_and_restore() {
+        let (_, outer) = capture(|| {
+            outln!("before");
+            let (_, inner) = capture(|| outln!("inner"));
+            assert_eq!(inner, "inner\n");
+            outln!("after");
+        });
+        assert_eq!(outer, "before\nafter\n");
+    }
+
+    #[test]
+    fn capture_output_passes_diagnostics_to_the_enclosing_capture() {
+        let (_, outer) = capture(|| {
+            let (_, inner) = capture_output(|| {
+                outln!("data");
+                write_diagnostic_fmt(format_args!("error: bad\n"), true);
+                let (_, innermost) =
+                    capture(|| write_diagnostic_fmt(format_args!("warning: kept\n"), false));
+                assert_eq!(innermost, "warning: kept\n");
+            });
+            assert_eq!(inner, "data\n");
+        });
+        assert_eq!(outer, "error: bad\n");
+    }
+
+    #[test]
+    fn capture_keeps_blank_lines_between_text_and_drops_the_leading_and_trailing_ones() {
+        let (_, text) = capture(|| {
+            outln!("registers");
+            outln!();
+            out!("stack");
+            out!("\n\n");
+            outln!("  #0\n");
+            outln!();
+        });
+        assert_eq!(text, "registers\n\nstack\n\n  #0\n");
+        let (_, text) = capture(|| {
+            outln!("listing\n");
+            write_diagnostic_fmt(format_args!("error: cut short\n"), true);
+        });
+        assert_eq!(text, "listing\n\nerror: cut short\n");
+        let (_, text) = capture(|| outln!());
+        assert_eq!(text, "");
+        let (_, text) = capture(|| {
+            outln!();
+            outln!("\nfirst");
+        });
+        assert_eq!(text, "first\n");
+    }
+
+    /// Before a prompt, output that ended with any number of blank lines, or
+    /// none, or in mid-line, ends with exactly one; no output gets none.
+    #[test]
+    fn a_prompt_is_set_apart_by_one_blank_line_from_output_only() {
+        let separated = |pieces: &[&str]| {
+            let mut blank_lines = BlankLines::new(true);
+            let mut text = String::new();
+            let mut write = |piece: &str| text.push_str(piece);
+            for piece in pieces {
+                blank_lines.pass(piece, &mut write);
+            }
+            blank_lines.end(&mut write);
+            text
+        };
+        assert_eq!(separated(&["bl\n"]), "bl\n\n");
+        assert_eq!(separated(&["\nstack\n", "  00\n\n\n"]), "stack\n  00\n\n");
+        assert_eq!(separated(&["VM running..."]), "VM running...\n\n");
+        assert_eq!(separated(&[]), "");
+        assert_eq!(separated(&["\n\n"]), "");
+    }
+
+    #[test]
+    fn strip_ansi_handles_osc_and_lone_escape() {
+        assert_eq!(strip_ansi("a\x1b]0;title\x07b"), "ab");
+        assert_eq!(strip_ansi("a\x1b]0;title\x1b\\b"), "ab");
+        assert_eq!(strip_ansi("a\x1b"), "a");
+        assert_eq!(strip_ansi("plain"), "plain");
+    }
+
+    /// A target's text cannot drive the terminal: a link, a color, a title
+    /// or a C1 CSI comes out as visible characters, while the layout a
+    /// print uses (tabs, line ends) and other text pass through.
+    #[test]
+    fn neutralize_controls_shows_escapes_and_keeps_layout() {
+        assert_eq!(
+            neutralize_controls("\x1b]8;;ntoseye://eb\x1b\\click\x1b]8;;\x1b\\"),
+            "\u{241b}]8;;ntoseye://eb\u{241b}\\click\u{241b}]8;;\u{241b}\\"
+        );
+        assert_eq!(
+            neutralize_controls("\x1b[31mred\x07"),
+            "\u{241b}[31mred\u{2407}"
+        );
+        assert_eq!(neutralize_controls("\u{9b}2J\x7f"), "\u{fffd}2J\u{2421}");
+        assert_eq!(neutralize_controls("a\tb\r\nüñ"), "a\tb\r\nüñ");
+    }
+}

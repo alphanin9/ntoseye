@@ -1,0 +1,152 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  check:
+    name: ${{ matrix.os }} (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The feature set the release archives are built with
+          # (dist-workspace.toml): no embedded Python, so the runner needs no
+          # Python toolchain. One entry per target we ship a binary for.
+          - os: ubuntu-latest
+            label: dist
+            features: --no-default-features --features cli,mcp,dap,gdbserver
+          - os: ubuntu-24.04-arm
+            label: dist
+            features: --no-default-features --features cli,mcp,dap,gdbserver
+          - os: macos-latest
+            label: dist
+            features: --no-default-features --features cli,mcp,dap,gdbserver
+          # What `cargo install ntoseye` and a plain `cargo build` produce:
+          # embedded Python linked against the local interpreter. Nothing else
+          # here compiles the `python` feature.
+          - os: ubuntu-latest
+            label: default
+            features: ""
+          - os: macos-latest
+            label: default
+            features: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        if: matrix.label == 'default'
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --locked -p ntoseye ${{ matrix.features }} --all-targets
+      # The debugger core alone, with no host: a core module that reaches into
+      # the REPL, MCP, DAP, gdbserver or Python fails to compile here, which
+      # keeps the hosts layered on the core rather than tangled into it.
+      - name: Clippy, core only
+        if: matrix.os == 'ubuntu-latest' && matrix.label == 'dist'
+        run: cargo clippy --locked -p ntoseye --no-default-features --lib
+      - name: Test
+        run: cargo test --locked -p ntoseye ${{ matrix.features }}
+      # The SDK's type hints compile only with `python-stubs`; this checks each
+      # record field form's hint against the value it renders, with no guest.
+      - name: Test the SDK type hints
+        if: matrix.label == 'default'
+        run: cargo test --locked -p ntoseye --features python-stubs --lib hosts::python::record::hints
+      # What `cargo install ntoseye` builds: the packaged crates alone, which
+      # the release publishes only after the GitHub release and wheels. The
+      # macros are packaged with ntoseye, which resolves them from there.
+      - name: Package
+        if: matrix.os == 'ubuntu-latest' && matrix.label == 'default'
+        run: cargo package --locked -p ntoseye-macros -p ntoseye
+
+  # The documentation site. Nitpicky warnings are errors, so a link to a
+  # renamed page, heading, command, or SDK name fails here. The command
+  # reference comes from this commit's registry; the dist feature set has
+  # every command and needs no Python toolchain to build.
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Dump the command reference
+        run: cargo run --locked --no-default-features --features cli,mcp,dap,gdbserver --bin ntoseye -- --dump-command-reference > "$RUNNER_TEMP/commands.json"
+      - name: Build
+        env:
+          NTOSEYE_COMMAND_REFERENCE: ${{ runner.temp }}/commands.json
+        run: |
+          python -m pip install --quiet -r docs/requirements.txt
+          sphinx-build -b dirhtml -n -W --keep-going docs docs/_build/html
+
+  # The wheel's cdylib, and the only build of the `python-extension` feature:
+  # it links against the interpreter differently than the embedded one above.
+  # The stub is regenerated from the build and must match the checked-in one
+  # the wheel ships; the oldest and newest supported Pythons run the tests.
+  extension:
+    name: python extension (${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.13"]
+    # setup-python has no Python 3.9 for Ubuntu 26.04, which ubuntu-latest
+    # now runs.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check
+        run: cargo check --locked -p ntoseye-py --all-targets
+      - name: Build, regenerating the stub
+        working-directory: python
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet maturin mypy pytest
+          VIRTUAL_ENV="$RUNNER_TEMP/venv" "$RUNNER_TEMP/venv/bin/maturin" develop --locked --generate-stubs
+      - name: Stub is current
+        run: git diff --exit-code -- python/ntoseye/_ntoseye.pyi
+      - name: Type-check the package and examples
+        working-directory: python
+        run: |
+          "$RUNNER_TEMP/venv/bin/mypy" --strict -p ntoseye
+          "$RUNNER_TEMP/venv/bin/mypy" --strict ../examples/standalone
+      - name: Test
+        working-directory: python
+        run: |
+          "$RUNNER_TEMP/venv/bin/pytest" -q tests

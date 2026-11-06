@@ -1,8 +1,8 @@
 [workspace]
-members = ["ntoseye-py"]
+members = ["python", "macros"]
 
 [workspace.package]
-version = "0.27.0"
+version = "0.52.0"
 
 [package]
 name = "ntoseye"
@@ -11,10 +11,12 @@ edition = "2024"
 authors = [ "dmaivel" ]
 description = "WinDbg-like kernel debugger for Windows, from Linux and macOS"
 license = "MIT"
+homepage = "https://ntoseye.com"
 repository = "https://github.com/dmaivel/ntoseye"
 readme = "README.md"
 keywords = [ "virtualization", "introspection", "memory", "windbg", "kvm" ]
 categories = [ "security", "os" ]
+exclude = [ "media/*", "docs/*", "tools/*" ]
 
 [[bin]]
 name = "ntoseye"
@@ -29,16 +31,21 @@ memmap2 = "0.9.9"
 owo-colors = "4.2.3"
 pelite = "0.10.0"
 reqwest = { version = "0.13.4", default-features = false, features = [ "blocking", "rustls", "charset", "http2" ] }
-tabled = { version = "0.21.0", features = [ "ansi" ] }
+tabled = { version = "0.21.0", default-features = false, features = [ "std", "ansi" ] }
 zerocopy = { version = "0.8.31", features = [ "derive" ] }
 rayon = "1.11.0"
 thiserror = "2.0.18"
 hex = "0.4.3"
 derive_more = { version = "2.1.1", features = ["full"] }
 pdb2 = "0.10.1"
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "safe-encode"] }
+undname = "2.1.2"
 spin = "0.12.1"
 dashmap = "6.1.0"
+memchr = "2.8"
 nucleo-matcher = "0.3.1"
+rustc-hash = "2.1"
+smallvec = "1.15"
 single-instance = "0.3.3"
 winnow = "1.0"
 linkme = "0.3"
@@ -48,17 +55,27 @@ aes = "0.8"
 cbc = "0.1"
 getrandom = "0.3"
 hmac = "0.12"
+md-5 = "0.10"
+sha1 = "0.10"
 sha2 = "0.10"
 subtle = "2.6"
+indexmap = "2.14.0"
+# Published with the same version, before this crate.
+ntoseye-macros = { version = "=0.52.0", path = "macros" }
 
-pyo3 = { version = "0.29.0", features = ["abi3-py39"], optional = true }
+pyo3 = { version = "0.29.2", features = ["abi3-py39", "indexmap"], optional = true }
 
 ctrlc = { version = "3.4", optional = true }
-argh = { version = "0.1.13", optional = true }
+clap = { version = "4.6", features = ["derive"], optional = true }
+mimalloc = { version = "0.1.52", features = ["v2"], optional = true }
 dialoguer = { version = "0.12.0", default-features = false, optional = true }
 nu-ansi-term = { version = "0.50.3", optional = true }
 reedline = { version = "0.49.0", optional = true }
+# Exact: the Tern Surface Protocol SDK is pre-1.0, and a minor bump may
+# change the builders the native views use.
+tern-sdk = { version = "=0.1.0", optional = true }
 
+base64 = { version = "0.22", optional = true }
 rmcp = { version = "2.2", features = ["server", "transport-io", "transport-streamable-http-server", "macros"], optional = true }
 schemars = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
@@ -68,35 +85,50 @@ tokio-util = { version = "0.7", default-features = false, optional = true }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"], optional = true }
 tower-http = { version = "0.7", default-features = false, features = ["cors"], optional = true }
 anyhow = { version = "1", optional = true }
+gdbstub = { version = "0.7.10", default-features = false, features = ["std"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.31.3", features = [ "process", "uio" ] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
-# `python-embed` is on by default so a plain `cargo install ntoseye` / `cargo
-# build` gets in-REPL scripting out of the box (like distro gdb/lldb). It links
-# libpython, so the build needs the Python dev lib; to build without it, opt out:
-#   cargo build --no-default-features --features cli,mcp
-default = ["cli", "mcp", "agent", "python-embed"]
-cli = ["dep:ctrlc", "dep:argh", "dep:dialoguer", "dep:nu-ansi-term", "dep:reedline"]
-mcp = ["dep:rmcp", "dep:schemars", "dep:serde", "dep:serde_json", "dep:tokio", "dep:tokio-util", "dep:axum", "dep:tower-http", "dep:anyhow"]
-# `agent` exposes the line-delimited JSON stdio debugger protocol (the
-# `ntoseye agent` subcommand) used by AI agent workflows that need `sudo`. Pulls
-# `python-embed` (not just `python`) so the in-protocol `script.*` commands have
-# a live, auto-initialized interpreter even in a minimal `--features agent` build,
-# and shares the neutral `view` renderer with MCP.
-agent = ["dep:serde", "dep:serde_json", "python-embed"]
-# `python` compiles the SDK. `python-embed` (binary) links libpython and
-# auto-starts the interpreter. `python-extension` is for the ntoseye-py wheel
-# shim (libpython resolved at load). The two libpython modes are mutually
-# exclusive in one build, so don't build the binary and the wheel cdylib together
-# (`cargo build --workspace` fails; build per-package).
-python = ["dep:pyo3"]
-python-embed = ["python", "pyo3/auto-initialize"]
+default = ["cli", "mcp", "dap", "gdbserver", "python-embed"]
+# The command engine (parser, dispatcher, renderers) every host drives; the
+# interactive prompt itself needs `cli`. Off, the crate is the debugger core.
+repl = []
+cli = ["repl", "dep:ctrlc", "dep:clap", "dep:dialoguer", "dep:mimalloc", "dep:nu-ansi-term", "dep:reedline", "dep:tern-sdk"]
+mcp = ["repl", "dep:rmcp", "dep:schemars", "dep:serde", "dep:serde_json", "dep:tokio", "dep:tokio-util", "dep:axum", "dep:tower-http", "dep:anyhow"]
+dap = ["repl", "dep:serde_json", "dep:base64"]
+gdbserver = ["repl", "dep:gdbstub"]
+python = ["repl", "dep:pyo3", "pyo3/multiple-pymethods"]
+python-embed = ["python", "pyo3/auto-initialize", "dep:pyo3-build-config"]
 python-extension = ["python", "pyo3/extension-module"]
+# Emit PyO3 introspection data, from which `maturin` generates the SDK's type
+# stubs (`python/ntoseye/_ntoseye.pyi`).
+python-stubs = ["python", "pyo3/experimental-inspect"]
+
+[build-dependencies]
+pyo3-build-config = { version = "0.29.2", optional = true }
+# build.rs reads the sources for the `#[record]` classes the SDK exports, and
+# for the paths that must not cross the layers upward (with their lines).
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+syn = { version = "2", features = ["full", "visit"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+parking_lot = "0.12"
+# Synthetic hypervisor handlers for the partition-layout tests.
+iced-x86 = { version = "1.21.0", features = ["code_asm"] }
 
 [profile.dev.package.pdb2]
 debug-assertions = false
+
+[lints.clippy]
+too_many_arguments = "allow"
+large_enum_variant = "allow"
 
 [profile.test.package.pdb2]
 debug-assertions = false

@@ -1,0 +1,2176 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::ops::{Range, RangeInclusive};
+use std::sync::Arc;
+
+use ntoseye_macros::record;
+use pelite::pe64::{
+    Pe, PeView,
+    image::{IMAGE_DIRECTORY_ENTRY_EXCEPTION, RUNTIME_FUNCTION},
+};
+
+use crate::arch::{Arch, RegisterMap};
+use crate::{
+    backend::phys::PhysMem,
+    base::{
+        error::{Error, Result},
+        memory::{AddressSpace, DTB_IDENTITY},
+        types::{CodeMachine, Dtb, Keyed, VirtAddr},
+    },
+    nt::{
+        bugchecks::looks_like_kernel_pointer,
+        guest::{Image, ModuleInfo, ProcessInfo, SecureKernel, hypercalls::HypervisorSymbols},
+        pe::{CodeLayout, PeImage},
+        symbols::{
+            CodeFrame, ModuleSymbolStatus, SourceLocation, SymbolStore, format_symbol_with_offset,
+        },
+        target::{
+            ForeignModules, HYPERVISOR_CONTEXT, KTHREAD_STATE_RUNNING, KTHREAD_STATE_TERMINATED,
+            SavedThreadRegisters, SavedVtlContext, Target, ThreadInfo, lookup_register,
+        },
+        trapframe::{decode_kswitch_frame_seed, decode_ktrap_frame_for_thread},
+    },
+};
+
+pub mod amd64;
+mod arm64;
+mod arm64ec;
+mod tracer;
+mod walk;
+mod wow64;
+
+use crate::arch::amd64::unwind::{RUNTIME_FUNCTION_SIZE, runtime_function_at};
+use crate::arch::unwind::{FrameMemory, FrameRegisters, REGISTER_SLOTS, Unwound};
+pub use amd64::{FunctionEntry, RuntimeFunction};
+use amd64::{Lookup, lookup_runtime_function};
+use arm64::{Arm64Lookup, lookup_arm64_runtime_function};
+use walk::{build_recovered_stacktrace_seeded, ensure_module_symbols};
+
+// hard cap on frames walked, so a stack switch (which relaxes the sp-advances
+// guard) can't let a cyclic/corrupt stack spin forever
+const MAX_UNWIND_FRAMES: usize = 1024;
+
+#[derive(Debug, Clone)]
+pub struct ThreadTraceContext {
+    pub description: String,
+    pub active_dtb: Dtb,
+    pub kernel_dtb: Dtb,
+    pub process_dtb: Option<Dtb>,
+    pub kernel_modules: Vec<ModuleInfo>,
+    pub process_modules: Vec<ModuleInfo>,
+    /// An image named from memory in a root none of NT's (the hypervisor),
+    /// mapped in `active_dtb`. Its frames are labeled and unwound like any
+    /// module's, but it is never symbol-fetched: it has no loader entry, and
+    /// every vCPU has its own root, so a fetch would repeat per vCPU.
+    pub foreign_image: Option<ModuleInfo>,
+    /// When `foreign_image` is the Windows hypervisor's, where its functions
+    /// begin and its stacks start, for frames its `.pdata` cannot unwind.
+    pub hypervisor: Option<Arc<HypervisorSymbols>>,
+}
+
+/// How ntoseye recovered a frame. In the SDK, its tag: `current`, `seed`,
+/// `unwind`, `prolog` (read off its function's prolog, for the Windows
+/// hypervisor's code without its file), or `scan`.
+#[record]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameSource {
+    Current,
+    Seed,
+    Unwind,
+    /// Unwound by analyzing its function's prolog, for code whose unwind data
+    /// is not mapped (the Windows hypervisor's without its file).
+    Prolog,
+    Scan,
+}
+
+/// One frame of a stack walk.
+#[record]
+#[derive(Debug, Clone)]
+pub struct StackFrame {
+    /// The instruction pointer.
+    #[record(hex)]
+    pub ip: u64,
+    /// The stack pointer.
+    #[record(hex)]
+    pub sp: u64,
+    /// The symbol at `ip` (`module!procedure+offset`). For an inline frame,
+    /// `module!function`, the function inlined. Empty if no symbol
+    /// resolves.
+    pub symbol: String,
+    /// True for a call that the compiler inlined into the physical frame
+    /// after it, so the call has no stack frame of its own. `symbol` is the
+    /// inlined function, and `ip` and `sp` are those of the physical frame.
+    pub inline: bool,
+    /// How ntoseye recovered the frame.
+    pub source: FrameSource,
+    /// The source line of the frame, if line information resolves it. For
+    /// an inline frame this is the line in the inlined function, and for a
+    /// caller it is the line of the call (see
+    /// [`SymbolStore::frame_source_location`]).
+    pub source_location: Option<SourceLocation>,
+    /// The hardware-pushed machine frame the walk crossed to reach this
+    /// frame: the trap or interrupt that stopped it here. On Windows it is the
+    /// tail of the handler's `_KTRAP_FRAME` (see
+    /// [`crate::nt::trapframe::ktrap_frame_at_machine_frame`]).
+    #[record(skip)]
+    pub machine_frame: Option<u64>,
+    /// Where the frame is in code, and which of the frames there it is.
+    #[record(skip)]
+    pub code: CodeFrame,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StackTrace {
+    pub frames: Vec<StackFrame>,
+    pub truncated: usize,
+}
+
+/// A stack trace paired with the sparse register values recovered for every
+/// frame.
+#[derive(Debug, Clone)]
+pub struct RecoveredFrame {
+    pub frame: StackFrame,
+    pub registers: HashMap<String, u64>,
+    pub frame_base: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecoveredStackTrace {
+    pub frames: Vec<RecoveredFrame>,
+    pub truncated: usize,
+    /// The address space the walk read the stack and resolved symbols in
+    /// ([`ThreadTraceContext::dtb`]), which is what a frame's locals and
+    /// their values live in.
+    pub dtb: Dtb,
+    /// The parked thread (ETHREAD) whose saved context the walk started
+    /// from, `None` for a walk seeded from registers. Selecting another of
+    /// its frames walks the thread again, as `k` does, rather than walking
+    /// from its first frame's registers, which would miss what only the
+    /// thread walk adds (its WOW64 x86 frames).
+    pub thread: Option<VirtAddr>,
+}
+
+impl RecoveredStackTrace {
+    fn new(trace: &ThreadTraceContext) -> Self {
+        Self {
+            frames: Vec::new(),
+            truncated: 0,
+            dtb: trace.dtb(),
+            thread: None,
+        }
+    }
+
+    /// The frames alone, for hosts that only render the walk.
+    pub fn into_stacktrace(self) -> StackTrace {
+        StackTrace {
+            frames: self.frames.into_iter().map(|frame| frame.frame).collect(),
+            truncated: self.truncated,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadStackSource {
+    /// The registers of the vCPU running the thread.
+    Live,
+    /// The VTL0 state the Windows hypervisor saved for the vCPU running the
+    /// thread, which is halted in the hypervisor.
+    SavedVtl0,
+    TrapFrame {
+        address: VirtAddr,
+    },
+    ContextSwitch {
+        kernel_stack: VirtAddr,
+    },
+}
+
+impl ThreadStackSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::SavedVtl0 => "saved VTL0 context",
+            Self::TrapFrame { .. } => "ktrap-frame",
+            Self::ContextSwitch { .. } => "kernel-stack",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ThreadStackTrace {
+    pub source: ThreadStackSource,
+    pub stacktrace: StackTrace,
+}
+
+/// A parked thread's stack paired with the sparse registers recovered for each
+/// frame. See [`build_parked_thread_recovered_stack`].
+#[derive(Clone, Debug)]
+pub struct ThreadRecoveredStack {
+    pub source: ThreadStackSource,
+    pub stacktrace: RecoveredStackTrace,
+}
+
+#[derive(Debug, Clone)]
+struct CachedModule {
+    info: ModuleInfo,
+    // Arc so a frame walk can cheaply take its own handle to the image and
+    // release the borrow on the cache while parsing unwind data
+    image: Arc<PeImage>,
+    executable_ranges: Vec<(u32, u32)>,
+    /// Which instruction set each part of the image is, and where each
+    /// one's runtime functions are; `None` for a machine the walk does not
+    /// know.
+    layout: Option<Arc<CodeLayout>>,
+}
+
+#[derive(Debug, Clone)]
+struct OwnedModule {
+    info: ModuleInfo,
+    dtb: Dtb,
+}
+
+struct StackTracer<'a> {
+    target: &'a Target,
+    trace: &'a ThreadTraceContext,
+    symbols: &'a SymbolStore,
+    memory: AddressSpace<'a, PhysMem>,
+    modules: HashMap<(Dtb, u64), CachedModule>,
+    /// Stack pages read during this trace, by page address; `None` is a
+    /// page the target refused. Without this every 8-byte slot the walk or
+    /// the scan looks at is its own request over the transport.
+    stack_pages: RefCell<HashMap<u64, Option<StackPage>>>,
+    /// The kernel object, whose image is shared across traces.
+    kernel: Option<&'a Image>,
+    /// Each processor's stacks (see `processor_stacks` in `tracer`), read
+    /// the first time an unwind moves sp down.
+    processor_stacks: Option<Vec<Vec<RangeInclusive<u64>>>>,
+}
+
+/// A stack page a trace read. A user-mode minidump may hold only part of a
+/// page (a stack is captured from its stack pointer up).
+struct StackPage {
+    bytes: Box<[u8]>,
+    /// Which bytes were read; `None` when all were.
+    valid: Option<Box<[bool]>>,
+}
+
+/// Whose page-table root a thread runs on.
+enum RootOwner {
+    Kernel,
+    SecureKernel(Arc<SecureKernel>),
+    Process(ProcessInfo),
+    /// None of NT's: the Windows hypervisor, VTL1 code not yet recognized,
+    /// or a root this session cannot place.
+    Unknown,
+}
+
+/// Whether a thread on root `cr3_masked` runs in the kernel's view.
+fn in_kernel_root(debugger: &Target, cr3_masked: u64) -> bool {
+    let kernel_dtb = debugger.kernel_dtb();
+    // Triage dumps use DTB_IDENTITY because page-table walks are impossible,
+    // so force the kernel context regardless of the thread's real CR3.
+    kernel_dtb == DTB_IDENTITY || cr3_masked == kernel_dtb & debugger.arch().dtb_page_mask()
+}
+
+fn root_owner(debugger: &Target, cr3_masked: u64) -> RootOwner {
+    if in_kernel_root(debugger, cr3_masked) {
+        return RootOwner::Kernel;
+    }
+    // A root mapping the secure kernel: its modules and system root, so code
+    // reads, symbols and unwinding use the secure kernel, never NT's.
+    if debugger.recognize_secure_root(cr3_masked)
+        && let Some(secure) = debugger
+            .guest
+            .as_ref()
+            .and_then(|guest| guest.cached_secure_kernel())
+    {
+        return RootOwner::SecureKernel(secure);
+    }
+    match debugger.process_for_cr3(cr3_masked) {
+        Some(process) => RootOwner::Process(process),
+        None => RootOwner::Unknown,
+    }
+}
+
+/// The root a thread on `cr3` runs in, as [`resolve_thread_trace_context`]
+/// reports it (`active_dtb`) without walking any module list: `cr3` without
+/// its PCID and flush bits, or the kernel's view on a target that cannot
+/// walk page tables.
+pub fn thread_root(debugger: &Target, cr3: u64) -> Dtb {
+    let cr3_masked = cr3 & debugger.arch().dtb_page_mask();
+    if in_kernel_root(debugger, cr3_masked) {
+        debugger.kernel_dtb()
+    } else {
+        cr3_masked
+    }
+}
+
+pub fn resolve_thread_trace_context(debugger: &Target, cr3: u64) -> ThreadTraceContext {
+    thread_trace_context(debugger, cr3, true)
+}
+
+/// [`resolve_thread_trace_context`], walking a process root's own module
+/// list (its PEB loader list) only when `process_modules` asks for it.
+fn thread_trace_context(debugger: &Target, cr3: u64, process_modules: bool) -> ThreadTraceContext {
+    // A user dump's threads all run in its one process, whose modules the
+    // dump lists; a captured register file holds no page-table root.
+    if let (Some(info), Some(modules)) = (debugger.user_dump_info(), debugger.user_modules()) {
+        return ThreadTraceContext {
+            description: info.process_label(),
+            active_dtb: DTB_IDENTITY,
+            kernel_dtb: DTB_IDENTITY,
+            process_dtb: Some(DTB_IDENTITY),
+            kernel_modules: Vec::new(),
+            process_modules: modules.to_vec(),
+            foreign_image: None,
+            hypervisor: None,
+        };
+    }
+    let cr3_masked = cr3 & debugger.arch().dtb_page_mask();
+    let kernel_dtb = debugger.kernel_dtb();
+    match root_owner(debugger, cr3_masked) {
+        RootOwner::Kernel => ThreadTraceContext {
+            description: "kernel".to_string(),
+            active_dtb: kernel_dtb,
+            kernel_dtb,
+            process_dtb: None,
+            kernel_modules: debugger.kernel_modules().unwrap_or_default(),
+            process_modules: Vec::new(),
+            foreign_image: None,
+            hypervisor: None,
+        },
+        RootOwner::SecureKernel(secure) => ThreadTraceContext {
+            description: "VTL1".to_string(),
+            active_dtb: cr3_masked,
+            kernel_dtb: secure.image.dtb(),
+            process_dtb: None,
+            kernel_modules: debugger
+                .guest
+                .as_ref()
+                .and_then(|guest| secure.modules(guest).ok())
+                .unwrap_or_default(),
+            process_modules: Vec::new(),
+            foreign_image: None,
+            hypervisor: None,
+        },
+        RootOwner::Process(proc_info) => ThreadTraceContext {
+            description: format!("{} ({})", proc_info.name, proc_info.pid),
+            active_dtb: cr3_masked,
+            kernel_dtb,
+            process_dtb: Some(proc_info.dtb),
+            kernel_modules: debugger.kernel_modules().unwrap_or_default(),
+            process_modules: debugger
+                .guest
+                .as_ref()
+                .filter(|_| process_modules)
+                .and_then(|guest| guest.process_modules(&proc_info).ok())
+                .unwrap_or_default(),
+            foreign_image: None,
+            hypervisor: None,
+        },
+        RootOwner::Unknown => ThreadTraceContext {
+            description: UNKNOWN_CONTEXT.to_string(),
+            active_dtb: cr3_masked,
+            kernel_dtb,
+            process_dtb: None,
+            kernel_modules: debugger.kernel_modules().unwrap_or_default(),
+            process_modules: Vec::new(),
+            foreign_image: None,
+            hypervisor: None,
+        },
+    }
+}
+
+/// What an address is named after, as `k`, `ln` and a stop name it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SymbolName {
+    pub module: String,
+    /// The symbol, or `None` in a module without symbols, whose base the
+    /// offset counts from then.
+    pub name: Option<String>,
+    pub offset: u64,
+}
+
+impl std::fmt::Display for SymbolName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.name {
+            Some(name) => f.write_str(&format_symbol_with_offset(
+                &self.module,
+                name,
+                u32::try_from(self.offset).unwrap_or(u32::MAX),
+            )),
+            None => write!(f, "{}+{:#x}", self.module, self.offset),
+        }
+    }
+}
+
+/// What a compiler-generated funclet's name has (`Foo$filt$0`, `Foo$fin$1`).
+const FUNCLET_MARK: char = '$';
+
+/// Whether `symbol` names a funclet (see [`nearest_symbol`]).
+fn is_funclet(symbol: &SymbolName) -> bool {
+    symbol
+        .name
+        .as_deref()
+        .is_some_and(|name| name.contains(FUNCLET_MARK))
+}
+
+/// What `addr` is named after in the code `trace` runs: the nearest symbol
+/// below it, a split-off fragment's function, or the module it is in.
+pub fn symbol_name(debugger: &Target, trace: &ThreadTraceContext, addr: u64) -> Option<SymbolName> {
+    let named = |(module, name, offset): (String, String, u32)| SymbolName {
+        module,
+        name: Some(name),
+        offset: u64::from(offset),
+    };
+    let find = |dtb| {
+        debugger
+            .symbols
+            .find_closest_symbol_for_address(dtb, VirtAddr(addr))
+            .map(named)
+    };
+
+    if let Some(module) = trace.module_for_address(addr) {
+        let split = || split_function(debugger, trace, module.dtb, addr).map(named);
+        let symbol = match find(module.dtb).or_else(|| {
+            ensure_module_symbols(debugger, trace, std::iter::once(addr));
+            find(module.dtb)
+        }) {
+            // See [`nearest_symbol`].
+            Some(found) if is_funclet(&found) => split()
+                .filter(|fragment| fragment.name != found.name)
+                .or(Some(found)),
+            Some(found) => Some(found),
+            None => split(),
+        };
+        return Some(symbol.unwrap_or_else(|| {
+            // The module has no PDB, or its fetch is still running.
+            SymbolName {
+                module: module.info.short_name.clone(),
+                name: None,
+                offset: addr.saturating_sub(module.info.base_address.0),
+            }
+        }));
+    }
+
+    trace
+        .process_dtb
+        .and_then(find)
+        .or_else(|| find(trace.kernel_dtb))
+}
+
+pub fn try_format_symbol(
+    debugger: &Target,
+    trace: &ThreadTraceContext,
+    addr: u64,
+) -> Option<String> {
+    symbol_name(debugger, trace, addr).map(|name| name.to_string())
+}
+
+/// The context description for a root that is none of NT's.
+pub const UNKNOWN_CONTEXT: &str = "unknown";
+
+/// The symbol nearest below `address` in root `dtb`, as `ln` names it: the
+/// PDB's, else, for code split off from its function, that function's (see
+/// [`split_function`]). `(module, symbol, offset)`.
+pub fn nearest_symbol(
+    debugger: &Target,
+    dtb: Dtb,
+    address: VirtAddr,
+) -> Option<(String, String, u32)> {
+    let split = || {
+        let trace = resolve_thread_trace_context(debugger, dtb);
+        let module = trace.module_for_address(address.0)?;
+        split_function(debugger, &trace, module.dtb, address.0)
+    };
+    match debugger
+        .symbols
+        .find_closest_symbol_for_address(dtb, address)
+    {
+        // A funclet (`$filt$`, `$fin$`) is a small function the compiler
+        // generates, and the code after it is often a fragment split off
+        // from another function, which the funclet's name would claim:
+        // `nt!KiLockServiceTable$filt$0+0x2fe` is code of
+        // `nt!ExpWaitForResource`. Only then is the function table asked.
+        Some(found) if found.1.contains(FUNCLET_MARK) => split()
+            .filter(|(_, name, _)| *name != found.1)
+            .or(Some(found)),
+        Some(found) => Some(found),
+        None => split(),
+    }
+}
+
+/// `addr` named after its function when no symbol is near it but its code
+/// is a fragment the compiler split off from a function the PDB names, as
+/// profile-guided optimization moves cold blocks far from every symbol:
+/// its function-table entry chains to that function's
+/// (`nt!IopXxxControlFile+0x22bddf`). Only a module whose symbols are
+/// loaded is looked at, so frames in modules without a PDB read no unwind
+/// data. `(module, symbol, offset)`.
+fn split_function(
+    debugger: &Target,
+    trace: &ThreadTraceContext,
+    dtb: Dtb,
+    addr: u64,
+) -> Option<(String, String, u32)> {
+    let mut tracer = StackTracer::new(debugger, trace);
+    let base = tracer.module_containing(addr)?.info.base_address;
+    if !matches!(
+        debugger.symbols.module_symbol_status(dtb, base),
+        Some(ModuleSymbolStatus::Loaded)
+    ) || tracer.code_machine_at(addr) != CodeMachine::Amd64
+    {
+        return None;
+    }
+    let lookup = |tracer: &StackTracer<'_>| {
+        let (image, layout) = tracer.module_code(addr)?;
+        let found = amd64::primary_function_begin(&image, layout.as_deref(), base.0, addr);
+        Some((found, image.is_complete()))
+    };
+    let (mut found, complete) = lookup(&tracer)?;
+    if matches!(found, amd64::PrimaryLookup::Holed)
+        && !complete
+        && tracer.upgrade_module_image(addr)
+    {
+        found = lookup(&tracer)?.0;
+    }
+    let amd64::PrimaryLookup::Found(start) = found else {
+        return None;
+    };
+    // The function must start at the symbol, not somewhere after it.
+    let (module, name, offset) = debugger
+        .symbols
+        .find_closest_symbol_for_address(dtb, VirtAddr(start))?;
+    if offset != 0 {
+        return None;
+    }
+    let offset = u32::try_from(addr.checked_sub(start)?).ok()?;
+    Some((module, name, offset))
+}
+
+/// [`resolve_thread_trace_context`] for a thread stopped at `rip`. A root
+/// that is none of NT's is named for the code at `rip` (the Windows
+/// hypervisor or VTL1), and that code's modules join the trace, so its
+/// frames read `module+offset` (or symbols, for VTL1) rather than raw
+/// addresses among NT-looking stack values.
+pub fn resolve_thread_trace_context_at(
+    debugger: &Target,
+    cr3: u64,
+    rip: u64,
+) -> ThreadTraceContext {
+    code_trace_context_at(debugger, cr3, rip, true)
+}
+
+/// [`resolve_thread_trace_context_at`], walking a process root's module
+/// list only when `process_modules` asks for it.
+fn code_trace_context_at(
+    debugger: &Target,
+    cr3: u64,
+    rip: u64,
+    process_modules: bool,
+) -> ThreadTraceContext {
+    let mut trace = thread_trace_context(debugger, cr3, process_modules);
+    if trace.description != UNKNOWN_CONTEXT || try_format_symbol(debugger, &trace, rip).is_some() {
+        return trace;
+    }
+    let Some(code) = debugger.identify_foreign_code(cr3, rip) else {
+        return trace;
+    };
+    trace.description = code.context;
+    match code.modules {
+        ForeignModules::SecureKernel { root, modules } => {
+            trace.kernel_dtb = root;
+            trace.kernel_modules = modules;
+        }
+        ForeignModules::Image(image) => trace.foreign_image = Some(image),
+        ForeignModules::None => {}
+    }
+    trace.hypervisor = code.hypervisor;
+    trace
+}
+
+/// Whether a vCPU at `rip` on root `cr3` is halted in the Windows
+/// hypervisor, as [`resolve_thread_trace_context_at`] names it. A root that
+/// is NT's never is, so its module lists are not walked to find out.
+pub fn halted_in_windows_hypervisor(debugger: &Target, cr3: u64, rip: u64) -> bool {
+    matches!(
+        root_owner(debugger, cr3 & debugger.arch().dtb_page_mask()),
+        RootOwner::Unknown
+    ) && resolve_thread_trace_context_at(debugger, cr3, rip).description == HYPERVISOR_CONTEXT
+}
+
+/// The guest partition's virtual processor (WSL2, a Hyper-V VM) that a vCPU
+/// at `rip` on root `cr3`, on NT processor `processor`, runs because the
+/// Windows hypervisor put it on that processor, as `~` names it
+/// (`partition 0x6 VP 3`). The vCPU then shows that guest's registers, at
+/// code in no root of NT's that is neither the hypervisor's nor VTL1's,
+/// and the processor block names the guest's VP current; NT's state there
+/// waits in its root VP's saved state until the hypervisor runs that VP
+/// again. The partitions are walked only for a vCPU whose code ntoseye
+/// cannot place.
+pub fn guest_vp_running(
+    debugger: &Target,
+    cr3: u64,
+    rip: u64,
+    processor: Option<u16>,
+) -> Option<String> {
+    if !matches!(
+        root_owner(debugger, cr3 & debugger.arch().dtb_page_mask()),
+        RootOwner::Unknown
+    ) || resolve_thread_trace_context_at(debugger, cr3, rip).description != UNKNOWN_CONTEXT
+    {
+        return None;
+    }
+    debugger.guest_vp_label(processor?)
+}
+
+/// [`try_format_symbol`] for code a vCPU runs at `rip` with root `cr3`,
+/// named in that vCPU's own address space (code outside NT, such as the
+/// Windows hypervisor, for what it is) whatever the inspection scope is.
+/// Kernel code in an NT root is named from the modules whose symbols are
+/// loaded before any module list is walked: the lists are walked again at
+/// every halt, which over KD memory costs hundreds of reads a stop.
+pub fn try_format_symbol_at(debugger: &Target, cr3: u64, rip: u64) -> Option<String> {
+    let kernel = debugger.arch().paging().is_kernel_address(VirtAddr(rip));
+    if kernel
+        && matches!(
+            root_owner(debugger, cr3 & debugger.arch().dtb_page_mask()),
+            RootOwner::Kernel | RootOwner::Process(_)
+        )
+        && let Some(symbol) = debugger
+            .symbols
+            .format_closest_symbol_for_address(debugger.kernel_dtb(), VirtAddr(rip))
+        // A funclet's name is checked against the function table below.
+        && !symbol.contains(FUNCLET_MARK)
+    {
+        return Some(symbol);
+    }
+    try_format_symbol(
+        debugger,
+        &code_trace_context_at(debugger, cr3, rip, !kernel),
+        rip,
+    )
+}
+
+pub fn format_symbol(debugger: &Target, trace: &ThreadTraceContext, addr: u64) -> String {
+    try_format_symbol(debugger, trace, addr).unwrap_or_else(|| format!("{addr:#x}"))
+}
+
+/// One VTL of a virtual processor, as the Windows hypervisor last saved it
+/// in the VTL's Enlightened VMCS, with the symbol where it left off. A VMCS
+/// holds no general-purpose register other than `rsp`; `general_registers`
+/// has the others when they are known.
+#[record(impl)]
+#[derive(Debug, Clone)]
+pub struct SavedVtl {
+    #[record(skip)]
+    pub context: SavedVtlContext,
+    /// The symbol at the saved `rip`, resolved in the state's own address
+    /// space.
+    #[record(skip)]
+    pub symbol: Option<String>,
+}
+
+#[record]
+impl SavedVtl {
+    /// 0 or 1.
+    #[record(getter)]
+    pub fn vtl(&self) -> u8 {
+        self.context.vtl
+    }
+
+    /// Whether the VP assist page names this state's eVMCS as current. The
+    /// current VTL is the one that entered the hypervisor or that the
+    /// hypervisor is about to enter.
+    #[record(getter)]
+    pub fn current(&self) -> bool {
+        self.context.state.current
+    }
+
+    #[record(getter)]
+    pub fn rip(&self) -> VirtAddr {
+        VirtAddr(self.context.state.rip)
+    }
+
+    /// The symbol at `rip` in the VTL's address space, if one resolves.
+    #[record(getter, rename = "symbol")]
+    pub fn saved_symbol(&self) -> Option<String> {
+        self.symbol.clone()
+    }
+
+    #[record(getter)]
+    pub fn rsp(&self) -> VirtAddr {
+        VirtAddr(self.context.state.rsp)
+    }
+
+    #[record(getter, hex)]
+    pub fn rflags(&self) -> u64 {
+        self.context.state.rflags
+    }
+
+    #[record(getter, hex)]
+    pub fn cr0(&self) -> u64 {
+        self.context.state.cr0
+    }
+
+    /// The page-table root of the VTL.
+    #[record(getter, hex)]
+    pub fn cr3(&self) -> u64 {
+        self.context.state.cr3
+    }
+
+    #[record(getter, hex)]
+    pub fn cr4(&self) -> u64 {
+        self.context.state.cr4
+    }
+
+    #[record(getter, hex)]
+    pub fn dr7(&self) -> u64 {
+        self.context.state.dr7
+    }
+
+    #[record(getter, hex)]
+    pub fn cs(&self) -> u16 {
+        self.context.state.cs
+    }
+
+    #[record(getter, hex)]
+    pub fn ss(&self) -> u16 {
+        self.context.state.ss
+    }
+
+    #[record(getter, hex)]
+    pub fn ds(&self) -> u16 {
+        self.context.state.ds
+    }
+
+    #[record(getter, hex)]
+    pub fn es(&self) -> u16 {
+        self.context.state.es
+    }
+
+    #[record(getter, hex)]
+    pub fn fs(&self) -> u16 {
+        self.context.state.fs
+    }
+
+    #[record(getter, hex)]
+    pub fn gs(&self) -> u16 {
+        self.context.state.gs
+    }
+
+    #[record(getter)]
+    pub fn fs_base(&self) -> VirtAddr {
+        VirtAddr(self.context.state.fs_base)
+    }
+
+    #[record(getter)]
+    pub fn gs_base(&self) -> VirtAddr {
+        VirtAddr(self.context.state.gs_base)
+    }
+
+    /// The VM-exit reason of the last exit from the VTL. Bits 15:0 hold the
+    /// basic reason, and bit 31 is set for a failed VM entry.
+    #[record(getter, hex)]
+    pub fn exit_reason(&self) -> u32 {
+        self.context.state.exit_reason
+    }
+
+    /// The name of the exit reason (`HLT`, `VMCALL`, ...), if it is a
+    /// common reason.
+    #[record(getter)]
+    pub fn exit_reason_name(&self) -> Option<&'static str> {
+        self.context.state.exit_reason_name()
+    }
+
+    /// Reason-specific detail of the last exit, such as the access that
+    /// caused an EPT violation (Intel SDM, exit qualification).
+    #[record(getter, hex)]
+    pub fn exit_qualification(&self) -> u64 {
+        self.context.state.exit_qualification
+    }
+
+    /// The vector and type of the event behind an exception or interrupt
+    /// exit (Intel SDM, VM-exit interruption information).
+    #[record(getter, hex)]
+    pub fn exit_interruption_info(&self) -> u32 {
+        self.context.state.exit_interruption_info
+    }
+
+    /// The length of the instruction that caused the exit, for exits that
+    /// an instruction caused.
+    #[record(getter)]
+    pub fn exit_instruction_length(&self) -> u32 {
+        self.context.state.exit_instruction_length
+    }
+
+    /// The hypervisor's VM-exit entry point.
+    #[record(getter)]
+    pub fn host_rip(&self) -> VirtAddr {
+        VirtAddr(self.context.state.host_rip)
+    }
+
+    /// The stack the hypervisor's VM-exit entry point runs on.
+    #[record(getter)]
+    pub fn host_rsp(&self) -> VirtAddr {
+        VirtAddr(self.context.state.host_rsp)
+    }
+
+    /// The vCPU is stopped on `host_rip`, and not by a breakpoint there.
+    /// KVM writes the eVMCS when it enters the hypervisor, and a stop from
+    /// outside can fall between a VM exit and that entry, so this state
+    /// may still describe the exit before the one in progress. The
+    /// guest's general-purpose registers are then still in the vCPU's own
+    /// registers. A breakpoint on `host_rip` fires after the write.
+    /// Only the current state, the exiting VTL's, can be behind; when no
+    /// state of the VP is current, every state is marked.
+    #[record(getter)]
+    pub fn may_be_stale(&self) -> bool {
+        self.context.may_be_stale
+    }
+
+    /// The guest's general-purpose registers other than `rsp` at the last
+    /// exit (`rax` to `r15`), read where the hypervisor's VM-exit entry
+    /// code saved them. Experimental: where that is, is read off the
+    /// entry code. None when they are not known: for a VTL that is not
+    /// the current one, while the vCPU is on `host_rip` (unless it stopped
+    /// there on a breakpoint, when they are the vCPU's own) or still saving
+    /// them, or when the entry code does not save them in one block.
+    #[record(getter, hex)]
+    pub fn general_registers(&self) -> Option<Keyed<u64>> {
+        self.context
+            .general_registers
+            .as_ref()
+            .ok()
+            .map(crate::nt::guest::ordered_exit_gprs)
+    }
+
+    /// The physical address of the eVMCS page that ntoseye read the state
+    /// from.
+    #[record(getter, hex)]
+    pub fn evmcs(&self) -> u64 {
+        self.context.state.address
+    }
+
+    /// The hypercall of a VMCALL exit whose general-purpose registers are
+    /// known, with its input decoded.
+    #[record(getter)]
+    pub fn hypercall(&self) -> Option<crate::nt::guest::hypercall_input::DecodedHypercall> {
+        self.context.hypercall.call().cloned()
+    }
+}
+
+impl SavedVtl {
+    /// Where the state left off, as `VTL0 nt!HalProcessorIdle+0xf`, marked
+    /// when it may describe the exit before the one in progress.
+    pub fn describe(&self) -> String {
+        let rip = self.context.state.rip;
+        let place = match &self.symbol {
+            Some(symbol) => format!("VTL{} {symbol}", self.context.vtl),
+            None => format!("VTL{} {rip:#x}", self.context.vtl),
+        };
+        if self.context.may_be_stale {
+            format!("{place} (may be one exit behind)")
+        } else {
+            place
+        }
+    }
+
+    /// [`Self::describe`] with the hypercall of a VMCALL exit, as one-line
+    /// summaries of the vCPU (thread names, the MCP trailer) show it: `VTL0
+    /// hvcall!Hypercall (hypercall 0x0003 HvCallFlushVirtualAddressList rep
+    /// 0/12)`.
+    pub fn summary(&self) -> String {
+        match self.context.exit_detail() {
+            Some(detail) => format!("{} ({detail})", self.describe()),
+            None => self.describe(),
+        }
+    }
+
+    /// Whether a one-line summary of the vCPU names this state: VTL0's
+    /// always, VTL1's when its eVMCS is the current one (the hypervisor was
+    /// entered from VTL1, or is about to enter it).
+    pub fn summarized(&self) -> bool {
+        self.context.vtl == 0 || self.context.state.current
+    }
+}
+
+/// The VTL states the Windows hypervisor saved for the virtual processor a
+/// vCPU halted in it runs, each with its symbol. `cr3` is the vCPU's and
+/// `processor` its NT processor, as in [`Target::saved_vtl_contexts`].
+pub fn saved_vtls(
+    debugger: &Target,
+    cr3: u64,
+    rip: u64,
+    processor: Option<u16>,
+) -> Result<Vec<SavedVtl>> {
+    Ok(debugger
+        .saved_vtl_contexts(cr3, rip, processor)?
+        .into_iter()
+        .map(|context| {
+            let symbol = try_format_symbol_at(debugger, context.state.cr3, context.state.rip);
+            SavedVtl { context, symbol }
+        })
+        .collect())
+}
+
+pub fn preferred_code_dtb(trace: &ThreadTraceContext, addr: u64) -> Dtb {
+    trace
+        .module_for_address(addr)
+        .map(|module| module.dtb)
+        .unwrap_or(trace.active_dtb)
+}
+
+/// The frames the physical frame at `ip` shows as, innermost first: the
+/// calls the compiler inlined into its code, then the frame itself.
+/// `returned` says `ip` is where a call returns to, so the frame's code is
+/// the call's (`ip - 1`) rather than the next instruction's.
+fn expand_frame(
+    debugger: &Target,
+    trace: &ThreadTraceContext,
+    ip: u64,
+    sp: u64,
+    source: FrameSource,
+    machine_frame: Option<u64>,
+    returned: bool,
+) -> Vec<StackFrame> {
+    let address = VirtAddr(if returned { ip.wrapping_sub(1) } else { ip });
+    let module = trace.module_for_address(address.0);
+    let inline = module
+        .as_ref()
+        .map(|module| debugger.symbols.inline_frames(module.dtb, address))
+        .unwrap_or_default();
+    let physical = CodeFrame {
+        address,
+        inline_depth: inline.len(),
+    };
+    let mut frames: Vec<StackFrame> = inline
+        .into_iter()
+        .enumerate()
+        .map(|(inline_depth, frame)| StackFrame {
+            sp,
+            ip,
+            symbol: frame.symbol,
+            source,
+            source_location: frame.location,
+            machine_frame,
+            code: CodeFrame {
+                address,
+                inline_depth,
+            },
+            inline: true,
+        })
+        .collect();
+    frames.push(StackFrame {
+        sp,
+        ip,
+        symbol: format_symbol(debugger, trace, ip),
+        source,
+        source_location: module
+            .and_then(|module| debugger.symbols.source_location(module.dtb, address)),
+        machine_frame,
+        code: physical,
+        inline: false,
+    });
+    frames
+}
+
+/// The RVA range of the runtime functions for `image`'s code of `machine`:
+/// the exception directory, or in a hybrid image the table for the other
+/// instruction set (see [`CodeLayout::runtime_functions`]). `None` when the
+/// image has none.
+fn runtime_functions(
+    image: &PeImage,
+    layout: Option<&CodeLayout>,
+    machine: CodeMachine,
+) -> Option<Range<usize>> {
+    let view = PeView::from_bytes(image.headers()).ok()?;
+    let exception = view
+        .data_directory()
+        .get(IMAGE_DIRECTORY_ENTRY_EXCEPTION)
+        .map(|directory| (directory.VirtualAddress, directory.Size));
+    let (start, size) = match layout {
+        Some(layout) => layout.runtime_functions(machine, exception)?,
+        None => exception?,
+    };
+    if size == 0 {
+        return None;
+    }
+    let start = start as usize;
+    Some(start..start.checked_add(size as usize)?)
+}
+
+/// Resolve the runtime-function entry containing `address`.
+///
+/// PE exception metadata is the authoritative function boundary for `uf`: it
+/// remains correct when public symbols are sparse and avoids disassembling into
+/// the next function. A paged-out `.pdata` or `.xdata` range is retried against
+/// the matched on-disk image through the stack unwinder's image cache. Code no
+/// module holds, such as JIT-compiled code, is looked up in the user dump's
+/// dynamic function tables, as the unwinder does.
+pub fn function_range(
+    debugger: &Target,
+    trace: &ThreadTraceContext,
+    address: u64,
+) -> Option<(u64, u64)> {
+    fn range(
+        image: &PeImage,
+        layout: Option<&CodeLayout>,
+        base: u64,
+        address: u64,
+        machine: CodeMachine,
+    ) -> Option<(u64, u64)> {
+        let rva = u32::try_from(address.checked_sub(base)?).ok()?;
+        let pdata = runtime_functions(image, layout, machine)?;
+        let (begin, end) = match machine {
+            CodeMachine::Amd64 => {
+                let Lookup::Found(function) = lookup_runtime_function(
+                    pdata.len() / RUNTIME_FUNCTION_SIZE,
+                    |index| runtime_function_at(image, pdata.start, index),
+                    rva,
+                ) else {
+                    return None;
+                };
+                (function.BeginAddress, function.EndAddress)
+            }
+            CodeMachine::Arm64 => match lookup_arm64_runtime_function(image, pdata, rva) {
+                Arm64Lookup::Found(function) => (function.begin, function.end),
+                Arm64Lookup::Missing | Arm64Lookup::Unreadable => return None,
+            },
+            // x86 code has no runtime functions.
+            CodeMachine::X86 => return None,
+        };
+        Some((base + u64::from(begin), base + u64::from(end)))
+    }
+
+    let mut tracer = StackTracer::new(debugger, trace);
+    let Some(module) = tracer.module_containing(address) else {
+        let (base, function) = tracer.dynamic_function(address)?;
+        return Some((
+            base + u64::from(function.begin),
+            base + u64::from(function.end),
+        ));
+    };
+    let base = module.info.base_address.0;
+    let machine = tracer.code_machine_at(address);
+    let (image, layout) = tracer.module_code(address)?;
+    if let Some(found) = range(&image, layout.as_deref(), base, address, machine) {
+        return Some(found);
+    }
+
+    if !image.is_complete() && tracer.upgrade_module_image(address) {
+        let (image, layout) = tracer.module_code(address)?;
+        return range(&image, layout.as_deref(), base, address, machine);
+    }
+
+    None
+}
+
+/// The function-table entry covering `address` and its unwind data
+/// (`.fnent`): AMD64's with its chained parents, or ARM64's packed or
+/// `.xdata` form. Paged-out `.pdata` or `.xdata` is read from the matched
+/// on-disk image, as the unwinder does, and code no module holds from the
+/// user dump's dynamic function tables.
+pub fn function_entry(
+    debugger: &Target,
+    trace: &ThreadTraceContext,
+    address: u64,
+) -> Result<FunctionEntry> {
+    let mut tracer = StackTracer::new(debugger, trace);
+    let symbol = |address| format_symbol(debugger, trace, address);
+    let Some(module) = tracer.module_containing(address) else {
+        let Some((base, function)) = tracer.dynamic_function(address) else {
+            return Err(Error::DebugInfo(format!(
+                "{address:#x} is neither in a loaded module nor in a dynamic function table"
+            )));
+        };
+        // A dynamic table's unwind data lies in process memory above its base.
+        let machine = tracer.code_machine_at(address);
+        let code = amd64::DynamicCode {
+            memory: &tracer.memory,
+            base,
+        };
+        let found = if machine == CodeMachine::Arm64 {
+            arm64::describe_arm64_entry(
+                &code,
+                base,
+                arm64::Arm64Function {
+                    begin: function.begin,
+                    end: function.end,
+                    unwind_data: function.unwind_data,
+                },
+                symbol,
+            )
+        } else {
+            amd64::describe_entry_chain(
+                &code,
+                base,
+                RUNTIME_FUNCTION {
+                    BeginAddress: function.begin,
+                    EndAddress: function.end,
+                    UnwindData: function.unwind_data,
+                },
+                symbol,
+            )
+        };
+        return match found {
+            amd64::EntryLookup::Found {
+                entries,
+                incomplete,
+            } => Ok(FunctionEntry {
+                module: "a dynamic function table".to_string(),
+                image_base: base,
+                entries,
+                incomplete,
+            }),
+            amd64::EntryLookup::Leaf | amd64::EntryLookup::Holed => Err(Error::DebugInfo(format!(
+                "the unwind data of the dynamic function at {address:#x} is unreadable"
+            ))),
+        };
+    };
+    let (base, module) = (module.info.base_address.0, module.info.short_name.clone());
+    let machine = tracer.code_machine_at(address);
+    if machine == CodeMachine::X86 {
+        return Err(Error::DebugInfo(format!(
+            "{address:#x} is x86 code, which has no function table"
+        )));
+    }
+    let lookup = |tracer: &StackTracer<'_>| {
+        let (image, layout) = tracer.module_code(address)?;
+        let layout = layout.as_deref();
+        let found = if machine == CodeMachine::Arm64 {
+            arm64::describe_arm64_function_entry(&image, layout, base, address, symbol)
+        } else {
+            amd64::describe_function_entry(&image, layout, base, address, symbol)
+        };
+        Some((found, image.is_complete()))
+    };
+    let unreadable = || Error::DebugInfo(format!("the image of {module} is unreadable"));
+    let (mut found, complete) = lookup(&tracer).ok_or_else(unreadable)?;
+    if matches!(found, amd64::EntryLookup::Holed)
+        && !complete
+        && tracer.upgrade_module_image(address)
+    {
+        found = lookup(&tracer).ok_or_else(unreadable)?.0;
+    }
+    match found {
+        amd64::EntryLookup::Found {
+            entries,
+            incomplete,
+        } => Ok(FunctionEntry {
+            module,
+            image_base: base,
+            entries,
+            incomplete,
+        }),
+        amd64::EntryLookup::Leaf => Err(Error::DebugInfo(format!(
+            "no function table entry in {module} covers {address:#x}; a leaf function has none"
+        ))),
+        amd64::EntryLookup::Holed => Err(Error::DebugInfo(format!(
+            "the function table of {module} is paged out at {address:#x}, and no on-disk image was found"
+        ))),
+    }
+}
+
+pub fn build_stacktrace(
+    debugger: &Target,
+    register_map: &RegisterMap,
+    regs: &[u8],
+    limit: usize,
+) -> StackTrace {
+    build_stacktrace_with_context(debugger, register_map, regs, limit).into_stacktrace()
+}
+
+/// Build a stack trace while retaining the register values known at every
+/// frame. Caller frames intentionally expose only values justified by unwind
+/// metadata (plus the address-space CR3), rather than copying volatile values
+/// from the stopped frame.
+pub fn build_stacktrace_with_context(
+    debugger: &Target,
+    register_map: &RegisterMap,
+    regs: &[u8],
+    limit: usize,
+) -> RecoveredStackTrace {
+    build_stacktrace_from_values(
+        debugger,
+        debugger.register_values(register_map, regs),
+        limit,
+    )
+}
+
+/// [`build_stacktrace_with_context`] for the registers of `thread`, the
+/// Windows thread they belong to (on a user-mode minidump, its selected
+/// thread): a WOW64 thread's walk goes on into its x86 frames where it left
+/// x86 code (see [`wow64`]).
+pub fn build_thread_stacktrace(
+    debugger: &Target,
+    register_map: &RegisterMap,
+    regs: &[u8],
+    thread: Option<&ThreadInfo>,
+    limit: usize,
+) -> RecoveredStackTrace {
+    let mut stack = build_stacktrace_with_context(debugger, register_map, regs, limit);
+    // A user-mode minidump's thread is its selected one.
+    let teb = match thread {
+        Some(thread) => thread.teb,
+        None => debugger
+            .user_thread()
+            .map(|thread| VirtAddr(thread.teb))
+            .filter(|teb| !teb.is_zero()),
+    };
+    if let Some(teb) = teb {
+        let trace = resolve_thread_trace_context(debugger, stack.dtb);
+        wow64::add_x86_frames(debugger, &trace, teb, &mut stack, limit);
+    }
+    stack
+}
+
+/// Build a recovered trace from a sparse selected-frame register map. This is
+/// used after `.frame`, `.cxr`, `.trap`, or a saved VTL0 state, where there is
+/// no backend packet to provide the original register byte layout. A register
+/// the context lacks stays unknown to the unwinder and absent from frame 0,
+/// rather than reading zero: a frame that unwinds through an unknown frame
+/// pointer falls back to scanning instead of following a false one.
+pub fn build_stacktrace_with_register_values(
+    debugger: &Target,
+    register_map: &RegisterMap,
+    values: &HashMap<String, u64>,
+    limit: usize,
+) -> RecoveredStackTrace {
+    let mut values = register_map.supplied_values(values);
+    let dtb_name = debugger.arch().dtb_register();
+    // A user dump's one address space has no page-table root to name.
+    if debugger.user_dump().is_none()
+        && values.get(dtb_name).is_none_or(|dtb| *dtb == 0)
+        && register_map.contains(dtb_name)
+    {
+        values.insert(dtb_name.to_string(), debugger.current_dtb());
+    }
+    build_stacktrace_from_values(debugger, values, limit)
+}
+
+/// Walk from `values`, the registers known at the innermost frame, named as
+/// [`RegisterMap::to_hashmap`] names them; absent registers are unknown.
+fn build_stacktrace_from_values(
+    debugger: &Target,
+    values: HashMap<String, u64>,
+    limit: usize,
+) -> RecoveredStackTrace {
+    let cr3 = values
+        .get(debugger.arch().dtb_register())
+        .copied()
+        .unwrap_or(0);
+    let context = FrameRegisters::from_lookup(debugger.arch(), |name| values.get(name).copied());
+    let trace = resolve_thread_trace_context_at(debugger, cr3, context.pc);
+    if let Some(stack) = wow64::live_x86_stack(debugger, &trace, &values, limit) {
+        return stack;
+    }
+    build_recovered_stacktrace_seeded(
+        debugger,
+        &trace,
+        context,
+        FrameSource::Current,
+        limit,
+        values,
+    )
+}
+
+/// Resolve the frame-relative local base for a sparse register context. This
+/// mirrors the first frame of a recovered trace without requiring a backend
+/// register packet, so `dv` uses unwind metadata rather than assuming RBP is a
+/// frame pointer.
+pub fn frame_base_for_register_values(
+    debugger: &Target,
+    values: &HashMap<String, u64>,
+) -> Option<u64> {
+    let lookup = |name: &str| lookup_register(debugger.arch(), values, name);
+    let context = FrameRegisters::from_lookup(debugger.arch(), lookup);
+    let dtb = lookup(debugger.arch().dtb_register())
+        .filter(|dtb| *dtb != 0)
+        .unwrap_or_else(|| debugger.current_dtb());
+    let trace = resolve_thread_trace_context(debugger, dtb);
+    let mut tracer = StackTracer::new(debugger, &trace);
+    tracer.frame_base_for(&context)
+}
+
+/// The caller's instruction pointer for a sparse register context: WinDbg's
+/// `$ra`. One unwind step, so a scope nothing has walked for display still
+/// answers `g @$ra`. `None` means the unwind step could not produce a valid
+/// executable return address.
+pub fn return_address_for_register_values(
+    debugger: &Target,
+    values: &HashMap<String, u64>,
+) -> Option<u64> {
+    let lookup = |name: &str| lookup_register(debugger.arch(), values, name);
+    lookup(debugger.arch().pc_register())?;
+    let mut context = FrameRegisters::from_lookup(debugger.arch(), lookup);
+    let dtb = lookup(debugger.arch().dtb_register())
+        .filter(|dtb| *dtb != 0)
+        .unwrap_or_else(|| debugger.current_dtb());
+    let trace = resolve_thread_trace_context(debugger, dtb);
+    let mut tracer = StackTracer::new(debugger, &trace);
+    match tracer.unwind_once(&mut context) {
+        Unwound::Frame { .. } | Unwound::Prolog => (context.pc != 0).then_some(context.pc),
+        Unwound::Stop => None,
+    }
+}
+
+/// Recover the build-specific context-switch frame using the matching image's
+/// unwind metadata. `KTHREAD.KernelStack` is the stack pointer the switch
+/// saved; no private `_KSWITCH_FRAME` layout or build table is needed.
+fn recover_context_switch_seed(
+    debugger: &Target,
+    process_dtb: Dtb,
+    kernel_stack: VirtAddr,
+) -> Result<FrameRegisters> {
+    let ntoskrnl = &debugger.guest()?.ntoskrnl;
+    let swap_context = ntoskrnl.symbol("SwapContext")?.address().0;
+    let ki_swap_context = ntoskrnl.symbol("KiSwapContext")?.address().0;
+    let trace = resolve_thread_trace_context(debugger, process_dtb);
+    let mut tracer = StackTracer::new(debugger, &trace);
+    let (ki_swap_start, ki_swap_end) = function_range(debugger, &trace, ki_swap_context)
+        .ok_or_else(|| Error::DebugInfo("KiSwapContext has no usable PE unwind metadata".into()))?;
+
+    let seed = unwinder(debugger.arch()).context_switch_frame(
+        &mut tracer,
+        kernel_stack.0,
+        swap_context,
+        ki_swap_start..ki_swap_end,
+    )?;
+
+    // `seed` stays private to the stack walker: it is not a complete register
+    // context (volatile registers and flags are never preserved).
+    let mut caller = seed.clone();
+    if !matches!(
+        tracer.unwind_once(&mut caller),
+        Unwound::Frame {
+            stack_switch: false
+        }
+    ) || caller.sp <= seed.sp
+        || !tracer.is_executable_address(caller.pc)
+    {
+        return Err(Error::DebugInfo(
+            "failed to validate the saved KiSwapContext frame".into(),
+        ));
+    }
+
+    Ok(seed)
+}
+
+fn switch_seed_is_plausible(arch: Arch, thread: &ThreadInfo, seed: &FrameRegisters) -> bool {
+    let (Some(kernel_stack), Some(stack_limit), Some(stack_base)) =
+        (thread.kernel_stack, thread.stack_limit, thread.stack_base)
+    else {
+        return false;
+    };
+    looks_like_kernel_pointer(arch, seed.pc)
+        && kernel_stack >= stack_limit
+        && kernel_stack < stack_base
+        && seed.sp >= stack_limit.0
+        && seed.sp <= stack_base.0
+}
+
+/// Build a non-running Windows thread's kernel stack, keeping the sparse
+/// registers recovered for each frame, without manufacturing a persistent
+/// register context. The walk starts where the thread was switched out (its
+/// `KernelStack` context-switch frame), its most recent state; it unwinds
+/// through a system call into user mode. `KTHREAD.TrapFrame` is only the
+/// fallback: it is older (the system call's entry, or an interrupt taken
+/// since), so a walk from it skips the frames above it.
+///
+/// A host that only renders frames wants [`build_parked_thread_stack`]; a host
+/// that also selects frames and resolves their locals (the DAP call stack)
+/// needs the per-frame registers this returns.
+pub fn build_parked_thread_recovered_stack(
+    debugger: &Target,
+    thread: &ThreadInfo,
+    limit: usize,
+) -> Result<ThreadRecoveredStack> {
+    let process_dtb = debugger.thread_process_dtb(thread).ok_or_else(|| {
+        Error::DebugInfo("parked thread owning process DTB is unavailable".into())
+    })?;
+    let trace = resolve_thread_trace_context(debugger, process_dtb);
+    // A running thread's context-switch frame was consumed when it was
+    // switched in, and its stack has moved on since; only its processor's
+    // registers say where it is.
+    if thread.state == Some(KTHREAD_STATE_RUNNING) {
+        return Err(Error::DebugInfo(
+            "thread stack unavailable: the thread is running, and its processor's registers are unavailable"
+                .into(),
+        ));
+    }
+    // The trap frame and the context-switch frame both live on the kernel
+    // stack, which a terminated thread has freed. One a long wait swapped out
+    // (`KernelStackResident` clear) usually still sits in RAM on the standby
+    // list, readable through its transition PTEs, so it is walked anyway.
+    if thread.state == Some(KTHREAD_STATE_TERMINATED) {
+        return Err(Error::DebugInfo(
+            "parked thread stack unavailable: the thread has terminated".into(),
+        ));
+    }
+    let mut failures = Vec::new();
+    if thread.kernel_stack_resident == Some(false) {
+        failures.push("kernel stack is swapped out".to_string());
+    }
+
+    if let Some(kernel_stack) = thread.kernel_stack {
+        let pdb_seed = decode_kswitch_frame_seed(debugger, process_dtb, kernel_stack)
+            .ok()
+            .and_then(|registers| frame_registers_from_saved(&registers));
+        let seed = match pdb_seed {
+            Some(seed) => Ok(seed),
+            None => recover_context_switch_seed(debugger, process_dtb, kernel_stack),
+        };
+        match seed {
+            Ok(seed) if switch_seed_is_plausible(debugger.arch(), thread, &seed) => {
+                let mut stacktrace = build_recovered_stacktrace_seeded(
+                    debugger,
+                    &trace,
+                    seed,
+                    FrameSource::Seed,
+                    limit,
+                    HashMap::from([(debugger.arch().dtb_register().to_string(), process_dtb)]),
+                );
+                if let Some(teb) = thread.teb {
+                    wow64::add_x86_frames(debugger, &trace, teb, &mut stacktrace, limit);
+                }
+                stacktrace.thread = Some(thread.ethread);
+                return Ok(ThreadRecoveredStack {
+                    source: ThreadStackSource::ContextSwitch { kernel_stack },
+                    stacktrace,
+                });
+            }
+            Ok(_) => failures.push(
+                "context-switch seed is outside the captured resident kernel stack".to_string(),
+            ),
+            Err(error) => failures.push(format!("context-switch seed is unavailable: {error}")),
+        }
+    } else {
+        failures.push("KTHREAD.KernelStack is not present".to_string());
+    }
+
+    if let Some(address) = thread.trap_frame {
+        match decode_ktrap_frame_for_thread(debugger, process_dtb, address)
+            .ok()
+            .and_then(|registers| frame_registers_from_saved(&registers))
+        {
+            Some(seed) if seed.pc != 0 && seed.sp != 0 => {
+                let mut stacktrace = build_recovered_stacktrace_seeded(
+                    debugger,
+                    &trace,
+                    seed,
+                    FrameSource::Seed,
+                    limit,
+                    HashMap::from([(debugger.arch().dtb_register().to_string(), process_dtb)]),
+                );
+                if let Some(teb) = thread.teb {
+                    wow64::add_x86_frames(debugger, &trace, teb, &mut stacktrace, limit);
+                }
+                stacktrace.thread = Some(thread.ethread);
+                return Ok(ThreadRecoveredStack {
+                    source: ThreadStackSource::TrapFrame { address },
+                    stacktrace,
+                });
+            }
+            _ => failures.push("KTHREAD.TrapFrame is absent or unusable".to_string()),
+        }
+    } else {
+        failures.push("KTHREAD.TrapFrame is not present".to_string());
+    }
+
+    Err(Error::DebugInfo(format!(
+        "parked thread stack unavailable: {}",
+        failures.join("; ")
+    )))
+}
+
+/// The frames of a parked thread's stack without the recovered registers, for
+/// hosts that only render the walk (`k`, `!thread`, `!stacks`).
+pub fn build_parked_thread_stack(
+    debugger: &Target,
+    thread: &ThreadInfo,
+    limit: usize,
+) -> Result<ThreadStackTrace> {
+    let recovered = build_parked_thread_recovered_stack(debugger, thread, limit)?;
+    Ok(ThreadStackTrace {
+        source: recovered.source,
+        stacktrace: recovered.stacktrace.into_stacktrace(),
+    })
+}
+
+/// The context a thread saved when it left the processor; `None` without
+/// its program counter and stack pointer.
+fn frame_registers_from_saved(registers: &SavedThreadRegisters) -> Option<FrameRegisters> {
+    let arch = registers.arch();
+    registers.get(arch.pc_register())?;
+    registers.get(arch.sp_register())?;
+    Some(FrameRegisters::from_lookup(arch, |name| {
+        registers.get(name)
+    }))
+}
+
+impl ThreadTraceContext {
+    /// The traced thread's address space: its process's page-table root when
+    /// the walk identified one, else the root it was given.
+    pub fn dtb(&self) -> Dtb {
+        self.process_dtb.unwrap_or(self.active_dtb)
+    }
+
+    fn module_for_address(&self, address: u64) -> Option<OwnedModule> {
+        self.kernel_modules
+            .iter()
+            .find(|module| module.contains_address(VirtAddr(address)))
+            .cloned()
+            .map(|info| OwnedModule {
+                info,
+                dtb: self.kernel_dtb,
+            })
+            .or_else(|| {
+                self.process_modules
+                    .iter()
+                    .find(|module| module.contains_address(VirtAddr(address)))
+                    .cloned()
+                    .map(|info| OwnedModule {
+                        info,
+                        dtb: self.dtb(),
+                    })
+            })
+            .or_else(|| {
+                self.foreign_image
+                    .as_ref()
+                    .filter(|image| image.contains_address(VirtAddr(address)))
+                    .map(|info| OwnedModule {
+                        info: info.clone(),
+                        dtb: self.active_dtb,
+                    })
+            })
+    }
+}
+
+/// How the Windows code of one architecture unwinds: the formats of its
+/// exception directory (`.pdata` and `.xdata`) and the frames its kernel
+/// leaves, which the Windows ABI defines per architecture. The walk asks the
+/// target's unwinder, as GDB's frame code asks an architecture's, and never
+/// names an architecture itself.
+trait Unwinder: Sync {
+    /// Step `context` to its caller's frame. Registers the caller cannot
+    /// rely on (volatile across a call) come back unknown.
+    fn unwind_once(&self, tracer: &mut StackTracer<'_>, context: &mut FrameRegisters) -> Unwound;
+
+    /// The address the PDB's frame-relative locations of the function at
+    /// `context`'s program counter are counted from.
+    fn frame_base(&self, tracer: &mut StackTracer<'_>, context: &FrameRegisters) -> Option<u64>;
+
+    /// The instruction set of the code at `address`, which picks how its
+    /// frame unwinds.
+    fn code_machine_at(&self, tracer: &mut StackTracer<'_>, address: u64) -> CodeMachine;
+
+    /// The frame a switched-out thread resumes in, from `kernel_stack`, the
+    /// stack pointer its context switch saved in `KTHREAD.KernelStack`:
+    /// inside `SwapContext` (at `swap_context`), which KiSwapContext (at
+    /// `ki_swap_context`) called.
+    fn context_switch_frame(
+        &self,
+        tracer: &mut StackTracer<'_>,
+        kernel_stack: u64,
+        swap_context: u64,
+        ki_swap_context: Range<u64>,
+    ) -> Result<FrameRegisters>;
+}
+
+/// The unwinder for `arch`'s Windows code.
+fn unwinder(arch: Arch) -> &'static dyn Unwinder {
+    match arch {
+        Arch::Amd64 => &amd64::Amd64Unwinder,
+        Arch::Arm64 => &arm64::Arm64Unwinder,
+    }
+}
+
+impl StackTracer<'_> {
+    /// Step `context` to its caller's frame, by the target's unwinder.
+    fn unwind_once(&mut self, context: &mut FrameRegisters) -> Unwound {
+        context.machine_frame = None;
+        unwinder(self.target.arch()).unwind_once(self, context)
+    }
+
+    /// Resolve the stack base PDB frame-relative locations are addressed from
+    /// for the function containing `context`'s program counter.
+    fn frame_base_for(&mut self, context: &FrameRegisters) -> Option<u64> {
+        unwinder(self.target.arch()).frame_base(self, context)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use super::{
+        FrameRegisters, FrameSource, build_stacktrace_with_register_values,
+        frame_registers_from_saved,
+    };
+    use crate::arch::Arch;
+    use crate::base::types::VirtAddr;
+    use crate::nt::guest::ModuleInfo;
+    use crate::nt::guest::hypercalls::HypervisorSymbols;
+    use crate::nt::target::{Amd64SavedRegisters, SavedThreadRegisters, SelectedFrame};
+    use crate::session::{Session, session_over_memory};
+    use std::path::Path;
+
+    /// Where the fixture image is loaded, and the stack page after it.
+    const IMAGE: u64 = 0x1_4000_0000;
+    const IMAGE_SIZE: usize = 0x3000;
+    const STACK: u64 = IMAGE + IMAGE_SIZE as u64;
+    /// A function that sets up `rbp` as its frame pointer, and its caller.
+    const FRAMED: u32 = 0x1100;
+    const CALLER: u32 = 0x1200;
+    /// Inside `FRAMED`'s body, past its prolog.
+    const FRAMED_RIP: u64 = IMAGE + FRAMED as u64 + 0x10;
+    /// The call site in `CALLER` that `FRAMED` returns to.
+    const RETURN_ADDRESS: u64 = IMAGE + CALLER as u64 + 0x10;
+    const FRAMED_RSP: u64 = STACK + 0x800;
+    const FRAMED_RBP: u64 = STACK + 0x820;
+    /// What `FRAMED` pushed from its caller's `rbp`.
+    const CALLER_RBP: u64 = STACK + 0x900;
+
+    /// An AMD64 image whose `.pdata` covers `FRAMED` (prolog `push rbp; mov
+    /// rbp, rsp`, unwound through `UWOP_SET_FPREG`) and `CALLER` (no prolog).
+    fn frame_pointer_image() -> Vec<u8> {
+        let mut image = vec![0u8; IMAGE_SIZE];
+        let mut put = |offset: usize, bytes: &[u8]| {
+            image[offset..offset + bytes.len()].copy_from_slice(bytes);
+        };
+        let pe = 0x80;
+        put(0, b"MZ");
+        put(0x3c, &(pe as u32).to_le_bytes());
+        put(pe, b"PE\0\0");
+        put(pe + 4, &0x8664u16.to_le_bytes());
+        put(pe + 6, &2u16.to_le_bytes());
+        put(pe + 20, &240u16.to_le_bytes());
+        let optional = pe + 24;
+        put(optional, &0x20bu16.to_le_bytes());
+        put(optional + 32, &0x1000u32.to_le_bytes());
+        put(optional + 36, &0x200u32.to_le_bytes());
+        put(optional + 56, &(IMAGE_SIZE as u32).to_le_bytes());
+        put(optional + 60, &0x1000u32.to_le_bytes());
+        put(optional + 108, &16u32.to_le_bytes());
+        // Data directory 3: the exception table (two RUNTIME_FUNCTIONs).
+        put(optional + 112 + 3 * 8, &0x2000u32.to_le_bytes());
+        put(optional + 112 + 3 * 8 + 4, &24u32.to_le_bytes());
+        let sections = optional + 240;
+        for (index, (name, rva, characteristics)) in [
+            (b".text\0\0\0", 0x1000u32, 0x6000_0020u32),
+            (b".rdata\0\0", 0x2000, 0x4000_0040),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let header = sections + 40 * index;
+            put(header, name);
+            put(header + 8, &0x1000u32.to_le_bytes());
+            put(header + 12, &rva.to_le_bytes());
+            put(header + 16, &0x1000u32.to_le_bytes());
+            put(header + 20, &rva.to_le_bytes());
+            put(header + 36, &characteristics.to_le_bytes());
+        }
+        put(0x1000, &[0xcc; 0x1000]);
+        // The `call FRAMED` that `RETURN_ADDRESS` follows.
+        let call = CALLER as usize + 0x10 - 5;
+        put(call, &[0xe8]);
+        put(call + 1, &(FRAMED as i32 - (call as i32 + 5)).to_le_bytes());
+        for (index, (begin, unwind_info)) in [(FRAMED, 0x2100u32), (CALLER, 0x2110)]
+            .into_iter()
+            .enumerate()
+        {
+            let entry = 0x2000 + 12 * index;
+            put(entry, &begin.to_le_bytes());
+            put(entry + 4, &(begin + 0x80).to_le_bytes());
+            put(entry + 8, &unwind_info.to_le_bytes());
+        }
+        // Version 1, a 4-byte prolog, two codes, frame register rbp at
+        // offset 0; codes: UWOP_SET_FPREG at 4, UWOP_PUSH_NONVOL rbp at 1.
+        put(0x2100, &[0x01, 0x04, 0x02, 0x05, 0x04, 0x03, 0x01, 0x50]);
+        put(0x2110, &[0x01, 0x00, 0x00, 0x00]);
+        image
+    }
+
+    /// The fixture image and a stack where `FRAMED` runs with its frame at
+    /// `FRAMED_RBP`, called from `CALLER`, which is the thread's first frame.
+    fn frame_pointer_session() -> Session {
+        frame_pointer_session_with(&[(8, RETURN_ADDRESS)])
+    }
+
+    /// [`frame_pointer_session`] with `slots` (offset from `FRAMED_RBP`,
+    /// value) written above the saved `rbp` instead of the return address.
+    fn frame_pointer_session_with(slots: &[(usize, u64)]) -> Session {
+        let mut memory = frame_pointer_image();
+        memory.resize(IMAGE_SIZE + 0x2000, 0);
+        let stack = |address: u64| (address - IMAGE) as usize;
+        memory[stack(FRAMED_RBP)..stack(FRAMED_RBP) + 8].copy_from_slice(&CALLER_RBP.to_le_bytes());
+        for &(offset, value) in slots {
+            let at = stack(FRAMED_RBP) + offset;
+            memory[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        let mut session = session_over_memory(IMAGE, &memory);
+        session
+            .target
+            .set_kernel_modules_for_test(vec![ModuleInfo::new(
+                "fixture.sys".to_string(),
+                VirtAddr(IMAGE),
+                IMAGE_SIZE as u32,
+            )]);
+        session.register_map = Arch::Amd64.register_map().clone();
+        session
+    }
+
+    fn registers(values: &[(&str, u64)]) -> HashMap<String, u64> {
+        values
+            .iter()
+            .map(|(name, value)| (name.to_string(), *value))
+            .collect()
+    }
+
+    #[test]
+    fn a_known_frame_pointer_unwinds_its_frame() {
+        let session = frame_pointer_session();
+        let seed = registers(&[
+            ("rip", FRAMED_RIP),
+            ("rsp", FRAMED_RSP),
+            ("rbp", FRAMED_RBP),
+        ]);
+
+        let trace =
+            build_stacktrace_with_register_values(&session.target, &session.register_map, &seed, 8);
+
+        let frames: Vec<_> = trace
+            .frames
+            .iter()
+            .map(|frame| (frame.frame.ip, frame.frame.source))
+            .collect();
+        assert_eq!(
+            frames,
+            [
+                (FRAMED_RIP, FrameSource::Current),
+                (RETURN_ADDRESS, FrameSource::Unwind)
+            ]
+        );
+        assert_eq!(trace.frames[1].registers.get("rbp"), Some(&CALLER_RBP));
+        assert_eq!(trace.frames[1].frame.sp, FRAMED_RBP + 16);
+    }
+
+    /// A context without `rbp` (the VTL0 state the Windows hypervisor saves)
+    /// cannot unwind a frame-pointer frame; the caller is found by scanning,
+    /// rather than lost to a frame pointer taken as zero.
+    #[test]
+    fn an_unknown_frame_pointer_falls_back_to_scanning() {
+        let session = frame_pointer_session();
+        let seed = registers(&[("rip", FRAMED_RIP), ("rsp", FRAMED_RSP)]);
+
+        let trace =
+            build_stacktrace_with_register_values(&session.target, &session.register_map, &seed, 8);
+
+        let frames: Vec<_> = trace
+            .frames
+            .iter()
+            .map(|frame| (frame.frame.ip, frame.frame.source))
+            .collect();
+        assert_eq!(
+            frames,
+            [
+                (FRAMED_RIP, FrameSource::Current),
+                (RETURN_ADDRESS, FrameSource::Scan)
+            ]
+        );
+    }
+
+    /// A scan lists each return address once: another copy of one higher up
+    /// (a spill slot, a frame since popped) is no second frame.
+    #[test]
+    fn a_scan_lists_a_return_address_once() {
+        let session = frame_pointer_session_with(&[(8, RETURN_ADDRESS), (0x18, RETURN_ADDRESS)]);
+        let seed = registers(&[("rip", FRAMED_RIP), ("rsp", FRAMED_RSP)]);
+
+        let trace =
+            build_stacktrace_with_register_values(&session.target, &session.register_map, &seed, 8);
+
+        let frames: Vec<_> = trace
+            .frames
+            .iter()
+            .map(|frame| (frame.frame.ip, frame.frame.source))
+            .collect();
+        assert_eq!(
+            frames,
+            [
+                (FRAMED_RIP, FrameSource::Current),
+                (RETURN_ADDRESS, FrameSource::Scan)
+            ]
+        );
+    }
+
+    /// A scan skips a code address no call precedes: a function pointer or
+    /// a value that lands in code is no return address.
+    #[test]
+    fn a_scan_skips_code_no_call_precedes() {
+        let session = frame_pointer_session_with(&[
+            (8, IMAGE + u64::from(CALLER) + 0x20),
+            (0x18, RETURN_ADDRESS),
+        ]);
+        let seed = registers(&[("rip", FRAMED_RIP), ("rsp", FRAMED_RSP)]);
+
+        let trace =
+            build_stacktrace_with_register_values(&session.target, &session.register_map, &seed, 8);
+
+        let frames: Vec<_> = trace
+            .frames
+            .iter()
+            .map(|frame| (frame.frame.ip, frame.frame.sp, frame.frame.source))
+            .collect();
+        assert_eq!(
+            frames,
+            [
+                (FRAMED_RIP, FRAMED_RSP, FrameSource::Current),
+                (RETURN_ADDRESS, FRAMED_RBP + 0x18, FrameSource::Scan)
+            ]
+        );
+    }
+
+    /// A function that called itself returns to its own call site: the
+    /// unwind lists both frames and goes on to the outer caller, as the
+    /// stack moved between them.
+    #[test]
+    fn a_recursive_call_unwinds_through_both_frames() {
+        let outer_rbp = CALLER_RBP - FRAMED_RBP;
+        let session = frame_pointer_session_with(&[
+            (8, FRAMED_RIP),
+            (outer_rbp as usize, 0),
+            (outer_rbp as usize + 8, RETURN_ADDRESS),
+        ]);
+        let seed = registers(&[
+            ("rip", FRAMED_RIP),
+            ("rsp", FRAMED_RSP),
+            ("rbp", FRAMED_RBP),
+        ]);
+
+        let trace =
+            build_stacktrace_with_register_values(&session.target, &session.register_map, &seed, 3);
+
+        let frames: Vec<_> = trace
+            .frames
+            .iter()
+            .map(|frame| (frame.frame.ip, frame.frame.sp, frame.frame.source))
+            .collect();
+        assert_eq!(
+            frames,
+            [
+                (FRAMED_RIP, FRAMED_RSP, FrameSource::Current),
+                (FRAMED_RIP, FRAMED_RBP + 16, FrameSource::Unwind),
+                (RETURN_ADDRESS, CALLER_RBP + 16, FrameSource::Unwind),
+            ]
+        );
+    }
+
+    /// On a root none of NT's (the Windows hypervisor's), only its own
+    /// image holds return addresses: an NT module's address on its stack is
+    /// a guest's value, which the scan does not take for a frame.
+    #[test]
+    fn a_foreign_root_scan_takes_only_its_own_image() {
+        // The fixture image twice: the hypervisor's at `IMAGE`, and an NT
+        // module's copy after the stack. The stack holds a return address
+        // into each, the NT one nearer its top.
+        const NT_IMAGE: u64 = STACK + 0x2000;
+        let nt_return_address = NT_IMAGE + u64::from(CALLER) + 0x10;
+        let mut memory = frame_pointer_image();
+        memory.resize(IMAGE_SIZE + 0x2000, 0);
+        memory.extend_from_slice(&frame_pointer_image());
+        let stack = |address: u64| (address - IMAGE) as usize;
+        for (offset, value) in [
+            (0, CALLER_RBP),
+            (8, nt_return_address),
+            (0x18, RETURN_ADDRESS),
+        ] {
+            let at = stack(FRAMED_RBP) + offset;
+            memory[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        let mut session = session_over_memory(IMAGE, &memory);
+        session
+            .target
+            .set_kernel_modules_for_test(vec![ModuleInfo::new(
+                "fixture.sys".to_string(),
+                VirtAddr(NT_IMAGE),
+                IMAGE_SIZE as u32,
+            )]);
+        let mut trace = super::resolve_thread_trace_context(&session.target, 0);
+        trace.foreign_image = Some(ModuleInfo::new(
+            "hv".to_string(),
+            VirtAddr(IMAGE),
+            IMAGE_SIZE as u32,
+        ));
+
+        let walk = super::walk::build_recovered_stacktrace_seeded(
+            &session.target,
+            &trace,
+            FrameRegisters::new(Arch::Amd64, FRAMED_RIP, FRAMED_RSP),
+            FrameSource::Seed,
+            8,
+            HashMap::new(),
+        );
+
+        let frames: Vec<_> = walk.frames.iter().map(|frame| frame.frame.ip).collect();
+        assert_eq!(frames, [FRAMED_RIP, RETURN_ADDRESS]);
+    }
+
+    /// Windows hypervisor code whose unwind data leaves out its prolog's
+    /// `sub rsp, 0x28`, as some assembly's does from build 22621 (its
+    /// external-interrupt exit handler's): at its call, the data's frame
+    /// would read the return address from the spill area, where a stale one
+    /// lies. The walk takes the prolog's frame, which keeps the caller's RSP
+    /// aligned as at every call, and reaches the real caller.
+    #[test]
+    fn a_hypervisor_frame_whose_unwind_data_misaligns_its_caller_takes_its_prolog() {
+        // The handler, the code that calls it, what it calls, and another
+        // call site whose return address is the stale one. Each calls with
+        // the 5 bytes before its offset 0x10.
+        const HANDLER: u32 = 0x1100;
+        const ENTRY: u32 = 0x1200;
+        const CALLEE: u32 = 0x1300;
+        const DECOY: u32 = 0x1400;
+        let returns_to = |function: u32| IMAGE + u64::from(function) + 0x10;
+        // The handler's RSP at its call, 16-byte aligned as at every call.
+        let rsp = STACK + 0x800;
+
+        let mut memory = frame_pointer_image();
+        // Four RUNTIME_FUNCTIONs, all with the fixture's unwind data of no
+        // codes at 0x2110.
+        memory[0x124..0x128].copy_from_slice(&48u32.to_le_bytes());
+        for (index, begin) in [HANDLER, ENTRY, CALLEE, DECOY].into_iter().enumerate() {
+            let entry = 0x2000 + 12 * index;
+            memory[entry..entry + 4].copy_from_slice(&begin.to_le_bytes());
+            memory[entry + 4..entry + 8].copy_from_slice(&(begin + 0x80).to_le_bytes());
+            memory[entry + 8..entry + 12].copy_from_slice(&0x2110u32.to_le_bytes());
+        }
+        for (function, target) in [(HANDLER, CALLEE), (ENTRY, HANDLER), (DECOY, CALLEE)] {
+            let at = function as usize;
+            memory[at..at + 0xb].fill(0x90);
+            memory[at + 0xb] = 0xe8;
+            let displacement = target.wrapping_sub(function + 0x10);
+            memory[at + 0xc..at + 0x10].copy_from_slice(&displacement.to_le_bytes());
+        }
+        memory[HANDLER as usize..HANDLER as usize + 4].copy_from_slice(&[0x48, 0x83, 0xec, 0x28]);
+        memory.resize(IMAGE_SIZE + 0x2000, 0);
+        for (address, value) in [
+            (rsp - 8, returns_to(HANDLER)),
+            (rsp, returns_to(DECOY)),
+            (rsp + 0x28, returns_to(ENTRY)),
+        ] {
+            let at = (address - IMAGE) as usize;
+            memory[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        let mut session = session_over_memory(IMAGE, &memory);
+        session
+            .target
+            .set_kernel_modules_for_test(vec![ModuleInfo::new(
+                "hv".to_string(),
+                VirtAddr(IMAGE),
+                IMAGE_SIZE as u32,
+            )]);
+        let mut trace = super::resolve_thread_trace_context(&session.target, 0);
+        trace.foreign_image = Some(ModuleInfo::new(
+            "hv".to_string(),
+            VirtAddr(IMAGE),
+            IMAGE_SIZE as u32,
+        ));
+        trace.hypervisor = Some(Arc::new(HypervisorSymbols {
+            names: Vec::new(),
+            extents: HashMap::new(),
+            starts: vec![HANDLER, ENTRY, CALLEE, DECOY],
+            exit_entries: Vec::new(),
+        }));
+
+        let walk = super::walk::build_recovered_stacktrace_seeded(
+            &session.target,
+            &trace,
+            FrameRegisters::new(Arch::Amd64, IMAGE + u64::from(CALLEE), rsp - 8),
+            FrameSource::Seed,
+            8,
+            HashMap::new(),
+        );
+
+        let frames: Vec<_> = walk
+            .frames
+            .iter()
+            .map(|frame| (frame.frame.ip, frame.frame.source))
+            .collect();
+        assert_eq!(
+            frames,
+            [
+                (IMAGE + u64::from(CALLEE), FrameSource::Seed),
+                (returns_to(HANDLER), FrameSource::Unwind),
+                (returns_to(ENTRY), FrameSource::Prolog),
+            ]
+        );
+    }
+
+    /// An unwind that lands on a value no code can sit at (the null page, a
+    /// non-canonical address) went wrong: it is not listed as a frame, and
+    /// the caller is found by scanning above it.
+    #[test]
+    fn a_return_address_in_the_null_page_is_not_a_frame() {
+        let session = frame_pointer_session_with(&[(8, 0x288), (0x18, RETURN_ADDRESS)]);
+        let seed = registers(&[
+            ("rip", FRAMED_RIP),
+            ("rsp", FRAMED_RSP),
+            ("rbp", FRAMED_RBP),
+        ]);
+
+        let trace =
+            build_stacktrace_with_register_values(&session.target, &session.register_map, &seed, 8);
+
+        let frames: Vec<_> = trace
+            .frames
+            .iter()
+            .map(|frame| (frame.frame.ip, frame.frame.source))
+            .collect();
+        assert_eq!(
+            frames,
+            [
+                (FRAMED_RIP, FrameSource::Current),
+                (RETURN_ADDRESS, FrameSource::Scan)
+            ]
+        );
+    }
+
+    /// The fixture image with `DriverEntry` of the inline-frames fixture PDB
+    /// (`tests/fixtures/inline_frames.pdb`) at RVA 0x1000..0x1059 instead of
+    /// `FRAMED`, unwound as its prolog `sub rsp, 0x10` says, and that PDB
+    /// loaded for the image. `returns` are `(offset from FRAMED_RSP, value)`
+    /// stack slots.
+    fn inline_frames_session(returns: &[(usize, u64)]) -> Session {
+        let mut memory = frame_pointer_image();
+        memory[0x2000..0x2004].copy_from_slice(&0x1000u32.to_le_bytes());
+        memory[0x2004..0x2008].copy_from_slice(&0x1059u32.to_le_bytes());
+        memory[0x2008..0x200c].copy_from_slice(&0x2120u32.to_le_bytes());
+        // Version 1, a 4-byte prolog, one code: UWOP_ALLOC_SMALL of 16 at 4.
+        memory[0x2120..0x2128].copy_from_slice(&[0x01, 0x04, 0x01, 0x00, 0x04, 0x12, 0, 0]);
+        memory.resize(IMAGE_SIZE + 0x2000, 0);
+        for &(offset, value) in returns {
+            let at = (FRAMED_RSP - IMAGE) as usize + offset;
+            memory[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        let mut session = session_over_memory(IMAGE, &memory);
+        session
+            .target
+            .set_kernel_modules_for_test(vec![ModuleInfo::new(
+                "fixture.sys".to_string(),
+                VirtAddr(IMAGE),
+                IMAGE_SIZE as u32,
+            )]);
+        session.register_map = Arch::Amd64.register_map().clone();
+        let dtb = session.target.kernel_dtb();
+        session
+            .target
+            .symbols
+            .load_pdb_for_test(
+                Path::new(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/inline_frames.pdb"
+                )),
+                "fixture",
+                dtb,
+                VirtAddr(IMAGE),
+                IMAGE_SIZE as u32,
+            )
+            .unwrap();
+        session
+    }
+
+    /// A physical frame in inlined code shows as the inline frames there,
+    /// innermost first, then itself; a caller's frames are those of its call
+    /// (the byte before the return address), which here is still in the
+    /// inlined `fetch_add` although the return address is past it.
+    #[test]
+    fn inlined_calls_expand_into_frames_and_a_caller_is_at_its_call() {
+        let stopped = IMAGE + 0x101d;
+        let returned = IMAGE + 0x1026;
+        let session = inline_frames_session(&[(0x10, returned)]);
+        let seed = registers(&[("rip", stopped), ("rsp", FRAMED_RSP)]);
+
+        let trace = build_stacktrace_with_register_values(
+            &session.target,
+            &session.register_map,
+            &seed,
+            16,
+        );
+
+        let frames: Vec<_> = trace
+            .frames
+            .iter()
+            .map(|frame| {
+                let frame = &frame.frame;
+                let line = frame.source_location.as_ref().map(|location| location.line);
+                (frame.ip, frame.inline, frame.symbol.as_str(), line)
+            })
+            .collect();
+        let in_fetch_add = |ip| {
+            [
+                (
+                    ip,
+                    true,
+                    "fixture!core::sync::atomic::atomic_add",
+                    Some(3927),
+                ),
+                (
+                    ip,
+                    true,
+                    "fixture!core::sync::atomic::Atomic<u32>::fetch_add",
+                    Some(3148),
+                ),
+                (ip, true, "fixture!inline_frames::scale", Some(11)),
+                (ip, true, "fixture!inline_frames::accumulate", Some(17)),
+            ]
+        };
+        let mut expected = in_fetch_add(stopped).to_vec();
+        expected.push((stopped, false, "fixture!DriverEntry+0x1d", Some(25)));
+        expected.extend(in_fetch_add(returned));
+        expected.push((returned, false, "fixture!DriverEntry+0x26", Some(25)));
+        assert_eq!(frames, expected);
+
+        let codes: Vec<_> = trace.frames.iter().map(|frame| frame.frame.code).collect();
+        for (index, code) in codes.iter().enumerate() {
+            let (address, depth) = if index < 5 {
+                (stopped, index)
+            } else {
+                (returned - 1, index - 5)
+            };
+            assert_eq!(code.address, VirtAddr(address));
+            assert_eq!(code.inline_depth, depth);
+        }
+        // The stopped frame's inline frames share its (live) registers; the
+        // caller's are recovered.
+        assert_eq!(trace.frames[0].registers, trace.frames[4].registers);
+        assert_eq!(trace.frames[5].registers, trace.frames[9].registers);
+        let selected = |index| SelectedFrame::from_recovered(&trace, index, Some(&seed), true);
+        assert!(selected(3).unwrap().is_live());
+        assert!(selected(4).unwrap().is_live());
+        assert!(!selected(5).unwrap().is_live());
+    }
+
+    #[test]
+    fn saved_register_context_preserves_missing_values() {
+        let registers = SavedThreadRegisters::Amd64(Amd64SavedRegisters {
+            rip: Some(0xffff_f800_1000),
+            rsp: Some(0xffff_a000_2000),
+            rbp: Some(0xffff_a000_2100),
+            ..Amd64SavedRegisters::default()
+        });
+        let context = frame_registers_from_saved(&registers).unwrap();
+        assert_eq!(context.pc, 0xffff_f800_1000);
+        assert_eq!(context.sp, 0xffff_a000_2000);
+        assert_eq!(context.get(5), Some(0xffff_a000_2100));
+        assert_eq!(context.get(3), None);
+
+        let missing_rsp = SavedThreadRegisters::Amd64(Amd64SavedRegisters {
+            rip: Some(0xffff_f800_1000),
+            ..Amd64SavedRegisters::default()
+        });
+        assert!(frame_registers_from_saved(&missing_rsp).is_none());
+    }
+}

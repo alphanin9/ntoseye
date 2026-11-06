@@ -1,0 +1,1999 @@
+use super::cache::{ModuleIdentities, ModuleIdentity, PdbReference};
+use super::download::local_source_candidates;
+use super::index_build::{insert_symbol_rva, undecorate_x86};
+use super::locals::live_range_contains;
+use super::lookup::preferred_symbol_records;
+use super::source::{SourceFileQuery, lookup_source_line, remap_source_file};
+use super::*;
+use crate::arch::Arch;
+use crate::base::error::Result;
+use crate::base::memory::MemoryOps;
+use crate::base::types::PhysAddr;
+use smallvec::smallvec;
+use std::io::Write;
+use std::path::Path;
+
+#[test]
+fn symbol_path_parser_supports_local_http_and_srv_syntax() {
+    let sources = parse_symbol_sources(&[
+        "/private",
+        "https://symbols.example.test/",
+        "srv*/cache*https://backup.example.test",
+    ]);
+    assert_eq!(
+        sources,
+        vec![
+            SymbolSource::LocalDirectory("/private".into()),
+            SymbolSource::Http("https://symbols.example.test".to_string()),
+            SymbolSource::LocalDirectory("/cache".into()),
+            SymbolSource::Http("https://backup.example.test".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn source_path_parser_supports_roots_and_prefix_mappings() {
+    assert_eq!(
+        parse_source_paths(&[";a;;b=c=d;"]),
+        vec![
+            SourcePathMapping {
+                recorded_prefix: None,
+                local_root: "a".into(),
+            },
+            SourcePathMapping {
+                recorded_prefix: Some("b".to_string()),
+                local_root: "c=d".into(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn local_locations_describe_negative_offsets_as_subtraction() {
+    assert_eq!(
+        LocalVariableLocation::RegisterRelative {
+            register: "rsp".to_string(),
+            offset: -0x20,
+        }
+        .describe(),
+        "[rsp-0x20]"
+    );
+}
+
+fn temp_root(name: &str) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("ntoseye-{name}-{nonce}"))
+}
+
+fn identity(name: &str) -> ModuleIdentity {
+    ModuleIdentity {
+        name: name.to_string(),
+        time_date_stamp: 0x6600_0000,
+        size_of_image: 0x7000,
+    }
+}
+
+fn reference(age: u32) -> PdbReference {
+    PdbReference {
+        server_name: "driver.pdb".to_string(),
+        guid: 0x0123_4567_89ab_cdef_0123_4567_89ab_cdef,
+        age,
+    }
+}
+
+#[test]
+fn module_identities_persist_across_reopen() {
+    let root = temp_root("identities");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("identities");
+
+    let identities = ModuleIdentities::open(Some(path.clone()));
+    identities.insert(identity("a.sys"), reference(1));
+    identities.insert(identity("b.sys"), reference(2));
+    identities.insert(identity("a.sys"), reference(3));
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"garbage line\n")
+        .unwrap();
+
+    let reopened = ModuleIdentities::open(Some(path.clone()));
+    assert_eq!(reopened.get(&identity("a.sys")), Some(reference(3)));
+    assert_eq!(reopened.get(&identity("b.sys")), Some(reference(2)));
+    assert_eq!(reopened.get(&identity("c.sys")), None);
+
+    reopened.remove(&identity("a.sys"));
+    let again = ModuleIdentities::open(Some(path));
+    assert_eq!(again.get(&identity("a.sys")), None);
+    assert_eq!(again.get(&identity("b.sys")), Some(reference(2)));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn remembered_module_is_discovered_without_reading_the_target() {
+    struct NoReads;
+    impl MemoryOps<PhysAddr> for NoReads {
+        fn read_bytes(&self, addr: PhysAddr, _: &mut [u8]) -> Result<()> {
+            panic!("read at {addr:#x} for a remembered module");
+        }
+        fn write_bytes(&self, _: PhysAddr, _: &[u8]) -> Result<()> {
+            unreachable!()
+        }
+    }
+
+    let root = temp_root("identity-discovery");
+    std::fs::create_dir_all(&root).unwrap();
+    let store = SymbolStore::new();
+    let identities = ModuleIdentities::open(Some(root.join("identities")));
+    identities.insert(identity("driver.sys"), reference(2));
+    store.identities.set(identities).ok().unwrap();
+
+    let mut module = ModuleInfo::new(
+        "\\SystemRoot\\drivers\\Driver.sys".to_string(),
+        VirtAddr(0xffff_f800_1000_0000),
+        0x7000,
+    );
+    module = module.with_time_date_stamp(0x6600_0000);
+    let discovery = store
+        .extract_download_job(&NoReads, 0x1000, &module, Arch::Amd64)
+        .unwrap();
+    let ModuleSymbolDiscovery::Ready { job, guid, source } = discovery else {
+        panic!("expected a ready job");
+    };
+    assert!(matches!(source, ModuleSymbolSource::Identity));
+    assert_eq!(guid, reference(2).guid);
+    assert_eq!(job.filename, "driver.pdb");
+    assert!(
+        job.path
+            .ends_with("driver.pdb/0123456789ABCDEF0123456789ABCDEF2/driver.pdb"),
+        "{}",
+        job.path.display()
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn local_source_paths_cover_direct_and_symbol_store_layouts() {
+    let identity = PdbIdentity {
+        guid: 0x00112233445566778899AABBCCDDEEFF,
+        age: 2,
+    };
+    let root = Path::new("/symbols");
+
+    assert_eq!(
+        local_source_candidates(root, "private.pdb", identity),
+        vec![
+            root.join("private.pdb"),
+            root.join("private.pdb")
+                .join("00112233445566778899AABBCCDDEEFF2")
+                .join("private.pdb")
+        ]
+    );
+}
+
+#[test]
+fn local_source_candidates_go_on_to_pdbs_further_down() {
+    let identity = PdbIdentity {
+        guid: 0x00112233445566778899AABBCCDDEEFF,
+        age: 2,
+    };
+    let root = temp_root("nested-pdbs");
+    let put = |relative: &str| {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"pdb").unwrap();
+        path
+    };
+    // A virtio-win ISO's layout, in either case, down to the deepest level
+    // read.
+    let mut nested = vec![
+        put("viorng/2k22/amd64/viorng.pdb"),
+        put("viorng/w11/ARM64/VIORNG.PDB"),
+        put("1/2/3/4/5/6/7/viorng.pdb"),
+    ];
+    put("1/2/3/4/5/6/7/8/viorng.pdb");
+    // Another build in the symbol-store layout is not this one.
+    put("viorng.pdb/FFEEDDCCBBAA99887766554433221100/viorng.pdb");
+    put("viorng/2k22/amd64/viorng.sys");
+    // A link back up the tree is not followed into the same PDBs again.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&root, root.join("viorng/2k22/up")).unwrap();
+
+    let mut candidates = local_source_candidates(&root, "viorng.pdb", identity);
+    let flat = candidates.drain(..2).collect::<Vec<_>>();
+    assert_eq!(
+        flat,
+        [
+            root.join("viorng.pdb"),
+            root.join("viorng.pdb/00112233445566778899AABBCCDDEEFF2/viorng.pdb"),
+        ]
+    );
+    candidates.sort();
+    nested.sort();
+    assert_eq!(candidates, nested);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_pdb_put_in_a_local_directory_is_found_once_reload_forgets_it() {
+    let identity = PdbIdentity {
+        guid: 0x00112233445566778899AABBCCDDEEFF,
+        age: 2,
+    };
+    let root = temp_root("nested-pdbs-reload");
+    std::fs::create_dir_all(root.join("viostor/w11/amd64")).unwrap();
+    assert_eq!(
+        local_source_candidates(&root, "viostor.pdb", identity).len(),
+        2
+    );
+
+    let added = root.join("viostor/w11/amd64/viostor.pdb");
+    std::fs::write(&added, b"pdb").unwrap();
+    SymbolStore::new().forget_unavailable();
+    assert_eq!(
+        local_source_candidates(&root, "viostor.pdb", identity)[2..],
+        [added]
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn an_image_whose_background_fetch_failed_is_not_queued_again() {
+    use crate::base::notice::{Notice, NoticeLevel};
+    use std::time::{Duration, Instant};
+
+    // No server to ask, so the fetch fails at once, as one a server has no
+    // copy for does.
+    let job = DownloadJob {
+        urls: Vec::new(),
+        path: temp_root("failed-image-fetch").join("driver.sys"),
+        filename: "driver.sys".to_string(),
+        pdb: None,
+    };
+    let store = Arc::new(SymbolStore::new());
+    assert!(store.fetch_image_later(job.clone()).unwrap().is_none());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut notices = Vec::new();
+    let failure = loop {
+        if let Some(notice) = notices
+            .iter()
+            .find(|notice: &&Notice| notice.level == NoticeLevel::Warning)
+        {
+            break notice.text.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the background fetch never ended"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+        notices.extend(store.take_notices());
+    };
+
+    // A second client asking again learns why it failed, with nothing
+    // queued or announced.
+    let error = store.fetch_image_later(job.clone()).unwrap_err();
+    assert!(failure.ends_with(&error.to_string()), "{failure} / {error}");
+    assert!(store.take_notices().is_empty());
+
+    // `.reload` asks the sources again.
+    store.forget_unavailable();
+    assert!(store.fetch_image_later(job).unwrap().is_none());
+}
+
+#[test]
+fn pdb_identity_requires_guid_and_non_stale_age() {
+    let expected = PdbIdentity {
+        guid: 0x1234,
+        age: 3,
+    };
+    assert!(expected.matches(expected).is_ok());
+    assert!(
+        expected
+            .matches(PdbIdentity {
+                guid: expected.guid,
+                age: 4
+            })
+            .is_ok()
+    );
+    assert!(
+        expected
+            .matches(PdbIdentity {
+                guid: 0x5678,
+                age: 3
+            })
+            .unwrap_err()
+            .contains("GUID mismatch")
+    );
+    assert!(
+        expected
+            .matches(PdbIdentity {
+                guid: expected.guid,
+                age: 2
+            })
+            .unwrap_err()
+            .contains("age mismatch")
+    );
+}
+
+#[test]
+fn duplicate_private_symbols_remain_candidates_while_public_symbols_take_precedence() {
+    let mut symbols = FxHashMap::default();
+    insert_symbol_rva(
+        &mut symbols,
+        "duplicate",
+        0x100,
+        SymbolVisibility::Private,
+        Some("first.obj".to_string()),
+    );
+    insert_symbol_rva(
+        &mut symbols,
+        "duplicate",
+        0x200,
+        SymbolVisibility::Private,
+        Some("second.obj".to_string()),
+    );
+    assert_eq!(preferred_symbol_records(&symbols["duplicate"]).len(), 2);
+
+    insert_symbol_rva(
+        &mut symbols,
+        "duplicate",
+        0x300,
+        SymbolVisibility::Public,
+        None,
+    );
+    let preferred = preferred_symbol_records(&symbols["duplicate"]);
+    assert_eq!(preferred.len(), 1);
+    assert_eq!(preferred[0].rva, 0x300);
+    assert_eq!(symbols["duplicate"].len(), 3);
+}
+
+#[test]
+fn symbol_resolution_reports_distinct_private_candidates() {
+    let store = SymbolStore::new();
+    let dtb = 0x1000_u64;
+    let base = VirtAddr(0x0000_0001_8000_0000);
+    store.modules.insert(
+        SymbolStore::module_key(dtb, base),
+        LoadedModule {
+            name: "driver.sys".to_string(),
+            short_name: "driver".to_string(),
+            guid: 1,
+            base_address: base,
+            size: 0x1000,
+            dtb,
+        },
+    );
+    store.publish_symbol_rvas(
+        1,
+        FxHashMap::from_iter([(
+            "worker".into(),
+            smallvec![
+                IndexedSymbol {
+                    rva: 0x100,
+                    visibility: SymbolVisibility::Private,
+                    compiland: Some("first.obj".to_string()),
+                },
+                IndexedSymbol {
+                    rva: 0x200,
+                    visibility: SymbolVisibility::Private,
+                    compiland: Some("second.obj".to_string()),
+                },
+            ],
+        )]),
+    );
+
+    let candidates = store.find_symbol_candidates(dtb, "driver!worker");
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0].compiland.as_deref(), Some("first.obj"));
+    assert_eq!(candidates[1].address, base + 0x200_u64);
+    let error = store
+        .find_symbol_with_module(dtb, "driver!worker")
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("driver!worker"));
+    assert!(message.contains("first.obj"));
+    assert!(message.contains("second.obj"));
+}
+
+#[test]
+fn public_symbol_is_the_unique_resolution_for_a_duplicate_name() {
+    let store = SymbolStore::new();
+    let dtb = 0x1000_u64;
+    let base = VirtAddr(0x0000_0001_8000_0000);
+    store.modules.insert(
+        SymbolStore::module_key(dtb, base),
+        LoadedModule {
+            name: "driver.sys".to_string(),
+            short_name: "driver".to_string(),
+            guid: 1,
+            base_address: base,
+            size: 0x1000,
+            dtb,
+        },
+    );
+    store.publish_symbol_rvas(
+        1,
+        FxHashMap::from_iter([(
+            "worker".into(),
+            smallvec![
+                IndexedSymbol {
+                    rva: 0x100,
+                    visibility: SymbolVisibility::Private,
+                    compiland: Some("first.obj".to_string()),
+                },
+                IndexedSymbol {
+                    rva: 0x300,
+                    visibility: SymbolVisibility::Public,
+                    compiland: None,
+                },
+            ],
+        )]),
+    );
+
+    assert_eq!(
+        store.find_symbol_with_module(dtb, "driver!worker").unwrap(),
+        Some((base + 0x300_u64, "driver".to_string()))
+    );
+}
+
+#[test]
+fn cpp_public_names_are_shown_and_found_undecorated() {
+    let store = SymbolStore::new();
+    let dtb = 0x1000_u64;
+    let base = VirtAddr(0x0000_0001_8000_0000);
+    store.modules.insert(
+        SymbolStore::module_key(dtb, base),
+        LoadedModule {
+            name: "kernelbase.dll".to_string(),
+            short_name: "kernelbase".to_string(),
+            guid: 1,
+            base_address: base,
+            size: 0x10000,
+            dtb,
+        },
+    );
+    let interface_qualified =
+        "?GetMessageW@?QIServerCall@@StandardComServerCall@@UEBAPEAUtagRPCOLEMESSAGE@@XZ";
+    store.publish_public_names(
+        1,
+        [
+            ("?DebugBreak@details@wil@@YAXXZ", 0x100),
+            // ARM64EC's `$$h` marker, as an ARM64X image's PDB has it.
+            ("?eat@XmlInputBuffer@@$$hQEAAXK@Z", 0x200),
+            (
+                "?StDmpSinglePageInsert@?$ST_STORE@USM_TRAITS@@@@SAJPEAU_ST_DATA_MGR@1@PEAU_ST_IO_PARAMS@1@PEAU_ST_PAGE_RECORD@1@@Z",
+                0x300,
+            ),
+            ("??_C@_0BA@HKDEHBAO@RtlAllocateHeap@", 0x400),
+            ("RtlAllocateHeap", 0x500),
+            // An explicit interface qualifier, which the demangler cannot read.
+            (interface_qualified, 0x600),
+        ],
+    );
+
+    let closest = |rva: u64| store.closest_symbol(1, base, base + rva);
+    assert_eq!(
+        closest(0x102),
+        Some(("wil::details::DebugBreak".to_string(), 2))
+    );
+    assert_eq!(closest(0x200), Some(("XmlInputBuffer::eat".to_string(), 0)));
+    assert_eq!(
+        closest(0x300),
+        Some(("ST_STORE<SM_TRAITS>::StDmpSinglePageInsert".to_string(), 0))
+    );
+    assert_eq!(closest(0x404), Some(("`string'".to_string(), 4)));
+    assert_eq!(closest(0x500), Some(("RtlAllocateHeap".to_string(), 0)));
+    assert_eq!(closest(0x600), Some((interface_qualified.to_string(), 0)));
+
+    for (name, rva) in [
+        ("kernelbase!wil::details::DebugBreak", 0x100_u64),
+        (
+            "kernelbase!ST_STORE<SM_TRAITS>::StDmpSinglePageInsert",
+            0x300,
+        ),
+    ] {
+        assert_eq!(
+            store.find_symbol_with_module(dtb, name).unwrap(),
+            Some((base + rva, "kernelbase".to_string())),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn closest_symbol_picks_nearest_lower_record_and_prefers_public_at_ties() {
+    let store = SymbolStore::new();
+    let base = VirtAddr(0x0000_0001_8000_0000);
+    let mut rvas = FxHashMap::default();
+    let mut insert = |name: &str, rva, visibility, compiland: Option<&str>| {
+        insert_symbol_rva(
+            &mut rvas,
+            name,
+            rva,
+            visibility,
+            compiland.map(str::to_string),
+        );
+    };
+    insert("zeta", 0x100, SymbolVisibility::Public, None);
+    insert("alpha", 0x100, SymbolVisibility::Private, Some("a.obj"));
+    insert("later", 0x200, SymbolVisibility::Private, Some("b.obj"));
+    insert("far", 0x8000, SymbolVisibility::Public, None);
+    store.publish_symbol_rvas(1, rvas);
+
+    let closest = |rva: u64| store.closest_symbol(1, base, base + rva);
+    assert_eq!(closest(0x0), None);
+    assert_eq!(closest(0x100), Some(("zeta".to_string(), 0)));
+    assert_eq!(closest(0x1ff), Some(("zeta".to_string(), 0xff)));
+    assert_eq!(closest(0x200), Some(("later".to_string(), 0)));
+    assert_eq!(closest(0x200 + 8192), Some(("later".to_string(), 8192)));
+    assert_eq!(closest(0x200 + 8193), None);
+    assert_eq!(closest(0x8010), Some(("far".to_string(), 0x10)));
+}
+
+#[test]
+fn closest_symbol_stops_at_its_section_end() {
+    let store = SymbolStore::new();
+    let base = VirtAddr(0x0000_0001_8000_0000);
+    let mut rvas = FxHashMap::default();
+    insert_symbol_rva(&mut rvas, "last", 0x1f88, SymbolVisibility::Public, None);
+    store.publish_symbol_rvas(1, rvas);
+    store
+        .sections
+        .insert(1, vec![(0x1000, 0x1fc0), (0x2000, 0x3000)]);
+
+    let closest = |rva: u64| store.closest_symbol(1, base, base + rva);
+    assert_eq!(closest(0x1fbf), Some(("last".to_string(), 0x37)));
+    assert_eq!(closest(0x1fc0), None);
+    assert_eq!(closest(0x2000), None);
+}
+
+#[test]
+fn source_line_lookup_obeys_line_ranges() {
+    let lines = vec![
+        SourceLineEntry {
+            rva: 0x100,
+            length: Some(4),
+            location: SourceLocation {
+                file: "private.c".to_string(),
+                line: 10,
+                column: Some(2),
+                local: None,
+            },
+        },
+        SourceLineEntry {
+            rva: 0x110,
+            length: None,
+            location: SourceLocation {
+                file: "private.c".to_string(),
+                line: 11,
+                column: None,
+                local: None,
+            },
+        },
+        SourceLineEntry {
+            rva: 0x120,
+            length: Some(2),
+            location: SourceLocation {
+                file: "private.c".to_string(),
+                line: 12,
+                column: None,
+                local: None,
+            },
+        },
+    ];
+
+    assert_eq!(
+        lookup_source_line(&lines, 0x102).unwrap().0.location.line,
+        10
+    );
+    assert!(lookup_source_line(&lines, 0x104).is_none());
+    assert_eq!(
+        lookup_source_line(&lines, 0x11f).unwrap().0.location.line,
+        11
+    );
+    assert!(lookup_source_line(&lines, 0x122).is_none());
+}
+
+#[test]
+fn source_line_extent_reports_explicit_next_and_missing_ends() {
+    let store = SymbolStore::new();
+    let dtb = 0x1000_u64;
+    let base = VirtAddr(0x0000_0001_8000_0000);
+    store.inject_source_lines_for_test(
+        1,
+        dtb,
+        base,
+        0x1000,
+        "private.c",
+        &[(0x100, Some(4), 10), (0x110, None, 11), (0x120, None, 12)],
+    );
+
+    let explicit = store.source_line_extent(dtb, base + 0x101_u64).unwrap();
+    assert_eq!(explicit.end, Some(base + 0x104_u64));
+
+    let next_entry = store.source_line_extent(dtb, base + 0x111_u64).unwrap();
+    assert_eq!(next_entry.end, Some(base + 0x120_u64));
+
+    let final_entry = store.source_line_extent(dtb, base + 0x120_u64).unwrap();
+    assert_eq!(final_entry.end, None);
+}
+
+#[test]
+fn definition_range_excludes_gaps() {
+    let gaps = [(4, 2)];
+    assert!(!live_range_contains(0x100, 10, gaps, 0xff));
+    assert!(live_range_contains(0x100, 10, gaps, 0x103));
+    assert!(!live_range_contains(0x100, 10, gaps, 0x104));
+    assert!(!live_range_contains(0x100, 10, gaps, 0x105));
+    assert!(live_range_contains(0x100, 10, gaps, 0x106));
+    assert!(!live_range_contains(0x100, 10, gaps, 0x10a));
+}
+
+#[test]
+fn source_file_matching_supports_windows_paths_and_basenames() {
+    let recorded = r"C:\agent\src\private.c";
+    assert!(SourceFileQuery::new(r"c:\AGENT\src\PRIVATE.c").matches(recorded));
+    assert!(SourceFileQuery::new("c:/agent/SRC/private.c").matches(recorded));
+    assert!(SourceFileQuery::new("PRIVATE.c").matches(recorded));
+    assert!(!SourceFileQuery::new("other.c").matches(recorded));
+}
+
+fn unverified(_: &Path) -> Option<bool> {
+    None
+}
+
+fn local(path: PathBuf, state: LocalSourceState) -> Option<LocalSource> {
+    Some(LocalSource { path, state })
+}
+
+#[test]
+fn source_path_remapping_prefers_existing_ordered_candidate() {
+    let root = temp_root("source-remap");
+    let first = root.join("missing");
+    let second = root.join("checkout");
+    std::fs::create_dir_all(&second).unwrap();
+    std::fs::write(second.join("private.c"), "int private;\n").unwrap();
+    let mappings = vec![
+        SourcePathMapping {
+            recorded_prefix: Some(r"C:\agent\src".to_string()),
+            local_root: first.clone(),
+        },
+        SourcePathMapping {
+            recorded_prefix: Some(r"C:\agent\src".to_string()),
+            local_root: second.clone(),
+        },
+    ];
+
+    assert_eq!(
+        remap_source_file(r"C:\agent\src\private.c", &mappings, &mut unverified),
+        local(second.join("private.c"), LocalSourceState::Found)
+    );
+    assert_eq!(
+        remap_source_file(r"C:\agent\src\gone.c", &mappings, &mut unverified),
+        local(first.join("gone.c"), LocalSourceState::Missing)
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A bare root holds the recorded path's trailing components: the longest
+/// that names a file under it wins, exact case first, then ignoring case.
+#[test]
+fn a_bare_source_root_matches_the_longest_recorded_suffix() {
+    let root = temp_root("source-suffix");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("Inc")).unwrap();
+    std::fs::write(root.join("src/queue.c"), "queue\n").unwrap();
+    std::fs::write(root.join("queue.c"), "other queue\n").unwrap();
+    std::fs::write(root.join("Inc/Driver.h"), "driver\n").unwrap();
+    let mappings = [SourcePathMapping {
+        recorded_prefix: None,
+        local_root: root.clone(),
+    }];
+
+    assert_eq!(
+        remap_source_file(
+            r"C:\Users\me\repos\MyDriver\src\queue.c",
+            &mappings,
+            &mut unverified
+        ),
+        local(root.join("src/queue.c"), LocalSourceState::Found)
+    );
+    assert_eq!(
+        remap_source_file(r"C:\build\inc\driver.h", &mappings, &mut unverified),
+        local(root.join("Inc/Driver.h"), LocalSourceState::Found)
+    );
+    assert_eq!(
+        remap_source_file(r"C:\build\src\absent.c", &mappings, &mut unverified),
+        local(root.join("absent.c"), LocalSourceState::Missing)
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A file that is not the one compiled is passed over for one that is, and
+/// reported only when no candidate is.
+#[test]
+fn source_remapping_passes_over_files_that_are_not_the_one_compiled() {
+    let root = temp_root("source-verify");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/queue.c"), "edited\n").unwrap();
+    std::fs::write(root.join("queue.c"), "compiled\n").unwrap();
+    let mappings = [SourcePathMapping {
+        recorded_prefix: None,
+        local_root: root.clone(),
+    }];
+    let compiled = |path: &Path| Some(std::fs::read(path).unwrap() == b"compiled\n");
+
+    assert_eq!(
+        remap_source_file(r"C:\drv\src\queue.c", &mappings, &mut { compiled }),
+        local(root.join("queue.c"), LocalSourceState::Found)
+    );
+    std::fs::remove_file(root.join("queue.c")).unwrap();
+    assert_eq!(
+        remap_source_file(r"C:\drv\src\queue.c", &mappings, &mut { compiled }),
+        local(root.join("src/queue.c"), LocalSourceState::Differs)
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// The store checks a mapped file against the checksum the PDB records,
+/// again after the file changes.
+#[test]
+fn source_lines_report_whether_the_local_file_is_the_one_compiled() {
+    let root = temp_root("source-checksum");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let file = root.join("src/driver.c");
+    std::fs::write(&file, "int compiled;\n").unwrap();
+    let store = SymbolStore::new();
+    let (guid, dtb, base) = (0x77, 0x1000, VirtAddr(0xffff_f800_1000_0000));
+    let recorded = r"C:\agent\src\driver.c";
+    store.inject_source_lines_for_test(guid, dtb, base, 0x1000, recorded, &[(0x100, Some(4), 7)]);
+    let checksum = source::source_digest(&SourceChecksum::Sha256([0; 32]), b"int compiled;\n");
+    store.source_checksums.insert(
+        guid,
+        FxHashMap::from_iter([(recorded.to_string(), checksum)]),
+    );
+    store.set_source_paths(parse_source_paths(&[root.to_str().unwrap()]));
+    let state = || {
+        store
+            .source_location(dtb, base + 0x100_u64)
+            .and_then(|location| location.local)
+            .map(|local| local.state)
+    };
+
+    assert_eq!(state(), Some(LocalSourceState::Found));
+    std::fs::write(&file, "int edited since;\n").unwrap();
+    assert_eq!(state(), Some(LocalSourceState::Differs));
+    std::fs::write(&file, "int compiled;\n").unwrap();
+    assert_eq!(state(), Some(LocalSourceState::Found));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn source_path_remapping_rejects_traversal_and_symlink_escape() {
+    let root = temp_root("source-containment");
+    let checkout = root.join("checkout");
+    let outside = root.join("outside");
+    std::fs::create_dir_all(&checkout).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret.c"), "secret\n").unwrap();
+    std::os::unix::fs::symlink(&outside, checkout.join("link")).unwrap();
+    let mappings = [SourcePathMapping {
+        recorded_prefix: Some(r"C:\agent\src".to_string()),
+        local_root: checkout.clone(),
+    }];
+
+    assert_eq!(
+        remap_source_file(
+            r"C:\agent\src\..\outside\secret.c",
+            &mappings,
+            &mut unverified
+        ),
+        None
+    );
+    assert_eq!(
+        remap_source_file(r"C:\agent\src\link\secret.c", &mappings, &mut unverified),
+        local(checkout.join("link/secret.c"), LocalSourceState::Missing)
+    );
+    assert_eq!(remap_source_file("/etc/passwd", &[], &mut unverified), None);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn source_addresses_resolve_cached_file_and_line() {
+    let store = SymbolStore::new();
+    let guid = 0x55;
+    let dtb = 0x1000;
+    store.modules.insert(
+        (dtb, 0x140000000),
+        LoadedModule {
+            name: "private.exe".to_string(),
+            short_name: "private".to_string(),
+            guid,
+            base_address: VirtAddr(0x140000000),
+            size: 0x1000,
+            dtb,
+        },
+    );
+    store.source_lines.insert(
+        guid,
+        vec![
+            SourceLineEntry {
+                rva: 0x120,
+                length: Some(4),
+                location: SourceLocation {
+                    file: r"C:\agent\src\private.c".to_string(),
+                    line: 42,
+                    column: None,
+                    local: None,
+                },
+            },
+            SourceLineEntry {
+                rva: 0x180,
+                length: Some(4),
+                location: SourceLocation {
+                    file: r"C:\agent\src\private.c".to_string(),
+                    line: 42,
+                    column: None,
+                    local: None,
+                },
+            },
+        ],
+    );
+    store.set_source_paths(vec![SourcePathMapping {
+        recorded_prefix: Some(r"C:\agent\src".to_string()),
+        local_root: "/checkout".into(),
+    }]);
+
+    assert_eq!(
+        store.source_addresses(dtb, "private.c", 42),
+        vec![VirtAddr(0x140000120), VirtAddr(0x140000180)]
+    );
+    assert_eq!(
+        store.source_addresses(dtb, "/checkout/private.c", 42),
+        vec![VirtAddr(0x140000120), VirtAddr(0x140000180)]
+    );
+}
+
+#[test]
+fn invalidating_module_clears_registration_and_status() {
+    let store = SymbolStore::new();
+    let dtb = 0x1000;
+    let base = VirtAddr(0x180000000);
+    store.modules.insert(
+        (dtb, base.0),
+        LoadedModule {
+            name: "reload.dll".to_string(),
+            short_name: "reload".to_string(),
+            guid: 0x99,
+            base_address: base,
+            size: 0x1000,
+            dtb,
+        },
+    );
+    store.set_module_symbol_status(dtb, base, ModuleSymbolStatus::Loaded);
+
+    store.invalidate_modules(dtb, &[base]);
+
+    assert!(store.find_module_for_address(dtb, base).is_none());
+    assert!(store.module_symbol_status(dtb, base).is_none());
+}
+
+#[test]
+fn kernel_modules_are_visible_from_user_address_spaces() {
+    let store = SymbolStore::new();
+    let user_dtb = 0x1000;
+    let kernel_dtb = 0x2000;
+    let base = VirtAddr(0x180000000);
+    let module = |name: &str, guid, dtb| LoadedModule {
+        name: name.to_string(),
+        short_name: ModuleInfo::derive_short_name(name),
+        guid,
+        base_address: base,
+        size: 0x1000,
+        dtb,
+    };
+    store
+        .modules
+        .insert((kernel_dtb, base.0), module("kernel.sys", 0x22, kernel_dtb));
+
+    assert!(store.find_module_for_address(user_dtb, base).is_none());
+    assert!(store.module_base_by_name(user_dtb, "kernel").is_none());
+
+    store.set_kernel(Some(0x22), kernel_dtb);
+    let resolved = store.find_module_for_address(user_dtb, base).unwrap();
+    assert_eq!(resolved.name, "kernel.sys");
+    assert_eq!(store.module_base_by_name(user_dtb, "kernel"), Some(base));
+}
+
+#[test]
+fn type_lookup_prefers_the_kernel_unless_qualified() {
+    let store = SymbolStore::new();
+    let (kernel_dtb, dtb) = (0x2000, 0x1000);
+    let (kernel, ntdll32) = (0x22, 0x33);
+    let layout = |name: &str, size| TypeInfo {
+        name: name.to_string(),
+        size,
+        fields: Default::default(),
+        pointer_size: 8,
+    };
+    store.inject_module_for_test(kernel, vec![layout("_PEB", 2008)], &[]);
+    store.inject_module_for_test(ntdll32, vec![layout("_PEB", 1168)], &[]);
+    for (name, guid, module_dtb, base) in [
+        ("ntoskrnl.exe", kernel, kernel_dtb, 0xffff_f800_0000_0000),
+        ("ntdll.dll", ntdll32, dtb, 0x7773_0000),
+    ] {
+        let mut module = ModuleInfo::new(name.to_string(), VirtAddr(base), 0x1000);
+        if guid == ntdll32 {
+            module.short_name.push_str("32");
+        }
+        store.modules.insert(
+            (module_dtb, base),
+            LoadedModule {
+                name: module.name,
+                short_name: module.short_name,
+                guid,
+                base_address: VirtAddr(base),
+                size: 0x1000,
+                dtb: module_dtb,
+            },
+        );
+    }
+    store.set_kernel(Some(kernel), kernel_dtb);
+
+    let size = |name: &str| store.find_type_across_modules(dtb, name).map(|t| t.size);
+    assert_eq!(size("_PEB"), Some(2008));
+    assert_eq!(size("nt!_PEB"), Some(2008));
+    assert_eq!(size("ntdll32!_PEB"), Some(1168));
+    assert_eq!(size("ntdll!_PEB"), None);
+}
+
+#[test]
+fn type_lookup_without_a_kernel_prefers_ntdll() {
+    // A user-mode minidump: no kernel PDB, and CRT PDBs that carry the
+    // public `winternl.h` `_PEB` (712 bytes) beside ntdll's real one.
+    let store = SymbolStore::new();
+    let dtb = 0x1000;
+    let layout = |name: &str, size| TypeInfo {
+        name: name.to_string(),
+        size,
+        fields: Default::default(),
+        pointer_size: 8,
+    };
+    let modules = [
+        ("vcruntime140.dll", 0x11, 0x7ff9_1000_0000_u64, 712),
+        ("ntdll.dll", 0x10, 0x7ff9_4926_0000, 2008),
+        ("ucrtbase.dll", 0x12, 0x7ff9_4680_0000, 712),
+        ("msvcrt.dll", 0x13, 0x7ff9_47f3_0000, 712),
+    ];
+    for (name, guid, base, peb_size) in modules {
+        store.inject_module_for_test(guid, vec![layout("_PEB", peb_size)], &[]);
+        let module = ModuleInfo::new(name.to_string(), VirtAddr(base), 0x1000);
+        store.modules.insert(
+            (dtb, base),
+            LoadedModule {
+                name: module.name,
+                short_name: module.short_name,
+                guid,
+                base_address: VirtAddr(base),
+                size: 0x1000,
+                dtb,
+            },
+        );
+    }
+
+    let size = |name: &str| store.find_type_across_modules(dtb, name).map(|t| t.size);
+    assert_eq!(size("_PEB"), Some(2008));
+    assert_eq!(size("msvcrt!_PEB"), Some(712));
+}
+
+#[test]
+fn nested_types_name_the_module_that_defines_them() {
+    let store = SymbolStore::new();
+    let (kernel_dtb, user_dtb) = (0x2000, 0x1000);
+    let (kernel, balloon, viorng, ntdll32) = (0x22, 0x44, 0x45, 0x55);
+    let layout = |name: &str, size| TypeInfo {
+        name: name.to_string(),
+        size,
+        fields: Default::default(),
+        pointer_size: 8,
+    };
+    store.set_kernel(Some(kernel), kernel_dtb);
+    store.register_module_for_test(balloon, "balloon", kernel_dtb);
+    store.register_module_for_test(viorng, "viorng", kernel_dtb);
+    store.register_module_for_test(ntdll32, "ntdll32", user_dtb);
+    store.pdb_pointer_sizes.insert(ntdll32, 4);
+    store.inject_module_for_test(balloon, vec![layout("DEVICE_CONTEXT", 0x40)], &[]);
+    store.inject_module_for_test(viorng, vec![layout("DEVICE_CONTEXT", 0x20)], &[]);
+    store.struct_defs.insert(
+        balloon,
+        HashMap::from([(
+            "DEVICE_CONTEXT".to_string(),
+            (0x40, pdb2::TypeIndex(0x1000)),
+        )]),
+    );
+    store.index_enums.insert(
+        balloon,
+        SymbolIndex::from_names(vec!["BALLOON_STATE".to_string()]),
+    );
+
+    // A driver qualifies what its PDB defines; a forward reference resolves
+    // in the kernel's.
+    let driver = store.nested_type_prefix(balloon);
+    let context = driver.aggregate(&store, "DEVICE_CONTEXT", Some(0x1000));
+    assert_eq!(context, "balloon!DEVICE_CONTEXT");
+    assert_eq!(driver.aggregate(&store, "_EPROCESS", None), "_EPROCESS");
+    assert_eq!(
+        driver.enumeration(&store, "BALLOON_STATE"),
+        "balloon!BALLOON_STATE"
+    );
+    assert_eq!(driver.enumeration(&store, "_POOL_TYPE"), "_POOL_TYPE");
+    assert_eq!(
+        driver.aggregate(&store, "<unnamed-tag>", Some(0x1124)),
+        "balloon!<unnamed-tag>#1124"
+    );
+    // The name resolves to the defining driver's layout, not another's.
+    let size = |name: &str| {
+        store
+            .find_type_across_modules(kernel_dtb, name)
+            .map(|t| t.size)
+    };
+    assert_eq!(size(&context), Some(0x40));
+
+    let nt = store.nested_type_prefix(kernel);
+    assert_eq!(nt.aggregate(&store, "_KPRCB", Some(0x10)), "_KPRCB");
+    assert_eq!(
+        nt.aggregate(&store, "<unnamed-tag>", Some(0x10)),
+        "nt!<unnamed-tag>#10"
+    );
+    // A 32-bit module qualifies every named type, defined here or not.
+    let wow = store.nested_type_prefix(ntdll32);
+    assert_eq!(
+        wow.aggregate(&store, "_LIST_ENTRY", None),
+        "ntdll32!_LIST_ENTRY"
+    );
+}
+
+#[test]
+fn x86_public_names_lose_their_calling_convention_decoration() {
+    assert_eq!(undecorate_x86("_RtlAllocateHeap@12"), "RtlAllocateHeap");
+    assert_eq!(undecorate_x86("_RtlpLFHKey"), "RtlpLFHKey");
+    assert_eq!(undecorate_x86("@RtlpFastCall@8"), "RtlpFastCall");
+    assert_eq!(undecorate_x86("_wcslen"), "wcslen");
+    assert_eq!(
+        undecorate_x86("??_C@_0BA@HKDEHBAO@RtlAllocateHeap@"),
+        "??_C@_0BA@HKDEHBAO@RtlAllocateHeap@"
+    );
+}
+
+#[test]
+fn merged_indexes_cover_the_selected_address_space_only() {
+    let store = SymbolStore::new();
+    let kernel_dtb = 0x2000;
+    let selected_dtb = 0x1000;
+    let other_dtb = 0x3000;
+    let register = |name: &str, guid: u128, dtb, base: u64, symbol: &str, type_name: &str| {
+        store.modules.insert(
+            (dtb, base),
+            LoadedModule {
+                name: name.to_string(),
+                short_name: ModuleInfo::derive_short_name(name),
+                guid,
+                base_address: VirtAddr(base),
+                size: 0x1000,
+                dtb,
+            },
+        );
+        store
+            .index
+            .insert(guid, SymbolIndex::from_names(vec![symbol.to_string()]));
+        store
+            .index_types
+            .insert(guid, SymbolIndex::from_names(vec![type_name.to_string()]));
+    };
+    register(
+        "ntoskrnl.exe",
+        0x22,
+        kernel_dtb,
+        0xffff_f800_0000_0000,
+        "KeBugCheckEx",
+        "_EPROCESS",
+    );
+    register(
+        "user32.dll",
+        0x33,
+        selected_dtb,
+        0x7ff0_0000_0000,
+        "PostQuitMessage",
+        "_WND",
+    );
+    register(
+        "notepad.exe",
+        0x44,
+        other_dtb,
+        0x7ff1_0000_0000,
+        "WinMain",
+        "_NOTEPAD",
+    );
+    store.set_kernel(Some(0x22), kernel_dtb);
+
+    let symbols = store.merged_symbol_index(Some(selected_dtb));
+    assert_eq!(
+        symbols.names,
+        vec![
+            "nt!KeBugCheckEx".to_string(),
+            "user32!PostQuitMessage".to_string()
+        ]
+    );
+    assert_eq!(
+        symbols.search("PostQuit", 10),
+        vec!["user32!PostQuitMessage".to_string()]
+    );
+
+    let types = store.merged_types_index(Some(selected_dtb));
+    assert_eq!(
+        types.names,
+        vec!["_EPROCESS".to_string(), "_WND".to_string()]
+    );
+}
+
+#[test]
+fn secure_roots_do_not_resolve_nt_symbols_at_colliding_addresses() {
+    let store = SymbolStore::new();
+    let base = VirtAddr(0xffff_f800_0000_0000);
+    for (guid, dtb, name, symbol) in [
+        (1, 0x1000, "nt", "NtOnly"),
+        (2, 0x2000, "securekernel", "SkOnly"),
+    ] {
+        store.inject_module_for_test(guid, vec![], &[(symbol, 0x100)]);
+        store.modules.insert(
+            (dtb, base.0),
+            LoadedModule {
+                name: name.to_string(),
+                short_name: name.to_string(),
+                guid,
+                base_address: base,
+                size: 0x1000,
+                dtb,
+            },
+        );
+    }
+    store.set_kernel(Some(1), 0x1000);
+    store.set_secure_roots(0x2000, [0x3000]);
+    assert_eq!(
+        store
+            .find_module_for_address(0x4000, base)
+            .unwrap()
+            .short_name,
+        "nt"
+    );
+    assert_eq!(
+        store
+            .find_module_for_address(0x3000, base)
+            .unwrap()
+            .short_name,
+        "securekernel"
+    );
+    assert!(
+        store
+            .find_symbol_across_modules(0x3000, "nt!NtOnly")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .find_symbol_across_modules(0x3000, "securekernel!SkOnly")
+            .unwrap(),
+        Some(base + 0x100u64)
+    );
+    assert!(
+        store
+            .find_symbol_across_modules(0x4000, "securekernel!SkOnly")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store.find_closest_symbol_for_address(0x3000, base + 0x108u64),
+        Some(("securekernel".into(), "SkOnly".into(), 8))
+    );
+    // Selecting system scope must not reclassify a saved trustlet selection
+    // as NT; rebuilding the guest must discard that old classification.
+    store.set_secure_roots(0x2000, []);
+    assert!(
+        store
+            .find_symbol_across_modules(0x3000, "nt!NtOnly")
+            .unwrap()
+            .is_none()
+    );
+    store.set_kernel(Some(1), 0x1000);
+    assert_eq!(
+        store
+            .find_symbol_across_modules(0x3000, "nt!NtOnly")
+            .unwrap(),
+        Some(base + 0x100u64)
+    );
+}
+
+#[test]
+fn qualified_index_search_matches_bare_names_unless_query_names_a_module() {
+    let index = SymbolIndex::from_names(vec![
+        "nt!KeBugCheckEx".to_string(),
+        "nt!memcpy".to_string(),
+        "ntdll!memcpy".to_string(),
+    ]);
+    assert_eq!(index.search("Ke*", 10), vec!["nt!KeBugCheckEx"]);
+    assert_eq!(
+        index.search("memcpy", 10),
+        vec!["nt!memcpy", "ntdll!memcpy"]
+    );
+    assert_eq!(index.search("ntdll!*", 10), vec!["ntdll!memcpy"]);
+    assert!(index.search("nt!*", 10).contains(&"nt!memcpy".to_string()));
+    assert!(
+        !index
+            .search("nt!*", 10)
+            .contains(&"ntdll!memcpy".to_string())
+    );
+}
+
+#[test]
+fn prefix_search_ranks_and_substring_search_falls_back() {
+    let index = SymbolIndex::from_names(vec![
+        "nt!PostQuitMessage".to_string(),
+        "nt!PostThreadMessage".to_string(),
+        "nt!XPostQuitMessage".to_string(),
+    ]);
+
+    assert_eq!(
+        index.search("Post", 1),
+        vec!["nt!PostQuitMessage".to_string()]
+    );
+    assert_eq!(
+        index.search("Quit", 10),
+        vec![
+            "nt!PostQuitMessage".to_string(),
+            "nt!XPostQuitMessage".to_string()
+        ]
+    );
+}
+
+#[test]
+fn a_bare_module_qualifier_lists_that_module() {
+    // More names than the search scores per query sort ahead of `nt!`.
+    let mut names: Vec<String> = (0..60_000).map(|n| format!("acpi!f{n}")).collect();
+    names.extend([
+        "nt!KeBugCheckEx".to_string(),
+        "nt!memcpy".to_string(),
+        "ntdll!memcpy".to_string(),
+    ]);
+    let index = SymbolIndex::from_names(names);
+
+    let hits = index.search("nt!", 10);
+    assert_eq!(
+        hits,
+        ["nt!KeBugCheckEx".to_string(), "nt!memcpy".to_string()]
+    );
+}
+
+#[test]
+fn only_a_first_term_names_a_module() {
+    assert_eq!(split_query_module("nt!Ke !Bug"), Some(("nt", "Ke !Bug")));
+    assert_eq!(
+        split_query_module("kernel*!Raise"),
+        Some(("kernel*", "Raise"))
+    );
+    assert_eq!(split_query_module("Rtl !Heap"), None);
+    assert_eq!(split_query_module("!Heap"), None);
+    assert_eq!(split_query_module("^nt!Ke"), None);
+}
+
+#[test]
+fn operator_terms_match_the_bare_name() {
+    let index = SymbolIndex::from_names(vec![
+        "ntdll!RtlAllocateHeap".to_string(),
+        "ntdll!RtlUserThreadStart".to_string(),
+        "ntdll!RtlUserThreadStart$filt$0".to_string(),
+    ]);
+    let start = vec!["ntdll!RtlUserThreadStart".to_string()];
+    assert_eq!(index.search("Rtl !Heap !filt", 10), start);
+    assert_eq!(index.search("^RtlUser Start$", 10), start);
+    assert_eq!(index.search("^Heap", 10), Vec::<String>::new());
+}
+
+#[test]
+fn a_module_glob_searches_every_module_it_matches() {
+    let store = SymbolStore::new();
+    let dtb = 0x1000;
+    for (guid, name, base) in [
+        (1, "kernelbase.dll", 0x7ff0_0000_0000),
+        (2, "kernel32.dll", 0x7ff1_0000_0000),
+        (3, "ntdll.dll", 0x7ff2_0000_0000),
+    ] {
+        store.modules.insert(
+            (dtb, base),
+            LoadedModule {
+                name: name.to_string(),
+                short_name: ModuleInfo::derive_short_name(name),
+                guid,
+                base_address: VirtAddr(base),
+                size: 0x1000,
+                dtb,
+            },
+        );
+        store.index.insert(
+            guid,
+            SymbolIndex::from_names(vec!["RaiseException".to_string()]),
+        );
+    }
+
+    assert_eq!(
+        store.search_symbols_in_modules(dtb, "kernel*", "RaiseException", 10),
+        vec![
+            "kernel32!RaiseException".to_string(),
+            "kernelbase!RaiseException".to_string()
+        ]
+    );
+    assert_eq!(
+        store.search_symbols_in_modules(dtb, "*", "RaiseException", 2),
+        vec![
+            "kernel32!RaiseException".to_string(),
+            "kernelbase!RaiseException".to_string()
+        ]
+    );
+}
+
+/// Where `tests/fixtures/inline_frames.pdb` is loaded: the PDB of a Rust
+/// driver (`tests/fixtures/inline_frames`) whose `DriverEntry` (RVA 0x1000,
+/// 0x59 bytes) inlines `accumulate`, which inlines `scale` twice, each of
+/// which inlines `wrapping_mul` and `fetch_add` (itself inlining
+/// `atomic_add`); `black_box` and `wrapping_add` are inlined too. The
+/// expected ranges, lines and locals are llvm-pdbutil's reading of it.
+const INLINE_FIXTURE_BASE: u64 = 0x1_4000_0000;
+
+fn inline_fixture() -> (SymbolStore, Dtb) {
+    load_fixture(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/inline_frames.pdb"
+    ))
+}
+
+/// Load the fixture PDB at `path` as module `fixture` at
+/// [`INLINE_FIXTURE_BASE`].
+fn load_fixture(path: &str) -> (SymbolStore, Dtb) {
+    let store = SymbolStore::new();
+    let dtb: Dtb = 0x1000;
+    store
+        .load_pdb_for_test(
+            Path::new(path),
+            "fixture",
+            dtb,
+            VirtAddr(INLINE_FIXTURE_BASE),
+            0x8000,
+        )
+        .unwrap();
+    (store, dtb)
+}
+
+fn fixture_address(rva: u32) -> VirtAddr {
+    VirtAddr(INLINE_FIXTURE_BASE + u64::from(rva))
+}
+
+/// The frames at `rva`, innermost first, as `(symbol, file, line)`: the
+/// inline frames, then the physical frame's line-table line.
+fn frames_at(store: &SymbolStore, dtb: Dtb, rva: u32) -> Vec<(String, String, u32)> {
+    let address = fixture_address(rva);
+    let file = |path: &str| path.rsplit('\\').next().unwrap().to_string();
+    let mut frames: Vec<_> = store
+        .inline_frames(dtb, address)
+        .into_iter()
+        .map(|frame| {
+            let location = frame.location.unwrap();
+            (frame.symbol, file(&location.file), location.line)
+        })
+        .collect();
+    let physical = store.source_location(dtb, address).unwrap();
+    frames.push(("physical".to_string(), file(&physical.file), physical.line));
+    frames
+}
+
+fn frame(symbol: &str, file: &str, line: u32) -> (String, String, u32) {
+    (symbol.to_string(), file.to_string(), line)
+}
+
+#[test]
+fn inline_sites_become_frames_innermost_first_at_their_lines() {
+    let (store, dtb) = inline_fixture();
+
+    // Outside every inline site: the procedure alone.
+    assert_eq!(
+        frames_at(&store, dtb, 0x1000),
+        [frame("physical", "lib.rs", 23)]
+    );
+    assert_eq!(
+        frames_at(&store, dtb, 0x1054),
+        [frame("physical", "lib.rs", 27)]
+    );
+
+    // `black_box` covers [0x1004, 0x100d).
+    let black_box = [
+        frame("fixture!core::hint::black_box", "hint.rs", 491),
+        frame("physical", "lib.rs", 24),
+    ];
+    assert_eq!(frames_at(&store, dtb, 0x1004), black_box);
+    assert_eq!(frames_at(&store, dtb, 0x100c), black_box);
+
+    // Four sites deep in the first `scale`: each caller is at the line of
+    // its call, the procedure at the line inlining `accumulate`.
+    let first_fetch_add = [
+        frame("fixture!core::sync::atomic::atomic_add", "atomic.rs", 3927),
+        frame(
+            "fixture!core::sync::atomic::Atomic<u32>::fetch_add",
+            "atomic.rs",
+            3148,
+        ),
+        frame("fixture!inline_frames::scale", "lib.rs", 11),
+        frame("fixture!inline_frames::accumulate", "lib.rs", 17),
+        frame("physical", "lib.rs", 25),
+    ];
+    assert_eq!(frames_at(&store, dtb, 0x1019), first_fetch_add);
+    assert_eq!(frames_at(&store, dtb, 0x1025), first_fetch_add);
+
+    // The second `scale` starts at 0x1026 with its `wrapping_mul`, whose
+    // second range changes file.
+    assert_eq!(
+        frames_at(&store, dtb, 0x1026),
+        [
+            frame(
+                "fixture!core::num::impl$8::wrapping_mul",
+                "uint_macros.rs",
+                2688
+            ),
+            frame("fixture!inline_frames::scale", "lib.rs", 10),
+            frame("fixture!inline_frames::accumulate", "lib.rs", 18),
+            frame("physical", "lib.rs", 25),
+        ]
+    );
+    assert_eq!(
+        frames_at(&store, dtb, 0x102c)[0],
+        frame("fixture!core::num::impl$8::wrapping_mul", "hint.rs", 491)
+    );
+
+    // `accumulate`'s last range, then `wrapping_add` in the procedure's code.
+    assert_eq!(
+        frames_at(&store, dtb, 0x1040),
+        [
+            frame("fixture!inline_frames::accumulate", "lib.rs", 19),
+            frame("physical", "lib.rs", 25),
+        ]
+    );
+    assert_eq!(
+        frames_at(&store, dtb, 0x1053),
+        [
+            frame(
+                "fixture!core::num::impl$8::wrapping_add",
+                "uint_macros.rs",
+                2612
+            ),
+            frame("physical", "lib.rs", 26),
+        ]
+    );
+}
+
+#[test]
+fn each_frame_has_its_own_locals() {
+    let (store, dtb) = inline_fixture();
+    let locals = |rva: u32, inline_depth: usize| {
+        store
+            .frame_locals(
+                dtb,
+                CodeFrame {
+                    address: fixture_address(rva),
+                    inline_depth,
+                },
+            )
+            .unwrap()
+            .map(|locals| {
+                locals
+                    .iter()
+                    .map(|local| (local.name.clone(), local.location.clone()))
+                    .collect::<Vec<_>>()
+            })
+    };
+    fn reg(name: &str, register: &str) -> (String, LocalVariableLocation) {
+        let register = register.to_string();
+        (
+            name.to_string(),
+            LocalVariableLocation::Register { register },
+        )
+    }
+    fn frame(name: &str, offset: i32) -> (String, LocalVariableLocation) {
+        (
+            name.to_string(),
+            LocalVariableLocation::FrameRelative { offset },
+        )
+    }
+    fn unavailable(name: &str, reason: &str) -> (String, LocalVariableLocation) {
+        let reason = reason.to_string();
+        (
+            name.to_string(),
+            LocalVariableLocation::Unavailable { reason },
+        )
+    }
+    let optimized_out = |name| unavailable(name, "optimized out");
+    let not_live = |name| unavailable(name, "not live at this address");
+
+    // In the first `atomic_add`, five frames deep: every inline site's
+    // variables are its frame's, live where their ranges say. `dst` and
+    // `self` have no range at all: the compiler dropped them.
+    assert_eq!(
+        locals(0x101d, 0).unwrap(),
+        [optimized_out("dst"), frame("val", 0)]
+    );
+    assert_eq!(
+        locals(0x101d, 1).unwrap(),
+        [optimized_out("self"), frame("val", 0)]
+    );
+    assert_eq!(
+        locals(0x101d, 2).unwrap(),
+        [frame("value", 8), frame("scaled", 0)]
+    );
+    assert_eq!(
+        locals(0x101d, 3).unwrap(),
+        [frame("value", 8), not_live("doubled"), not_live("tripled")]
+    );
+    // The procedure's own: its parameters and its block's `seed`, none of
+    // the inlined calls', and not `total`, whose block starts at 0x1050.
+    assert_eq!(
+        locals(0x101d, 4).unwrap(),
+        [
+            reg("driver", "rcx"),
+            reg("registry", "rdx"),
+            frame("seed", 8)
+        ]
+    );
+    assert_eq!(locals(0x101d, 5), None);
+
+    // Outside the inline sites the innermost frame is the procedure.
+    assert_eq!(
+        locals(0x1000, 0).unwrap(),
+        [reg("driver", "rcx"), reg("registry", "rdx")]
+    );
+    assert_eq!(
+        locals(0x1053, 1).unwrap(),
+        [
+            not_live("driver"),
+            reg("registry", "rdx"),
+            frame("seed", 8),
+            frame("total", 0xc)
+        ]
+    );
+    assert_eq!(
+        locals(0x1053, 0).unwrap(),
+        [frame("self", 0xc), reg("rhs", "edx")]
+    );
+}
+
+/// MSVC's layout (`tests/fixtures/msvc_inline.pdb`, see its README): the
+/// same nesting as the Rust fixture's, with MSVC's annotations, and each
+/// parameter both as an S_LOCAL with its register and as a classic
+/// S_REGREL32 home slot the optimized code never writes.
+#[test]
+fn msvc_inline_sites_become_frames_with_their_own_locals() {
+    let (store, dtb) = load_fixture(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/msvc_inline.pdb"
+    ));
+    let chain = |accumulate_line| {
+        [
+            frame("fixture!_InlineInterlockedAdd", "wdm.h", 1975),
+            frame("fixture!InlineProbeScale", "PdbProbe.c", 13),
+            frame(
+                "fixture!InlineProbeAccumulate",
+                "PdbProbe.c",
+                accumulate_line,
+            ),
+            frame("physical", "PdbProbe.c", 39),
+        ]
+    };
+    // The `lock add` of the first and the second `InlineProbeScale`.
+    assert_eq!(frames_at(&store, dtb, 0x1008), chain(20));
+    assert_eq!(frames_at(&store, dtb, 0x1015), chain(21));
+    assert_eq!(
+        frames_at(&store, dtb, 0x1000),
+        [frame("physical", "PdbProbe.c", 38)]
+    );
+
+    let locals = |inline_depth| {
+        store
+            .frame_locals(
+                dtb,
+                CodeFrame {
+                    address: fixture_address(0x1008),
+                    inline_depth,
+                },
+            )
+            .unwrap()
+            .map(|locals| {
+                locals
+                    .iter()
+                    .map(|local| format!("{} {}", local.name, local.location.describe()))
+                    .collect::<Vec<_>>()
+            })
+    };
+    assert_eq!(locals(1).unwrap(), ["scaled eax"]);
+    assert_eq!(locals(2).unwrap(), Vec::<String>::new());
+    // Each parameter once, where the S_LOCAL says, not also at its home slot.
+    assert_eq!(
+        locals(3).unwrap(),
+        ["DriverObject rcx", "RegistryPath rdx", "seed r8d"]
+    );
+}
+
+/// A static of a private PDB has its type, as the source declares it
+/// (`static volatile LONG g_Counter`); the code's address has none.
+#[test]
+fn a_private_pdb_global_has_its_type() {
+    let (store, dtb) = load_fixture(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/msvc_inline.pdb"
+    ));
+    let (counter, _) = store
+        .find_symbol_with_module(dtb, "fixture!g_Counter")
+        .unwrap()
+        .unwrap();
+    let (type_data, size) = store.global_type(dtb, counter).unwrap();
+    assert_eq!(type_data.to_string(), "LONG");
+    assert_eq!(size, Some(4));
+    assert!(store.global_type(dtb, fixture_address(0x1000)).is_none());
+}
+
+/// A header reached only through inlined code (`wdm.h`, holding
+/// `_InlineInterlockedAdd`) has its checksum recorded, so a local copy of it
+/// is checked like any source file.
+#[test]
+fn a_header_only_inlined_code_names_has_its_checksum() {
+    let (store, _) = load_fixture(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/msvc_inline.pdb"
+    ));
+    let recorded: Vec<String> = store
+        .source_checksums
+        .iter()
+        .flat_map(|entry| entry.value().keys().cloned().collect::<Vec<_>>())
+        .collect();
+    assert!(
+        recorded.iter().any(|file| file.ends_with(r"\km\wdm.h")),
+        "{recorded:?}"
+    );
+}
+
+/// A module ntoseye names itself has names for only some functions: an
+/// address past the end of a named function is not attributed to it, however
+/// near.
+#[test]
+fn a_synthetic_symbol_covers_only_its_function() {
+    let store = SymbolStore::new();
+    let base = VirtAddr(0xffff_f840_b140_0000);
+    let module = ModuleInfo::new("hvix64.exe".to_string(), base, 0x40_0000);
+    store.register_synthetic_module(
+        0x1000,
+        &module,
+        7,
+        &[("HvCallCreatePartition".to_string(), 0x2831e0)],
+        HashMap::from([(0x2831e0, 0x40)]),
+    );
+    let closest = |rva: u64| store.closest_symbol(7, base, base + rva);
+    assert_eq!(
+        closest(0x28321f),
+        Some(("HvCallCreatePartition".to_string(), 0x3f))
+    );
+    assert_eq!(closest(0x283220), None);
+    assert_eq!(
+        store.format_closest_symbol_for_address(0x1000, base + 0x2831e8u64),
+        Some("hv!HvCallCreatePartition+0x8".to_string())
+    );
+}
+
+/// Clearing synthetic modules (a new boot) forgets their names as well as
+/// their registrations: the image registered again under the same key gets
+/// the names made then, not the first boot's.
+#[test]
+fn a_cleared_synthetic_module_takes_the_names_registered_next() {
+    let store = SymbolStore::new();
+    let base = VirtAddr(0xffff_f840_b140_0000);
+    let module = ModuleInfo::new("hvix64.exe".to_string(), base, 0x40_0000);
+    store.register_synthetic_module(
+        0x1000,
+        &module,
+        7,
+        &[("HvCallCreatePartition".to_string(), 0x2831e0)],
+        HashMap::from([(0x2831e0, 0x40)]),
+    );
+    store.clear_synthetic_modules();
+    assert!(store.find_module_for_address(0x1000, base).is_none());
+
+    store.register_synthetic_module(
+        0x1000,
+        &module,
+        7,
+        &[("VmExitEntry".to_string(), 0x2831e0)],
+        HashMap::from([(0x2831e0, 0x80)]),
+    );
+    assert_eq!(store.symbol_rva(7, "HvCallCreatePartition").unwrap(), None);
+    assert_eq!(
+        store.format_closest_symbol_for_address(0x1000, base + 0x283250u64),
+        Some("hv!VmExitEntry+0x70".to_string())
+    );
+}
+
+/// A refresh against the kernel's loader list forgets the modules no longer
+/// in it, and counts them as unloaded, but not a module ntoseye names
+/// itself in the same root, such as the hypercall page, which is in no
+/// loader list.
+#[test]
+fn a_loader_refresh_keeps_the_synthetic_modules() {
+    let store = SymbolStore::new();
+    let page = VirtAddr(0xffff_f805_171e_0000);
+    store.register_synthetic_module(
+        0x1000,
+        &ModuleInfo::new("hvcall".to_string(), page, 0x1000),
+        9,
+        &[("Hypercall".to_string(), 0)],
+        HashMap::from([(0, 3)]),
+    );
+    store.register_module_for_test(1, "unloaded", 0x1000);
+    let unloaded = VirtAddr(0x1000_0000 * 2);
+
+    assert_eq!(store.retain_modules_for_dtb(0x1000, &[]), 1);
+    assert!(store.find_module_for_address(0x1000, unloaded).is_none());
+    assert_eq!(
+        store.format_closest_symbol_for_address(0x1000, page),
+        Some("hvcall!Hypercall".to_string())
+    );
+}
+
+/// A minimal AMD64 PE file of the build `time_date_stamp`/`size_of_image`.
+fn pe_file(time_date_stamp: u32, size_of_image: u32) -> Vec<u8> {
+    let mut file = vec![0u8; 0x200];
+    file[..2].copy_from_slice(b"MZ");
+    file[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+    file[0x80..0x84].copy_from_slice(b"PE\0\0");
+    file[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
+    file[0x88..0x8c].copy_from_slice(&time_date_stamp.to_le_bytes());
+    file[0x94..0x96].copy_from_slice(&240u16.to_le_bytes());
+    file[0x98..0x9a].copy_from_slice(&0x20bu16.to_le_bytes());
+    file[0x98 + 56..0x98 + 60].copy_from_slice(&size_of_image.to_le_bytes());
+    file[0x98 + 60..0x98 + 64].copy_from_slice(&0x200u32.to_le_bytes());
+    file
+}
+
+/// A file imported from the guest lands at its own build's store path,
+/// where a lookup for the running build finds it; a copy of another build,
+/// at a store's root under the same name, is not taken for it.
+#[test]
+fn an_imported_image_is_found_for_its_own_build_only() {
+    let root = temp_root("import-image");
+    let source = temp_root("import-source");
+    std::fs::create_dir_all(&source).unwrap();
+    let copied = source.join("hvix64.exe");
+    std::fs::write(&copied, pe_file(0x1525_065d, 0x41_5000)).unwrap();
+
+    let imported = cache::import_image_into(&root, &copied).unwrap();
+    assert_eq!(imported, root.join("hvix64.exe/1525065D415000/hvix64.exe"));
+    let found =
+        cache::find_image_in_local_stores([root.as_path()], "hvix64.exe", 0x1525_065d, 0x41_5000);
+    assert_eq!(found, Some(imported));
+
+    let other = temp_root("import-other");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("hvix64.exe"), pe_file(0x1111_1111, 0x41_5000)).unwrap();
+    let bare = |stamp| {
+        cache::find_image_in_local_stores([other.as_path()], "hvix64.exe", stamp, 0x41_5000)
+    };
+    assert_eq!(bare(0x1525_065d), None, "another build");
+    assert_eq!(bare(0x1111_1111), Some(other.join("hvix64.exe")));
+    for directory in [root, source, other] {
+        let _ = std::fs::remove_dir_all(directory);
+    }
+}
+
+#[test]
+fn export_fallback_resolves_named_exports() {
+    let store = SymbolStore::new();
+    let dtb: Dtb = 0x1234;
+    let base = VirtAddr(0x0000_0001_8000_0000);
+    let module = ModuleInfo::new("myfault.sys".to_string(), base, 0xb000);
+    let export = |ordinal: u32, name: Option<&str>, rva: Option<u32>| ModuleExportInfo {
+        ordinal,
+        name: name.map(str::to_string),
+        rva,
+        address: rva.map(|rva| VirtAddr(base.0 + u64::from(rva))),
+        forwarder: None,
+    };
+    // A named export, an ordinal-only one, and a forwarder: only the first
+    // can name an address.
+    let exports = vec![
+        export(9, Some("nmf_fault_irql"), Some(0x1e00)),
+        export(10, None, Some(0x1e50)),
+        export(11, Some("forwarded"), None),
+    ];
+    let generation = store.load_generation();
+    store.index_module_exports(dtb, &module, 42, &exports);
+
+    // The module is registered, and frames in it resolve to
+    // module!export+offset the way a PDB's symbols would; the generation
+    // moves so deferred breakpoints on those names re-resolve.
+    assert_eq!(
+        store.find_closest_symbol_for_address(dtb, VirtAddr(base.0 + 0x1e35)),
+        Some(("myfault".to_string(), "nmf_fault_irql".to_string(), 0x35))
+    );
+    assert!(store.load_generation() > generation);
+}
+
+#[test]
+fn a_pdb_acquired_after_the_export_fallback_replaces_it() {
+    let path = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/inline_frames.pdb"
+    ));
+    let bytes = std::fs::read(path).unwrap();
+    let info = pdb2::PDB::open(std::io::Cursor::new(bytes.as_slice()))
+        .unwrap()
+        .pdb_information()
+        .unwrap();
+    let store = SymbolStore::new();
+    let dtb: Dtb = 0x1000;
+    let module = ModuleInfo::new(
+        "fixture.sys".to_string(),
+        VirtAddr(INLINE_FIXTURE_BASE),
+        0x8000,
+    );
+    let (mut job, guid) = store
+        .build_download_job("inline_frames.pdb", info.guid.as_u128(), info.age)
+        .unwrap();
+    job.path = path.to_path_buf();
+    let load = ModuleSymbolLoad::new(job, guid, ModuleSymbolSource::Memory, module.clone(), dtb);
+
+    // The PDB was unavailable at first: the export table stands in.
+    let exports = [ModuleExportInfo {
+        ordinal: 1,
+        name: Some("exported_entry".to_string()),
+        rva: Some(0x1000),
+        address: Some(fixture_address(0x1000)),
+        forwarder: None,
+    }];
+    store.index_module_exports(dtb, &module, guid, &exports);
+    let closest = || {
+        store
+            .find_closest_symbol_for_address(dtb, fixture_address(0x1010))
+            .map(|(_, symbol, offset)| (symbol, offset))
+    };
+    assert_eq!(closest(), Some(("exported_entry".to_string(), 0x10)));
+
+    // Then it is acquired (a source added, the process attached again):
+    // the PDB is loaded and its symbols replace the exports.
+    store.load_downloaded_pdb(&load, false).unwrap();
+    assert!(store.has_matching_pdb(&load.job));
+    assert_eq!(closest(), Some(("DriverEntry".to_string(), 0x10)));
+
+    // The export fallback never overwrites the PDB's symbols.
+    store.index_module_exports(dtb, &module, guid, &exports);
+    assert_eq!(closest(), Some(("DriverEntry".to_string(), 0x10)));
+}
+
+#[test]
+fn the_pdb_of_an_image_whose_identity_was_unknown_replaces_its_exports() {
+    let path = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/inline_frames.pdb"
+    ));
+    let bytes = std::fs::read(path).unwrap();
+    let info = pdb2::PDB::open(std::io::Cursor::new(bytes.as_slice()))
+        .unwrap()
+        .pdb_information()
+        .unwrap();
+    let store = SymbolStore::new();
+    let dtb: Dtb = 0x1000;
+    let module = ModuleInfo::new(
+        "fixture.sys".to_string(),
+        VirtAddr(INLINE_FIXTURE_BASE),
+        0x8000,
+    )
+    .with_time_date_stamp(0x6000_0000);
+    let load_for = |module: &ModuleInfo| {
+        let (mut job, guid) = store
+            .build_download_job("inline_frames.pdb", info.guid.as_u128(), info.age)
+            .unwrap();
+        job.path = path.to_path_buf();
+        ModuleSymbolLoad::new(job, guid, ModuleSymbolSource::Image, module.clone(), dtb)
+    };
+    let exports = [ModuleExportInfo {
+        ordinal: 1,
+        name: Some("exported_entry".to_string()),
+        rva: Some(0x1000),
+        address: Some(fixture_address(0x1000)),
+        forwarder: None,
+    }];
+    let closest = || {
+        store
+            .find_closest_symbol_for_address(dtb, fixture_address(0x1010))
+            .map(|(_, symbol, offset)| (symbol, offset))
+    };
+
+    // Memory named no PDB, so the exports are keyed by the image.
+    let image_key = SymbolStore::image_exports_key(&module);
+    store.index_module_exports(dtb, &module, image_key, &exports);
+    assert_eq!(closest(), Some(("exported_entry".to_string(), 0x10)));
+
+    // A job for another build at that address is stale, as before.
+    let other_build = module.clone().with_time_date_stamp(0x6000_0001);
+    assert!(
+        store
+            .load_downloaded_pdb(&load_for(&other_build), false)
+            .is_err()
+    );
+    assert_eq!(closest(), Some(("exported_entry".to_string(), 0x10)));
+
+    // The image, fetched since, names its PDB: it replaces the exports, and
+    // the image-keyed names go with them.
+    store
+        .load_downloaded_pdb(&load_for(&module), false)
+        .unwrap();
+    assert_eq!(closest(), Some(("DriverEntry".to_string(), 0x10)));
+    assert!(!store.symbol_rvas.contains_key(&image_key));
+}
+
+#[test]
+fn a_background_pdb_load_does_not_register_a_module_unloaded_meanwhile() {
+    let path = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/inline_frames.pdb"
+    ));
+    let bytes = std::fs::read(path).unwrap();
+    let info = pdb2::PDB::open(std::io::Cursor::new(bytes.as_slice()))
+        .unwrap()
+        .pdb_information()
+        .unwrap();
+    let store = SymbolStore::new();
+    let dtb: Dtb = 0x1000;
+    let module = ModuleInfo::new(
+        "fixture.sys".to_string(),
+        VirtAddr(INLINE_FIXTURE_BASE),
+        0x8000,
+    );
+    let (mut job, guid) = store
+        .build_download_job("inline_frames.pdb", info.guid.as_u128(), info.age)
+        .unwrap();
+    job.path = path.to_path_buf();
+    let load = ModuleSymbolLoad::new(job, guid, ModuleSymbolSource::Image, module, dtb);
+
+    // Cleanup dropped the `Fetching` status the fetch was started under.
+    assert!(store.load_downloaded_pdb(&load, true).is_err());
+    assert!(
+        store
+            .find_closest_symbol_for_address(dtb, fixture_address(0x1010))
+            .is_none()
+    );
+    assert!(
+        store
+            .module_symbol_status(dtb, load.module.base_address)
+            .is_none()
+    );
+
+    store.set_module_symbol_status(dtb, load.module.base_address, ModuleSymbolStatus::Fetching);
+    store.load_downloaded_pdb(&load, true).unwrap();
+    assert!(
+        store
+            .find_closest_symbol_for_address(dtb, fixture_address(0x1010))
+            .is_some()
+    );
+}

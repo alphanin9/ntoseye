@@ -1,8 +1,8 @@
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("This application only runs on Linux and macOS hosts.");
 
-#[cfg(feature = "agent")]
-pub mod agent;
+use crate::backend::kd::{self, KdMemorySource};
+use crate::base::error::{Error, Result};
 
 pub const DEFAULT_GDB_ADDR: &str = "127.0.0.1:1234";
 pub const DEFAULT_KD_SOCKET: &str = "/tmp/ntoseye-kd.sock";
@@ -76,18 +76,23 @@ pub enum TargetSpec {
         connect: Option<String>,
         /// KDNET encryption key (four base-36 components).
         kdnet_key: Option<String>,
-        memory_source: kd::KdMemorySource,
+        /// Initial KD/KDNET handshake timeout in positive integer seconds.
+        /// `None` uses `NTOSEYE_KD_TIMEOUT`, or 8 seconds when it is unset.
+        kd_handshake_timeout: Option<u64>,
+        memory_source: KdMemorySource,
     },
 }
 
 impl TargetSpec {
     /// Reject argument combinations that cannot work before touching any
     /// transport, with the same wording for every host.
-    pub fn validate(&self) -> std::result::Result<(), String> {
+    pub fn validate(&self) -> Result<()> {
+        let invalid = |message: &str| Error::InvalidArgument(message.to_string());
         let Self::Live {
             backend,
             connect,
             kdnet_key,
+            kd_handshake_timeout,
             memory_source,
         } = self
         else {
@@ -95,20 +100,30 @@ impl TargetSpec {
         };
         match backend {
             Backend::KdNet if kdnet_key.is_none() => {
-                return Err("kdnet backend requires a key".into());
+                return Err(invalid("kdnet backend requires a key"));
             }
             Backend::Kd | Backend::Gdb | Backend::Memory if kdnet_key.is_some() => {
-                return Err("key is only valid for the kdnet backend".into());
+                return Err(invalid("key is only valid for the kdnet backend"));
             }
             Backend::Memory if connect.is_some() => {
-                return Err("memory backend does not use a connect endpoint".into());
+                return Err(invalid("memory backend does not use a connect endpoint"));
             }
             _ => {}
         }
         if !matches!(backend, Backend::Kd | Backend::KdNet)
-            && *memory_source != kd::KdMemorySource::Auto
+            && *memory_source != KdMemorySource::Auto
         {
-            return Err("memory_source is only valid for kd and kdnet backends".into());
+            return Err(invalid(
+                "memory_source is only valid for kd and kdnet backends",
+            ));
+        }
+        if let Some(seconds) = kd_handshake_timeout {
+            if !matches!(backend, Backend::Kd | Backend::KdNet) {
+                return Err(invalid(
+                    "kd_handshake_timeout is only valid for kd and kdnet backends",
+                ));
+            }
+            kd::handshake_timeout(*seconds)?;
         }
         Ok(())
     }
@@ -125,48 +140,66 @@ impl TargetSpec {
     }
 }
 
-#[macro_use]
-pub mod output;
+// The layers, bottom to top. Each uses only the layers before it, and
+// build.rs fails the build on a reference to a later one (see
+// docs/internals/architecture.md for the map and its exceptions).
 
+/// Byte and text helpers, errors, notices, output and the core types.
+#[macro_use]
+pub mod base;
+
+/// What ntoseye knows about each CPU architecture: part of the base layer.
+#[macro_use]
+pub mod arch;
+
+/// The debug transports: KD, the GDB stub, host and partition memory.
 pub mod backend;
-pub mod bugchecks;
-#[cfg(feature = "cli")]
-pub mod cli;
-#[cfg(feature = "cli")]
-pub mod configure;
-pub mod cpu_state;
-pub mod dbg_backend;
-pub mod debugger_data;
-pub mod diagnostics;
-pub mod disasm;
-pub mod dmp;
-pub mod dump_writer;
-pub mod error;
-pub mod expr;
-pub mod gdb;
-pub mod guest;
-pub mod host;
-#[cfg(feature = "agent")]
-pub mod inspect;
-pub mod kd;
-pub mod kuser_shared;
-#[cfg(feature = "mcp")]
-pub mod mcp;
-pub mod memory;
-pub mod memory_backend;
-pub mod ntstatus;
-pub mod phys;
-#[cfg(feature = "python")]
-pub mod python;
-pub mod repl;
+
+/// The Windows model over a backend: the target, its guest, symbols, stacks,
+/// dump formats and breakpoints.
+pub mod nt;
+
+/// A debugging session: run control, stops and inspection.
 pub mod session;
-pub mod symbols;
-pub mod target;
-pub mod trapframe;
-pub mod triage;
-pub mod triage_report;
-pub mod types;
-pub mod ui;
-pub mod unwind;
-#[cfg(any(feature = "mcp", feature = "python", feature = "agent"))]
-pub mod view;
+
+/// Reports built over a session: `!analyze` triage and the blackbox.
+pub mod analysis;
+
+/// The front ends: the REPL, the Python SDK, MCP, DAP, gdbserver and the CLI.
+pub mod hosts;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kd_handshake_timeout_is_valid_only_for_kd_backends() {
+        for backend in [Backend::Kd, Backend::KdNet, Backend::Gdb, Backend::Memory] {
+            let spec = TargetSpec::Live {
+                backend,
+                connect: None,
+                kdnet_key: (backend == Backend::KdNet).then(|| "1.2.3.4".into()),
+                kd_handshake_timeout: Some(20),
+                memory_source: KdMemorySource::Auto,
+            };
+            assert_eq!(
+                spec.validate().is_ok(),
+                matches!(backend, Backend::Kd | Backend::KdNet)
+            );
+        }
+    }
+
+    #[test]
+    fn kd_handshake_timeout_rejects_zero_and_deadline_overflow_before_connecting() {
+        for seconds in [0, u64::MAX] {
+            let spec = TargetSpec::Live {
+                backend: Backend::Kd,
+                connect: None,
+                kdnet_key: None,
+                kd_handshake_timeout: Some(seconds),
+                memory_source: KdMemorySource::Auto,
+            };
+            assert!(matches!(spec.validate(), Err(Error::InvalidArgument(_))));
+        }
+    }
+}

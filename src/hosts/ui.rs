@@ -1,0 +1,211 @@
+//! The single presentation layer for terminal styling. Domain types (e.g.
+//! `VirtAddr`) stay plain; everything that adds color goes through here, so the
+//! palette lives in one place and stays consistent.
+
+use owo_colors::OwoColorize;
+use std::fmt::{self, Display, Write as _};
+use std::path::Path;
+use std::sync::LazyLock;
+
+use crate::backend::dbg_backend::{thread_kind, thread_label};
+use crate::base::bytes::before_nul;
+use crate::base::disasm::{AsmKind, AsmToken};
+use crate::base::types::VirtAddr;
+
+/// Absolute address: bare 16-digit, default foreground. Never format a
+/// `VirtAddr` with `{:#x}` for display; route it through here so the styling
+/// can't drift.
+pub fn addr(value: u64) -> String {
+    format!("{value:016x}")
+}
+
+/// An address, or a muted `-` when null: a pointer to nothing.
+pub fn addr_opt(value: VirtAddr) -> String {
+    if value.is_zero() {
+        muted("-")
+    } else {
+        addr(value.0)
+    }
+}
+
+/// A resolved symbol: light-blue name (module prefix included), with any
+/// trailing `+0x...` offset dimmed so the eye lands on the name. A raw
+/// `0x...` fallback (nothing resolved) renders fully muted.
+pub fn symbol(sym: &str) -> String {
+    if sym.starts_with("0x") {
+        return muted(sym);
+    }
+    let (body, offset) = match sym.rfind("+0x") {
+        Some(idx) => (&sym[..idx], &sym[idx..]),
+        None => (sym, ""),
+    };
+    let body = body.bright_blue().to_string();
+    if offset.is_empty() {
+        body
+    } else {
+        format!("{}{}", body, muted(offset))
+    }
+}
+
+/// Secondary / de-emphasized text: scan tags, "N more", offsets, raw fallbacks.
+pub fn muted(text: &str) -> String {
+    muted_style(&text).to_string()
+}
+
+fn muted_style<T: Display>(text: &T) -> impl Display + '_ {
+    text.bright_black()
+}
+
+/// A bold, uncolored label/header (e.g. `break:`, `breakpoint:`, section
+/// titles). Color is reserved for content; labels are bold only.
+pub fn label(text: &str) -> String {
+    text.bold().to_string()
+}
+
+/// A numeric value in content color, styled under `{}`, `{:x}`, `{:X}` and
+/// `{:b}` alike so width and padding flags still apply to the digits.
+pub struct Value<T>(pub T);
+
+macro_rules! impl_value_fmt {
+    ($($trait:path),+) => {
+        $(
+            impl<T: $trait> $trait for Value<T> {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    <_ as $trait>::fmt(&self.0.cyan(), f)
+                }
+            }
+        )+
+    };
+}
+
+impl_value_fmt!(fmt::Display, fmt::LowerHex, fmt::UpperHex, fmt::Binary);
+
+/// Style a disassembled instruction's [`AsmToken`]s
+/// for the listing: mnemonic as the anchor, registers and immediates in content
+/// color, punctuation muted.
+pub fn disasm_asm(tokens: &[AsmToken]) -> String {
+    let mut out = String::new();
+    for token in tokens {
+        let text = &token.text;
+        let _ = match token.kind {
+            AsmKind::Register => write!(out, "{}", text.cyan()),
+            AsmKind::Number => write!(out, "{}", text.green()),
+            AsmKind::Punctuation | AsmKind::Keyword => write!(out, "{}", muted_style(text)),
+            AsmKind::Mnemonic => write!(out, "{}", text.bright_magenta()),
+            AsmKind::Text => out.write_str(text),
+        };
+    }
+    out
+}
+
+/// A value that changed since the target last stopped, such as a register
+/// a step wrote: yellow like the current-instruction cursor.
+pub fn changed(text: &str) -> String {
+    text.yellow().to_string()
+}
+
+/// A breakpoint identifier accent, e.g. `#3` in cyan. Used consistently across
+/// every breakpoint message (set/hit/cleared/disabled/enabled).
+pub fn bp_id(id: impl Display) -> String {
+    format!("#{id}").cyan().to_string()
+}
+
+/// The backend thread `id` as its label (see [`thread_label`]), cyan like
+/// [`bp_id`]: `3` for a processor, `7b0.404` for a user-mode thread.
+pub fn thread_id(id: &str) -> String {
+    thread_label(id).cyan().to_string()
+}
+
+/// The backend thread `id` in prose: `processor 3`, `thread 7b0.404`.
+pub fn thread(id: &str) -> String {
+    format!("{} {}", thread_kind(id), thread_id(id))
+}
+
+/// An event badge like ` BREAK `: white on red, reserved for execution-stop
+/// announcements.
+pub fn badge(text: &str) -> String {
+    format!(" {text} ").white().on_red().to_string()
+}
+
+/// Event-banner background: palette "black", which themes remap toward
+/// their own background (near-black on dark themes, near-white on light
+/// ones), so the plate adapts without terminal queries. Inner styles must
+/// reset foreground only (`39`) and never carry a background.
+pub fn plate(text: &str) -> String {
+    text.on_black().to_string()
+}
+
+/// `text` as a terminal link (OSC 8) to the local file `path`: a click opens
+/// it in the terminals that support them, and the rest show `text`. Output
+/// that is not styled (a pipe, a capture, `NO_COLOR`) drops the link with
+/// the colors. The link names this host, so a terminal reached over SSH
+/// does not open a file of the same name on its own machine.
+pub fn file_link(path: &Path, text: &str) -> String {
+    let Ok(path) = std::path::absolute(path) else {
+        return text.to_string();
+    };
+    let mut uri = format!("file://{}", *HOSTNAME);
+    for byte in path.as_os_str().as_encoded_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'.' | b'_' | b'~' => {
+                uri.push(char::from(*byte));
+            }
+            _ => {
+                let _ = write!(uri, "%{byte:02X}");
+            }
+        }
+    }
+    format!("\x1b]8;;{uri}\x1b\\{text}\x1b]8;;\x1b\\")
+}
+
+/// This machine's name, as a `file:` link's host, or empty when unknown.
+static HOSTNAME: LazyLock<String> = LazyLock::new(hostname);
+
+#[cfg(unix)]
+fn hostname() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is writable for its length; gethostname writes at most
+    // that many bytes.
+    let status = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if status != 0 {
+        return String::new();
+    }
+    // A name a URI host cannot hold is left out; the link still opens the
+    // local file.
+    match std::str::from_utf8(before_nul(&buf)) {
+        Ok(name)
+            if name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.') =>
+        {
+            name.to_string()
+        }
+        _ => String::new(),
+    }
+}
+
+#[cfg(not(unix))]
+fn hostname() -> String {
+    String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::base::output::strip_ansi;
+
+    /// A link shows only its text once the styling is stripped, and a
+    /// path's characters that would end or change the URI are escaped.
+    #[test]
+    fn file_link_keeps_its_text_and_escapes_the_path() {
+        let link = file_link(Path::new("/src/my driver/#1.c"), "[local driver.c:42]");
+        assert_eq!(strip_ansi(&link), "[local driver.c:42]");
+        assert!(
+            link.starts_with(&format!(
+                "\x1b]8;;file://{}/src/my%20driver/%231.c\x1b\\",
+                *HOSTNAME
+            )),
+            "{link:?}"
+        );
+    }
+}

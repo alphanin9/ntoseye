@@ -1,0 +1,2035 @@
+#[cfg(all(feature = "cli", unix))]
+use libc::{SIGHUP, SIGTERM, c_int, sigaction, sigemptyset, sighandler_t};
+#[cfg(feature = "cli")]
+use nu_ansi_term::{Color, Style};
+#[cfg(feature = "cli")]
+use reedline::{
+    DefaultHinter, DescriptionMode, Emacs, FileBackedHistory, IdeMenu, KeyCode, KeyModifiers,
+    MenuBuilder, Osc133Markers, ReedlineEvent, ReedlineMenu, default_emacs_keybindings,
+};
+#[cfg(feature = "cli")]
+use reedline::{Reedline, Signal};
+#[cfg(feature = "cli")]
+use std::io;
+#[cfg(feature = "cli")]
+use std::io::{BufRead, Write};
+#[cfg(all(feature = "cli", unix))]
+use std::mem::zeroed;
+use std::path::PathBuf;
+#[cfg(all(feature = "cli", unix))]
+use std::ptr::null_mut;
+use std::sync::Arc;
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use tabled::builder::Builder;
+use tabled::settings::Padding;
+
+use owo_colors::OwoColorize;
+
+#[cfg(feature = "cli")]
+use crate::backend::dbg_backend::DebugBackend;
+use crate::backend::dbg_backend::thread_label;
+use crate::backend::dbg_backend::{BackendCapability, DebugCapability};
+use crate::base::diagnostics;
+#[cfg(feature = "cli")]
+use crate::base::error::{Error, Result};
+#[cfg(feature = "cli")]
+use crate::base::output::{
+    self, drop_leading_blank_lines, log_input_line, prompting, separate_prompt,
+};
+#[cfg(feature = "cli")]
+use crate::base::time::unix_time_to_iso;
+#[cfg(feature = "cli")]
+use crate::base::types::VirtAddr;
+#[cfg(feature = "python")]
+use crate::hosts::python::embed;
+use crate::hosts::ui;
+use crate::nt::expr::NumberRadix;
+use crate::nt::guest::ModuleSymbolLoadReport;
+use crate::nt::symbols::{ntoseye_home, split_query_module};
+#[cfg(all(unix, feature = "cli"))]
+use crate::nt::target::InterruptRequester;
+#[cfg(feature = "cli")]
+use crate::nt::target::Target;
+#[cfg(feature = "cli")]
+use crate::session::Motion;
+use crate::session::Session;
+
+/// Set by [`note_termination`]; polled by the prompt loops so a termination
+/// signal leaves through the same teardown as `q`.
+#[cfg(feature = "cli")]
+static TERMINATION_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Set while Tern's own prompt reads the line: it polls for termination
+/// itself, and its session needs the real terminal to close.
+#[cfg(feature = "cli")]
+pub static NATIVE_PROMPT: AtomicBool = AtomicBool::new(false);
+pub const BREAK_STACKTRACE_DISPLAY_LIMIT: usize = 6;
+/// Frames a stop walks: one past those it shows, which tells whether there
+/// are more without walking them all, each frame a few memory reads (slow
+/// ones over KD).
+pub const BREAK_STACKTRACE_WALK_LIMIT: usize = BREAK_STACKTRACE_DISPLAY_LIMIT + 1;
+/// Frames a bugcheck stop walks to find the one that faulted, under the
+/// bugcheck's own.
+pub const BUGCHECK_FAULT_SEARCH_LIMIT: usize = 64;
+#[cfg(feature = "cli")]
+const REPL_HISTORY_SIZE: usize = 5000;
+
+pub fn error(msg: &str) {
+    diagnostics::print_error(msg);
+}
+
+/// Print a command's error. A read that failed at an address also says why
+/// the page there is not in memory, as the current address space's page
+/// tables tell it: the error does not say which space the read was in, and
+/// it is that one but for a command that reads another process's.
+pub fn report_error(state: &ReplState<'_>, error: &crate::base::error::Error) {
+    self::error(&error.to_string());
+    if let crate::base::error::Error::BadVirtualAddress(address) = error
+        && let Some(why) = unreadable_reason(&state.ctx.target, *address)
+    {
+        diagnostics::print_note(format!("{}: {why}", ui::addr(address.0)));
+    }
+}
+
+/// Why `address` does not read in the inspection address space, as its page
+/// tables tell it. At a stop whose context is the Windows hypervisor's own,
+/// a VM-exit entry's or one `.cxr` selected, that space maps no NT memory,
+/// which the page walk alone would only call unmapped.
+pub fn unreadable_reason(
+    target: &crate::nt::target::Target,
+    address: crate::base::types::VirtAddr,
+) -> Option<String> {
+    let why = target.non_resident(target.current_dtb(), address);
+    let unmapped = why
+        .as_ref()
+        .is_none_or(|why| why.place == crate::base::memory::Place::Unmapped);
+    if unmapped && target.in_hypervisor_address_space() {
+        return Some(
+            "not mapped in the Windows hypervisor's address space, which this stop's context is; \
+             .vtlcxr selects where VTL0 left off"
+                .to_string(),
+        );
+    }
+    why.map(|why| why.to_string())
+}
+
+macro_rules! error {
+    ($($arg:tt)*) => {
+        error(&format!($($arg)*))
+    };
+}
+
+mod aliases;
+pub mod args;
+mod bugcheck;
+mod command;
+mod commands;
+mod completion;
+mod disasm;
+#[cfg(feature = "cli")]
+mod line_editor;
+pub mod listing;
+mod memory_view;
+#[cfg(feature = "cli")]
+pub mod native;
+#[cfg(feature = "cli")]
+mod palette;
+mod remote;
+mod stop;
+mod terminal;
+#[cfg(feature = "cli")]
+mod tern_prompt;
+pub mod usage;
+
+pub use crate::session::effects::{RunEffect, RunState, TargetScope};
+pub use crate::session::exception_policy::*;
+pub use aliases::*;
+pub use bugcheck::*;
+pub use command::*;
+pub use commands::{ReplActions, command_reference_json, json_string, open_session};
+pub use completion::*;
+pub use disasm::*;
+#[cfg(feature = "cli")]
+use line_editor::{CaretContext, CustomPrompt, MyCompleter, TrackingHighlighter, caret_context};
+pub use memory_view::*;
+pub use remote::*;
+pub use stop::*;
+#[cfg(feature = "cli")]
+use terminal::PromptMark;
+
+pub fn print_module_symbol_report(report: &ModuleSymbolLoadReport) {
+    let mut summary = format!("loaded {}/{}", report.loaded, report.total);
+    if report.failed_count() > 0 {
+        summary.push_str(&format!(", {} failed", report.failed_count()));
+    }
+    if report.no_pdb > 0 {
+        summary.push_str(&format!(", {} no-pdb", report.no_pdb));
+    }
+    if report.skipped > 0 {
+        summary.push_str(&format!(", {} skipped", report.skipped));
+    }
+    if report.fetching > 0 {
+        summary.push_str(&format!(", {} fetching in background", report.fetching));
+    }
+    if report.diagnostic_count > 0 {
+        summary.push_str(&format!(
+            ", {} PDB warning{}",
+            report.diagnostic_count,
+            if report.diagnostic_count == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
+    outln!("{} {summary}", ui::muted("symbols:"));
+    const DISPLAY_LIMIT: usize = 8;
+    for diagnostic in report.diagnostics.iter().take(DISPLAY_LIMIT) {
+        let location = diagnostic
+            .compiland
+            .as_deref()
+            .map(|compiland| format!("{} ({compiland})", diagnostic.module))
+            .unwrap_or_else(|| diagnostic.module.clone());
+        diagnostics::print_warning(format!(
+            "{location}: {}: {}",
+            diagnostic.phase, diagnostic.message
+        ));
+    }
+    if report.diagnostic_count > DISPLAY_LIMIT {
+        diagnostics::print_warning(format!(
+            "{} additional PDB diagnostics omitted",
+            report.diagnostic_count - DISPLAY_LIMIT
+        ));
+    }
+}
+
+/// The capability matrix, after `note` (what the target is, when that
+/// explains the matrix).
+pub fn print_backend_capabilities(capabilities: &[BackendCapability], note: Option<&str>) {
+    const COLUMNS: usize = 4;
+
+    outln!("{}", "capabilities".bold());
+    if let Some(note) = note {
+        outln!("  {}", ui::muted(note));
+    }
+
+    let mut builder = Builder::default();
+    for chunk in capabilities.chunks(COLUMNS) {
+        let mut row = chunk
+            .iter()
+            .enumerate()
+            .map(|(idx, capability)| {
+                let marker = if capability.supported {
+                    "+".green().to_string()
+                } else {
+                    "-".red().to_string()
+                };
+                let cell = format!("{} {}", marker, capability.capability.label());
+                if idx + 1 == COLUMNS {
+                    cell
+                } else {
+                    format!("{cell}  ")
+                }
+            })
+            .collect::<Vec<_>>();
+        row.resize(COLUMNS, String::new());
+        builder.push_record(row);
+    }
+
+    let mut table = builder.build();
+    table
+        .with(tabled::settings::Style::empty())
+        .with(Padding::zero());
+    for line in table.to_string().lines() {
+        outln!("  {line}");
+    }
+    outln!();
+}
+
+pub fn print_backend_capability_warning(capabilities: &[BackendCapability]) {
+    if capabilities.iter().all(|capability| capability.supported) {
+        return;
+    }
+
+    diagnostics::print_warning(
+        "selected backend has reduced capabilities; run `capabilities` for details",
+    );
+    outln!();
+}
+
+pub fn print_padded_table(builder: Builder) {
+    print_indented_table(builder, "");
+}
+
+/// [`print_padded_table`] `indent` in, under a heading that is.
+pub fn print_indented_table(builder: Builder, indent: &str) {
+    let mut table = builder.build();
+    table
+        .with(tabled::settings::Style::empty())
+        .with(Padding::new(0, 2, 0, 0));
+    // tabled pads the last column too: its rows end without the spaces.
+    for line in table.to_string().lines() {
+        outln!("{indent}{}", line.trim_end());
+    }
+    // Apart from what follows; dropped when nothing does.
+    outln!();
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Flow {
+    Continue,
+    Quit,
+    /// The dispatch context refused a command's run effect, or a script
+    /// construct could not run (already reported); the rest of the command
+    /// list is abandoned.
+    Denied,
+    /// A control token ending the command list on its way out to the
+    /// construct it steers, which consumes it: `.break`/`.continue` to the
+    /// innermost `.for`/`.while`/`.do`, `gc` to the breakpoint action. Each
+    /// token refuses to run where nothing would consume it, so a host never
+    /// receives one.
+    Jump(Jump),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Jump {
+    Break,
+    Continue,
+    /// Resume from the breakpoint whose action is running.
+    Resume,
+}
+
+pub struct ReplState<'a> {
+    pub ctx: &'a mut Session,
+    pub caches: ReplCaches,
+    pub aliases: UserAliases,
+    /// Breakpoint actions and exception commands being dispatched, one
+    /// inside another: a command loop inside one leaves Ctrl+C to the stop
+    /// loop that ran it.
+    pub event_command_depth: usize,
+    /// Nested command loops (`.foreach`, `!for_each_*`). Bounded so an alias
+    /// that loops over itself ends with an error instead of the stack.
+    pub command_loop_depth: usize,
+    /// [`Target::interrupt_requests`] when the outermost command loop began;
+    /// a count past it means Ctrl+C was pressed during the loop, even if a
+    /// command inside it took the interrupt flag.
+    pub command_loop_interrupts: u64,
+    /// Whether the innermost command loop is a `.for`/`.while`/`.do`, the
+    /// loops `.break` and `.continue` steer.
+    pub breakable_loop: bool,
+    pub line: String,
+    /// Who is dispatching; decides which [`RunEffect`]s a command may have.
+    pub context: DispatchContext,
+    /// Where `ls` continues: the file and the line after the last one listed.
+    pub source_cursor: Option<(PathBuf, u32)>,
+    /// The pattern and address `#` continues with.
+    pub disasm_search: DisasmSearch,
+    /// Where a `u` given no address continues.
+    pub disasm_cursor: Option<DisasmCursor>,
+    /// How long a resuming command may wait for the next stop before handing
+    /// control back with the target still running. `None` (the interactive
+    /// prompt) waits until a stop or Ctrl+C. A request/response host sets it
+    /// per dispatch so no call blocks past the client's patience; the target
+    /// keeps running and the host collects the stop on a later call with
+    /// [`ReplState::collect_stop`].
+    pub stop_wait: Option<StopWaitBudget>,
+    /// Set once this dispatch rendered a stop the remote client has not seen
+    /// (parked between calls, or collected while waiting for a halt), so a
+    /// resume later on the same line is refused once rather than continuing
+    /// past it unread. Stops the line itself causes (`break`, a resume
+    /// landing on a breakpoint) do not set it; see
+    /// [`ReplState::gate_remote_command`].
+    pub unseen_stop_rendered: bool,
+    /// How many command lists are being dispatched, one inside another (a
+    /// loop's body, an alias): the outermost is the line the user sent.
+    pub line_depth: usize,
+    /// The next line of debug output read from the kernel's DbgPrint
+    /// buffer to print, for a backend without KD's stream, which prints
+    /// its own: the interactive prompt prints them while a run waits.
+    pub printed_debug_seq: u64,
+    /// How long the run last driven took, until its stop is rendered: after
+    /// a long one at the interactive prompt, the terminal is asked to notify
+    /// (see [`ReplState::notify_stop`]).
+    pub last_run: Option<Duration>,
+    /// What `!virtio` and `!vring` last saw of each queue, to show what
+    /// moved since.
+    pub virtio_seen: commands::virtio::VirtioSeen,
+}
+
+/// An optional deadline plus a host-owned cancel flag (client disconnect,
+/// server shutdown). Reaching the deadline or cancellation returns control
+/// without interrupting the target.
+#[derive(Clone, Debug)]
+pub struct StopWaitBudget {
+    /// `None` waits until a stop or `cancel`.
+    pub deadline: Option<Instant>,
+    pub cancel: Arc<AtomicBool>,
+}
+
+impl StopWaitBudget {
+    pub fn new(timeout: Duration, cancel: Arc<AtomicBool>) -> Self {
+        Self {
+            deadline: Some(Instant::now() + timeout),
+            cancel,
+        }
+    }
+
+    /// A budget with no deadline, ended only by `cancel`.
+    pub fn unbounded(cancel: Arc<AtomicBool>) -> Self {
+        Self {
+            deadline: None,
+            cancel,
+        }
+    }
+
+    pub fn exhausted(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+            || self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+}
+
+/// Where a command line comes from. It determines which run-control commands
+/// are allowed; see `ReplState::run_control_denial`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DispatchContext {
+    /// The user's prompt: anything goes.
+    Interactive,
+    /// A breakpoint's action string; only `gc` or a plain `g` may resume.
+    BreakpointAction,
+    /// An exception policy's command; the policy's `-f` owns the disposition.
+    ExceptionCommand,
+    /// A request/response host whose command policy and stop-wait budget govern
+    /// whether and how long a command may run the target.
+    Remote(RemoteClient),
+}
+
+/// The protocol server behind a [`DispatchContext::Remote`] session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteClient {
+    /// The MCP `command` tool. Resumes are allowed; the optional deadline and
+    /// cancellation in [`ReplState::stop_wait`] govern the wait. `quit` is
+    /// refused (the client closes).
+    Mcp,
+    /// The Python SDK's `Debugger.command()`. A resume waits for a stop unless
+    /// [`ReplState::stop_wait`] has an elapsed deadline or cancellation; `quit`
+    /// is refused because the owner calls `close()` explicitly.
+    Sdk,
+    /// The DAP Debug Console, alongside the client's own run-control buttons.
+    Dap,
+    /// `monitor` commands from a GDB remote client, which owns run control.
+    Gdb,
+}
+
+/// Everything a [`ReplState`] owns besides its session borrow. A host that
+/// runs commands one at a time against a session it owns (MCP or the Python
+/// SDK) keeps one of these between calls, so completion caches, aliases, and
+/// the `ls` and `u` cursors persist exactly as in the interactive REPL, and
+/// rebuilds the borrowing `ReplState` per call with [`ReplState::attach`].
+pub struct ReplStore {
+    caches: ReplCaches,
+    aliases: UserAliases,
+    context: DispatchContext,
+    source_cursor: Option<(PathBuf, u32)>,
+    disasm_search: DisasmSearch,
+    disasm_cursor: Option<DisasmCursor>,
+    virtio_seen: commands::virtio::VirtioSeen,
+}
+
+impl ReplStore {
+    /// Fresh REPL state for `ctx`: caches seeded from the current symbol
+    /// context, persisted aliases loaded.
+    /// The symbol and type indexes are built when a search first reads them.
+    pub fn new(ctx: &Session, context: DispatchContext) -> Self {
+        let caches = ReplCaches {
+            symbols: Arc::default(),
+            types: Arc::default(),
+            symbol_store: Arc::clone(&ctx.target.symbols),
+            dtb: Arc::new(RwLock::new(ctx.target.current_dtb())),
+            processes: Arc::new(RwLock::new(Vec::new())),
+            threads: Arc::new(RwLock::new(Vec::new())),
+            vcpus: Arc::new(RwLock::new(Vec::new())),
+            breakpoints: Arc::new(RwLock::new(Vec::new())),
+            drivers: Arc::new(RwLock::new(Vec::new())),
+            registers: Arc::new(ctx.register_map.names()),
+            expression_variables: Arc::new(RwLock::new(Vec::new())),
+            user_commands: Arc::new(RwLock::new(initial_user_commands())),
+            aliases: Arc::new(RwLock::new(Vec::new())),
+            partition: Arc::new(AtomicU64::new(ctx.partition().unwrap_or(0))),
+            indexed_at: Arc::new(AtomicU64::new(NOT_INDEXED)),
+        };
+        caches.refresh_expression_context(&ctx.target);
+        let aliases = UserAliases::load();
+        *caches.aliases.write().unwrap() = aliases.entries();
+        Self {
+            caches,
+            aliases,
+            context,
+            source_cursor: None,
+            disasm_search: DisasmSearch::default(),
+            disasm_cursor: None,
+            virtio_seen: Default::default(),
+        }
+    }
+
+    /// Type names matching `query`, best first, from the index `dt`
+    /// completes from: a host's search box (the GUI's palette) shares it.
+    pub fn search_types(&self, session: &Session, query: &str, limit: usize) -> Vec<String> {
+        self.caches.refresh_loaded_symbols(&session.target);
+        self.caches.types.read().unwrap().search(query, limit)
+    }
+
+    /// Module-qualified symbol names matching `query`, best first, from the
+    /// index symbol completion uses; `module!query` searches the modules
+    /// `module` names.
+    pub fn search_symbols(&self, session: &Session, query: &str, limit: usize) -> Vec<String> {
+        if let Some((module, query)) = split_query_module(query) {
+            return self.caches.symbol_store.search_symbols_in_modules(
+                session.target.current_dtb(),
+                module,
+                query,
+                limit,
+            );
+        }
+        self.caches.refresh_loaded_symbols(&session.target);
+        self.caches.symbols.read().unwrap().search(query, limit)
+    }
+}
+
+/// Where custom command scripts live (`~/.ntoseye/commands/`).
+pub fn commands_dir() -> Option<PathBuf> {
+    ntoseye_home().map(|home| home.join("commands"))
+}
+
+/// Custom commands are Python, which this build lacks: say so when the
+/// commands directory holds scripts, instead of ignoring them silently.
+#[cfg(not(feature = "python"))]
+pub fn print_python_commands_notice() {
+    let Some(dir) = commands_dir() else {
+        return;
+    };
+    let scripts = std::fs::read_dir(&dir).map_or(0, |entries| {
+        entries
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "py"))
+            .count()
+    });
+    if scripts > 0 {
+        let plural = if scripts == 1 { "" } else { "s" };
+        diagnostics::print_warning(format!(
+            "{} has {scripts} Python command script{plural}, which this build cannot run; \
+             `uv tool install ntoseye` (or `pipx install ntoseye`) installs an ntoseye that can",
+            dir.display()
+        ));
+    }
+}
+
+/// The user-command completion set: the registered Python commands when the
+/// binary embeds Python (`python-embed`), else empty.
+pub fn initial_user_commands() -> Vec<(String, String, Vec<CompletionStrategy>)> {
+    #[cfg(feature = "python")]
+    {
+        embed::command_list()
+    }
+    #[cfg(not(feature = "python"))]
+    {
+        Vec::new()
+    }
+}
+
+impl<'a> ReplState<'a> {
+    /// Bind stored REPL state to a session for one dispatch; [`Self::detach`]
+    /// hands the state back afterwards.
+    pub fn attach(ctx: &'a mut Session, store: ReplStore) -> Self {
+        ReplState {
+            ctx,
+            caches: store.caches,
+            aliases: store.aliases,
+            event_command_depth: 0,
+            command_loop_depth: 0,
+            command_loop_interrupts: 0,
+            breakable_loop: false,
+            line: String::new(),
+            context: store.context,
+            source_cursor: store.source_cursor,
+            disasm_search: store.disasm_search,
+            disasm_cursor: store.disasm_cursor,
+            stop_wait: None,
+            unseen_stop_rendered: false,
+            line_depth: 0,
+            printed_debug_seq: 0,
+            last_run: None,
+            virtio_seen: store.virtio_seen,
+        }
+    }
+
+    /// Release the session borrow, keeping the REPL state for the next
+    /// [`Self::attach`].
+    pub fn detach(self) -> ReplStore {
+        ReplStore {
+            caches: self.caches,
+            aliases: self.aliases,
+            context: self.context,
+            source_cursor: self.source_cursor,
+            disasm_search: self.disasm_search,
+            disasm_cursor: self.disasm_cursor,
+            virtio_seen: self.virtio_seen,
+        }
+    }
+
+    /// The unstyled prompt, `ntoseye>` or `0: kd>`, that the plain REPL
+    /// prints and a script echoes its commands after.
+    pub fn plain_prompt(&self) -> String {
+        if self.ctx.current_thread.is_empty() {
+            "ntoseye>".to_string()
+        } else {
+            format!("{}: {}>", self.prompt_thread(), self.prompt_backend())
+        }
+    }
+
+    /// What the prompt names the current thread by: the number `~` selects
+    /// it by, the processor's (`3`) or, in a user-mode dump, the thread's
+    /// place in the dump's list (`17`), as WinDbg's `0:017>` does.
+    pub fn prompt_thread(&self) -> String {
+        let thread = &self.ctx.current_thread;
+        self.ctx
+            .target
+            .user_dump_info()
+            .and_then(|info| info.thread_index(info.tid_for_backend_id(thread)?))
+            .map_or_else(|| thread_label(thread), |index| index.to_string())
+    }
+
+    /// The window title: the prompt's processor and backend, and where the
+    /// target stopped or that it runs (`ntoseye - 3: kd - nt!NtClose+0x5`).
+    pub fn window_title(&self, running: bool) -> String {
+        let thread = &self.ctx.current_thread;
+        let mut title = if thread.is_empty() {
+            "ntoseye".to_string()
+        } else {
+            format!(
+                "ntoseye - {}: {}",
+                self.prompt_thread(),
+                self.prompt_backend()
+            )
+        };
+        if running {
+            title.push_str(" - running");
+        } else if let Some(shown) = self
+            .ctx
+            .shown_stop
+            .as_ref()
+            .filter(|shown| shown.thread == *thread)
+        {
+            title.push_str(&format!(" - {}", shown.symbol));
+        }
+        title
+    }
+
+    /// What the prompt names after the processor: the backend (`kd`), or
+    /// the guest partition a view inspects (`partition 0x3`).
+    pub fn prompt_backend(&self) -> String {
+        match self.ctx.partition() {
+            Some(partition) => format!("partition {partition:#x}"),
+            None => self.ctx.backend.name().to_string(),
+        }
+    }
+
+    /// Build a transient REPL state around an existing context for one-off
+    /// command dispatch. Completion caches start empty (no live REPL to
+    /// populate them). Output goes to stdout unless
+    /// the caller wraps dispatch in [`crate::base::output::capture`].
+    #[cfg(test)]
+    fn for_oneshot(ctx: &'a mut Session) -> Self {
+        if ctx.target.selected_frame.is_none() {
+            ctx.restore_live_register_cache();
+        }
+        let store = ReplStore::new(ctx, DispatchContext::Interactive);
+        Self::attach(ctx, store)
+    }
+}
+
+/// What the command line asks of the REPL besides its prompt: command
+/// lists to run first (`-c`), and with `batch`, to quit after them instead
+/// of prompting, leaving out the startup summary and the stop.
+#[derive(Debug)]
+pub struct Startup {
+    pub commands: Vec<String>,
+    pub batch: bool,
+}
+
+#[cfg(feature = "cli")]
+pub fn start_repl(ctx: &mut Session, startup: &Startup) -> Result<()> {
+    start_repl_with_mode(ctx, false, startup)
+}
+
+/// Signal-handler safe: one atomic store through an already-initialized static.
+#[cfg(all(unix, feature = "cli"))]
+extern "C" fn note_termination(_signal: c_int) {
+    TERMINATION_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// Turn a termination signal into an ordinary exit so the teardown below runs.
+///
+/// The default disposition kills the process outright, which leaves an `int3`
+/// in guest code and holds one of the target's 32 breakpoint-table entries for
+/// the rest of the boot, since only the debugger owning a handle can release
+/// it.
+/// `SIGINT` is left to the Ctrl+C handler, which means "interrupt the guest".
+/// `SA_RESTART` is deliberately unset: the interrupted `read` is how a loop
+/// blocked on input learns to stop waiting.
+#[cfg(all(unix, feature = "cli"))]
+fn install_termination_handler() {
+    for signal in [SIGTERM, SIGHUP] {
+        // SAFETY: the handler only performs one atomic store.
+        unsafe {
+            let mut action: sigaction = zeroed();
+            action.sa_sigaction = note_termination as *const () as sighandler_t;
+            sigemptyset(&mut action.sa_mask);
+            sigaction(signal, &action, null_mut());
+        }
+    }
+}
+
+#[cfg(all(not(unix), feature = "cli"))]
+fn install_termination_handler() {}
+
+/// How often the bridge below looks for a termination signal.
+#[cfg(all(unix, feature = "cli"))]
+const TERMINATION_POLL: Duration = Duration::from_millis(100);
+
+/// Make a termination signal stop a wait on the guest.
+///
+/// The prompt loops poll [`termination_requested`], but a resuming command is
+/// not at the prompt: it is inside the stop wait, which polls the target's
+/// interrupt flag instead. Without this bridge a signal that arrives while the
+/// guest runs is not seen until the guest stops on its own, so a supervisor
+/// escalates to `SIGKILL` and the teardown this handler exists for never runs.
+///
+/// Raising the interrupt is exactly what Ctrl+C does, so the wait ends through
+/// the path that is already there, and the prompt then leaves through the same
+/// teardown as `q`.
+#[cfg(all(unix, feature = "cli"))]
+fn bridge_termination_to_interrupt(interrupt: InterruptRequester) {
+    std::thread::spawn(move || {
+        let mut woke = false;
+        loop {
+            // Re-raised every tick: a wait that takes the flag with `swap`
+            // must not be the only one to see it.
+            if termination_requested() {
+                interrupt.raise();
+                if !woke && !NATIVE_PROMPT.load(Ordering::SeqCst) {
+                    woke = true;
+                    wake_line_editor();
+                }
+            }
+            std::thread::sleep(TERMINATION_POLL);
+        }
+    });
+}
+
+/// Hand the prompt an Enter on a fresh stdin, so a pending `read_line`
+/// returns and the prompt loop sees the termination request before running
+/// anything.
+///
+/// On a terminal that hung up (its pane closed, its ssh session dropped),
+/// reedline's reader, crossterm 0.29, retries the failing read forever: it
+/// treats any error but `WouldBlock` as "try again", so the process spins a
+/// core and never reaches the teardown, while the guest stays halted under
+/// the debugger. Reading the pipe instead gives it a key. The write end stays
+/// open, so no reader ever sees end of file.
+#[cfg(all(unix, feature = "cli"))]
+fn wake_line_editor() {
+    use std::os::fd::AsRawFd;
+
+    let Ok((reader, mut writer)) = io::pipe() else {
+        return;
+    };
+    if writer.write_all(b"\r").is_err() {
+        return;
+    }
+    // SAFETY: both descriptors are open; dup2 only replaces descriptor 0.
+    unsafe { libc::dup2(reader.as_raw_fd(), libc::STDIN_FILENO) };
+    std::mem::forget(writer);
+}
+
+#[cfg(feature = "cli")]
+fn termination_requested() -> bool {
+    TERMINATION_REQUESTED.load(Ordering::SeqCst)
+}
+
+/// Read one line, noticing a termination signal that arrived mid-read.
+///
+/// `BufRead::read_line` retries `EINTR` internally, so a signal delivered while
+/// the prompt waits for input stays invisible until the next keypress, leaving
+/// the process alive with breakpoints still installed in the guest. Returns
+/// `None` when termination was requested instead of a line.
+#[cfg(feature = "cli")]
+fn read_line_interruptible<R: BufRead>(
+    input: &mut R,
+    buffer: &mut String,
+) -> io::Result<Option<usize>> {
+    let mut line = Vec::new();
+    loop {
+        if termination_requested() {
+            return Ok(None);
+        }
+        let available = match input.fill_buf() {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if available.is_empty() {
+            break;
+        }
+        let (chunk, complete) = match available.iter().position(|byte| *byte == b'\n') {
+            Some(index) => (&available[..=index], true),
+            None => (available, false),
+        };
+        // Decoded once at the end: a multi-byte character can straddle two
+        // fills, and lossy-decoding each chunk would mangle it.
+        line.extend_from_slice(chunk);
+        let consumed = chunk.len();
+        input.consume(consumed);
+        if complete {
+            break;
+        }
+    }
+    buffer.push_str(&String::from_utf8_lossy(&line));
+    Ok(Some(line.len()))
+}
+
+#[cfg(feature = "cli")]
+pub fn start_plain_repl(ctx: &mut Session, startup: &Startup) -> Result<()> {
+    start_repl_with_mode(ctx, true, startup)
+}
+
+/// Run `line` as if typed at the prompt.
+#[cfg(feature = "cli")]
+fn run_typed_line(state: &mut ReplState<'_>, line: &str) -> Result<Flow> {
+    log_input_line(line);
+    drop_leading_blank_lines();
+    state.line = line.to_string();
+    // A Ctrl+C that ended the last command's step is spent.
+    state.ctx.target.interrupt.store(false, Ordering::SeqCst);
+    state.dispatch_line(line)
+}
+
+/// Run the command line's `-c` lists in order, each echoed after the prompt
+/// and run as if typed there: an error ends its own list, not the next one.
+/// `true` when one quits (`q`).
+#[cfg(feature = "cli")]
+fn run_startup_commands(state: &mut ReplState<'_>, commands: &[String]) -> Result<bool> {
+    for command in commands.iter().map(|command| command.trim()) {
+        if command.is_empty() {
+            continue;
+        }
+        separate_prompt();
+        outln!("{} {command}", state.plain_prompt());
+        if run_typed_line(state, command)? == Flow::Quit {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// What the session found of the target's kernel.
+#[cfg(feature = "cli")]
+struct KernelSummary {
+    /// `NtBuildNumber`, when the kernel was found.
+    build: Option<u16>,
+    base: Option<u64>,
+    /// `PsLoadedModuleList`; zero when unavailable.
+    modules: Option<u64>,
+}
+
+/// What a user-mode minidump captured, as the session opens with it.
+#[cfg(feature = "cli")]
+struct UserDumpSummary {
+    /// `charmap.exe (PID 1234)`.
+    process: String,
+    /// `Windows 10.0.26100 AMD64`, with the build string when recorded.
+    system: String,
+    /// When the dump was written (`MINIDUMP_HEADER.TimeDateStamp`).
+    written: Option<String>,
+    threads: usize,
+    modules: usize,
+    /// Captured memory: how many ranges, how many bytes.
+    memory: String,
+    /// The exception the dump was written for, described.
+    exception: Option<String>,
+}
+
+/// The session's opening summary of the target's kernel.
+#[cfg(feature = "cli")]
+fn print_target(target: &KernelSummary) {
+    outln!("\n{}", ui::label("target"));
+    match (target.build, target.base) {
+        (Some(build), Some(base)) => {
+            outln!("  {} Windows {}", ui::muted("kernel"), build);
+            outln!("  {} {}", ui::muted("base  "), ui::addr(base));
+            outln!(
+                "  {} {}",
+                ui::muted("psmods"),
+                ui::addr_opt(VirtAddr(target.modules.unwrap_or(0)))
+            );
+        }
+        (None, Some(base)) => outln!("  {} {}", ui::muted("base  "), ui::addr(base)),
+        (_, None) => outln!(
+            "  {} {}",
+            ui::muted("kernel"),
+            ui::muted("unknown (ntoskrnl not found in dump)")
+        ),
+    }
+    outln!();
+}
+
+/// What a user-mode minidump captured, for the session's opening summary;
+/// `None` for a kernel target.
+#[cfg(feature = "cli")]
+fn user_dump_summary(target: &Target) -> Option<UserDumpSummary> {
+    let dump = target.user_dump()?;
+    let info = dump.info();
+    let system = &info.system;
+    let mut version = format!(
+        "Windows {}.{}.{} {}",
+        system.major_version,
+        system.minor_version,
+        system.build_number,
+        info.arch.label()
+    );
+    if let Some(build) = &info.build_string {
+        version.push_str(&format!(" ({build})"));
+    }
+    let captured: u64 = dump.memory_ranges().iter().map(|range| range.length).sum();
+    Some(UserDumpSummary {
+        process: info.process_label(),
+        system: version,
+        written: unix_time_to_iso(u64::from(info.time_date_stamp)),
+        threads: info.threads.len(),
+        modules: info.modules.len(),
+        memory: format!(
+            "{} ranges, {} KiB",
+            dump.memory_ranges().len(),
+            captured / 1024
+        ),
+        exception: target.user_exception_summary(),
+    })
+}
+
+/// The session's opening summary of a user-mode minidump.
+#[cfg(feature = "cli")]
+fn print_user_dump_target(dump: &UserDumpSummary) {
+    outln!("\n{}", ui::label("user-mode minidump"));
+    outln!("  {} {}", ui::muted("process  "), dump.process);
+    outln!("  {} {}", ui::muted("system   "), dump.system);
+    if let Some(written) = &dump.written {
+        outln!("  {} {}", ui::muted("written  "), written);
+    }
+    outln!(
+        "  {} {} threads, {} modules",
+        ui::muted("captured "),
+        dump.threads,
+        dump.modules
+    );
+    outln!("  {} {}", ui::muted("memory   "), dump.memory);
+    if let Some(exception) = &dump.exception {
+        outln!("  {} {}", ui::muted("exception"), exception);
+    }
+    outln!();
+}
+
+#[cfg(feature = "cli")]
+fn start_repl_with_mode(ctx: &mut Session, plain: bool, startup: &Startup) -> Result<()> {
+    if startup.batch {
+        // Nothing comes before the first command's output to set it apart
+        // from.
+        drop_leading_blank_lines();
+    }
+    // Warnings the attach raised (unreadable PRCB contexts, a corrupt triage
+    // signature, kernel discovery falling back) precede the banner.
+    for notice in ctx.take_notices() {
+        diagnostics::print_notice(&notice);
+    }
+    let debugger: &mut Target = &mut ctx.target;
+    let client: &mut dyn DebugBackend = ctx.backend.as_mut();
+
+    let interrupt = debugger.interrupt_requester();
+    ctrlc::set_handler(move || interrupt.raise())?;
+    install_termination_handler();
+    #[cfg(unix)]
+    bridge_termination_to_interrupt(debugger.interrupt_requester());
+
+    // Loaded up front so the summary prints with the transport banner and
+    // the completion caches below see them.
+    #[cfg(feature = "python")]
+    let py_report = embed::load_commands_dir();
+    let (aliases, alias_report) = UserAliases::load_with_report();
+    let mut loaded_parts: Vec<String> = Vec::new();
+    #[cfg(feature = "python")]
+    if !py_report.loaded.is_empty() || !py_report.failed.is_empty() {
+        let mut part = format!("{} python", py_report.loaded.len());
+        if !py_report.failed.is_empty() {
+            part.push_str(&format!(" ({} failed)", py_report.failed.len()));
+        }
+        loaded_parts.push(part);
+    }
+    if alias_report.loaded > 0 || !alias_report.failed.is_empty() {
+        let n = alias_report.loaded;
+        let mut part = format!("{n} alias{}", if n == 1 { "" } else { "es" });
+        if !alias_report.failed.is_empty() {
+            part.push_str(&format!(" ({} failed)", alias_report.failed.len()));
+        }
+        loaded_parts.push(part);
+    }
+    if !loaded_parts.is_empty() && !startup.batch {
+        outln!(
+            "{}",
+            ui::muted(&format!("loaded: {}", loaded_parts.join(", ")))
+        );
+    }
+    #[cfg(feature = "python")]
+    embed::print_script_load_failures(&py_report);
+    #[cfg(not(feature = "python"))]
+    print_python_commands_notice();
+    print_alias_load_failures(&alias_report);
+
+    if startup.batch {
+        // A batch run's output is its commands'.
+    } else if let Some(dump) = user_dump_summary(debugger) {
+        print_user_dump_target(&dump);
+    } else {
+        // Triage dumps may lack the ntoskrnl PE header needed for full kernel
+        // discovery; a missing kernel is non-fatal and commands that need it
+        // fail individually.
+        let target = match debugger.startup_message_data() {
+            Ok(message_data) => KernelSummary {
+                build: Some(message_data.build_number),
+                base: Some(message_data.base_address.0),
+                modules: Some(message_data.loaded_module_list.0),
+            },
+            Err(Error::NtoskrnlNotFound) | Err(Error::AddressNotInDump(_)) => KernelSummary {
+                build: None,
+                base: debugger.kernel_base().map(|base| base.0),
+                modules: None,
+            },
+            Err(e) => return Err(e),
+        };
+        print_target(&target);
+    }
+    if !startup.batch {
+        print_backend_capability_warning(&client.capabilities());
+    }
+
+    let has_register_context = client.supports(DebugCapability::ReadRegisters);
+
+    if has_register_context && !startup.batch {
+        // A user dump written for an exception stops on the thread that
+        // raised it; `.ecxr` selects the exception's own context.
+        let cause = ctx.target.user_exception().map(|exception| {
+            format!(
+                "{} {:#x}  {}",
+                ui::muted("exception"),
+                exception.code,
+                ui::muted(".ecxr selects its context, .exr -1 shows its record")
+            )
+        });
+        print_break_context_at(ctx, None, cause);
+    }
+    let debugger: &mut Target = &mut ctx.target;
+    let client: &mut dyn DebugBackend = ctx.backend.as_mut();
+
+    let ide_menu = IdeMenu::default()
+        .with_name("completion_menu")
+        .with_max_completion_width(50)
+        .with_max_completion_height(12)
+        .with_padding(1)
+        .with_description_mode(DescriptionMode::PreferRight)
+        .with_min_description_width(0)
+        .with_max_description_width(50)
+        .with_description_offset(1)
+        .with_correct_cursor_pos(false)
+        .with_marker(" ")
+        .with_text_style(Style::new().fg(Color::LightGray));
+    let completion_menu = Box::new(ide_menu);
+
+    let mut keybindings = default_emacs_keybindings();
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Tab,
+        ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::Menu("completion_menu".to_string()),
+            ReedlineEvent::MenuNext,
+        ]),
+    );
+    keybindings.add_binding(
+        KeyModifiers::SHIFT,
+        KeyCode::BackTab,
+        ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::Menu("completion_menu".to_string()),
+            ReedlineEvent::MenuPrevious,
+        ]),
+    );
+    keybindings.add_binding(KeyModifiers::NONE, KeyCode::Left, ReedlineEvent::Left);
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Right,
+        ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::HistoryHintComplete,
+            ReedlineEvent::Right,
+        ]),
+    );
+
+    // Alt+P opens the command palette, which only Tern can draw. Tern keeps
+    // F1 for itself.
+    if native::active() {
+        keybindings.add_binding(
+            KeyModifiers::ALT,
+            KeyCode::Char('p'),
+            ReedlineEvent::ExecuteHostCommand(palette::PALETTE_COMMAND.to_owned()),
+        );
+    }
+    let edit_mode = Box::new(Emacs::new(keybindings));
+
+    let initial_vcpus = if client.supports(DebugCapability::ThreadList) {
+        client.thread_list().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    // Process and driver lists are never walked ahead of use: completions
+    // enumerate them on demand through the target loan below, and listing
+    // commands refresh the fallback snapshots as a side effect.
+    let caches = ReplCaches {
+        symbols: Arc::default(),
+        types: Arc::default(),
+        symbol_store: Arc::clone(&debugger.symbols),
+        dtb: Arc::new(RwLock::new(debugger.current_dtb())),
+        processes: Arc::new(RwLock::new(Vec::new())),
+        // populated on demand by the threads/thread commands
+        threads: Arc::new(RwLock::new(Vec::new())),
+        vcpus: Arc::new(RwLock::new(initial_vcpus)),
+        breakpoints: Arc::new(RwLock::new(Vec::new())),
+        drivers: Arc::new(RwLock::new(Vec::new())),
+        registers: Arc::new(ctx.register_map.names()),
+        expression_variables: Arc::new(RwLock::new(Vec::new())),
+        user_commands: Arc::new(RwLock::new(initial_user_commands())),
+        aliases: Arc::new(RwLock::new(aliases.entries())),
+        // A session starts on the target; only `.partition` shows a view.
+        partition: Arc::new(AtomicU64::new(0)),
+        indexed_at: Arc::new(AtomicU64::new(NOT_INDEXED)),
+    };
+    // The tab completer reads the symbol and type indexes as the first line
+    // is typed, so they are built before the prompt. The plain REPL has no
+    // completer and builds them when a search first needs them.
+    if !plain {
+        caches.refresh_loaded_symbols(debugger);
+    }
+    caches.refresh_expression_context(debugger);
+
+    let target_loan = TargetLoan::default();
+    let completor = Box::new(MyCompleter {
+        caches: caches.clone(),
+        target: target_loan.clone(),
+    });
+
+    let had_content = Arc::new(AtomicBool::new(false));
+    let highlighter = TrackingHighlighter {
+        had_content: Arc::clone(&had_content),
+    };
+
+    // Under `NO_COLOR` the prompt and the completion menu are plain, and no
+    // line is suggested: without its dim style a suggestion would read as
+    // typed, and Enter would run something other than what the line shows.
+    let styled = output::stdout_styled();
+    let mut line_editor = Reedline::create()
+        .with_completer(completor)
+        .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
+        .with_ansi_colors(styled)
+        // OSC 133 `A` and `B` around the prompt; the loop below marks the
+        // output (`C`) and the end of each line it runs (`D`).
+        .with_semantic_markers(Some(Osc133Markers::boxed()))
+        .with_edit_mode(edit_mode)
+        .with_highlighter(Box::new(highlighter))
+        .with_history_exclusion_prefix(Some(" ".to_string()));
+    if styled {
+        // The rest of the newest earlier line that starts with what is
+        // typed, dim after the cursor; Right, End or Ctrl+E takes it.
+        line_editor = line_editor.with_hinter(Box::new(
+            DefaultHinter::default().with_style(Style::new().fg(Color::DarkGray)),
+        ));
+    }
+    if let Some(history_path) = ntoseye_home().map(|root| root.join("history")) {
+        match FileBackedHistory::with_file(REPL_HISTORY_SIZE, history_path.clone()) {
+            Ok(history) => {
+                line_editor = line_editor.with_history(Box::new(history));
+            }
+            Err(err) => diagnostics::print_warning(format!(
+                "failed to load command history from {}: {}",
+                history_path.display(),
+                err
+            )),
+        }
+    }
+
+    let mut tern_prompt =
+        native::active().then(|| tern_prompt::TernPrompt::new(line_editor.history()));
+    let mut prompt_completer = MyCompleter {
+        caches: caches.clone(),
+        target: target_loan.clone(),
+    };
+    let mut state = ReplState {
+        ctx,
+        caches,
+        aliases,
+        event_command_depth: 0,
+        command_loop_depth: 0,
+        command_loop_interrupts: 0,
+        breakable_loop: false,
+        line: String::new(),
+        context: DispatchContext::Interactive,
+        source_cursor: None,
+        disasm_search: DisasmSearch::default(),
+        disasm_cursor: None,
+        stop_wait: None,
+        unseen_stop_rendered: false,
+        line_depth: 0,
+        printed_debug_seq: 0,
+        last_run: None,
+        virtio_seen: Default::default(),
+    };
+    if !plain {
+        terminal::begin();
+    }
+    // An error ends the prompt, not the cleanup below: breakpoints left
+    // planted in a guest that resumes without a debugger crash it.
+    let prompt: Result<()> = (|| {
+        if run_startup_commands(&mut state, &startup.commands)? || startup.batch {
+            return Ok(());
+        }
+        if plain {
+            let stdin = io::stdin();
+            let mut input = stdin.lock();
+            let mut buffer = String::new();
+
+            loop {
+                if termination_requested() {
+                    break;
+                }
+                separate_prompt();
+                outln!("{}", state.plain_prompt());
+                io::stdout().flush()?;
+
+                buffer.clear();
+                match read_line_interruptible(&mut input, &mut buffer) {
+                    // A termination signal, or end of input.
+                    Ok(None) | Ok(Some(0)) => break,
+                    Ok(Some(_)) => {}
+                    Err(error) => return Err(error.into()),
+                }
+                let command = buffer.trim();
+                if command.is_empty() {
+                    // Nothing ran, so nothing sets the next prompt apart.
+                    drop_leading_blank_lines();
+                    continue;
+                }
+                if run_typed_line(&mut state, command)? == Flow::Quit {
+                    break;
+                }
+            }
+        } else {
+            loop {
+                if termination_requested() {
+                    break;
+                }
+                separate_prompt();
+                // A run that ended without a result to show still stops
+                // its indicator before the prompt.
+                native::finish_running();
+                terminal::set_title(&state.window_title(false));
+                // In Tern the line is read in Tern's own field.
+                let native = match tern_prompt.as_mut() {
+                    Some(native) => native.read(
+                        &state,
+                        &mut prompt_completer,
+                        &target_loan,
+                        line_editor.history_mut(),
+                    ),
+                    None => tern_prompt::Read::Unavailable,
+                };
+                let sig = match native {
+                    tern_prompt::Read::Line(line) => Signal::Success(line),
+                    tern_prompt::Read::Interrupt => Signal::CtrlC,
+                    tern_prompt::Read::Quit => Signal::CtrlD,
+                    tern_prompt::Read::Clear => continue,
+                    tern_prompt::Read::Unavailable => {
+                        tern_prompt = None;
+                        let prompt =
+                            CustomPrompt::new(&state.prompt_backend(), &state.prompt_thread());
+                        match target_loan.lend(&state.ctx.target, || {
+                            prompting(|| line_editor.read_line(&prompt))
+                        }) {
+                            Ok(sig) => sig,
+                            Err(_) if termination_requested() => break,
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                };
+                if termination_requested() {
+                    break;
+                }
+                match sig {
+                    Signal::Success(buffer) => {
+                        if !buffer.trim().is_empty() {
+                            log_input_line(buffer.trim());
+                            drop_leading_blank_lines();
+                            state.line = buffer.trim().to_string();
+                            // A Ctrl+C that ended the last command's step is spent.
+                            state.ctx.target.interrupt.store(false, Ordering::SeqCst);
+                            let errors = diagnostics::errors_reported();
+                            terminal::mark(PromptMark::Output);
+                            let flow = state.dispatch_line(&buffer);
+                            terminal::mark(PromptMark::Finished {
+                                failed: flow.is_err() || diagnostics::errors_reported() != errors,
+                            });
+                            match flow? {
+                                Flow::Quit => break,
+                                Flow::Continue | Flow::Denied | Flow::Jump(_) => {}
+                            }
+                        }
+                    }
+                    Signal::CtrlD => {
+                        break;
+                    }
+                    Signal::HostCommand(command) if command == palette::PALETTE_COMMAND => {
+                        state.open_palette(&mut line_editor);
+                    }
+                    Signal::CtrlC => {
+                        if had_content.load(Ordering::Relaxed) {
+                            had_content.store(false, Ordering::Relaxed);
+                            continue;
+                        }
+
+                        if state.ctx.backend.is_running() {
+                            state.run_motion(Motion::Break);
+                        } else {
+                            outln!("{}", ui::muted("the target is already halted"));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    })();
+
+    terminal::end();
+    if let Err(error) = state.ctx.cleanup_for_exit() {
+        error!("debugger cleanup failed; target was not resumed: {error}");
+    }
+
+    prompt
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::arch::Arch;
+    use crate::backend::dbg_backend::{BugcheckInfo, StopEvent};
+    use crate::base::output::capture;
+    use crate::base::types::VirtAddr;
+    use crate::hosts::repl::{DispatchContext, Flow, RemoteClient, ReplActions, ReplState};
+    use crate::nt::layout::{FieldInfo, ParsedType, TypeInfo};
+    use crate::session::tests::{
+        MockBackend, breakpoint_event, session_running_code, session_with_mock,
+    };
+    use crate::session::{Session, session_over_memory};
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    use super::{
+        bugcheck_fault_ip, looks_like_kernel_pointer, parse_byte_pattern, plausible_bugcheck_code,
+        repeat_pattern,
+    };
+
+    #[test]
+    fn parse_byte_pattern_accepts_contiguous_hex() {
+        assert_eq!(
+            parse_byte_pattern("4883792000740a"),
+            Some(vec![0x48, 0x83, 0x79, 0x20, 0x00, 0x74, 0x0a])
+        );
+    }
+
+    #[test]
+    fn plausible_bugcheck_code_rejects_pointer_like_values() {
+        assert!(plausible_bugcheck_code(0xe2));
+        assert!(plausible_bugcheck_code(0x0000_0139));
+        assert!(!plausible_bugcheck_code(0));
+        assert!(!plausible_bugcheck_code(0xfffff8007f1afb50));
+    }
+
+    #[test]
+    fn kernel_pointer_heuristic_accepts_canonical_kernel_addresses() {
+        assert!(looks_like_kernel_pointer(Arch::Amd64, 0xfffff8007f1afb50));
+        assert!(!looks_like_kernel_pointer(Arch::Amd64, 0x00000000000000e2));
+    }
+
+    #[test]
+    fn bugcheck_fault_ip_uses_only_real_fault_instruction_arguments() {
+        let mut info = BugcheckInfo {
+            code: 0x50,
+            parameters: [0x1, 0x2, 0xfffff804877d1805, 0x4],
+            driver: None,
+        };
+        assert_eq!(bugcheck_fault_ip(&info), Some(0xfffff804877d1805));
+
+        info.code = 0xd1;
+        info.parameters = [0x1, 0x2, 0x0, 0xfffff804877d1730];
+        assert_eq!(bugcheck_fault_ip(&info), Some(0xfffff804877d1730));
+
+        info.code = 0x4a;
+        info.parameters = [0x00007ffb32481d84, 0x2, 0x0, 0xffffdf8669067b20];
+        assert_eq!(bugcheck_fault_ip(&info), None);
+    }
+
+    #[test]
+    fn parse_byte_pattern_accepts_hex_escape_bytes() {
+        assert_eq!(
+            parse_byte_pattern(r"\x48\x83\x79\x20\x00\x74\x0a"),
+            Some(vec![0x48, 0x83, 0x79, 0x20, 0x00, 0x74, 0x0a])
+        );
+    }
+
+    #[test]
+    fn parse_byte_pattern_rejects_odd_length_hex() {
+        assert_eq!(parse_byte_pattern("488379200074a"), None);
+    }
+
+    #[test]
+    fn repeat_pattern_repeats_and_truncates() {
+        assert_eq!(repeat_pattern(&[0x90], 4), vec![0x90, 0x90, 0x90, 0x90]);
+        assert_eq!(
+            repeat_pattern(&[0x48, 0x83, 0x79], 8),
+            vec![0x48, 0x83, 0x79, 0x48, 0x83, 0x79, 0x48, 0x83]
+        );
+    }
+
+    #[test]
+    fn windbg_forms_produce_windbg_shaped_output() {
+        let mut memory = [0u8; 0x40];
+        memory[..4].copy_from_slice(&0x12345678u32.to_le_bytes());
+        memory[0x10..0x14].copy_from_slice(b"abc\0");
+        let mut session = session_over_memory(0x1000, &memory);
+        let dtb = session.target.current_dtb();
+        session.target.symbols.set_kernel(Some(1), dtb);
+        session.target.symbols.inject_module_for_test(
+            1,
+            vec![
+                TypeInfo {
+                    name: "_NODE".to_string(),
+                    pointer_size: 8,
+                    size: 0x10,
+                    fields: [(
+                        "Value".to_string(),
+                        FieldInfo {
+                            offset: 0,
+                            size: 4,
+                            type_data: ParsedType::Primitive("ULONG".to_string()),
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                },
+                // A layout whose fields sit past 0xfff, where WinDbg's three-digit
+                // offset pad gives way to the natural width.
+                TypeInfo {
+                    name: "_WIDE".to_string(),
+                    pointer_size: 8,
+                    size: 0x1160,
+                    fields: [(
+                        "Far".to_string(),
+                        FieldInfo {
+                            offset: 0x1150,
+                            size: 4,
+                            type_data: ParsedType::Primitive("ULONG".to_string()),
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                },
+            ],
+            &[],
+        );
+        let mut state = ReplState::for_oneshot(&mut session);
+
+        for (line, expected) in [
+            // Hexadecimal default radix, `0n` decimal override.
+            ("? 0n42", "000000000000002a"),
+            ("? 1000 + 0n16", "0000000000001010"),
+            // WinDbg prints every 64-bit address with a `\`` between its halves
+            // and takes that spelling back, so a copied address must evaluate.
+            ("? 00000000`00001000", "0000000000001000"),
+            ("? fffff803`1a2b3c4d", "fffff8031a2b3c4d"),
+            ("db 00000000`00001000 L4", "78 56 34 12"),
+            // Memory dumps are address-prefixed rows of fixed-width units.
+            ("db 1000 L4", "78 56 34 12"),
+            ("dd 1000 L1", "12345678"),
+            ("da 1010 4", "abc"),
+            // `dt` rows: WinDbg's three-digit minimum offset, name, type, value.
+            ("dt _NODE 1000", "+0x000 Value : ULONG = 0x12345678"),
+            ("dt _WIDE 0", "+0x1150 Far : ULONG"),
+            // `.formats` shows one value in every radix WinDbg lists.
+            (".formats 0n42", "2a"),
+        ] {
+            let (result, text) = capture(|| state.dispatch_line(line));
+            result.unwrap_or_else(|error| panic!("{line} failed: {error}"));
+            if line.starts_with("dt ") {
+                let expected_line = format!("  {expected}");
+                assert!(
+                    text.lines().any(|line| line == expected_line),
+                    "{line} printed {text:?}"
+                );
+            } else {
+                assert!(text.contains(expected), "{line} printed {text:?}");
+            }
+        }
+    }
+
+    /// The command line's lists run in order, each echoed after the prompt:
+    /// an error ends its own list and not the next one, and `q` ends them
+    /// all.
+    #[cfg(feature = "cli")]
+    #[test]
+    fn startup_commands_run_as_typed_lines() {
+        let mut session = session_over_memory(0x1000, &[0u8; 8]);
+        let mut state = ReplState::for_oneshot(&mut session);
+        let prompt = state.plain_prompt();
+        let lists = ["? 11; ? no_such_symbol; ? 12", "? 13", "q", "? 14"].map(String::from);
+        let (quit, text) = capture(|| super::run_startup_commands(&mut state, &lists));
+        assert!(quit.unwrap(), "q quits");
+        assert!(text.contains(&format!("{prompt} ? 13")), "{text}");
+        for (value, shown) in [(0x11, true), (0x12, false), (0x13, true), (0x14, false)] {
+            assert_eq!(
+                text.contains(&format!("{value:016x}")),
+                shown,
+                "{value:#x}: {text}"
+            );
+        }
+        let (quit, _) = capture(|| super::run_startup_commands(&mut state, &lists[..2]));
+        assert!(!quit.unwrap(), "no q, no quit");
+    }
+    #[test]
+    fn session_radix_switch_applies_to_later_expressions() {
+        let mut session = session_over_memory(0x1000, &[0u8; 8]);
+        let mut state = ReplState::for_oneshot(&mut session);
+        let (result, _) = capture(|| state.dispatch_line("n 10"));
+        result.unwrap();
+        let (result, text) = capture(|| state.dispatch_line("? 42"));
+        result.unwrap();
+        assert!(text.contains("000000000000002a"), "decimal radix: {text:?}");
+        // A separated address is the debugger's own address spelling, so it stays
+        // hexadecimal even while the session default is decimal.
+        let (result, text) = capture(|| state.dispatch_line("? 00000000`00001000"));
+        result.unwrap();
+        assert!(
+            text.contains("0000000000001000"),
+            "separated address under decimal radix: {text:?}"
+        );
+        let (result, _) = capture(|| state.dispatch_line("n 16"));
+        result.unwrap();
+        let (result, text) = capture(|| state.dispatch_line("? 42"));
+        result.unwrap();
+        assert!(text.contains("0000000000000042"), "hex radix: {text:?}");
+    }
+
+    fn remote_state(session: &mut Session, budget_ms: u64) -> ReplState<'_> {
+        let mut state = ReplState::for_oneshot(session);
+        state.context = super::DispatchContext::Remote(super::RemoteClient::Mcp);
+        state.stop_wait = Some(super::StopWaitBudget::new(
+            std::time::Duration::from_millis(budget_ms),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ));
+        state
+    }
+
+    #[test]
+    fn bounded_wait_hands_back_a_running_target_instead_of_blocking() {
+        let mut session = session_with_mock(MockBackend::default().running());
+        let mut state = remote_state(&mut session, 150);
+        let started = std::time::Instant::now();
+        let ((), text) = capture(|| state.collect_stop());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(text.contains("target still running"), "{text:?}");
+        assert!(state.ctx.backend.is_running());
+    }
+
+    #[test]
+    fn bounded_wait_renders_the_stop_that_arrives_within_budget() {
+        let mut backend = MockBackend::default().running();
+        backend.queue_interrupt(breakpoint_event(0x1000));
+        let mut session = session_with_mock(backend);
+        let mut state = remote_state(&mut session, 5_000);
+        let ((), text) = capture(|| state.collect_stop());
+        assert!(!state.ctx.backend.is_running());
+        assert!(!text.contains("target still running"), "{text:?}");
+    }
+
+    /// A halted-only command that runs on the mock (`r`/`k` need a thread
+    /// context it does not model): bare `bd` prints its usage.
+    const HALTED_PROBE: &str = "bd";
+    const HALTED_PROBE_RAN: &str = "bd <id";
+
+    #[test]
+    fn halted_only_command_waits_for_the_stop_then_runs() {
+        let mut backend = MockBackend::default().running();
+        backend.queue_interrupt(breakpoint_event(0x1000));
+        let mut session = session_with_mock(backend);
+        session
+            .breakpoints
+            .edit()
+            .insert_for_test(0, VirtAddr(0x1000), true, None);
+        let mut state = remote_state(&mut session, 5_000);
+        let (result, text) = capture(|| state.dispatch_line(HALTED_PROBE));
+        assert_eq!(result.unwrap(), Flow::Continue);
+        assert!(!text.contains("not run"), "{text:?}");
+        assert!(text.contains(HALTED_PROBE_RAN), "bd did not run: {text:?}");
+        assert!(!state.ctx.backend.is_running());
+    }
+
+    #[test]
+    fn halted_only_command_is_not_run_on_a_target_still_running() {
+        let mut session = session_with_mock(MockBackend::default().running());
+        session
+            .breakpoints
+            .edit()
+            .insert_for_test(0, VirtAddr(0x1000), true, None);
+        let mut state = remote_state(&mut session, 150);
+        let (result, text) = capture(|| state.dispatch_line(HALTED_PROBE));
+        assert_eq!(result.unwrap(), Flow::Denied);
+        assert!(text.contains("not run"), "{text:?}");
+        assert!(
+            !text.contains(HALTED_PROBE_RAN),
+            "bd ran on a running target: {text:?}"
+        );
+        assert!(state.ctx.backend.is_running());
+    }
+
+    /// With no breakpoint set, nothing the debugger set up will stop the
+    /// target, so a halted-only command says so at once instead of waiting
+    /// out the budget.
+    #[test]
+    fn halted_only_command_fails_at_once_when_nothing_is_set_to_stop_the_target() {
+        let mut session = session_with_mock(MockBackend::default().running());
+        let mut state = remote_state(&mut session, 5_000);
+        let started = std::time::Instant::now();
+        let (result, text) = capture(|| state.dispatch_line(HALTED_PROBE));
+        assert_eq!(result.unwrap(), Flow::Denied);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(!text.contains(HALTED_PROBE_RAN), "{text:?}");
+        assert!(state.ctx.backend.is_running());
+    }
+
+    /// A module load filter that breaks is set to stop the target as a
+    /// breakpoint is, so the command waits for the stop and then runs.
+    #[test]
+    fn halted_only_command_waits_when_a_load_filter_breaks() {
+        let mut backend = MockBackend::default().running();
+        backend.queue_interrupt(breakpoint_event(0x1000));
+        let mut session = session_with_mock(backend);
+        session.exception_policies.set_module_event(
+            crate::backend::dbg_backend::ModuleEvent::Load,
+            None,
+            crate::session::exception_policy::ExceptionPolicyMode::Break,
+            None,
+        );
+        let mut state = remote_state(&mut session, 5_000);
+        let (result, text) = capture(|| state.dispatch_line(HALTED_PROBE));
+        result.unwrap();
+        assert!(text.contains(HALTED_PROBE_RAN), "{text:?}");
+        assert!(!state.ctx.backend.is_running());
+    }
+
+    #[test]
+    fn resuming_command_is_refused_against_the_stop_it_waited_for() {
+        let mut backend = MockBackend::default().running();
+        backend.queue_interrupt(breakpoint_event(0x1000));
+        let mut session = session_with_mock(backend);
+        session
+            .breakpoints
+            .edit()
+            .insert_for_test(0, VirtAddr(0x1000), true, None);
+        let mut state = remote_state(&mut session, 5_000);
+        let (result, text) = capture(|| state.dispatch_line("g"));
+        assert_eq!(result.unwrap(), Flow::Denied);
+        assert!(text.contains("not run"), "{text:?}");
+        assert!(
+            !state.ctx.backend.is_running(),
+            "the stop was continued past"
+        );
+    }
+
+    #[test]
+    fn resuming_command_is_refused_against_a_parked_stop_after_earlier_commands_ran() {
+        let mut backend = MockBackend::default().running().with_pending_stop();
+        backend.queue_interrupt(breakpoint_event(0x1000));
+        let mut session = session_with_mock(backend);
+        session.service_idle();
+        assert!(!session.backend.is_running(), "the stop was not parked");
+        let mut state = remote_state(&mut session, 5_000);
+        let (begin, _) = capture(|| state.begin_remote_line(".echo earlier; g"));
+        assert!(begin.is_none());
+        let (result, text) = capture(|| state.dispatch_line(".echo earlier; g"));
+        assert_eq!(result.unwrap(), Flow::Denied, "{text:?}");
+        assert!(
+            text.contains("earlier"),
+            "the command before the refused g did not run: {text:?}"
+        );
+        assert!(text.contains("not run"), "{text:?}");
+        assert!(
+            !state.ctx.backend.is_running(),
+            "the parked stop was continued past"
+        );
+    }
+
+    /// A command missing its argument prints its help and counts as an
+    /// error, so the `;` list stops there instead of resuming the target.
+    #[test]
+    fn missing_argument_stops_a_command_list() {
+        let mut session = session_with_mock(MockBackend::default());
+        let mut state = remote_state(&mut session, 5_000);
+        let (result, text) = capture(|| state.dispatch_line("bd; g"));
+        result.unwrap();
+        assert!(text.contains(HALTED_PROBE_RAN), "{text:?}");
+        assert!(!state.ctx.backend.is_running(), "g ran after bd failed");
+    }
+
+    /// A handler that checks its own operands counts the missing argument
+    /// as an error too, so the list stops before `g`.
+    #[test]
+    fn handler_missing_argument_stops_a_command_list() {
+        let mut session = session_with_mock(MockBackend::default());
+        let mut state = remote_state(&mut session, 5_000);
+        let (result, text) = capture(|| state.dispatch_line("undisplay; g"));
+        result.unwrap();
+        assert!(text.contains("undisplay <number>"), "{text:?}");
+        assert!(
+            !state.ctx.backend.is_running(),
+            "g ran after undisplay failed"
+        );
+    }
+
+    /// `.pagein` resumes the target for the guest's worker, so every context
+    /// that must not move the target refuses it, as it refuses `g`.
+    #[test]
+    fn pagein_is_refused_where_run_control_is() {
+        for context in [
+            DispatchContext::BreakpointAction,
+            DispatchContext::ExceptionCommand,
+            DispatchContext::Remote(RemoteClient::Gdb),
+            DispatchContext::Remote(RemoteClient::Dap),
+        ] {
+            let mut session = session_with_mock(MockBackend::default());
+            let mut state = ReplState::for_oneshot(&mut session);
+            state.context = context;
+            let (result, text) = capture(|| state.dispatch_line(".pagein 1000"));
+            assert_eq!(result.unwrap(), Flow::Denied, "{context:?}: {text}");
+            assert!(text.contains("'.pagein'"), "{context:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn running_safe_command_runs_without_waiting() {
+        let mut session = session_with_mock(MockBackend::default().running());
+        let mut state = remote_state(&mut session, 5_000);
+        let started = std::time::Instant::now();
+        let (result, _) = capture(|| state.dispatch_line("help"));
+        assert_eq!(result.unwrap(), Flow::Continue);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(state.ctx.backend.is_running());
+    }
+
+    #[test]
+    fn break_earlier_on_the_line_halts_the_target_for_a_later_command() {
+        // A guest that only stops when broken into: waiting for a halt before
+        // running the line would burn the budget and never run `break`.
+        let mut backend = MockBackend::default().running().halts_only_on_interrupt();
+        backend.queue_interrupt(breakpoint_event(0x1000));
+        let mut session = session_with_mock(backend);
+        let mut state = remote_state(&mut session, 150);
+        let started = std::time::Instant::now();
+        let (result, text) = capture(|| state.dispatch_line("break; bd"));
+        assert_eq!(result.unwrap(), Flow::Continue);
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        assert!(!text.contains("not run"), "{text:?}");
+        assert!(
+            text.contains(HALTED_PROBE_RAN),
+            "bd after break did not run: {text:?}"
+        );
+        assert!(!state.ctx.backend.is_running());
+    }
+
+    #[test]
+    fn resume_after_break_on_the_same_line_is_allowed() {
+        let mut backend = MockBackend::default().running().halts_only_on_interrupt();
+        backend.queue_interrupt(breakpoint_event(0x1000));
+        let mut session = session_with_mock(backend);
+        let mut state = remote_state(&mut session, 150);
+        let (result, text) = capture(|| state.dispatch_line("break; g"));
+        assert_eq!(result.unwrap(), Flow::Continue);
+        assert!(!text.contains("not run"), "{text:?}");
+        assert!(
+            state.ctx.backend.is_running(),
+            "g after break did not resume"
+        );
+    }
+
+    /// A command that reports an error ends its line, so a resume after a
+    /// failed breakpoint does not run, and the remote result says it failed.
+    #[test]
+    fn a_failed_command_ends_the_line_and_the_result_reports_it() {
+        let mut session = session_with_mock(MockBackend::default());
+        let mut store = None;
+        let remote = super::remote::run_remote_command(
+            &mut session,
+            &mut store,
+            super::RemoteClient::Mcp,
+            "nosuchcommand; g",
+            super::StopWaitBudget::new(
+                std::time::Duration::from_millis(150),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ),
+        );
+        assert!(remote.reported_error, "{}", remote.text);
+        assert!(
+            remote.text.contains("not run after that error: g"),
+            "{}",
+            remote.text
+        );
+        assert!(!session.backend.is_running(), "g ran after the error");
+    }
+
+    /// `break` on a halted target has nothing to do and is no error, so
+    /// `break; bp ...; g` runs on whichever state it starts in.
+    #[test]
+    fn break_on_a_halted_target_lets_the_line_run_on() {
+        let mut session = session_with_mock(MockBackend::default());
+        let mut state = remote_state(&mut session, 150);
+        let (result, text) = capture(|| state.dispatch_line("break; bd"));
+        assert_eq!(result.unwrap(), Flow::Continue);
+        assert!(text.contains("already halted"), "{text:?}");
+        assert!(text.contains(HALTED_PROBE_RAN), "bd did not run: {text:?}");
+    }
+
+    /// As in WinDbg, `r` shows the registers a list names, separated by
+    /// commas or spaces, on one line.
+    #[test]
+    fn r_shows_each_register_a_list_names() {
+        let mut session = session_with_mock(MockBackend::default().one_vcpu());
+        let mut state = ReplState::for_oneshot(&mut session);
+        let (result, text) = capture(|| state.dispatch_line("r rax, rbx @rcx"));
+        result.unwrap();
+        assert!(
+            text.starts_with("rax=") && text.contains("  rbx=") && text.contains("  rcx="),
+            "{text:?}"
+        );
+        assert_eq!(text.lines().count(), 1, "{text:?}");
+    }
+
+    /// The `_ETHREAD` the mock's vCPU runs in the run-command tests below.
+    const THREAD: u64 = 0xffff_8000_0000_a000;
+    /// Its stack pointer.
+    const STACK: u64 = 0x2000;
+
+    /// A vCPU at `rip` in nops at 0x1000.., which takes breakpoints.
+    fn vcpu_at(rip: u64) -> MockBackend {
+        MockBackend::default()
+            .with_breakpoints()
+            .one_vcpu()
+            .standing_at(rip, STACK, THREAD)
+    }
+
+    fn rip(state: &mut ReplState<'_>) -> u64 {
+        let registers = state.ctx.backend.read_registers().unwrap();
+        state.ctx.register_map.read_u64("rip", &registers).unwrap()
+    }
+
+    /// `g` runs until the breakpoint `bp` set, and renders that hit.
+    #[test]
+    fn g_stops_at_the_breakpoint_bp_set() {
+        let backend = vcpu_at(0x1010).runs_stopping_at(&[(0x1000, STACK, THREAD)]);
+        let sites = backend.site_log();
+        let mut session = session_running_code(&[0x90; 0x40], backend);
+        let mut state = remote_state(&mut session, 5_000);
+
+        let (result, text) = capture(|| state.dispatch_line("bp 1000; g"));
+        assert_eq!(result.unwrap(), Flow::Continue);
+        assert!(text.contains("breakpoint #0"), "{text:?}");
+        assert!(!state.ctx.backend.is_running());
+        assert_eq!(rip(&mut state), 0x1000);
+        assert!(sites.lock().contains(&(0x1000, true)), "{:?}", sites.lock());
+    }
+
+    /// `t` executes one instruction and stops after it.
+    #[test]
+    fn t_steps_one_instruction() {
+        let mut session = session_running_code(&[0x90; 0x40], vcpu_at(0x1000));
+        let mut state = remote_state(&mut session, 5_000);
+
+        let (result, text) = capture(|| state.dispatch_line("t"));
+        assert_eq!(result.unwrap(), Flow::Continue, "{text:?}");
+        assert!(!state.ctx.backend.is_running());
+        assert_eq!(rip(&mut state), 0x1001, "{text:?}");
+    }
+
+    /// `p` on a call runs to the return site rather than stepping into the
+    /// callee, and lifts the temporary breakpoint it planted there.
+    #[test]
+    fn p_runs_over_a_call_to_its_return_site() {
+        let mut code = [0x90u8; 0x40];
+        code[..5].copy_from_slice(&[0xe8, 0x1b, 0x00, 0x00, 0x00]); // call 0x1020
+        let backend = vcpu_at(0x1000).runs_stopping_at(&[(0x1005, STACK, THREAD)]);
+        let sites = backend.site_log();
+        let continues = backend.continue_count();
+        let mut session = session_running_code(&code, backend);
+        let mut state = remote_state(&mut session, 5_000);
+
+        let (result, text) = capture(|| state.dispatch_line("p"));
+        assert_eq!(result.unwrap(), Flow::Continue, "{text:?}");
+        assert_eq!(rip(&mut state), 0x1005, "{text:?}");
+        assert_eq!(continues.load(Ordering::Relaxed), 1);
+        let sites = sites.lock();
+        assert!(sites.iter().all(|&(site, _)| site == 0x1005), "{sites:?}");
+        assert_eq!(sites.last(), Some(&(0x1005, false)));
+        assert!(state.ctx.breakpoints.list().is_empty());
+    }
+
+    /// A hit whose `do` action ends in `gc` runs the action and resumes: the
+    /// run goes on to the next breakpoint, which has no action and stops.
+    #[test]
+    fn a_do_action_ending_in_gc_resumes_past_its_hit() {
+        let backend =
+            vcpu_at(0x1020).runs_stopping_at(&[(0x1000, STACK, THREAD), (0x1010, STACK, THREAD)]);
+        let continues = backend.continue_count();
+        let mut session = session_running_code(&[0x90; 0x40], backend);
+        session.set_action_runner(Box::new(ReplActions::default()));
+        let mut state = remote_state(&mut session, 5_000);
+
+        let (result, text) =
+            capture(|| state.dispatch_line(r#"bp 1000 do ".echo action ran; gc"; bp 1010; g"#));
+        assert_eq!(result.unwrap(), Flow::Continue, "{text:?}");
+        assert_eq!(text.matches("action ran").count(), 1, "{text:?}");
+        assert_eq!(text.matches(" BREAK ").count(), 1, "{text:?}");
+        assert!(text.contains("├─ breakpoint #1"), "{text:?}");
+        assert_eq!(rip(&mut state), 0x1010);
+        assert_eq!(continues.load(Ordering::Relaxed), 2);
+    }
+
+    /// A `do` action reads its numbers in the radix `n` set at the prompt,
+    /// as the same text typed there would, at every hit.
+    #[test]
+    fn a_do_action_reads_numbers_in_the_radix_n_set() {
+        let backend =
+            vcpu_at(0x1020).runs_stopping_at(&[(0x1000, STACK, THREAD), (0x1010, STACK, THREAD)]);
+        let mut session = session_running_code(&[0x90; 0x40], backend);
+        session.set_action_runner(Box::new(ReplActions::default()));
+        let mut state = remote_state(&mut session, 5_000);
+
+        let (result, text) = capture(|| {
+            state.dispatch_line(r#"n 10; bp 0x1000 do "? 42; gc"; bp 0x1010 do "? 42"; g"#)
+        });
+        assert_eq!(result.unwrap(), Flow::Continue, "{text:?}");
+        assert_eq!(text.matches("000000000000002a").count(), 2, "{text:?}");
+        assert!(!text.contains("0000000000000042"), "{text:?}");
+    }
+
+    /// `bl` lists each breakpoint with its state, site, condition and
+    /// action; `bc` clears the ones it names, and `bc *` the rest.
+    #[test]
+    fn bl_lists_what_bp_set_and_bc_clears_it() {
+        let mut session = session_running_code(&[0x90; 0x40], vcpu_at(0x1020));
+        let mut state = remote_state(&mut session, 5_000);
+        let (result, text) = capture(|| {
+            state.dispatch_line(r#"bp 1000 if @rax == 5; bp 1010 do "r rax"; bp 1018; bd 2"#)
+        });
+        assert_eq!(result.unwrap(), Flow::Continue, "{text:?}");
+
+        let (result, text) = capture(|| state.dispatch_line("bl"));
+        result.unwrap();
+        let row = |id: &str| {
+            text.lines()
+                .find(|line| line.split_whitespace().any(|word| word == id))
+                .unwrap_or_else(|| panic!("no row for {id}: {text:?}"))
+                .to_string()
+        };
+        let (first, second, third) = (row("#0"), row("#1"), row("#2"));
+        assert!(first.contains("0000000000001000"), "{first:?}");
+        assert!(first.contains("@rax == 5"), "{first:?}");
+        assert!(second.contains("0000000000001010"), "{second:?}");
+        assert!(second.contains("r rax"), "{second:?}");
+        assert!(third.contains(" d "), "{third:?}");
+        assert!(first.contains(" e "), "{first:?}");
+
+        let (result, text) = capture(|| state.dispatch_line("bc 1"));
+        result.unwrap();
+        assert!(text.contains("breakpoint #1 cleared"), "{text:?}");
+        let ids = |state: &ReplState<'_>| -> Vec<u32> {
+            state
+                .ctx
+                .breakpoints
+                .list()
+                .iter()
+                .map(|bp| bp.id)
+                .collect()
+        };
+        assert_eq!(ids(&state), [0, 2]);
+
+        let (result, _) = capture(|| state.dispatch_line("bc *"));
+        result.unwrap();
+        assert!(ids(&state).is_empty());
+        let (result, text) = capture(|| state.dispatch_line("bl"));
+        result.unwrap();
+        assert!(text.contains("no breakpoints set"), "{text:?}");
+    }
+
+    /// `sxe` makes a first-chance exception the default policy passes on
+    /// stop the target, and its `-c` command runs at that stop.
+    #[test]
+    fn sxe_stops_on_the_exception_and_runs_its_command() {
+        const ACCESS_VIOLATION: u32 = 0xC000_0005;
+        let mut backend = vcpu_at(0x1020).running();
+        backend.queue_interrupt(StopEvent {
+            exception_code: Some(ACCESS_VIOLATION),
+            ..breakpoint_event(0x1020)
+        });
+        let mut session = session_running_code(&[0x90; 0x40], backend);
+        session.set_action_runner(Box::new(ReplActions::default()));
+        let mut state = remote_state(&mut session, 5_000);
+
+        let (result, text) = capture(|| state.dispatch_line(r#"sxe -c ".echo seen" -f break av"#));
+        assert_eq!(result.unwrap(), Flow::Continue, "{text:?}");
+        assert!(text.contains("sxe 0xc0000005 (av)"), "{text:?}");
+
+        let (flow, text) = capture(|| state.begin_remote_line(""));
+        assert_eq!(flow, Some(Flow::Continue));
+        assert!(!state.ctx.backend.is_running(), "{text:?}");
+        assert!(text.contains("seen"), "{text:?}");
+        assert!(text.contains("exception 0xc0000005"), "{text:?}");
+    }
+
+    /// A remote client's budget ends `wt` where it got to, halted, and the
+    /// trace says it was interrupted rather than running to its limit.
+    #[test]
+    fn wt_ends_within_the_remote_budget() {
+        let backend = vcpu_at(0x1000).with_register_read_delay(Duration::from_millis(5));
+        let mut session = session_running_code(&[0x90; 0x1000], backend);
+        let mut state = remote_state(&mut session, 150);
+
+        let started = Instant::now();
+        let (result, text) = capture(|| state.dispatch_line("wt"));
+        assert_eq!(result.unwrap(), Flow::Continue, "{text:?}");
+        assert!(started.elapsed() < Duration::from_secs(2), "{text:?}");
+        assert!(text.contains("wt interrupted after"), "{text:?}");
+        assert!(!state.ctx.backend.is_running());
+    }
+}

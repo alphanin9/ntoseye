@@ -1,0 +1,915 @@
+//! The inspection selection: the current vCPU, a parked Windows thread, a
+//! selected frame, and the register file and address space they imply.
+
+use std::collections::HashMap;
+
+use crate::arch::{ArgumentLocation, RegisterFile, RegisterMap};
+use crate::backend::dbg_backend::{DebugCapability, processor_index_from_backend_thread_id};
+use crate::base::error::{Error, Result};
+use crate::base::memory::DTB_IDENTITY;
+use crate::base::types::VirtAddr;
+use crate::nt::guest::ProcessInfo;
+use crate::nt::guest::hypervisor::guest_vp_label;
+use crate::nt::target::{
+    HYPERVISOR_CONTEXT, KTHREAD_STATE_TERMINATED, SelectedFrame, Target, ThreadInfo,
+};
+use crate::nt::unwind::{
+    UNKNOWN_CONTEXT, guest_vp_running, halted_in_windows_hypervisor, resolve_thread_trace_context,
+    resolve_thread_trace_context_at, saved_vtls, try_format_symbol,
+};
+use crate::session::{Selection, Session, ThreadContext, UserThreadSummary, VcpuInfo};
+
+pub(super) fn update_target_context_from_registers(
+    target: &mut Target,
+    register_map: &RegisterMap,
+    registers: Result<Vec<u8>>,
+) {
+    target.selected_frame = None;
+    let Ok(registers) = registers else {
+        target.registers = None;
+        target.clear_context_dtb_override();
+        return;
+    };
+    target.registers = Some(target.register_values(register_map, &registers));
+    match register_map.read_u64(target.arch().dtb_register(), &registers) {
+        // For triage dumps all modules are loaded with DTB_IDENTITY and
+        // memory reads use identity mapping, so the context DTB from the
+        // CONTEXT
+        // record is meaningless.  Setting it here would cause a DTB
+        // mismatch that makes symbol lookup, type resolution, and eval
+        // fail.
+        Ok(dtb) if dtb != 0 && target.guest.is_some() && target.kernel_dtb() != DTB_IDENTITY => {
+            target.recognize_secure_root(dtb);
+            target.set_context_dtb_override(dtb)
+        }
+        _ => target.clear_context_dtb_override(),
+    }
+}
+
+/// [`Error::TargetRunning`] payload for the live register file.
+const REGISTERS_NEED_HALT: &str = "Registers belong to the halted context.";
+
+impl Session {
+    /// Select `id` as the current inspection thread (e.g. a vCPU id), so
+    /// registers/backtrace/step operate on it. Validates the id against the
+    /// backend. Shared by the REPL's `thread`/`vcpu` commands and the SDKs.
+    pub fn set_current_thread(&mut self, id: &str) -> Result<()> {
+        self.backend.set_current_thread(id)?;
+        self.target.selected_frame = None;
+        self.current_thread = id.to_string();
+        self.refresh_context_for_current_thread();
+        Ok(())
+    }
+
+    /// Select a non-running Windows thread for metadata and stack inspection
+    /// without changing the backend vCPU. This deliberately does not attempt to
+    /// manufacture a register context for the parked thread.
+    pub fn select_parked_windows_thread(&mut self, thread: &ThreadInfo) {
+        self.target.selected_frame = None;
+        self.parked_windows_thread = Some(thread.ethread);
+        self.target.set_parked_windows_thread(thread.clone());
+    }
+
+    /// Install a debugger-selected frame/context as the inspection context:
+    /// its recovered registers shadow the live ones and its address space
+    /// becomes the expression/memory scope. Shared by the REPL's `.frame` /
+    /// `.cxr` / `.trap` and the DAP frame selection so the two can't drift.
+    pub fn select_frame(&mut self, selected: SelectedFrame) {
+        self.target.select_frame(selected);
+    }
+
+    pub fn parked_windows_thread(&self) -> Option<&ThreadInfo> {
+        let ethread = self.parked_windows_thread?;
+        self.target
+            .windows_thread_selection
+            .as_ref()
+            .filter(|thread| thread.ethread == ethread)
+    }
+
+    /// Every Windows thread the target knows plus the ones currently on a
+    /// vCPU (which a mid-creation walk may not list yet). The candidate set
+    /// for selecting a thread by tid/ETHREAD/KTHREAD.
+    pub fn windows_thread_candidates(&mut self) -> Result<Vec<ThreadInfo>> {
+        let mut threads = self.target.enumerate_threads()?;
+        let active = self.active_thread_map();
+        for (_, thread) in active.values() {
+            if !threads.iter().any(|known| known.ethread == thread.ethread) {
+                threads.push(thread.clone());
+            }
+        }
+        if threads.is_empty()
+            && let Some(thread) = self.target.windows_thread_selection.clone()
+        {
+            threads.push(thread);
+        }
+        Ok(threads)
+    }
+
+    /// The one Windows thread `value` names: a thread id, an ETHREAD, or a
+    /// KTHREAD address. Ambiguity (a tid colliding with an address) is an
+    /// error rather than a guess.
+    pub fn find_windows_thread(&mut self, value: u64) -> Result<ThreadInfo> {
+        let matches: Vec<ThreadInfo> = self
+            .windows_thread_candidates()?
+            .into_iter()
+            .filter(|thread| {
+                thread.tid == Some(value) || thread.ethread.0 == value || thread.kthread.0 == value
+            })
+            .collect();
+        match matches.len() {
+            1 => Ok(matches.into_iter().next().unwrap()),
+            0 => Err(Error::DebugInfo(format!(
+                "no Windows thread matches {value:#x} (tid, ETHREAD, or KTHREAD)"
+            ))),
+            many => Err(Error::DebugInfo(format!(
+                "ambiguous Windows thread {value:#x}: {many} matches"
+            ))),
+        }
+    }
+
+    /// Make `thread` the inspection context (`.thread`): a thread that is on
+    /// a vCPU switches to that vCPU (see [`Self::select_running_windows_thread`]);
+    /// any other thread is parked (stack-only, no coherent register file),
+    /// and so is every thread while the target runs: there is no vCPU to
+    /// switch to, and the thread's stack is walked from memory as it is when
+    /// walked.
+    pub fn select_windows_thread(&mut self, thread: &ThreadInfo) -> Result<ThreadContext> {
+        let active = if self.backend.is_running() {
+            HashMap::new()
+        } else {
+            self.active_thread_map()
+        };
+        match active.get(&thread.ethread.0) {
+            Some((vcpu, _)) => {
+                let vcpu = vcpu.clone();
+                self.select_running_windows_thread(&vcpu, thread)
+            }
+            None => {
+                self.select_parked_windows_thread(thread);
+                Ok(ThreadContext::Parked)
+            }
+        }
+    }
+
+    /// Switch to `vcpu` with `thread`, the Windows thread it runs, as the
+    /// inspection context. A vCPU halted in the Windows hypervisor holds the
+    /// hypervisor's registers, not the thread's: switching to it selects the
+    /// VTL0 state the hypervisor saved (see
+    /// [`Self::select_stop_context_default`]), so registers, `k`, and
+    /// expressions see where NT left off. Without a saved state (no eVMCS)
+    /// the vCPU's own registers stay the context.
+    pub fn select_running_windows_thread(
+        &mut self,
+        vcpu: &str,
+        thread: &ThreadInfo,
+    ) -> Result<ThreadContext> {
+        self.set_current_thread(vcpu)?;
+        self.target
+            .set_current_windows_thread_context(thread.clone());
+        // Naming the thread drops the saved VTL0 state the switch selected
+        // and leaves that state's registers cached: select it again from
+        // the vCPU's own registers, so a selected context now is it.
+        self.restore_live_register_cache();
+        self.select_stop_context_default();
+        Ok(if self.target.selected_frame.is_some() {
+            ThreadContext::SavedVtl0(vcpu.to_string())
+        } else {
+            ThreadContext::Live(vcpu.to_string())
+        })
+    }
+
+    /// The default inspection context of the current vCPU at a stop: its own
+    /// registers, or, when it is halted in the Windows hypervisor, where NT
+    /// left off (the saved VTL0 state; `.cxr` returns to the hypervisor's).
+    /// Leaves an existing selection or a parked thread alone.
+    pub(super) fn select_stop_context_default(&mut self) {
+        if self.parked_windows_thread.is_none()
+            && !self.backend.is_running()
+            && self.backend.halts_in_windows_hypervisor()
+        {
+            self.target.select_saved_vtl0(&self.current_thread);
+        }
+    }
+
+    /// Drop any selected frame or context and return to the stop's default
+    /// ([`Self::select_stop_context_default`]). A host that forgets its frame
+    /// handles at a stop (DAP) resets through this, so it lands where the
+    /// console does.
+    pub fn reset_to_stop_context(&mut self) {
+        // Whatever dropped the selection (`.process` attaching drops it too)
+        // may have left its registers behind: start from the vCPU's own.
+        self.target.selected_frame = None;
+        self.restore_live_register_cache();
+        self.select_stop_context_default();
+    }
+
+    /// The backend vCPU of each NT processor, by processor index. Empty when
+    /// the backend cannot list its vCPUs.
+    pub fn processor_vcpus(&mut self) -> HashMap<u16, String> {
+        self.backend
+            .thread_list()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|vcpu| Some((processor_index_from_backend_thread_id(&vcpu)?, vcpu)))
+            .collect()
+    }
+
+    /// Drop any Windows-thread selection and return to the backend's current
+    /// vCPU context and the thread it is running (`.thread` with no argument).
+    pub fn reset_windows_thread(&mut self) -> Result<()> {
+        // A running target has no vCPU to switch back to; dropping the
+        // thread returns inspection to the attached process or the kernel.
+        if self.backend.is_running() {
+            self.target.selected_frame = None;
+            self.target.clear_context_dtb_override();
+            self.refresh_context_for_current_thread();
+            return Ok(());
+        }
+        let current = self.current_thread.clone();
+        self.set_current_thread(&current)
+    }
+
+    /// Move the whole inspection selection out (process scope, frame, parked
+    /// thread, vCPU), leaving the session detached on the same vCPU. A host
+    /// that scopes one operation itself (the Python SDK binds every handle to
+    /// its own address space) runs it between this and
+    /// [`Self::restore_selection`], so the user's `.process`/`.thread`/`.frame`
+    /// choice survives untouched.
+    pub fn take_selection(&mut self) -> Selection {
+        Selection {
+            target: self.target.take_selection(),
+            current_thread: self.current_thread.clone(),
+            parked_windows_thread: self.parked_windows_thread.take(),
+            partition: self.partition(),
+        }
+    }
+
+    /// Put back a selection taken with [`Self::take_selection`], switching the
+    /// backend back to its vCPU if the operation moved it.
+    pub fn restore_selection(&mut self, selection: Selection) -> Result<()> {
+        let switched = if self.current_thread != selection.current_thread {
+            self.backend.set_current_thread(&selection.current_thread)
+        } else {
+            Ok(())
+        };
+        self.current_thread = selection.current_thread;
+        self.parked_windows_thread = selection.parked_windows_thread;
+        self.target.restore_selection(selection.target);
+        switched
+    }
+
+    /// Select stack frame `index` (`.frame N`) of the current context's stack
+    /// ([`Self::recovered_backtrace`]: a vCPU's, or a parked thread's) as the
+    /// inspection context, so registers, locals, and expressions see that
+    /// frame's recovered register file. Returns the frame.
+    pub fn select_frame_index(&mut self, index: usize) -> Result<SelectedFrame> {
+        const MAX_FRAME_INDEX: usize = 4096;
+        if index > MAX_FRAME_INDEX {
+            return Err(Error::InvalidArgument("frame index is too large".into()));
+        }
+        let (trace, seed, live) = self.recovered_backtrace(index.saturating_add(1))?;
+        let selected = SelectedFrame::from_recovered(&trace, index, Some(&seed), live)
+            .ok_or_else(|| Error::DebugInfo(format!("frame {index} is unavailable")))?;
+        self.select_frame(selected.clone());
+        Ok(selected)
+    }
+
+    /// Refill the target's register cache from the live backend context, or
+    /// clear it while the VM runs, so expression evaluation follows the
+    /// current thread's address space. A parked thread has no register file:
+    /// its process's address space is the scope again.
+    pub fn restore_live_register_cache(&mut self) {
+        if let Some(thread) = self.parked_windows_thread().cloned() {
+            self.target.registers = None;
+            self.target.scope_to_parked_thread(&thread);
+            return;
+        }
+        let registers = if self.backend.is_running() {
+            Err(Error::TargetRunning(REGISTERS_NEED_HALT))
+        } else {
+            self.read_registers()
+        };
+        update_target_context_from_registers(&mut self.target, &self.register_map, registers);
+    }
+
+    /// Forget a selected frame/context and go back to the live register file
+    /// (`.frame` reset / `.cxr` with no argument).
+    pub fn clear_selected_frame(&mut self) {
+        if self.target.selected_frame.take().is_some() {
+            self.restore_live_register_cache();
+        }
+    }
+
+    /// Whether the current vCPU is halted in the Windows hypervisor's code.
+    pub(super) fn vcpu_halted_in_hypervisor(&mut self) -> Result<bool> {
+        if self.backend.is_running() || !self.backend.halts_in_windows_hypervisor() {
+            return Ok(false);
+        }
+        let registers = self
+            .backend
+            .set_current_thread(&self.current_thread)
+            .and_then(|()| self.backend.read_registers())?;
+        let value = |name| self.register_map.read_u64(name, &registers).ok();
+        let (Some(cr3), Some(rip)) = (
+            value(self.target.arch().dtb_register()),
+            value(self.target.arch().pc_register()),
+        ) else {
+            return Ok(false);
+        };
+        Ok(halted_in_windows_hypervisor(&self.target, cr3, rip))
+    }
+
+    /// The guest partition's VP that the current vCPU runs because the
+    /// Windows hypervisor put it on its processor, as `~` names it
+    /// ([`guest_vp_running`]).
+    pub(super) fn vcpu_guest_vp(&mut self) -> Result<Option<String>> {
+        if self.backend.is_running() || !self.backend.halts_in_windows_hypervisor() {
+            return Ok(None);
+        }
+        let registers = self
+            .backend
+            .set_current_thread(&self.current_thread)
+            .and_then(|()| self.backend.read_registers())?;
+        let value = |name| self.register_map.read_u64(name, &registers).ok();
+        let (Some(cr3), Some(rip)) = (
+            value(self.target.arch().dtb_register()),
+            value(self.target.arch().pc_register()),
+        ) else {
+            return Ok(None);
+        };
+        let processor = processor_index_from_backend_thread_id(&self.current_thread);
+        Ok(guest_vp_running(&self.target, cr3, rip, processor))
+    }
+
+    /// Refuse to step a vCPU halted in the Windows hypervisor: the step would
+    /// run hypervisor code, not the NT code the stop shows, and plant its
+    /// temporary sites in the hypervisor's image. A vCPU that runs a guest
+    /// partition's VP would run that guest, whose code NT's tables do not
+    /// map. In a partition view the thread is the guest's VP, which a step
+    /// runs the target to the partition's breakpoints for.
+    pub(super) fn require_steppable_vcpu(&mut self) -> Result<()> {
+        self.require_live_register_context()?;
+        if self.partition().is_some() {
+            return Ok(());
+        }
+        if self.vcpu_halted_in_hypervisor()? {
+            return Err(Error::DebugInfo(format!(
+                "{} is halted in the Windows hypervisor: a step would run hypervisor code, not \
+                 the NT code shown. Resume with g, or stop in NT with a breakpoint",
+                self.current_thread
+            )));
+        }
+        if let Some(vp) = self.vcpu_guest_vp()? {
+            return Err(Error::DebugInfo(format!(
+                "{} runs {vp} of a guest partition, which the Windows hypervisor put on its \
+                 processor: a step would run that guest, not NT. Resume with g, or stop in NT \
+                 with a breakpoint",
+                self.current_thread
+            )));
+        }
+        Ok(())
+    }
+
+    pub(super) fn require_live_register_context(&self) -> Result<()> {
+        if self.parked_windows_thread().is_some() {
+            return Err(Error::DebugInfo(
+                "selected Windows thread is parked; registers and execution control require a live vCPU context (use `vcpu <id>`)".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Make the current vCPU the inspection context: read its registers, set
+    /// `target.registers` and `context_dtb_override` from its CR3 (or ARM64
+    /// TTBR0), and select the Windows thread it is running (what `!thread`
+    /// and `$thread` read), so reads, steps, and breakpoint installs scope to
+    /// the focused thread rather than an earlier stop on another thread.
+    /// Called from the thread-selection entry points;
+    /// [`Self::classify_stop_event`] establishes the same context inline for a
+    /// stop. Best-effort and a no-op while the guest runs (no coherent
+    /// register file).
+    pub(super) fn refresh_context_for_current_thread(&mut self) {
+        self.parked_windows_thread = None;
+        self.target.clear_current_windows_thread_context();
+        if self.backend.is_running() {
+            return;
+        }
+        let registers = self
+            .backend
+            .set_current_thread(&self.current_thread)
+            .and_then(|_| self.backend.read_registers());
+        update_target_context_from_registers(&mut self.target, &self.register_map, registers);
+        refresh_windows_thread_context_for_backend_thread(&mut self.target, &self.current_thread);
+        self.select_stop_context_default();
+    }
+
+    /// Best-effort current RIP of the selected thread (0 if unreadable).
+    pub fn current_rip(&mut self) -> u64 {
+        self.backend
+            .read_registers()
+            .ok()
+            .and_then(|r| {
+                self.register_map
+                    .read_u64(self.target.arch().pc_register(), &r)
+                    .ok()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Argument `index` of the function the current thread has just entered,
+    /// where the calling convention puts it: a register `register` reads, or
+    /// a stack slot above the stack pointer `register` reads.
+    pub fn argument_on_entry(
+        &self,
+        index: usize,
+        register: impl Fn(&str) -> Option<u64>,
+    ) -> Option<u64> {
+        let arch = self.target.arch();
+        match arch.argument(index) {
+            ArgumentLocation::Register(name) => register(name),
+            ArgumentLocation::Stack(offset) => {
+                let stack = register(arch.sp_register())?;
+                self.target
+                    .address_space(self.target.current_dtb())
+                    .read_pointer(VirtAddr(stack.wrapping_add(offset)))
+                    .ok()
+                    .map(|value| value.0)
+            }
+        }
+    }
+
+    /// Read the selected live vCPU register file. A parked Windows thread is a
+    /// stack-only inspection target and must never fall through to the backend's
+    /// unrelated live register context.
+    pub fn read_registers(&mut self) -> Result<Vec<u8>> {
+        self.require_live_register_context()?;
+        if self.backend.is_running() {
+            return Err(Error::TargetRunning(REGISTERS_NEED_HALT));
+        }
+        self.backend.set_current_thread(&self.current_thread)?;
+        self.backend.read_registers()
+    }
+
+    /// Set a single register on the current thread by name, as a read-modify-
+    /// write of the register file (read all, patch the one, write back).
+    pub fn write_register(&mut self, name: &str, value: u64) -> Result<()> {
+        self.patch_registers(|map, regs| map.write_u64(name, regs, value))
+    }
+
+    /// Read-modify-write the current thread's register file: `patch` edits the
+    /// raw file laid out by [`Self::register_map`], which is written back and
+    /// becomes the live frame's register view.
+    pub fn patch_registers(
+        &mut self,
+        patch: impl FnOnce(&RegisterMap, &mut [u8]) -> Result<()>,
+    ) -> Result<()> {
+        self.require_live_register_context()?;
+        // A recovered context (a caller frame, `.cxr`, a thread's saved VTL0
+        // state) is not the vCPU's register file; writing would change the
+        // vCPU's instead.
+        if self
+            .target
+            .selected_frame
+            .as_ref()
+            .is_some_and(|frame| !frame.is_live())
+        {
+            return Err(Error::DebugInfo(
+                "the selected context's registers are recovered, not the vCPU's, and are read-only"
+                    .into(),
+            ));
+        }
+        if self.backend.is_running() {
+            return Err(Error::TargetRunning(REGISTERS_NEED_HALT));
+        }
+        // The hypervisor's own registers: changing them would corrupt it,
+        // and it is not what a Windows debugger is editing.
+        if self.vcpu_halted_in_hypervisor()? {
+            return Err(Error::DebugInfo(format!(
+                "{} is halted in the Windows hypervisor, whose registers are read-only",
+                self.current_thread
+            )));
+        }
+        if !self.backend.supports(DebugCapability::WriteRegisters) {
+            return Err(Error::RegisterWriteUnsupported);
+        }
+        let mut regs = self.read_registers()?;
+        if self
+            .register_map
+            .read_u64(self.target.arch().dtb_register(), &regs)
+            .is_ok_and(|dtb| self.target.recognize_secure_root(dtb))
+        {
+            return Err(Error::DebugInfo("VTL1 registers are read-only".into()));
+        }
+        // A partition view's VP is a vCPU's, which the write goes to first.
+        let before = self.partition().is_some().then(|| regs.clone());
+        patch(&self.register_map, &mut regs)?;
+        if let Some(before) = before {
+            self.write_vp_registers(&before, &regs)?;
+        }
+        self.backend.write_registers(&regs)?;
+        let values = self.register_map.to_hashmap(&regs);
+        // A live frame 0 selection is this register file; keep it, and the
+        // seed a `.frame N` walk starts from, in step with the write.
+        if let Some(frame) = self
+            .target
+            .selected_frame
+            .as_mut()
+            .filter(|frame| frame.is_live())
+        {
+            frame.registers.clone_from(&values);
+            frame.seed_registers.clone_from(&values);
+        }
+        self.target.registers = Some(values);
+        Ok(())
+    }
+
+    /// The threads a user-mode minidump captured, each with where its
+    /// context stopped. `None` on a kernel target.
+    pub fn user_threads(&self) -> Option<Vec<UserThreadSummary>> {
+        let info = self.target.user_dump_info()?;
+        let exception_thread = info.exception.as_ref().map(|exception| exception.thread_id);
+        let trace = resolve_thread_trace_context(&self.target, 0);
+        Some(
+            info.threads
+                .iter()
+                .enumerate()
+                .map(|(index, thread)| {
+                    let id = info.backend_thread_id(thread.tid);
+                    let rip = thread.context.as_ref().ok().map(|raw| {
+                        RegisterFile::from_context(info.arch, raw).instruction_pointer()
+                    });
+                    UserThreadSummary {
+                        index,
+                        current: id.eq_ignore_ascii_case(&self.current_thread),
+                        id,
+                        tid: thread.tid,
+                        suspend_count: thread.suspend_count,
+                        teb: thread.teb,
+                        name: thread.name.clone(),
+                        symbol: rip.and_then(|rip| try_format_symbol(&self.target, &trace, rip)),
+                        rip,
+                        error: thread.context.as_ref().err().cloned(),
+                        exception: exception_thread == Some(thread.tid),
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// Inspect every backend execution context (vCPU): its RIP, the address space
+    /// it is running in (kernel / a process / unknown), and the nearest symbol.
+    /// Selects each vCPU in turn to read its register file, then restores the
+    /// originally-stopped one. The VM must be halted.
+    pub fn vcpus(&mut self) -> Result<Vec<VcpuInfo>> {
+        let original = self.backend.stopped_thread_id()?;
+        let threads = self.backend.thread_list()?;
+        let mut out = Vec::with_capacity(threads.len());
+        let mut roots = Vec::with_capacity(threads.len());
+        for thread in &threads {
+            let regs = self
+                .backend
+                .set_current_thread(thread)
+                .and_then(|_| self.backend.read_registers());
+            roots.push(regs.as_ref().ok().and_then(|regs| {
+                self.register_map
+                    .read_u64(self.target.arch().dtb_register(), regs)
+                    .ok()
+            }));
+            out.push(match regs {
+                Ok(regs) => self.describe_vcpu(thread, &regs),
+                Err(e) => VcpuInfo {
+                    id: thread.clone(),
+                    rip: None,
+                    context: String::new(),
+                    symbol: None,
+                    saved_vtl: Vec::new(),
+                    serving: None,
+                    error: Some(e.to_string()),
+                },
+            });
+        }
+
+        let _ = self.backend.set_current_thread(&original);
+        // One partition walk names every vCPU running a guest partition's
+        // VP, and the one each vCPU in the hypervisor serves.
+        if out
+            .iter()
+            .any(|vcpu| vcpu.context == UNKNOWN_CONTEXT || vcpu.context == HYPERVISOR_CONTEXT)
+            && let Ok(partitions) = self.target.hypervisor_partitions()
+        {
+            for (vcpu, root) in out.iter_mut().zip(roots) {
+                let number = processor_index_from_backend_thread_id(&vcpu.id);
+                if vcpu.context == UNKNOWN_CONTEXT
+                    && let Some(label) =
+                        number.and_then(|number| guest_vp_label(&partitions, number))
+                {
+                    vcpu.context = label;
+                } else if vcpu.context == HYPERVISOR_CONTEXT
+                    && let (Some(number), Some(root), Some(rip)) = (number, root, vcpu.rip)
+                {
+                    vcpu.serving = self
+                        .target
+                        .served_guest_vp_in(&partitions, root, rip, number);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// What vCPU `id`, whose register file is `regs`, is running: the address
+    /// space, the nearest symbol (code outside NT named for what it is, such
+    /// as the Windows hypervisor), and, in the hypervisor, where its VTLs left
+    /// off.
+    pub(super) fn describe_vcpu(&self, id: &str, regs: &[u8]) -> VcpuInfo {
+        let (Ok(rip), Ok(dtb)) = (
+            self.register_map
+                .read_u64(self.target.arch().pc_register(), regs),
+            self.register_map
+                .read_u64(self.target.arch().dtb_register(), regs),
+        ) else {
+            return VcpuInfo {
+                id: id.to_string(),
+                rip: None,
+                context: String::new(),
+                symbol: None,
+                saved_vtl: Vec::new(),
+                serving: None,
+                error: None,
+            };
+        };
+
+        // RIP=0 means the dump did not capture this CPU's context
+        if rip == 0 {
+            return VcpuInfo {
+                id: id.to_string(),
+                rip: Some(0),
+                context: "no context".to_string(),
+                symbol: None,
+                saved_vtl: Vec::new(),
+                serving: None,
+                error: None,
+            };
+        }
+
+        let dtb_mask = self.target.arch().dtb_page_mask();
+        let dtb_masked = dtb & dtb_mask;
+        let kernel_dtb_masked = self
+            .target
+            .guest
+            .as_ref()
+            .map(|g| g.ntoskrnl.dtb() & dtb_mask);
+        let (context, symbol) = if self.target.recognize_secure_root(dtb_masked) {
+            let trace = resolve_thread_trace_context_at(&self.target, dtb, rip);
+            (
+                trace.description.clone(),
+                try_format_symbol(&self.target, &trace, rip),
+            )
+        } else if kernel_dtb_masked.is_some_and(|k| dtb_masked == k) {
+            let sym = self
+                .target
+                .symbols
+                .format_closest_symbol_for_address(self.target.kernel_dtb(), VirtAddr(rip));
+            ("kernel".to_string(), sym)
+        } else {
+            // The root's process as an earlier stop found it, checked: the
+            // list walk reads each long name from its process's memory.
+            let process = self
+                .target
+                .guest
+                .as_ref()
+                .and_then(|guest| guest.process_for_root(dtb_masked, dtb_mask));
+            match process {
+                Some(proc) => {
+                    let sym = self
+                        .target
+                        .symbols
+                        .format_closest_symbol_for_address(proc.dtb, VirtAddr(rip));
+                    (proc.name.clone(), sym)
+                }
+                // The hypervisor's code has names too (hv!HvCall...), which
+                // must not make its root read as NT's.
+                None if self.target.guest.as_ref().is_some_and(|guest| {
+                    guest.is_hypervisor_address(dtb_masked, VirtAddr(rip))
+                }) =>
+                {
+                    let trace = resolve_thread_trace_context_at(&self.target, dtb, rip);
+                    let symbol = try_format_symbol(&self.target, &trace, rip);
+                    (trace.description, symbol)
+                }
+                None => match self
+                    .target
+                    .symbols
+                    .format_closest_symbol_for_address(dtb_masked, VirtAddr(rip))
+                {
+                    Some(sym) => ("kernel".to_string(), Some(sym)),
+                    // Outside NT under VBS: the hypervisor or VTL1.
+                    None => {
+                        let trace = resolve_thread_trace_context_at(&self.target, dtb, rip);
+                        let symbol = try_format_symbol(&self.target, &trace, rip);
+                        (trace.description, symbol)
+                    }
+                },
+            }
+        };
+
+        // A refused state is reported by the stop header and .vtlcxr;
+        // listed here it would read as a saved state.
+        let saved_vtl = if context == HYPERVISOR_CONTEXT {
+            saved_vtls(
+                &self.target,
+                dtb,
+                rip,
+                processor_index_from_backend_thread_id(id),
+            )
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        VcpuInfo {
+            id: id.to_string(),
+            rip: Some(rip),
+            context,
+            symbol,
+            saved_vtl,
+            serving: None,
+            error: None,
+        }
+    }
+
+    /// Map each *active* Windows thread (one currently scheduled on a vCPU) to
+    /// the vCPU running it and its [`ThreadInfo`], keyed by `ETHREAD` address.
+    /// Walks every backend vCPU, resolves the Windows thread it is executing,
+    /// and restores the originally-stopped vCPU. Best-effort (empty map if the
+    /// backend can't enumerate vCPUs).
+    pub fn active_thread_map(&mut self) -> HashMap<u64, (String, ThreadInfo)> {
+        let Ok(original) = self.backend.stopped_thread_id() else {
+            return HashMap::new();
+        };
+        let Ok(vcpus) = self.backend.thread_list() else {
+            return HashMap::new();
+        };
+
+        let mut active = HashMap::new();
+        for vcpu in &vcpus {
+            if self.backend.set_current_thread(vcpu).is_err() {
+                continue;
+            }
+            if self
+                .target
+                .guest
+                .as_ref()
+                .and_then(|guest| guest.cached_secure_kernel())
+                .is_some()
+                && self
+                    .backend
+                    .read_registers()
+                    .ok()
+                    .and_then(|regs| {
+                        self.register_map
+                            .read_u64(self.target.arch().dtb_register(), &regs)
+                            .ok()
+                    })
+                    .is_some_and(|dtb| self.target.recognize_secure_root(dtb))
+            {
+                continue;
+            }
+            let Some(processor) = processor_index_from_backend_thread_id(vcpu) else {
+                continue;
+            };
+            if let Ok(thread) = self.target.current_windows_thread_for_processor(processor) {
+                active.insert(thread.ethread.0, (vcpu.clone(), thread));
+            }
+        }
+
+        let _ = self.backend.set_current_thread(&original);
+        active
+    }
+
+    /// Enumerate all Windows threads, merged with the currently-active threads
+    /// (so a thread scheduled on a vCPU but absent from the walk is still
+    /// included), sorted by `(pid, tid)`. Returns the threads plus a map of
+    /// `ETHREAD -> vCPU id` for those currently running; hosts apply their own
+    /// filtering/rendering.
+    /// Select a thread of `process` (see [`Self::select_windows_thread`]):
+    /// one a processor runs, whose registers are live, else, by its stack,
+    /// its first whose kernel stack is resident, or its first that has not
+    /// terminated. What a host selects after switching
+    /// to a process, so the thread's own views (`!teb`, `!gle`, `k`) are the
+    /// process's. `None` when the process has no thread to select; then, as
+    /// on an error, no thread is selected, rather than one of the process
+    /// switched away from.
+    pub fn select_process_thread(
+        &mut self,
+        process: &ProcessInfo,
+    ) -> Result<Option<(ThreadInfo, ThreadContext)>> {
+        let selected = self.select_thread_of(process);
+        if !matches!(selected, Ok(Some(_))) {
+            self.target.clear_current_windows_thread_context();
+        }
+        selected
+    }
+
+    /// [`Self::select_process_thread`] before a failure clears the selection.
+    fn select_thread_of(
+        &mut self,
+        process: &ProcessInfo,
+    ) -> Result<Option<(ThreadInfo, ThreadContext)>> {
+        let running = if self.backend.is_running() {
+            None
+        } else {
+            self.active_thread_map()
+                .into_values()
+                .map(|(_, thread)| thread)
+                .filter(|thread| thread.eprocess == Some(process.eprocess))
+                .min_by_key(|thread| thread.tid)
+        };
+        let thread = match running {
+            Some(thread) => thread,
+            None => {
+                let threads: Vec<ThreadInfo> = self
+                    .target
+                    .enumerate_threads_for_process_info(process)?
+                    .into_iter()
+                    .filter(|thread| thread.state != Some(KTHREAD_STATE_TERMINATED))
+                    .collect();
+                // One whose kernel stack is resident can be walked.
+                let walkable = threads
+                    .iter()
+                    .position(|thread| thread.kernel_stack_resident == Some(true))
+                    .unwrap_or(0);
+                match threads.into_iter().nth(walkable) {
+                    Some(thread) => thread,
+                    None => return Ok(None),
+                }
+            }
+        };
+        let context = self.select_windows_thread(&thread)?;
+        Ok(Some((thread, context)))
+    }
+
+    pub fn windows_threads(&mut self) -> Result<(Vec<ThreadInfo>, HashMap<u64, String>)> {
+        let active = self.active_thread_map();
+        let mut threads = self.target.enumerate_threads()?;
+        for (_, thread) in active.values() {
+            if !threads.iter().any(|known| known.ethread == thread.ethread) {
+                threads.push(thread.clone());
+            }
+        }
+        threads
+            .sort_by_key(|thread| (thread.pid.unwrap_or(u64::MAX), thread.tid, thread.ethread.0));
+        let active_vcpus = active
+            .into_iter()
+            .map(|(ethread, (vcpu, _))| (ethread, vcpu))
+            .collect();
+        Ok((threads, active_vcpus))
+    }
+}
+
+/// Adopt the Windows thread a backend vCPU is running as the inspection
+/// context, walked from that processor's KPRCB. Returns it, or `None` when the
+/// id is not a processor context or the walk fails, clearing the stale
+/// selection either way.
+///
+/// Every host has to do this at every stop: the selection is what `!thread`
+/// reports and what the `$thread`/`$proc` pseudo-registers read, and a resume
+/// clears it. Shared by the REPL (re-exported from `repl::stop`) and
+/// [`Session::run_status`] so the two cannot report different threads.
+pub fn refresh_windows_thread_context_for_backend_thread(
+    debugger: &mut Target,
+    thread_id: &str,
+) -> Option<ThreadInfo> {
+    // A user dump's backend threads are its captured threads, which have no
+    // kernel thread object to walk.
+    if debugger.user_dump().is_some() {
+        debugger.select_user_thread(thread_id);
+        debugger.clear_current_windows_thread_context();
+        return None;
+    }
+    let thread = windows_thread_on_backend_thread(debugger, thread_id);
+    match thread.clone() {
+        Some(thread) => debugger.set_current_windows_thread_context(thread),
+        None => debugger.clear_current_windows_thread_context(),
+    }
+    thread
+}
+
+/// The Windows thread a backend vCPU is running, walked from that
+/// processor's KPRCB, without selecting it. `None` when the id is not a
+/// processor context, the walk fails, or the vCPU runs VTL1: NT's per-CPU
+/// current thread is suspended then, and presenting it as the secure thread
+/// gives false IDs, stacks, and filters.
+pub fn windows_thread_on_backend_thread(debugger: &Target, thread_id: &str) -> Option<ThreadInfo> {
+    if debugger
+        .registers
+        .as_ref()
+        .and_then(|registers| registers.get(debugger.arch().dtb_register()))
+        .is_some_and(|dtb| debugger.recognize_secure_root(*dtb))
+    {
+        return None;
+    }
+    processor_index_from_backend_thread_id(thread_id).and_then(|processor| {
+        debugger
+            .current_windows_thread_for_processor(processor)
+            .ok()
+    })
+}

@@ -1,0 +1,632 @@
+//! Run control: resuming, stepping and interrupting the target, and
+//! recording and classifying the stops it reports.
+
+use super::machine::machine;
+use std::collections::HashSet;
+use std::io::ErrorKind;
+use std::ops::Range;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
+use crate::arch::{Family, RegisterMap};
+use crate::backend::dbg_backend::{
+    ContinueDisposition, DebugBackend, ModuleEvent, ModuleNotification, StopEvent,
+};
+use crate::base::error::{Error, Result};
+
+use super::breakpoints::{
+    breakpoint_instruction_at, reclaimed_breakpoints_notice, restore_unowned_breakpoint_handles,
+};
+use super::{
+    AwaitStateOptions, ContinueDrain, DBG_KD_EXCEPTION_STATE_CHANGE,
+    DBG_KD_LOAD_SYMBOLS_STATE_CHANGE, KD_REQUEST_TIMEOUT, KdBackend, Link, STATUS_BREAKPOINT,
+    StateChange, StateChangeFilter, advance_pc_past_breakpoint, api, await_state_change,
+    backend_thread_id, blocking_read_timeout, breakin_and_wait, hardware_watch_address,
+    read_program_counter, with_framing_read_timeout,
+};
+
+const POST_BUGCHECK_RECONNECT_ASSIST_DELAY: Duration = Duration::from_secs(20);
+
+pub(super) fn stop_event(stop: StateChange) -> StopEvent {
+    // The kernel's module list changes only for a kernel image; a user-mode
+    // one (`!gflag +ksl`) is mapped into one process.
+    let kernel_module_changed = stop.new_state == DBG_KD_LOAD_SYMBOLS_STATE_CHANGE
+        && stop
+            .load_symbols
+            .as_ref()
+            .is_none_or(|image| image.base.0 >> 63 == 1);
+    let module_event = stop.load_symbols.map(|image| {
+        let user = image.base.0 >> 63 == 0;
+        ModuleNotification {
+            kind: if image.unload {
+                ModuleEvent::Unload
+            } else {
+                ModuleEvent::Load
+            },
+            base: image.base,
+            size: image.size,
+            path: image.path,
+            process: user.then_some(image.process & 0xffff_ffff),
+        }
+    });
+    StopEvent {
+        thread_id: Some(backend_thread_id(stop.processor)),
+        exception_code: (stop.new_state == DBG_KD_EXCEPTION_STATE_CHANGE)
+            .then_some(stop.exception_code),
+        first_chance: stop.exception_first_chance,
+        exception_address: stop.exception_address,
+        program_counter: Some(stop.program_counter),
+        watchpoint_address: stop
+            .exception_record
+            .as_ref()
+            .and_then(hardware_watch_address),
+        is_bugcheck: stop.is_bugcheck,
+        bugcheck: stop.bugcheck,
+        target_reloaded: stop.target_reloaded,
+        target_kernel_base_hint: stop.kernel_base_hint,
+        modules_changed: kernel_module_changed,
+        module_event,
+        assisted_breakin: stop.assisted_breakin,
+        break_in: false,
+    }
+}
+
+impl KdBackend {
+    fn known_breakin_stop(&self, stop: &StateChange) -> bool {
+        self.unmanaged_breakpoint_stop(stop)
+            && (self.late_breakin || self.breakin_addresses.contains(&stop.program_counter))
+            // A break the host asked for is not assist noise, even though the
+            // guest signals it from the same address our break-ins land on.
+            && self.surface_break_at != Some(stop.program_counter)
+    }
+
+    /// A `STATUS_BREAKPOINT` exception on none of our breakpoints: how the
+    /// target reports a break-in.
+    fn unmanaged_breakpoint_stop(&self, stop: &StateChange) -> bool {
+        stop.new_state == DBG_KD_EXCEPTION_STATE_CHANGE
+            && stop.exception_code == STATUS_BREAKPOINT
+            && !self.managed_bp_addresses.contains(&stop.program_counter)
+    }
+
+    pub(super) fn mark_known_breakin_stop(&self, mut stop: StateChange) -> StateChange {
+        if self.known_breakin_stop(&stop) {
+            stop.assisted_breakin = true;
+        }
+        stop
+    }
+
+    pub(super) fn record_stop(&mut self, stop: &StateChange) {
+        self.last_exception_record = stop.exception_record.clone();
+        if self.unmanaged_breakpoint_stop(stop) {
+            self.late_breakin = false;
+        }
+        if stop.target_reloaded {
+            // The breakpoints are forgotten when the session reloads (see
+            // `forget_target_breakpoints`): a reset need not be a reboot, and
+            // the table keeps its entries across one.
+            kd_trace!("kd: target reload detected");
+            self.breakin_addresses.clear();
+            self.late_breakin = false;
+        } else if stop.is_bugcheck {
+            self.reconnect_assist_after_continue = Some(POST_BUGCHECK_RECONNECT_ASSIST_DELAY);
+        }
+        let managed_breakpoint_stop = stop.exception_code == STATUS_BREAKPOINT
+            && self.managed_bp_addresses.contains(&stop.program_counter);
+        if stop.assisted_breakin
+            && stop.exception_code == STATUS_BREAKPOINT
+            && !managed_breakpoint_stop
+        {
+            self.breakin_addresses.insert(stop.program_counter);
+        }
+        kd_trace!(
+            "kd: stop on p{}, new_state={:#x}, exception_code={:#x}, rip={:#x}, managed_bp={}",
+            stop.processor + 1,
+            stop.new_state,
+            stop.exception_code,
+            stop.program_counter,
+            managed_breakpoint_stop
+        );
+        self.current_processor = stop.processor;
+        // A rebooted target reports its real count; between reboots the count
+        // never shrinks (no hot-unplug), so keep the high-water mark.
+        self.processor_count = if stop.target_reloaded {
+            stop.number_processors.max(1)
+        } else {
+            self.processor_count.max(stop.number_processors.max(1))
+        };
+        self.last_stop_processor = stop.processor;
+        self.last_exception_code = stop.exception_code;
+        self.last_rip = stop.program_counter;
+        self.drop_report_window(stop.report_window(self.arch));
+        self.registers
+            .stopped(stop.processor, stop.control_report.clone());
+        self.stop_was_managed_breakpoint = managed_breakpoint_stop;
+        if self.surface_break_at == Some(stop.program_counter) {
+            self.surface_break_at = None;
+        }
+        // EFER and the KPCRs survive: the guest sets EFER once entering long
+        // mode, and places a processor's KPCR when it starts it, so a reload
+        // is the only way either can differ from the one we read. Re-reading
+        // them per stop costs a round trip in every absorbed breakpoint hit.
+        if stop.target_reloaded {
+            self.efer_cache.clear();
+            self.kpcr_cache.clear();
+        }
+        self.link.halt();
+    }
+
+    pub(super) fn record_running(&mut self) {
+        self.link.resume(&mut self.registers);
+        self.stop_was_managed_breakpoint = false;
+        self.virtual_lines.clear();
+        self.table_lines.clear();
+        self.translations.resume();
+    }
+
+    /// Step the resume PC past a hard-coded `int3`, when that is genuinely what
+    /// is at the PC.
+    ///
+    /// An `int3` that is really part of the guest's code has already executed
+    /// by the time the kernel reports the stop with the PC back on it, so
+    /// resuming in place would trap on it forever and the PC has to move past
+    /// it. Every other `int3` at a stop PC is a *displaced* byte standing in
+    /// for a real instruction, and moving the PC past one of those resumes
+    /// inside that instruction: `48 8b c4` (`mov rax,rsp`) entered at its
+    /// second byte is `8b c4` (`mov eax,esp`), which truncates the register the
+    /// next instruction dereferences, and the guest faults three bytes into the
+    /// function it was entering. So a displaced byte is never stepped over:
+    ///
+    /// * One of ours is left alone; the host's step-over owns removing and
+    ///   restoring it.
+    /// * A table entry a dead session stranded is released, which makes the
+    ///   target restore the byte it displaced. Attach clears the table, but a
+    ///   target reload drops our handles while the entries survive.
+    /// * A PC that cannot be read resumes in place. Failing that way costs a
+    ///   repeated stop; failing the other way corrupts the guest.
+    ///
+    /// The PC comes from the register cache rather than the recorded stop:
+    /// hosts rewind and rewrite it between a stop and the resume, and a write
+    /// invalidates that cache, so the cached value is always what is about to
+    /// execute. It is already warm whenever the host classified the stop,
+    /// which makes the common path free.
+    pub(super) fn skip_hardcoded_breakpoint(&mut self, processor: u16) -> Result<()> {
+        if self.last_exception_code != STATUS_BREAKPOINT {
+            return Ok(());
+        }
+        self.require_no_pending_write_breakpoint()?;
+        let arch = self.arch;
+        let register_map = self.register_map.clone();
+        let pc = self.resume_program_counter(processor, &register_map)?;
+        // Our own site, disabled by the host's step-over between the stop and
+        // this resume. Reading memory here would find the restored original
+        // byte and prove only what the stop already said.
+        if self.stop_was_managed_breakpoint && pc == self.last_rip {
+            return Ok(());
+        }
+        if self.managed_bp_addresses.contains(&pc) {
+            return Ok(());
+        }
+        if !breakpoint_instruction_at(self.link.framing(self.running_reason)?, arch, processor, pc)
+        {
+            kd_trace!(
+                "kd: stop at {pc:#x} reported a breakpoint but memory holds none; resuming in place"
+            );
+            return Ok(());
+        }
+
+        let owned: HashSet<u32> = self.bp_handles.values().copied().collect();
+        let reclaimed = restore_unowned_breakpoint_handles(
+            self.link.framing(self.running_reason)?,
+            processor,
+            &owned,
+            &mut self.stranded,
+        )?;
+        self.notices.extend(reclaimed_breakpoints_notice(reclaimed));
+        if reclaimed.released != 0
+            && !breakpoint_instruction_at(
+                self.link.framing(self.running_reason)?,
+                arch,
+                processor,
+                pc,
+            )
+        {
+            kd_trace!("kd: released a stranded breakpoint at {pc:#x}; resuming in place");
+            return Ok(());
+        }
+
+        kd_trace!(
+            "kd: advancing p{} past a hard-coded int3 at {pc:#x}",
+            processor + 1
+        );
+        // The PC goes straight through the context API, behind
+        // `write_registers` and its cache invalidation.
+        self.registers.invalidate(processor);
+        advance_pc_past_breakpoint(
+            self.link.framing(self.running_reason)?,
+            &register_map,
+            arch,
+            processor,
+            pc,
+        )
+    }
+
+    /// The program counter `processor` resumes from, served from the halt's
+    /// register cache when it already holds that processor.
+    ///
+    /// Only a warm cache is consulted. Filling it would fetch the control
+    /// registers and EFER alongside the context, which costs more than the
+    /// bare context request this replaces.
+    fn resume_program_counter(
+        &mut self,
+        processor: u16,
+        register_map: &RegisterMap,
+    ) -> Result<u64> {
+        if let Some(context) = self.registers.context(processor)
+            && let Ok(pc) = register_map.read_u64(self.arch.pc_register(), context)
+        {
+            return Ok(pc);
+        }
+        let arch = self.arch;
+        read_program_counter(
+            self.link.framing(self.running_reason)?,
+            register_map,
+            arch,
+            processor,
+        )
+    }
+
+    /// Continue `processor` with `status`, single-stepping when `trace`,
+    /// with the hardware breakpoints the halt set kept.
+    pub fn resume_processor(&mut self, processor: u16, status: u32, trace: bool) -> Result<()> {
+        machine(self.arch).resume(self, processor, status, trace)
+    }
+
+    pub(super) fn request_reboot(&mut self) -> Result<()> {
+        let processor = self.current_processor;
+        with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
+            api::reboot(framing, processor)
+        })?;
+        // Reboot has no manipulate-state reply: after the transport ACK the
+        // kernel resets the KD stream and eventually emits a fresh state
+        // change. Keep the backend visibly running and let the pump perform
+        // the existing reconnect/reload detection dance.
+        self.record_running();
+        self.start_pump(Some(Duration::ZERO), None)
+    }
+
+    pub(super) fn request_bugcheck(&mut self) -> Result<()> {
+        let processor = self.current_processor;
+        with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
+            api::cause_bugcheck(framing, processor)
+        })?;
+        // KeBugCheck2 skips the fatal print and the first debugger break for
+        // MANUALLY_INITIATED_CRASH: the target writes its dump (tens of seconds,
+        // interrupts off, break-ins ignored) and then reboots, or breaks in
+        // afterwards when automatic restart is disabled. Treat it like a reboot,
+        // but do not poke immediately: the kernel still polls for break-ins on
+        // its way into KeBugCheck2 and an early poke detours it into a stop.
+        self.record_running();
+        self.start_pump(Some(POST_BUGCHECK_RECONNECT_ASSIST_DELAY), None)
+    }
+
+    pub(super) fn resume_with(&mut self, disposition: ContinueDisposition) -> Result<()> {
+        // A stop the target reached while it answered a request is where
+        // the target is; resuming would run on from it unreported. The pump
+        // reports it first.
+        if self.holds_stop() {
+            kd_trace!("kd: continue: the target holds a new stop; reporting it instead");
+            self.record_running();
+            return self.start_pump(None, None);
+        }
+        let resume_processor = self.last_stop_processor;
+        self.skip_hardcoded_breakpoint(resume_processor)?;
+        // The pump absorbs the re-break a stale break-in byte causes right
+        // after resume; it needs to know where we resumed from and which
+        // breakpoints are real. Nothing can change either while the VM runs.
+        let retired = std::mem::take(&mut self.retired_bp_addresses);
+        let drain = ContinueDrain::new(
+            self.last_rip,
+            self.managed_bp_addresses.clone(),
+            self.breakin_addresses.clone(),
+            retired.clone(),
+            self.register_map.clone(),
+            self.surface_break_at,
+        );
+        let reconnect_assist_after_continue = self.reconnect_assist_after_continue;
+        kd_trace!(
+            "kd: continue: sending ContinueApi2 on p{}",
+            resume_processor + 1
+        );
+        // A failed continue leaves the target halted, and the next resume must
+        // still absorb re-breaks at breakpoints removed during this halt.
+        if let Err(e) = self.resume_processor(
+            resume_processor,
+            api::status_for_disposition(disposition),
+            false,
+        ) {
+            self.retired_bp_addresses = retired;
+            return Err(e);
+        }
+        kd_trace!("kd: continue: ContinueApi2 ACKed, VM should resume");
+        self.record_running();
+        // Hand the socket to the background pump so prints keep getting ACKed
+        // (and the debugger stays "present") until the next stop.
+        self.start_pump(reconnect_assist_after_continue, Some(drain))
+    }
+
+    pub(super) fn single_step(&mut self) -> Result<()> {
+        // As for a continue (see `resume_with`): the wait reads the held
+        // stop first.
+        if self.holds_stop() {
+            kd_trace!("kd: step: the target holds a new stop; reporting it instead");
+            self.record_running();
+            return Ok(());
+        }
+        // Managed BP step-over needs to execute the original instruction. A
+        // single step stops almost immediately, so the caller's wait_for_stop
+        // reads it synchronously; no pump needed
+        let processor = self.current_processor;
+        let owner = self.last_stop_processor;
+        // An ARM64 target accepts the switch and the trace flag, but the
+        // processor it switched to never takes the step, and no stop
+        // arrives. Windows reports a frozen ARM64 processor as its own state
+        // inside nt!KiFreezeTargetExecution, with debug exceptions masked
+        // (PSTATE.D), not as the code the freeze interrupted, so the trace
+        // flag is set in a state where no step can occur.
+        if processor != owner && self.steps_only_the_stopping_processor() {
+            return Err(Error::Kd(format!(
+                "processor {owner} stopped the target, and on ARM64 only that processor can \
+                 step; select it with ~{owner}s, or resume with g"
+            )));
+        }
+        // A raw int3 stop still points at the int3; resuming from there would
+        // only execute it again and report the same stop.
+        self.skip_hardcoded_breakpoint(owner)?;
+        if processor == owner {
+            self.resume_processor(processor, api::DBG_CONTINUE, true)?;
+        } else {
+            self.step_other_processor(processor, owner)?;
+        }
+        self.record_running();
+        Ok(())
+    }
+
+    /// Resume the target with `processor` single-stepping, while `owner`,
+    /// the processor that reported the stop, holds the target.
+    ///
+    /// A continue resumes the target only when it answers the stop that
+    /// `owner` reported. So the host first switches to `processor`, which
+    /// reports `STATUS_WAKE_SYSTEM_DEBUGGER`. Continuing that report with the
+    /// trace flag arms the step and hands the target back to `owner`, which
+    /// reports its stop again. Continuing that second report resumes every
+    /// processor, and `processor` stops after one instruction.
+    fn step_other_processor(&mut self, processor: u16, owner: u16) -> Result<()> {
+        kd_trace!(
+            "kd: step: switching from p{} to p{}",
+            owner + 1,
+            processor + 1
+        );
+        with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
+            api::switch_processor(framing, processor)
+        })?;
+        self.adopt_report_from(processor)?;
+        self.resume_processor(processor, api::DBG_CONTINUE, true)?;
+        self.adopt_report_from(owner)?;
+        self.resume_processor(owner, api::DBG_CONTINUE, false)
+    }
+
+    /// Run `request` with `processor` holding the target. The target runs
+    /// an MSR access or a device read on the processor that reported the
+    /// stop, whatever processor the request names, so for another one the
+    /// host switches to it, which reports `STATUS_WAKE_SYSTEM_DEBUGGER`,
+    /// sends the request, and switches back, so the stop's owner reports
+    /// again and still holds the target. Both reports drop the breakpoint
+    /// sites in their windows, which the next resume re-arms
+    /// (`sites_dropped_by_stop`). On ARM64, where a switched-to processor
+    /// reports from its freeze rather than its own state, it is refused.
+    pub(super) fn on_processor<T>(
+        &mut self,
+        processor: u16,
+        request: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let owner = self.last_stop_processor;
+        if processor == owner {
+            return request(self);
+        }
+        match self.arch.family() {
+            Family::X86 => {}
+            Family::Arm => {
+                return Err(Error::Kd(format!(
+                    "processor {owner} stopped the target, and on ARM64 the target reads \
+                     registers only on that processor"
+                )));
+            }
+        }
+        kd_trace!(
+            "kd: switching from p{} to p{} for a register read",
+            owner + 1,
+            processor + 1
+        );
+        with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
+            api::switch_processor(framing, processor)
+        })?;
+        self.adopt_report_from(processor)?;
+        let result = request(self);
+        with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
+            api::switch_processor(framing, owner)
+        })?;
+        self.adopt_report_from(owner)?;
+        result
+    }
+
+    /// Receive the state change `processor` reports while the target stays
+    /// halted, adopt its register report, and note its PC: the report
+    /// deleted the breakpoint-table entries in its window. A report from
+    /// any other processor is recorded as the stop, and the step fails.
+    fn adopt_report_from(&mut self, processor: u16) -> Result<()> {
+        let arch = self.arch;
+        let debug_log = self.debug_log.clone();
+        let stop = with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
+            await_state_change(
+                framing,
+                AwaitStateOptions {
+                    arch: Some(arch),
+                    saw_kd_refresh: None,
+                    filter: StateChangeFilter::Runtime,
+                    bugcheck: None,
+                    bugcheck_capture: None,
+                    deadline: Some(Instant::now() + KD_REQUEST_TIMEOUT),
+                    debug_log: Some(&debug_log),
+                },
+            )
+        })?;
+        if stop.processor != processor {
+            self.record_stop(&stop);
+            return Err(Error::Kd(format!(
+                "expected processor {processor} to report during the processor switch, but \
+                 processor {} reported",
+                stop.processor
+            )));
+        }
+        self.drop_report_window(stop.report_window(self.arch));
+        self.registers.stopped(processor, stop.control_report);
+        Ok(())
+    }
+
+    /// A stop report deleted every table entry in `window` (see
+    /// [`StateChange::report_window`]), freeing its handle before the report
+    /// was on the wire.
+    pub fn drop_report_window(&mut self, window: Range<u64>) {
+        let dropped: Vec<u64> = self
+            .bp_handles
+            .keys()
+            .copied()
+            .filter(|addr| window.contains(addr))
+            .collect();
+        for addr in dropped {
+            self.bp_handles.remove(&addr);
+            self.dropped_bp_addresses.insert(addr);
+        }
+    }
+
+    pub(super) fn break_in(&mut self) -> Result<StopEvent> {
+        let stop = if let Link::RunningPumped(pump) = &self.link {
+            // Pump owns the socket; poke the kernel with a break-in over the
+            // cloned fd, then collect the state-change the pump reports back.
+            // Flag it first: the stop lands at the KD break-in instruction,
+            // where the pump would otherwise absorb it as post-continue noise.
+            pump.breakin_requested.store(true, Ordering::SeqCst);
+            self.send_raw_breakin()?;
+            match self.take_pump_stop(Some(Duration::from_secs(10)))? {
+                Some(stop) => stop,
+                None => {
+                    self.shutdown_pump();
+                    return Err(Error::Kd("no break-in response within 10s".into()));
+                }
+            }
+        } else {
+            // Stopped, or running via a bare step: drive the break-in inline
+            let arch = self.arch;
+            breakin_and_wait(self.framing()?, arch, Duration::from_secs(10))?
+        };
+        self.late_breakin = !self.unmanaged_breakpoint_stop(&stop);
+        self.record_stop(&stop);
+        Ok(stop_event(stop))
+    }
+
+    pub(super) fn await_stop(&mut self) -> Result<StopEvent> {
+        if matches!(self.link, Link::RunningPumped(_)) {
+            let stop = self
+                .take_pump_stop(None)?
+                .ok_or_else(|| Error::Kd("KD pump returned no stop".into()))?;
+            let stop = self.mark_known_breakin_stop(stop);
+            self.record_stop(&stop);
+            return Ok(stop_event(stop));
+        }
+        let debug_log = self.debug_log.clone();
+        let arch = self.arch;
+        // Request paths leave shorter timeouts in place; a blocking wait needs a long one.
+        let _ = self
+            .framing()?
+            .transport_mut()
+            .set_read_timeout(Some(blocking_read_timeout()));
+        let stop = await_state_change(
+            self.framing()?,
+            AwaitStateOptions {
+                arch: Some(arch),
+                saw_kd_refresh: None,
+                filter: StateChangeFilter::Runtime,
+                bugcheck: None,
+                bugcheck_capture: None,
+                deadline: None,
+                debug_log: Some(&debug_log),
+            },
+        )?;
+        let stop = self.mark_known_breakin_stop(stop);
+        self.record_stop(&stop);
+        Ok(stop_event(stop))
+    }
+
+    pub(super) fn poll_stop(&mut self, timeout: Duration) -> Result<Option<StopEvent>> {
+        // Pump path: the background thread already services the socket and
+        // detects stops, so just poll it. This is the common case while running
+        if matches!(self.link, Link::RunningPumped(_)) {
+            return match self.take_pump_stop(Some(timeout))? {
+                Some(stop) => {
+                    let stop = self.mark_known_breakin_stop(stop);
+                    kd_trace!(
+                        "kd: try_wait: pump reported stop rip={:#x} exc={:#x}",
+                        stop.program_counter,
+                        stop.exception_code
+                    );
+                    self.record_stop(&stop);
+                    Ok(Some(stop_event(stop)))
+                }
+                None => Ok(None),
+            };
+        }
+        // Synchronous fallback (no pump, e.g. polling after a bare step)
+        self.framing()?
+            .transport_mut()
+            .set_read_timeout(Some(timeout))?;
+        let mut saw_kd_refresh = false;
+        let debug_log = self.debug_log.clone();
+        let arch = self.arch;
+        let result = await_state_change(
+            self.framing()?,
+            AwaitStateOptions {
+                arch: Some(arch),
+                saw_kd_refresh: Some(&mut saw_kd_refresh),
+                filter: StateChangeFilter::Runtime,
+                bugcheck: None,
+                bugcheck_capture: None,
+                deadline: Some(Instant::now() + timeout),
+                debug_log: Some(&debug_log),
+            },
+        );
+
+        let stop = match result {
+            Ok(stop) => stop,
+            Err(Error::Io(e))
+                if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
+            {
+                if saw_kd_refresh {
+                    kd_trace!("kd: try_wait: KD refresh observed while polling");
+                }
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+
+        let stop = self.mark_known_breakin_stop(stop);
+        kd_trace!(
+            "kd: try_wait: stop rip={:#x} exc={:#x} in_managed={}",
+            stop.program_counter,
+            stop.exception_code,
+            self.managed_bp_addresses.contains(&stop.program_counter)
+        );
+
+        self.record_stop(&stop);
+        Ok(Some(stop_event(stop)))
+    }
+}
