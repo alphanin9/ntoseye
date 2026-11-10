@@ -86,8 +86,10 @@ struct TargetOptions {
     #[arg(short = 'b', long, global = true)]
     backend: Option<Backend>,
 
-    /// The backend target: a GDB address, a KD socket path, or a KDNET listen
-    /// address. The memory backend does not use it
+    /// The backend target: a GDB address, a KD socket path (a named pipe on
+    /// Windows), or a KDNET listen address, or `target=HOST:PORT` to contact
+    /// a KDNET target first (a Hyper-V VM's debug port). The memory backend
+    /// does not use it
     #[arg(long, global = true)]
     connect: Option<String>,
 
@@ -311,7 +313,15 @@ Then connect to that path as root:
 sudo ntoseye --backend kd --connect \"$HOME/Library/Containers/com.utmapp.QEMUHelper/Data/tmp/ntoseye-kd.sock\"
 
 ntoseye supports Windows ARM64 (machine 0xAA64). Disable Secure Boot,
-or bcdedit /debug on does not work.";
+or bcdedit /debug on does not work.
+
+Windows (Hyper-V): attach the VM's COM1 to the ntoseye default pipe
+while the VM is off, from an elevated PowerShell:
+
+Set-VMComPort -VMName NAME -Number 1 -Path \\\\.\\pipe\\ntoseye-kd
+
+Then run ntoseye from an elevated terminal. `ntoseye configure` does
+this, or sets up KDNET over Hyper-V's synthetic debug device instead.";
 
 pub fn main() {
     std::process::exit(run_with_args(std::env::args_os()));

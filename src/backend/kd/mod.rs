@@ -60,6 +60,8 @@ mod hw_breakpoints;
 mod kdnet;
 mod machine;
 mod memory;
+#[cfg(windows)]
+mod pipe;
 mod pump;
 pub mod registers;
 mod run;
@@ -906,5 +908,7 @@ impl DebugBackend for KdBackend {
     }
 }
 
-#[cfg(test)]
+// The fake kernel these drive talks over `UnixStream::pair()`, whose
+// half-close and non-blocking modes a named pipe has no equivalent of.
+#[cfg(all(test, unix))]
 mod tests;

@@ -1,6 +1,6 @@
 # ntoseye
 
-`ntoseye` is a Windows debugger for Linux and macOS. It debugs the Windows kernel and user-mode processes on virtual and physical machines, and analyzes crash dumps offline, using WinDbg's command language.
+`ntoseye` is a Windows debugger for Linux, macOS, and Windows. It debugs the Windows kernel and user-mode processes on virtual and physical machines, and analyzes crash dumps offline, using WinDbg's command language.
 
 | Debugging via REPL | Debugging via VS Code + DAP |
 | - | - |
@@ -58,9 +58,9 @@ For your own drivers, [private PDBs and local source](using/symbols.md) add sour
 | XP RTM | Untested | No |  |
 | 2000 |  | No |  |
 
-`ntoseye` runs on Linux (x86-64 and ARM64) and on macOS on Apple Silicon.
+`ntoseye` runs on Linux (x86-64 and ARM64), on macOS on Apple Silicon, and on Windows (x86-64).
 
-It sets up and works directly with [KVM/QEMU](setup/kvm-qemu.md) and [VMware Workstation](setup/vmware.md) on Linux and [UTM](setup/utm.md) on macOS. Any other machine, physical or virtual, connects over [KDNET](setup/kdnet.md).
+It sets up and works directly with [KVM/QEMU](setup/kvm-qemu.md) and [VMware Workstation](setup/vmware.md) on Linux, [UTM](setup/utm.md) on macOS, and [Hyper-V](setup/hyperv.md) on Windows. Any other machine, physical or virtual, connects over [KDNET](setup/kdnet.md).
 
 ## Get involved
 
@@ -94,6 +94,7 @@ setup/backends
 setup/kvm-qemu
 setup/vmware
 setup/utm
+setup/hyperv
 setup/kdnet
 ```
 

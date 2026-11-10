@@ -228,10 +228,15 @@ fn control_report(payload: &[u8]) -> Option<ControlReport> {
 }
 
 pub fn kd_socket_connect_error(socket_path: &str, err: std::io::Error) -> Error {
+    #[cfg(unix)]
+    const START: &str = "Start the VM with a Unix serial socket at this path";
+    #[cfg(windows)]
+    const START: &str = "Start the Hyper-V VM with its COM port on this pipe \
+         (Set-VMComPort -VMName NAME -Number 1 -Path PIPE)";
     let message = match err.kind() {
         ErrorKind::NotFound => format!(
             "KD serial socket '{socket_path}' does not exist.\n\
-             Start the VM with a Unix serial socket at this path, or pass --connect <path>.\n\
+             {START}, or pass --connect <path>.\n\
              If this guest is not configured for Windows KD, use --backend gdb or --backend memory."
         ),
         ErrorKind::ConnectionRefused => format!(
@@ -356,8 +361,21 @@ pub fn poll_for_initial_break(
                     next_progress_at += KD_INITIAL_PROGRESS_INTERVAL;
                 }
                 if now >= deadline {
-                    let message = match framing.transport_mut().network_datagrams_received() {
-                        Some(0) => format!(
+                    let transport = framing.transport_mut();
+                    let dial_target = transport.network_dial_target();
+                    let message = match (transport.network_datagrams_received(), dial_target) {
+                        (Some(0), Some(target)) => format!(
+                            "KDNET target {target} sent no UDP datagrams within {}s.\n\
+                             Check:\n\
+                               - Windows has `bcdedit /debug on` and `bcdedit /dbgsettings net` enabled\n\
+                               - on Hyper-V, the VM's debug port is {} (Msvm_VirtualSystemSettingData.DebugPort,\n\
+                                 set by kdnetdebugvm.ps1) and the VM was powered off and on since it was set\n\
+                               - the guest was rebooted after changing BCD settings\n\
+                               - nothing else (WinDbg, another ntoseye) is polling the same debug port",
+                            budget.as_secs(),
+                            target.port()
+                        ),
+                        (Some(0), None) => format!(
                             "KDNET listener received no UDP datagrams within {}s.\n\
                              Check:\n\
                                - Windows has `bcdedit /debug on` enabled\n\
@@ -367,12 +385,12 @@ pub fn poll_for_initial_break(
                                - the guest debug NIC and its `busparams` are supported and correct",
                             budget.as_secs()
                         ),
-                        Some(received) => format!(
+                        (Some(received), _) => format!(
                             "KDNET listener received {received} UDP datagram(s), but none contained a usable target packet within {}s.\n\
                              Check that Windows targets this UDP port and that `--kdnet-key` exactly matches the key printed by bcdedit",
                             budget.as_secs()
                         ),
-                        None => format!(
+                        (None, _) => format!(
                             "host serial socket is connected, but Windows KD did not send packets within {}s.\n\
                              Check:\n\
                                - Windows has `bcdedit /debug on` enabled\n\
@@ -1017,7 +1035,7 @@ pub fn run_pump(
     framing
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::io::Write as _;
     use std::os::unix::net::UnixStream;

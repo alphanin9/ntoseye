@@ -1,9 +1,11 @@
+#[cfg(unix)]
 struct MemoryRegion {
     start: u64,
     end: u64,
     length: u64,
 }
 
+#[cfg(unix)]
 impl MemoryRegion {
     /// Host address of the `len` bytes at `offset` into the region, if they
     /// all lie inside it.
@@ -848,6 +850,59 @@ mod platform {
 
         fn write_bytes(&self, addr: PhysAddr, buf: &[u8]) -> Result<()> {
             self.write_bytes_at(addr, buf)
+        }
+    }
+}
+
+/// Windows host: Hyper-V keeps guest RAM in the protected `vmmem` process,
+/// out of any user-mode debugger's reach, so no live handle exists and the
+/// KD backends read guest memory through the target instead.
+#[cfg(windows)]
+mod platform {
+    use crate::base::error::{Error, Result};
+    use crate::base::memory::MemoryOps;
+    use crate::base::types::PhysAddr;
+
+    pub enum VmHandle {}
+
+    impl VmHandle {
+        pub fn new() -> Result<Self> {
+            Err(Error::DebugInfo(
+                "host memory is not readable on a Windows host: Hyper-V keeps guest RAM in the \
+                 protected vmmem process. Use --backend kd or kdnet, which read guest memory \
+                 through the target."
+                    .into(),
+            ))
+        }
+
+        pub fn guest_debug_aborts_vm(&self) -> bool {
+            match *self {}
+        }
+
+        pub fn describe(&self) -> String {
+            match *self {}
+        }
+
+        pub fn ram_base(&self) -> u64 {
+            match *self {}
+        }
+
+        pub fn ram_size(&self) -> u64 {
+            match *self {}
+        }
+
+        pub fn ram_runs(&self) -> Vec<(u64, u64)> {
+            match *self {}
+        }
+    }
+
+    impl MemoryOps<PhysAddr> for VmHandle {
+        fn read_bytes(&self, _addr: PhysAddr, _buf: &mut [u8]) -> Result<()> {
+            match *self {}
+        }
+
+        fn write_bytes(&self, _addr: PhysAddr, _buf: &[u8]) -> Result<()> {
+            match *self {}
         }
     }
 }

@@ -3,7 +3,6 @@
 
 use super::machine::machine;
 use std::collections::{HashMap, HashSet};
-use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -63,10 +62,10 @@ impl KdBackend {
     ) -> Result<Self> {
         let timeout = timeout.map(handshake_timeout).transpose()?;
         progress(&format!("kd: using KDCOM backend on {socket_path}"));
-        let stream = UnixStream::connect(socket_path)
+        let transport = KdTransport::connect_serial(socket_path)
             .map_err(|err| kd_socket_connect_error(socket_path, err))?;
         Self::connect_transport(
-            KdTransport::Serial(stream),
+            transport,
             "kd: serial connected; waiting for Windows KD target",
             "kd",
             timeout,
@@ -74,20 +73,33 @@ impl KdBackend {
         )
     }
 
-    /// Listen for a KDNET target and stop at the initial state-change, with
-    /// `timeout` as [`KdBackend::connect`] takes it.
+    /// Open a KDNET session and stop at the initial state-change, with
+    /// `timeout` as [`KdBackend::connect`] takes it. `endpoint` is the
+    /// `ADDR:PORT` to listen on for the target, or `target=HOST:PORT` to
+    /// reach it there first: a Hyper-V VM's KDNET runs over the host's
+    /// synthetic debug device, which forwards it only to whoever last sent
+    /// to the VM's debug port.
     pub fn connect_net(
-        listen_addr: &str,
+        endpoint: &str,
         key: &str,
         timeout: Option<u64>,
         progress: &mut dyn FnMut(&str),
     ) -> Result<Self> {
         let timeout = timeout.map(handshake_timeout).transpose()?;
-        progress(&format!("kdnet: listening on {listen_addr}"));
-        let stream = KdNetStream::bind(listen_addr, key)?;
+        let stream = KdNetStream::open(endpoint, key)?;
+        let waiting_message = match stream.dial_target() {
+            Some(target) => {
+                progress(&format!("kdnet: reaching the target at {target}"));
+                "kdnet: polling the target; waiting for Windows KDNET"
+            }
+            None => {
+                progress(&format!("kdnet: listening on {endpoint}"));
+                "kdnet: listener ready; waiting for Windows KDNET target"
+            }
+        };
         Self::connect_transport(
             KdTransport::Network(stream),
-            "kdnet: listener ready; waiting for Windows KDNET target",
+            waiting_message,
             "kdnet",
             timeout,
             progress,

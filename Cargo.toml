@@ -9,7 +9,7 @@ name = "ntoseye"
 version.workspace = true
 edition = "2024"
 authors = [ "dmaivel" ]
-description = "WinDbg-like kernel debugger for Windows, from Linux and macOS"
+description = "WinDbg-like kernel debugger for Windows, from Linux, macOS, and Windows"
 license = "MIT"
 homepage = "https://ntoseye.com"
 repository = "https://github.com/dmaivel/ntoseye"
@@ -92,6 +92,18 @@ nix = { version = "0.31.3", features = [ "process", "uio" ] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
 
 [features]
 default = ["cli", "mcp", "dap", "gdbserver", "python-embed"]

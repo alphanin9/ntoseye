@@ -1,6 +1,6 @@
 # Install
 
-`ntoseye` runs on Linux (x86-64, ARM64) and on macOS on Apple Silicon. Each method below installs the same debugger. The methods differ in whether they embed Python, which [custom commands](../scripting/commands.md) need, and in what software you need before you install:
+`ntoseye` runs on Linux (x86-64, ARM64), on macOS on Apple Silicon, and on Windows (x86-64). Each method below installs the same debugger. The methods differ in whether they embed Python, which [custom commands](../scripting/commands.md) need, and in what software you need before you install:
 
 | Method | Custom commands | Needs |
 |---|---|---|
@@ -11,7 +11,7 @@
 
 ## Shell script
 
-The installer script puts a prebuilt binary in `~/.local/bin`:
+On Linux and macOS, the installer script puts a prebuilt binary in `~/.local/bin`:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dmaivel/ntoseye/releases/latest/download/ntoseye-installer.sh | sh
@@ -59,7 +59,7 @@ cargo build --release --no-default-features --features cli,mcp,dap,gdbserver
 
 ## Files and network access
 
-When `ntoseye` needs symbols or images, it downloads them from Microsoft's official symbol server. It keeps its configuration, cache, and REPL state in `~/.ntoseye`:
+When `ntoseye` needs symbols or images, it downloads them from Microsoft's official symbol server. It keeps its configuration, cache, and REPL state in `~/.ntoseye` (`%USERPROFILE%\.ntoseye` on Windows):
 
 - `~/.ntoseye/commands/` for custom scripted commands.
 - `~/.ntoseye/symbols/` for PDBs and images, as a symbol store in the `symstore` layout that WinDbg, IDA, Ghidra, and rizin read.

@@ -668,6 +668,7 @@ fn resolve_ntoseye_home() -> Option<PathBuf> {
     Some(path)
 }
 
+#[cfg(unix)]
 fn user_home_dir() -> Option<PathBuf> {
     std::env::var("SUDO_USER")
         .ok()
@@ -680,6 +681,13 @@ fn user_home_dir() -> Option<PathBuf> {
             }
         })
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+}
+
+/// The profile directory (`%USERPROFILE%`), which an elevated terminal
+/// shares with the user who opened it.
+#[cfg(windows)]
+fn user_home_dir() -> Option<PathBuf> {
+    std::env::home_dir()
 }
 
 /// Whether a lookup in the image cache may download a missing image.

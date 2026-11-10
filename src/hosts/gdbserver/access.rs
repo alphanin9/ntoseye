@@ -3,21 +3,22 @@
 
 use std::num::NonZeroUsize;
 
+use crate::base::error::{Error, Result};
+use crate::base::types::VirtAddr;
+use crate::nt::target::MemoryKind;
+use crate::session::Session;
 use gdbstub::common::Tid;
 use gdbstub::target::ext::base::multithread::{MultiThreadBase, MultiThreadResumeOps};
 use gdbstub::target::ext::base::single_register_access::{
     SingleRegisterAccess, SingleRegisterAccessOps,
 };
 use gdbstub::target::{TargetError, TargetResult};
-use libc::EFAULT;
-
-use crate::base::error::{Error, Result};
-use crate::base::types::VirtAddr;
-use crate::nt::target::MemoryKind;
-use crate::session::Session;
 
 use super::layout::Layout;
 use super::{GdbTarget, WireRegId, WireRegisters};
+
+/// The GDB remote protocol's `EFAULT`, the same number on every host.
+const EFAULT: u8 = 14;
 
 impl GdbTarget<'_> {
     pub(super) fn sync_threads(&mut self) {
@@ -121,7 +122,7 @@ impl MultiThreadBase for GdbTarget<'_> {
         // Memory follows the inspection context (`monitor .process`), not
         // the thread: kernel space is the same on every vCPU.
         match self.session.read_masked_partial(VirtAddr(start_addr), data) {
-            0 if !data.is_empty() => Err(TargetError::Errno(EFAULT as u8)),
+            0 if !data.is_empty() => Err(TargetError::Errno(EFAULT)),
             read => Ok(read),
         }
     }
@@ -130,7 +131,7 @@ impl MultiThreadBase for GdbTarget<'_> {
         let written = self
             .session
             .write_memory(MemoryKind::Virtual, start_addr, data);
-        written.map_err(|_| TargetError::Errno(EFAULT as u8))
+        written.map_err(|_| TargetError::Errno(EFAULT))
     }
 
     fn list_active_threads(

@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "ntoseye"
 dynamic = ["version"]
-description = "The ntoseye Windows kernel debugger for Linux and macOS: Python SDK and CLI"
+description = "The ntoseye Windows kernel debugger for Linux, macOS, and Windows: Python SDK and CLI"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }

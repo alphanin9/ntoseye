@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 use crate::backend::dbg_backend::{thread_kind, thread_label};
+#[cfg(unix)]
 use crate::base::bytes::before_nul;
 use crate::base::disasm::{AsmKind, AsmToken};
 use crate::base::types::VirtAddr;
@@ -139,17 +140,29 @@ pub fn plate(text: &str) -> String {
 /// it in the terminals that support them, and the rest show `text`. Output
 /// that is not styled (a pipe, a capture, `NO_COLOR`) drops the link with
 /// the colors. The link names this host, so a terminal reached over SSH
-/// does not open a file of the same name on its own machine.
+/// does not open a file of the same name on its own machine. A Windows path
+/// takes the URI form of one: `file:///C:/dir/file`, or `file://server/...`
+/// for a UNC path.
 pub fn file_link(path: &Path, text: &str) -> String {
     let Ok(path) = std::path::absolute(path) else {
         return text.to_string();
     };
-    let mut uri = format!("file://{}", *HOSTNAME);
-    for byte in path.as_os_str().as_encoded_bytes() {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let separator = |byte: u8| byte == b'/' || (cfg!(windows) && byte == b'\\');
+    let mut uri = if cfg!(windows) {
+        let unc = bytes.len() >= 2 && separator(bytes[0]) && separator(bytes[1]);
+        if unc { "file:" } else { "file:///" }.to_string()
+    } else {
+        format!("file://{}", *HOSTNAME)
+    };
+    for &byte in bytes {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'.' | b'_' | b'~' => {
-                uri.push(char::from(*byte));
+            byte if separator(byte) => uri.push('/'),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                uri.push(char::from(byte));
             }
+            // A drive's colon (`C:`) is a plain path character in a URI.
+            b':' if cfg!(windows) => uri.push(':'),
             _ => {
                 let _ = write!(uri, "%{byte:02X}");
             }
@@ -198,13 +211,31 @@ mod tests {
     /// path's characters that would end or change the URI are escaped.
     #[test]
     fn file_link_keeps_its_text_and_escapes_the_path() {
-        let link = file_link(Path::new("/src/my driver/#1.c"), "[local driver.c:42]");
+        let (path, uri) = if cfg!(windows) {
+            (
+                r"C:\src\my driver\#1.c",
+                "file:///C:/src/my%20driver/%231.c".to_string(),
+            )
+        } else {
+            (
+                "/src/my driver/#1.c",
+                format!("file://{}/src/my%20driver/%231.c", *HOSTNAME),
+            )
+        };
+        let link = file_link(Path::new(path), "[local driver.c:42]");
         assert_eq!(strip_ansi(&link), "[local driver.c:42]");
         assert!(
-            link.starts_with(&format!(
-                "\x1b]8;;file://{}/src/my%20driver/%231.c\x1b\\",
-                *HOSTNAME
-            )),
+            link.starts_with(&format!("\x1b]8;;{uri}\x1b\\")),
+            "{link:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_unc_path_links_to_its_server() {
+        let link = file_link(Path::new(r"\\build\src\drv.c"), "drv.c");
+        assert!(
+            link.starts_with("\x1b]8;;file://build/src/drv.c\x1b\\"),
             "{link:?}"
         );
     }

@@ -11,6 +11,7 @@ Select a host address that the target can reach. The hypervisors that `ntoseye` 
 - [KVM/QEMU](kvm-qemu.md#kdnet): Set the libvirt Hyper-V vendor ID to `KVMKVMKVM`, then power off the VM completely and start it again, because a Windows reboot is not enough. `ntoseye configure` sets the vendor override automatically.
 - [VMware Workstation](vmware.md#kdnet): You do not need to configure more virtual hardware, but the bridged, NAT, or host-only NIC of the guest must be able to reach the selected host address.
 - [UTM](utm.md#kdnet): Disable Secure Boot before you change the Windows BCD debug settings, and make sure that the guest NIC can reach the selected macOS address.
+- [Hyper-V](hyperv.md#kdnet): The guest's KDNET goes through a synthetic debug device instead of its NIC, and the host forwards it only to a debugger that contacts it first, so set the VM's debug port and attach with `--connect target=<hyperv-host>:<port>`.
 
 Other targets that Windows can debug over KDNET need no configuration on the host. If a host firewall filters inbound UDP, allow the selected port, which is 50000 by default.
 
@@ -54,7 +55,7 @@ Start `ntoseye` with the key from the guest:
 ntoseye --backend kdnet --kdnet-key 1.2.3.4
 ```
 
-By default, KDNET listens on `0.0.0.0:50000`. To use a different listener, use `--connect <listen-address>:<port>`.
+By default, KDNET listens on `0.0.0.0:50000`. To use a different listener, use `--connect <listen-address>:<port>`. To contact the target first instead of waiting for it, as a [Hyper-V](hyperv.md#kdnet) VM needs, use `--connect target=<host>:<port>`: ntoseye then pokes that address from an ephemeral port until the target answers, and again whenever the target is quiet for a second.
 
 With `--memory-source auto`, ntoseye reads memory from the VM process when the VM is local and matches the target. For a fully remote session, add `--memory-source kd`, which is also the mode that ARM64 guests under UTM use. See [memory sources](../using/memory.md#where-reads-come-from).
 

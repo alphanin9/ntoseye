@@ -25,6 +25,7 @@ The host configuration depends on the hypervisor:
 - [KVM/QEMU (including libvirt/virt-manager)](kvm-qemu.md)
 - [VMware Workstation](vmware.md)
 - [UTM (macOS, Apple Silicon)](utm.md)
+- [Hyper-V (Windows)](hyperv.md)
 
 ## Supported live environments
 
@@ -35,8 +36,9 @@ You can debug any Windows 10/11 target that is reachable over the network with `
 | Linux | KVM/QEMU | AMD64 | Yes | Yes | Yes | Yes |
 | Linux | VMware Workstation | AMD64 | Yes | Yes | Yes | Yes |
 | macOS | UTM (QEMU/HVF) | ARM64 | Yes | Yes | Yes (see below) | Yes |
+| Windows | Hyper-V | AMD64 | Yes | Yes | No | No |
 
-We did not test these integrations with other hypervisors. Crash-dump analysis supports AMD64 and ARM64 dumps.
+We did not test these integrations with other hypervisors. Crash-dump analysis supports AMD64 and ARM64 dumps. Hyper-V keeps guest memory out of the host's reach, so on Hyper-V `kd` and `kdnet` read memory through the target, and the [Hyper-V guide](hyperv.md) has the setup.
 
 On UTM, the `gdb` backend needs "Use Hypervisor" turned off, because QEMU versions before 10.1 abort the VM when a debugger enables guest debugging on HVF. If "Use Hypervisor" is on, `ntoseye` does not connect. If your QEMU version has the fix, set `NTOSEYE_GDB_ON_HVF=1` to override this check. The [UTM guide](utm.md) has the details. The other backends do not have this problem, because they do not ask the hypervisor for debug traps.
 

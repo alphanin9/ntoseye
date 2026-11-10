@@ -1,17 +1,27 @@
 use std::io::{self, Read, Write};
-use std::os::unix::net::UnixStream;
+use std::net::SocketAddr;
+#[cfg(unix)]
+pub use std::os::unix::net::UnixStream as SerialStream;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use super::kdnet::KdNetStream;
+#[cfg(windows)]
+pub use super::pipe::PipeStream as SerialStream;
 
 pub enum KdTransport {
-    Serial(UnixStream),
+    Serial(SerialStream),
     Network(KdNetStream),
 }
 
 impl KdTransport {
+    /// Open the serial pipe a hypervisor serves a guest COM port on: a Unix
+    /// socket path, or on Windows a named pipe (`\\.\pipe\NAME`).
+    pub fn connect_serial(path: &str) -> io::Result<Self> {
+        SerialStream::connect(path).map(Self::Serial)
+    }
+
     pub fn try_clone(&self) -> io::Result<Self> {
         match self {
             Self::Serial(stream) => stream.try_clone().map(Self::Serial),
@@ -45,10 +55,19 @@ impl KdTransport {
             Self::Serial(_) => None,
         }
     }
+
+    /// The `HOST:PORT` a KDNET session dials (`target=HOST:PORT`), `None`
+    /// for a listener or a serial pipe.
+    pub fn network_dial_target(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Network(stream) => stream.dial_target(),
+            Self::Serial(_) => None,
+        }
+    }
 }
 
-impl From<UnixStream> for KdTransport {
-    fn from(stream: UnixStream) -> Self {
+impl From<SerialStream> for KdTransport {
+    fn from(stream: SerialStream) -> Self {
         Self::Serial(stream)
     }
 }
@@ -84,7 +103,7 @@ impl Write for KdTransport {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

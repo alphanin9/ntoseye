@@ -333,7 +333,7 @@ struct OpenArgs {
     )]
     backend: BackendArg,
     #[schemars(
-        description = "Connection target: Unix socket path for kd (default /tmp/ntoseye-kd.sock), listen address for kdnet (default 0.0.0.0:50000), host:port for gdb (default 127.0.0.1:1234), absolute .dmp path for dump (required). Not used by memory."
+        description = "Connection target: Unix socket path for kd (default /tmp/ntoseye-kd.sock; on Windows a named pipe, default \\\\.\\pipe\\ntoseye-kd), listen address for kdnet (default 0.0.0.0:50000) or target=HOST:PORT to contact a KDNET target first (a Hyper-V VM's debug port), host:port for gdb (default 127.0.0.1:1234), absolute .dmp path for dump (required). Not used by memory."
     )]
     connect: Option<String>,
     #[schemars(

@@ -13,6 +13,16 @@ Keeping this file:
 - To release, rename "## Unreleased" to "## vX.Y.Z (YYYY-MM-DD)", the version in Cargo.toml. The release workflow refuses a tag whose version has no section here, or an empty one; dist publishes the section as the release notes, under the tag as the release title.
 -->
 
+## Unreleased
+
+ntoseye runs on Windows, and debugs Hyper-V VMs there over KDNET or KD on a serial port; it also reaches a Hyper-V VM's KDNET from Linux and macOS.
+
+### Added
+
+- Windows hosts. `ntoseye configure` and `ntoseye status` set up and show Hyper-V VMs: KDNET on the VM's debug port, or KD on COM1 served at `\\.\pipe\ntoseye-kd`, the `kd` backend's default on Windows. See [Hyper-V](https://ntoseye.com/setup/hyperv/).
+- `--backend kdnet --connect target=<host>:<port>` contacts the target first, as WinDbg's `target=` does, and keeps poking it whenever it is quiet. A Hyper-V VM sends its KDNET only to a debugger that contacts its host's debug port first, so this is how ntoseye attaches to one, from the Hyper-V host or from another machine.
+- On Windows, `.shell` runs its command with `cmd /c`.
+
 ## v0.53.0 (2026-11-06)
 
 Stops over KD are several times faster, `dx` and `dt` show typed globals from private PDBs, and many bugs are fixed, in `!heap` and `!pool` on recent Windows 11 builds, in stack walks, and in symbols.

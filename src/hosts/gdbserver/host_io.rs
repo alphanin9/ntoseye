@@ -3,7 +3,6 @@
 
 use std::fs::File;
 use std::io;
-use std::os::unix::fs::FileExt;
 
 use gdbstub::target::ext::host_io::{
     FsKind, HostIo, HostIoClose, HostIoCloseOps, HostIoErrno, HostIoError, HostIoFstat,
@@ -34,7 +33,7 @@ impl OpenFile {
     /// reads for where they stop.
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         match self {
-            Self::Image(file) => file.read_at(buf, offset),
+            Self::Image(file) => read_file_at(file, buf, offset),
             Self::Generated(bytes) => {
                 let rest = usize::try_from(offset)
                     .ok()
@@ -53,6 +52,18 @@ impl OpenFile {
             Self::Generated(bytes) => Ok(bytes.len() as u64),
         }
     }
+}
+
+#[cfg(unix)]
+fn read_file_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(file, buf, offset)
+}
+
+/// Every read names its offset, so moving the cursor, as Windows' positional
+/// read does, changes nothing.
+#[cfg(windows)]
+fn read_file_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(file, buf, offset)
 }
 
 impl GdbTarget<'_> {

@@ -7,7 +7,7 @@
 [![crates.io](https://img.shields.io/crates/v/ntoseye?style=flat-square&labelColor=1c1c1c&logo=rust&logoColor=white)](https://crates.io/crates/ntoseye)
 [![docs.rs](https://img.shields.io/docsrs/ntoseye?style=flat-square&labelColor=1c1c1c&logo=docsdotrs&logoColor=white)](https://docs.rs/ntoseye)
 
-A WinDbg-like Windows debugger for Linux and macOS, with support for kernel-mode and user-mode debugging of virtual and physical machines, and offline crash-dump analysis.
+A WinDbg-like Windows debugger for Linux, macOS, and Windows, with support for kernel-mode and user-mode debugging of virtual and physical machines, and offline crash-dump analysis.
 
 ## Showcase
 
@@ -50,7 +50,7 @@ A WinDbg-like Windows debugger for Linux and macOS, with support for kernel-mode
 
 ### Supported hypervisors
 
-`ntoseye` supports any target that Windows can debug over [KDNET](https://ntoseye.com/setup/kdnet/). KVM/QEMU, VMware Workstation, and UTM guests additionally get [KDCOM, GDB, and memory-only backends](https://ntoseye.com/setup/backends/).
+`ntoseye` supports any target that Windows can debug over [KDNET](https://ntoseye.com/setup/kdnet/). KVM/QEMU, VMware Workstation, and UTM guests additionally get [KDCOM, GDB, and memory-only backends](https://ntoseye.com/setup/backends/), and Hyper-V guests get KDCOM over a named pipe and KDNET over Hyper-V's synthetic debug device ([Hyper-V](https://ntoseye.com/setup/hyperv/)).
 
 ### Files and network access
 
@@ -66,11 +66,11 @@ A WinDbg-like Windows debugger for Linux and macOS, with support for kernel-mode
 
 ## Install
 
-`ntoseye` runs on Linux (x86-64, ARM64) and macOS on Apple Silicon. Every method below installs the same debugger; they differ in whether it embeds Python, which [custom commands](https://ntoseye.com/scripting/commands/) need, and in what they need installed first:
+`ntoseye` runs on Linux (x86-64, ARM64), macOS on Apple Silicon, and Windows (x86-64). Every method below installs the same debugger; they differ in whether it embeds Python, which [custom commands](https://ntoseye.com/scripting/commands/) need, and in what they need installed first:
 
 | Method | Custom commands | Needs |
 |---|---|---|
-| [Shell script](#shell-script) | no | nothing |
+| [Shell script](#shell-script) (Linux, macOS) | no | nothing |
 | [uv or pipx](#uv-or-pipx) | yes | Python 3.9 or newer |
 | [cargo](#cargo) | yes | Rust, and Python 3.9 or newer with its development files (`python3-dev` on Debian and Ubuntu) |
 | [pip](#python-sdk), for the Python SDK | yes | Python 3.9 or newer |
@@ -136,7 +136,7 @@ For a live preview that rebuilds as you edit, `pip install sphinx-autobuild` and
 
 ## Quickstart
 
-If you are using QEMU/KVM, VMware, or UTM, you can use `ntoseye configure` for easy setup. Otherwise, look at [KDNET](https://ntoseye.com/setup/kdnet/) instructions.
+If you are using QEMU/KVM, VMware, UTM, or Hyper-V, you can use `ntoseye configure` for easy setup. Otherwise, look at [KDNET](https://ntoseye.com/setup/kdnet/) instructions.
 
 1. Power off the Windows VM.
 2. Run `ntoseye configure` and select the hypervisor, virtual machine, and debugger backend. Note the `Run` command it prints.
@@ -147,7 +147,7 @@ Run `ntoseye status` at any time to inspect configured transports, assigned gues
 
 ### Hypervisor setup
 
-`ntoseye configure` handles automatic setup for supported libvirt, VMware Workstation, and UTM guests. For plain QEMU or manual configuration, see the [KVM/QEMU](https://ntoseye.com/setup/kvm-qemu/), [VMware](https://ntoseye.com/setup/vmware/), and [UTM](https://ntoseye.com/setup/utm/) setup guides.
+`ntoseye configure` handles automatic setup for supported libvirt, VMware Workstation, UTM, and Hyper-V guests. For plain QEMU or manual configuration, see the [KVM/QEMU](https://ntoseye.com/setup/kvm-qemu/), [VMware](https://ntoseye.com/setup/vmware/), [UTM](https://ntoseye.com/setup/utm/), and [Hyper-V](https://ntoseye.com/setup/hyperv/) setup guides.
 
 For any other target, follow the [KDNET guide](https://ntoseye.com/setup/kdnet/) instead; `configure` is not needed.
 

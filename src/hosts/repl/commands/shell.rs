@@ -37,11 +37,12 @@ impl ReplState<'_> {
 
 /// Run a host command, and optionally send debugger output to it.
 ///
-/// The command runs <host command> with the shell of the host (sh -c) and waits
-/// until it exits. It shows what the host command writes to standard output and
-/// standard error, and then the exit status if the status is not zero. With
-/// -ci, the quoted debugger commands (separated by `;`) run first, and their
-/// output becomes the standard input of the host command. For example, `.shell
+/// The command runs <host command> with the shell of the host (sh -c, or cmd /c
+/// on Windows) and waits until it exits. It shows what the host command writes
+/// to standard output and standard error, and then the exit status if the
+/// status is not zero. With -ci, the quoted debugger commands (separated by
+/// `;`) run first, and their output becomes the standard input of the host
+/// command. For example, `.shell
 /// -ci "lm" grep nt` filters the module list, and `.shell -ci "!process 0 0"
 /// sort` sorts the process list. ntoseye shows errors from the debugger
 /// commands and does not send them to the host command. Without -ci, the host
@@ -92,12 +93,10 @@ fn shell(
     Ok(Flow::Continue)
 }
 
-/// Run `command` with `sh -c`, `input` on its standard input, and print what
-/// it writes.
+/// Run `command` with the host's shell (`sh -c`, or `cmd /c` on Windows as
+/// WinDbg does), `input` on its standard input, and print what it writes.
 fn run_host_command(command: &str, input: Option<String>) {
-    let child = Command::new("sh")
-        // `--` so a command starting with `-` is not read as sh options.
-        .args(["-c", "--", command])
+    let child = host_shell(command)
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {
@@ -109,7 +108,7 @@ fn run_host_command(command: &str, input: Option<String>) {
     let mut child = match child {
         Ok(child) => child,
         Err(error) => {
-            error!("{SHELL}: failed to start sh: {error}");
+            error!("{SHELL}: failed to start the host shell: {error}");
             return;
         }
     };
@@ -150,6 +149,26 @@ fn run_host_command(command: &str, input: Option<String>) {
     }
 }
 
+#[cfg(unix)]
+fn host_shell(command: &str) -> Command {
+    let mut shell = Command::new("sh");
+    // `--` so a command starting with `-` is not read as sh options.
+    shell.args(["-c", "--", command]);
+    shell
+}
+
+/// `cmd /d /s /c "<command>"`: with `/s`, cmd strips only the outer quotes
+/// and runs the rest as typed, so the command is passed unescaped.
+#[cfg(windows)]
+fn host_shell(command: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+    let mut shell = Command::new("cmd.exe");
+    shell
+        .args(["/d", "/s", "/c"])
+        .raw_arg(format!("\"{command}\""));
+    shell
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,14 +183,32 @@ mod tests {
         (flow.unwrap(), text)
     }
 
+    /// A filter the host's shell has, and what it makes of `b`, `a`, `c`.
+    /// Not `sort` on Windows: sort.exe reads a few bytes of input as UTF-16.
+    const FILTER: (&str, &str) = if cfg!(windows) {
+        ("findstr /v b", "a\nc\n")
+    } else {
+        ("sort -r", "c\nb\na\n")
+    };
+
+    /// Creates the file `path` names.
+    fn touch(path: &std::path::Path) -> String {
+        if cfg!(windows) {
+            format!("type nul > \"{}\"", path.display())
+        } else {
+            format!("touch {}", path.display())
+        }
+    }
+
     #[test]
     fn debugger_output_is_piped_through_the_host_filter() {
+        let (filter, filtered) = FILTER;
         let (flow, text) = run(
-            ".shell -ci \".echo b; .echo a; .echo c\" sort -r",
+            &format!(".shell -ci \".echo b; .echo a; .echo c\" {filter}"),
             DispatchContext::Interactive,
         );
         assert_eq!(flow, Flow::Continue);
-        assert_eq!(text, "c\nb\na\n");
+        assert_eq!(text.replace("\r\n", "\n"), filtered);
     }
 
     #[test]
@@ -188,15 +225,15 @@ mod tests {
         ] {
             // Nested in a loop too, which runs its body in the same context.
             let line = format!(
-                ".foreach /s (x \"1\") {{.shell touch {0}}}; .shell touch {0}",
-                marker.display()
+                ".foreach /s (x \"1\") {{.shell {0}}}; .shell {0}",
+                touch(&marker)
             );
             let (flow, text) = run(&line, context);
             assert_eq!(flow, Flow::Denied, "{context:?}: {text}");
             assert!(!marker.exists(), "{context:?} started a host program");
         }
         let (flow, _) = run(
-            &format!(".shell touch {}", marker.display()),
+            &format!(".shell {}", touch(&marker)),
             DispatchContext::Interactive,
         );
         assert_eq!(flow, Flow::Continue);

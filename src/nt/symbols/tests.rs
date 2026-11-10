@@ -778,6 +778,8 @@ fn source_lines_report_whether_the_local_file_is_the_one_compiled() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+// Creating a symlink on Windows takes a privilege a test can't count on.
+#[cfg(unix)]
 #[test]
 fn source_path_remapping_rejects_traversal_and_symlink_escape() {
     let root = temp_root("source-containment");

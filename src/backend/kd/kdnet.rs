@@ -45,6 +45,16 @@ const ACK_WAIT: Duration = Duration::from_secs(1);
 /// or a lost reply is sent again after this. A request sent again waits the
 /// whole read timeout, so a slow one is not given up on.
 const REPLY_WAIT: Duration = Duration::from_secs(1);
+/// How long a dialing stream (see [`KdNetStream::dial`]) lets the target go
+/// unheard before it pokes it. Each datagram is what has the host forward
+/// the target's traffic to us at all, so this bounds how long a VM that was
+/// powered on again (a new host worker that has forgotten us) stays mute.
+const DIAL_POKE_INTERVAL: Duration = Duration::from_secs(1);
+/// The KDNET version a dialing stream pokes with before the target has
+/// named its own: the one Windows 10 and 11 speak. A target of another
+/// version drops the poke, but the host forwards it all the same, which is
+/// what lets the target's own pokes through.
+const DIAL_VERSION: u8 = 5;
 
 type Aes256CbcEncryptor = cbc::Encryptor<Aes256>;
 type Aes256CbcDecryptor = cbc::Decryptor<Aes256>;
@@ -109,17 +119,61 @@ pub struct KdNetStream {
     /// How long one read may wait in total. The socket timeout alone only
     /// bounds a single `recvfrom`. See [`KdNetStream::recv_before`].
     read_timeout: Option<Duration>,
+    /// Where the target is reached first, for [`KdNetStream::dial`].
+    dial_target: Option<SocketAddr>,
+    /// The later of the last datagram from the target and our last poke:
+    /// the target is poked once it has gone [`DIAL_POKE_INTERVAL`] past it.
+    dial_quiet_since: Option<Instant>,
 }
 
 impl KdNetStream {
+    /// `endpoint` as `--connect` takes it for KDNET: `target=HOST:PORT` to
+    /// [`dial`](Self::dial), else the address to [`bind`](Self::bind).
+    pub fn open(endpoint: &str, key: &str) -> Result<Self> {
+        match endpoint.strip_prefix("target=") {
+            Some(target) => Self::dial(target, key),
+            None => Self::bind(endpoint, key),
+        }
+    }
+
+    /// Listen on `endpoint` for a target configured to send to it.
     pub fn bind(endpoint: &str, key: &str) -> Result<Self> {
-        let control_key = parse_key(key)?;
         let bind_addr = resolve_bind_addr(endpoint)?;
         let socket = UdpSocket::bind(bind_addr).map_err(|err| {
             Error::Kd(format!(
                 "failed to bind KDNET listener on '{endpoint}': {err}"
             ))
         })?;
+        Self::with_socket(socket, key, None)
+    }
+
+    /// Reach the target at `target` first, from an ephemeral port, as
+    /// WinDbg's `-k net:...,target=HOST` does: poke it until it answers, and
+    /// again whenever it falls quiet. Hyper-V carries a guest's KDNET over a
+    /// synthetic debug device whose host end (`vmwp.exe`) listens on the VM's
+    /// debug port and sends the guest's datagrams only to whoever sent to
+    /// that port last; the address the guest itself was given goes unused.
+    pub fn dial(target: &str, key: &str) -> Result<Self> {
+        let target_addr = target
+            .to_socket_addrs()
+            .map_err(|err| Error::Kd(format!("invalid KDNET target address '{target}': {err}")))?
+            .next()
+            .ok_or_else(|| {
+                Error::Kd(format!(
+                    "KDNET target address '{target}' resolved to nothing"
+                ))
+            })?;
+        let local = match target_addr {
+            SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
+            SocketAddr::V6(_) => SocketAddr::from(([0u16; 8], 0)),
+        };
+        let socket = UdpSocket::bind(local)
+            .map_err(|err| Error::Kd(format!("failed to bind a KDNET socket: {err}")))?;
+        Self::with_socket(socket, key, Some(target_addr))
+    }
+
+    fn with_socket(socket: UdpSocket, key: &str, dial_target: Option<SocketAddr>) -> Result<Self> {
+        let control_key = parse_key(key)?;
         let mut hmac_key = control_key;
         for byte in &mut hmac_key {
             *byte = !*byte;
@@ -150,7 +204,36 @@ impl KdNetStream {
             outbound: Vec::with_capacity(MAX_KD_STREAM_SIZE),
             deferred_breakin: false,
             read_timeout: None,
+            dial_target,
+            dial_quiet_since: None,
         })
+    }
+
+    pub fn dial_target(&self) -> Option<SocketAddr> {
+        self.dial_target
+    }
+
+    /// For a dialing stream, poke the target if it has been quiet too long,
+    /// and return when it will next be due.
+    fn poke_dialed_target(&mut self) -> io::Result<Option<Instant>> {
+        let Some(target) = self.dial_target else {
+            return Ok(None);
+        };
+        let now = Instant::now();
+        let quiet_since = match self.dial_quiet_since {
+            Some(since) if now < since + DIAL_POKE_INTERVAL => since,
+            _ => {
+                let version = match self.state.version.load(Ordering::Relaxed) {
+                    0 => DIAL_VERSION,
+                    version => version,
+                };
+                kd_trace!("kdnet: poking the dialed target {target}");
+                self.poke(target, version)?;
+                self.dial_quiet_since = Some(now);
+                now
+            }
+        };
+        Ok(Some(quiet_since + DIAL_POKE_INTERVAL))
     }
 
     pub fn try_clone(&self) -> io::Result<Self> {
@@ -172,6 +255,9 @@ impl KdNetStream {
             // The dup shares one socket, so it shares the timeout already set
             // on it.
             read_timeout: self.read_timeout,
+            // The dup only writes (break-ins); the reader does the poking.
+            dial_target: self.dial_target,
+            dial_quiet_since: None,
         })
     }
 
@@ -228,9 +314,26 @@ impl KdNetStream {
             (deadline, due) => deadline.or(due),
         };
         loop {
+            let poke_due = self.poke_dialed_target()?;
+            let wait = match (deadline, poke_due) {
+                (Some(deadline), Some(due)) => Some(deadline.min(due)),
+                (deadline, due) => deadline.or(due),
+            };
             datagram.resize(MAX_DATAGRAM_SIZE, 0);
-            let (size, source) = match self.recv_before(deadline, datagram) {
+            let (size, source) = match self.recv_before(wait, datagram) {
                 Ok(received) => received,
+                // Windows reports an ICMP port-unreachable that answered an
+                // earlier send as a reset of the next receive: the port was
+                // closed then (a VM not yet running), which is no error now.
+                Err(error) if error.kind() == ErrorKind::ConnectionReset => continue,
+                // Only the poke timer ran out: poke, and keep waiting.
+                Err(error)
+                    if poke_due.is_some()
+                        && framing::is_temporary_io_error(error.kind())
+                        && deadline.is_none_or(|deadline| Instant::now() < deadline) =>
+                {
+                    continue;
+                }
                 Err(error) => {
                     if self.answer_due.is_some_and(|due| due <= Instant::now()) {
                         self.answer_due = None;
@@ -240,6 +343,9 @@ impl KdNetStream {
             };
             self.received_datagrams = self.received_datagrams.saturating_add(1);
             kd_trace!("kdnet: received {size}-byte UDP datagram from {source}");
+            if self.dial_target == Some(source) {
+                self.dial_quiet_since = Some(Instant::now());
+            }
             if size < HEADER_SIZE + METADATA_SIZE + AUTH_TAG_SIZE {
                 continue;
             }
@@ -1711,5 +1817,68 @@ mod tests {
         );
         assert_eq!(generation.load(Ordering::Relaxed), 1);
         target_thread.join().unwrap();
+    }
+
+    /// Hyper-V's host worker sends the guest's KDNET only to whoever sent
+    /// to it last, so a dialing stream speaks first, and keeps poking while
+    /// the target is silent (a VM not yet running), until it answers.
+    #[test]
+    fn a_dialing_stream_pokes_until_the_target_answers_then_negotiates() {
+        let (key, hmac_key) = test_keys();
+        let worker = UdpSocket::bind("127.0.0.1:0").unwrap();
+        worker
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let target = format!("target={}", worker.local_addr().unwrap());
+        let mut host = KdNetStream::open(&target, "1.2.3.4").unwrap();
+        assert_eq!(host.dial_target(), Some(worker.local_addr().unwrap()));
+        host.set_read_timeout(Some(Duration::from_millis(2500)))
+            .unwrap();
+
+        let worker_thread = std::thread::spawn(move || {
+            let mut source = None;
+            for _ in 0..2 {
+                let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
+                let (len, from) = worker.recv_from(&mut buf).expect("the host pokes");
+                buf.truncate(len);
+                let body = open_datagram(buf, key, &hmac_key).expect("an authenticated poke");
+                assert!(body.is_empty(), "a host poke carries nothing");
+                source = Some(from);
+            }
+            let host_addr = source.unwrap();
+            worker
+                .send_to(&poke_datagram(0x11, 9, key, &hmac_key), host_addr)
+                .unwrap();
+            loop {
+                let datagram = recv_datagram(&worker).expect("the host answers the offer");
+                let body = open_datagram(datagram, key, &hmac_key).unwrap();
+                if body.len() == CONTROL_RESPONSE_SIZE {
+                    return;
+                }
+            }
+        });
+
+        let kind = host.read(&mut [0u8; 1]).unwrap_err().kind();
+        assert!(framing::is_temporary_io_error(kind), "{kind:?}");
+        worker_thread.join().unwrap();
+        assert!(read_lock(&host.state.data_key).unwrap().is_some());
+    }
+
+    /// Windows answers a send to a closed local port with a reset of the
+    /// next receive. A VM that is off is that port; the read must wait out
+    /// its timeout rather than fail.
+    #[test]
+    fn a_dialed_port_with_nothing_behind_it_only_times_out() {
+        let closed = UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let mut host = KdNetStream::open(&format!("target={closed}"), "1.2.3.4").unwrap();
+        host.set_read_timeout(Some(Duration::from_millis(1500)))
+            .unwrap();
+        let start = Instant::now();
+        let kind = host.read(&mut [0u8; 1]).unwrap_err().kind();
+        assert!(framing::is_temporary_io_error(kind), "{kind:?}");
+        assert!(start.elapsed() >= Duration::from_millis(1400));
     }
 }

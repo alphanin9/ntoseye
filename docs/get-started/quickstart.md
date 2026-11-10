@@ -1,6 +1,6 @@
 # Quickstart
 
-If you use QEMU/KVM, VMware, or UTM, `ntoseye configure` gives you an easy setup. For other targets, use the [KDNET](../setup/kdnet.md) instructions.
+If you use QEMU/KVM, VMware, UTM, or Hyper-V, `ntoseye configure` gives you an easy setup. For other targets, use the [KDNET](../setup/kdnet.md) instructions.
 
 1. Power off the Windows VM.
 2. Run `ntoseye configure` and select the hypervisor, the virtual machine, and the debugger backend. Write down the `Run` command that it shows.
@@ -12,7 +12,7 @@ To see the current configuration, run `ntoseye status`. You can run it at any ti
 
 ## Hypervisor setup
 
-`ntoseye configure` sets up supported libvirt, VMware Workstation, and UTM guests automatically. For plain QEMU or for manual configuration, see the [KVM/QEMU](../setup/kvm-qemu.md), [VMware](../setup/vmware.md), and [UTM](../setup/utm.md) setup guides.
+`ntoseye configure` sets up supported libvirt, VMware Workstation, UTM, and Hyper-V guests automatically. For plain QEMU or for manual configuration, see the [KVM/QEMU](../setup/kvm-qemu.md), [VMware](../setup/vmware.md), [UTM](../setup/utm.md), and [Hyper-V](../setup/hyperv.md) setup guides.
 
 For all other targets, follow the [KDNET guide](../setup/kdnet.md), which does not need `configure`.
 

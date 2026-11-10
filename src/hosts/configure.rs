@@ -19,6 +19,8 @@ use crate::{
     nt::symbols,
 };
 
+#[cfg(any(windows, test))]
+mod hyperv;
 #[cfg(target_os = "linux")]
 mod libvirt;
 #[cfg(any(target_os = "macos", test))]
@@ -175,12 +177,20 @@ impl ConfiguredTarget {
         }
     }
 
+    /// A KDNET target reached at the host's `port`, as Hyper-V serves one.
+    pub fn kdnet(port: u32) -> Self {
+        Self {
+            backend: BackendSelection::KdNet,
+            endpoint: format!("target=127.0.0.1:{port}"),
+            guest_port: None,
+            elevated: false,
+        }
+    }
+
     fn label(&self) -> &'static str {
         match self.backend {
             BackendSelection::Kd => "KD",
-            BackendSelection::KdNet => {
-                unreachable!("KDNET guest configuration is not host-inspectable")
-            }
+            BackendSelection::KdNet => "KDNET",
             #[cfg(any(target_os = "linux", test))]
             BackendSelection::Gdb => "GDB",
             #[cfg(any(target_os = "linux", test))]
@@ -205,7 +215,7 @@ impl ConfiguredTarget {
                 format!("{executable} --connect {}", shell_quote(&self.endpoint))
             }
             BackendSelection::KdNet => {
-                unreachable!("KDNET guest configuration is not host-inspectable")
+                format!("{executable} --backend kdnet --connect {}", self.endpoint)
             }
             #[cfg(any(target_os = "linux", test))]
             BackendSelection::Gdb if self.endpoint == DEFAULT_GDB_ADDR => {
@@ -522,6 +532,10 @@ fn host_configurators() -> Vec<Box<dyn Configurator>> {
     {
         vec![Box::new(utm::Utm)]
     }
+    #[cfg(windows)]
+    {
+        vec![Box::new(hyperv::HyperV)]
+    }
 }
 
 fn format_probe(name: &str, status: &ProbeStatus) -> String {
@@ -700,7 +714,6 @@ fn sanitize_filename(name: &str) -> String {
 }
 
 /// A failed command's stderr, or its stdout when stderr is empty.
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn command_detail(output: &std::process::Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if stderr.is_empty() {
@@ -765,16 +778,16 @@ mod tests {
         };
         assert_eq!(
             render_guest_status(&guest, &inspection),
-            concat!(
-                "  Windows (running)\n",
-                "    KD\n",
-                "      Guest port: COM2\n",
-                "      Endpoint: /tmp/ntoseye-kd.sock\n",
-                "    GDB\n",
-                "      Endpoint: 127.0.0.1:1234\n",
-                "    Run\n",
-                "      ntoseye\n",
-                "      ntoseye --backend gdb\n",
+            format!(
+                "  Windows (running)\n\
+                 \x20   KD\n\
+                 \x20     Guest port: COM2\n\
+                 \x20     Endpoint: {DEFAULT_KD_SOCKET}\n\
+                 \x20   GDB\n\
+                 \x20     Endpoint: 127.0.0.1:1234\n\
+                 \x20   Run\n\
+                 \x20     ntoseye\n\
+                 \x20     ntoseye --backend gdb\n",
             )
         );
     }

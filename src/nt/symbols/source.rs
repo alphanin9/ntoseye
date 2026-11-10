@@ -316,6 +316,9 @@ impl SymbolStore {
         let mut addresses = Vec::new();
         let mappings = self.source_paths.read();
         let query = SourceFileQuery::new(file);
+        // As the query does, take `\` for a separator: a local path joined
+        // on Windows holds both.
+        let local_query = file.replace('\\', "/");
         for module in self.modules.iter() {
             if !self.module_in_scope(&module, dtb) {
                 continue;
@@ -331,7 +334,11 @@ impl SymbolStore {
                     || *mapped.entry(recorded).or_insert_with(|| {
                         self.local_source(module.guid, recorded, &mappings)
                             .is_some_and(|local| {
-                                local.path.to_string_lossy().eq_ignore_ascii_case(file)
+                                local
+                                    .path
+                                    .to_string_lossy()
+                                    .replace('\\', "/")
+                                    .eq_ignore_ascii_case(&local_query)
                             })
                     });
                 if matches {

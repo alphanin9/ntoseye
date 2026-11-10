@@ -6,6 +6,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::mem::{offset_of, size_of};
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -303,14 +304,14 @@ pub fn create_temporary_file(destination: &Path) -> Result<(PathBuf, File)> {
         temporary_name.push(name);
         temporary_name.push(format!(".ntoseye.tmp-{}-{sequence}", std::process::id()));
         let temporary = parent.join(temporary_name);
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            // Replacing a private dump must not expose its memory through
-            // the temporary file or a more permissive replacement inode.
-            .mode(0o600)
-            .open(&temporary)
-        {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        // Replacing a private dump must not expose its memory through the
+        // temporary file or a more permissive replacement inode. On Windows
+        // the file takes its directory's ACL, as the replaced dump did.
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&temporary) {
             Ok(file) => return Ok((temporary, file)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
